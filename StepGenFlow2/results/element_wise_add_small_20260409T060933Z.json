@@ -1,0 +1,16 @@
+{
+  "success": true,
+  "outer_iterations": 1,
+  "total_tool_calls": 2,
+  "cycle_count": null,
+  "final_diagnosis": null,
+  "traces": [
+    {
+      "code": "def build_graph(dims):\n    # ------------------------------------------------------------\n    # Configuration\n    # ------------------------------------------------------------\n    M = dims[\"M\"]\n    K = dims[\"K\"]\n    tile_m = dims[\"tile_m\"]\n    tile_k = dims[\"tile_k\"]\n\n    # Tile grid for the 2\u2011D matrix\n    out_shape_tiled = (M // tile_m, K // tile_k)\n    # Stride for linear tile indexing: (cols_per_tile, 1)\n    stride = (K // tile_k, 1)\n\n    # ------------------------------------------------------------\n    # Deterministic random inputs (same seed as the reference)\n    # ------------------------------------------------------------\n    torch.manual_seed(42)\n    A = torch.randn(M, K)\n    B = torch.randn(M, K)\n\n    # ------------------------------------------------------------\n    # Build the STeP graph\n    # ------------------------------------------------------------\n    graph = Graph()\n\n    # Load the two matrices from off\u2011chip memory, tiled.\n    a_tile = LinearOffChipLoad(\n        A,\n        stride,\n        out_shape_tiled,\n        tile_row=tile_m,\n        tile_col=tile_k,\n        par_dispatch=1,\n        transposed=False,\n    )\n    b_tile = LinearOffChipLoad(\n        B,\n        stride,\n        out_shape_tiled,\n        tile_row=tile_m,\n        tile_col=tile_k,\n        par_dispatch=1,\n        transposed=False,\n    )\n\n    # Element\u2011wise addition (A + B)\n    add_tile = BinaryMap(\n        graph,\n        a_tile,\n        b_tile,\n        fn=Add(),\n        write_back_mu=False,\n        compute_bw=1,\n    )\n\n    # Store the result back to off\u2011chip (will be untiled by the emulator)\n    out_store = OffChipStore(graph, add_tile, par_dispatch=1)\n\n    # Resolve any pending broadcast needs and finish.\n    graph = infer_broadcast(graph)\n    return graph, out_store",
+      "tool_outputs": [
+        "[0] LinearOffChipLoad: shape=(1, 2, 3, 16, 16) min=-3.101606 max=3.445625 mean=0.004229\n[1] LinearOffChipLoad: shape=(1, 2, 3, 16, 16) min=-3.832532 max=3.035121 mean=0.006132\n[2] BinaryMap: shape=(1, 2, 3, 16, 16) min=-4.739002 max=4.501672 mean=0.010361\n[3] OffChipStore: shape=(1, 2, 3, 16, 16) min=-4.739002 max=4.501672 mean=0.010361",
+        "match=True\nmax_abs_err=0.00e+00\nrel_err=0.00e+00\noutput_shape=(32, 48)"
+      ]
+    }
+  ]
+}
