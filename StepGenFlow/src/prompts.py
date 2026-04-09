@@ -122,6 +122,13 @@ RetileStreamify(graph, input, split_row: bool, filter_mask: bool = False, chunk:
   Splits tiles along rows/cols into smaller tiles and streams them.
   If filter_mask=True, only emits valid (non-padded) chunks.
 
+### Data Types
+
+Tile(tile_dtype=Float32(), shape=(r, c))
+  Specifies the tile shape and dtype for output streams. Used as the `output_stream_dtype`
+  argument to Accum and BinaryMapAccum to set the output tile dimensions.
+  Example: Tile(tile_dtype=Float32(), shape=(tile_m, 1)) for a row-reduce producing scalars.
+
 ### Functions
 
 map_fn: Add(), Mul(), Div(), Silu(), Exp(), Pow2(), Rsqrt(), Square(), RowWiseSum(),
