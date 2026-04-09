@@ -1,0 +1,6 @@
+op_id,op_name,op_str,sim_start,ana_start,delta_start,sim_end,ana_end,delta_end,sim_duration,ana_duration,delta_duration,sim_tiles,ana_N_fire,sim_avg_tile_dur,ana_T_fire,ana_OCI,ana_OTI,ana_ICI,ana_ICD,ana_fto
+359,LinearOffChipLoad,LinearOffChipLoad_359,0.0,0,0.0,37.0,51,14.0,37.0,51,14.0,1.0,1,37.0,0,51,51,0,0,51
+360,RepeatStatic,RepeatStatic_360,,51,,,51,,,0,,,32,,0,0,0,0,0,51
+361,LinearOffChipLoad,LinearOffChipLoad_361,0.0,0,0.0,7500.0,1440,-6060.0,7500.0,1440,-6060.0,32.0,32,36.03125,0,45,45,0,0,45
+362,BinaryMap,BinaryMap_362 (fn: Matmul),39.0,51,12.0,8231.0,8243,12.0,8192.0,8192,0.0,32.0,32,256.0,256,256,256,0,0,307
+363,OffChipStore,OffChipStore_363,296.0,307,11.0,8240.0,8254,14.0,7944.0,7947,3.0,32.0,32,8.90625,0,256,256,256,0,318

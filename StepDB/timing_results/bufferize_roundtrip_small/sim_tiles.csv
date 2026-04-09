@@ -1,0 +1,17 @@
+context_id,name,id,start_ns,end_ns,is_stop,duration
+33,LinearOffChipLoad,96,0,8,False,8
+33,LinearOffChipLoad,96,8,16,False,8
+33,LinearOffChipLoad,96,16,24,True,8
+33,LinearOffChipLoad,96,24,32,False,8
+33,LinearOffChipLoad,96,32,40,False,8
+33,LinearOffChipLoad,96,40,48,True,8
+34,Bufferize,97,9,25,False,16
+34,Bufferize,97,33,49,False,16
+35,Streamify,98,26,37,False,11
+35,Streamify,98,50,61,False,11
+36,OffChipStore,99,27,35,False,8
+36,OffChipStore,99,35,43,False,8
+36,OffChipStore,99,43,51,False,8
+36,OffChipStore,99,51,59,False,8
+36,OffChipStore,99,59,67,False,8
+36,OffChipStore,99,67,75,False,8

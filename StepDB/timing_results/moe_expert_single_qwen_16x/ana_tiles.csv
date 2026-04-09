@@ -1,0 +1,15 @@
+name,id,start_ns,end_ns,is_stop
+LinearOffChipLoad,256,0,123,False
+LinearOffChipLoad,257,0,177,False
+BinaryMapAccum,258,177,689,False
+LinearOffChipLoad,259,0,123,False
+LinearOffChipLoad,260,0,177,False
+BinaryMapAccum,261,177,689,False
+UnaryMap,262,689,690,False
+BinaryMap,263,690,691,False
+Bufferize,264,691,691,False
+Streamify,265,691,691,False
+Reshape,266,691,739,False
+LinearOffChipLoad,267,0,177,False
+BinaryMapAccum,268,739,1123,False
+OffChipStore,269,1123,1166,False

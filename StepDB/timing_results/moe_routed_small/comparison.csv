@@ -1,0 +1,87 @@
+op_id,op_name,op_str,sim_start,ana_start,delta_start,sim_end,ana_end,delta_end,sim_duration,ana_duration,delta_duration,sim_tiles,ana_N_fire,sim_avg_tile_dur,ana_T_fire,ana_OCI,ana_OTI,ana_ICI,ana_ICD,ana_fto
+0,LinearOffChipLoad,LinearOffChipLoad_0,0.0,0,0.0,40.0,48,8.0,40.0,48,8.0,8.0,8,5.0,0,6,6,0,0,6
+1,SelectGen,SelectGen_1,,0,,,0,,,0,,,8,,0,0,0,0,0,0
+2,SelectGen,SelectGen_2,,0,,,0,,,0,,,8,,0,0,0,0,0,0
+3,LinearOffChipLoad,LinearOffChipLoad_3,0.0,0,0.0,319.0,48,-271.0,319.0,48,-271.0,8.0,8,5.0,0,6,6,0,0,6
+4,FlatPartition,FlatPartition_4 (0 D),6.0,6,0.0,44.0,50,6.0,38.0,44,6.0,8.0,8,3.0,2,6,24,0,0,8
+5,Reshape,Reshape_5 (0 D) (chunk: 4),,8,,,80,,,72,,,4,,0,24,6,0,0,8
+6,Flatten,"Flatten_6 (1 D, 2 D)",,8,,,26,,,18,,,4,,0,6,6,0,0,8
+7,Accum,Accum_7 (1 D) (fn: RetileRow),44.0,8,-36.0,44.0,27,-17.0,0.0,19,19.0,1.0,1,0.0,1,24,24,0,18,27
+8,Reshape,Reshape_8 (0 D) (chunk: 4),,8,,,80,,,72,,,4,,0,24,6,0,0,8
+9,Flatten,"Flatten_9 (1 D, 2 D)",,8,,,26,,,18,,,4,,0,6,6,0,0,8
+10,Accum,Accum_10 (1 D) (fn: RetileRow),,8,,,27,,,19,,,1,,1,24,24,0,18,27
+11,Reshape,Reshape_11 (0 D) (chunk: 4),,8,,,80,,,72,,,4,,0,24,6,0,0,8
+12,Flatten,"Flatten_12 (1 D, 2 D)",,8,,,26,,,18,,,4,,0,6,6,0,0,8
+13,Accum,Accum_13 (1 D) (fn: RetileRow),43.0,8,-35.0,43.0,27,-16.0,0.0,19,19.0,1.0,1,0.0,1,24,24,0,18,27
+14,Reshape,Reshape_14 (0 D) (chunk: 4),,8,,,80,,,72,,,4,,0,24,6,0,0,8
+15,Flatten,"Flatten_15 (1 D, 2 D)",,8,,,26,,,18,,,4,,0,6,6,0,0,8
+16,Accum,Accum_16 (1 D) (fn: RetileRow),47.0,8,-39.0,47.0,27,-20.0,0.0,19,19.0,1.0,1,0.0,1,24,24,0,18,27
+17,RepeatStatic,RepeatStatic_17,,27,,,27,,,0,,,1,,0,24,24,0,0,27
+18,RepeatStatic,RepeatStatic_18,,27,,,27,,,0,,,1,,0,24,24,24,0,27
+19,RepeatStatic,RepeatStatic_19,,27,,,27,,,0,,,1,,0,24,24,24,0,27
+20,RepeatStatic,RepeatStatic_20,,27,,,27,,,0,,,1,,0,24,24,24,0,27
+21,LinearOffChipLoadRef,LinearOffChipLoadRef_21 (rank=0),46.0,27,-19.0,103.0,102,-1.0,57.0,75,18.0,1.0,1,57.0,0,75,75,24,0,102
+22,LinearOffChipLoadRef,LinearOffChipLoadRef_22 (rank=0),,27,,,102,,,75,,,1,,0,75,75,24,0,102
+23,LinearOffChipLoadRef,LinearOffChipLoadRef_23 (rank=0),45.0,27,-18.0,102.0,102,0.0,57.0,75,18.0,1.0,1,57.0,0,75,75,24,0,102
+24,LinearOffChipLoadRef,LinearOffChipLoadRef_24 (rank=0),49.0,27,-22.0,110.0,102,-8.0,61.0,75,14.0,1.0,1,61.0,0,75,75,24,0,102
+25,Flatten,"Flatten_25 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+26,Flatten,"Flatten_26 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+27,Flatten,"Flatten_27 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+28,Flatten,"Flatten_28 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+29,BinaryMap,BinaryMap_29 (fn: Matmul),105.0,102,-3.0,201.0,198,-3.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,198
+30,BinaryMap,BinaryMap_30 (fn: Matmul),,102,,,198,,,96,,,1,,96,96,96,24,0,198
+31,BinaryMap,BinaryMap_31 (fn: Matmul),104.0,102,-2.0,200.0,198,-2.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,198
+32,BinaryMap,BinaryMap_32 (fn: Matmul),112.0,102,-10.0,208.0,198,-10.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,198
+33,LinearOffChipLoadRef,LinearOffChipLoadRef_33 (rank=0),46.0,27,-19.0,104.0,102,-2.0,58.0,75,17.0,1.0,1,58.0,0,75,75,24,0,102
+34,LinearOffChipLoadRef,LinearOffChipLoadRef_34 (rank=0),,27,,,102,,,75,,,1,,0,75,75,24,0,102
+35,LinearOffChipLoadRef,LinearOffChipLoadRef_35 (rank=0),45.0,27,-18.0,100.0,102,2.0,55.0,75,20.0,1.0,1,55.0,0,75,75,24,0,102
+36,LinearOffChipLoadRef,LinearOffChipLoadRef_36 (rank=0),49.0,27,-22.0,108.0,102,-6.0,59.0,75,16.0,1.0,1,59.0,0,75,75,24,0,102
+37,Flatten,"Flatten_37 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+38,Flatten,"Flatten_38 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+39,Flatten,"Flatten_39 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+40,Flatten,"Flatten_40 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+41,BinaryMap,BinaryMap_41 (fn: Matmul),106.0,102,-4.0,202.0,198,-4.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,198
+42,BinaryMap,BinaryMap_42 (fn: Matmul),,102,,,198,,,96,,,1,,96,96,96,24,0,198
+43,BinaryMap,BinaryMap_43 (fn: Matmul),102.0,102,0.0,198.0,198,0.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,198
+44,BinaryMap,BinaryMap_44 (fn: Matmul),110.0,102,-8.0,206.0,198,-8.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,198
+45,UnaryMap,UnaryMap_45 (fn: Silu),203.0,198,-5.0,205.0,199,-6.0,2.0,1,-1.0,1.0,1,2.0,1,96,96,24,0,199
+46,UnaryMap,UnaryMap_46 (fn: Silu),,198,,,199,,,1,,,1,,1,96,96,24,0,199
+47,UnaryMap,UnaryMap_47 (fn: Silu),199.0,198,-1.0,201.0,199,-2.0,2.0,1,-1.0,1.0,1,2.0,1,96,96,24,0,199
+48,UnaryMap,UnaryMap_48 (fn: Silu),207.0,198,-9.0,209.0,199,-10.0,2.0,1,-1.0,1.0,1,2.0,1,96,96,24,0,199
+49,BinaryMap,BinaryMap_49 (fn: Mul),206.0,199,-7.0,207.0,200,-7.0,1.0,1,0.0,1.0,1,1.0,1,96,96,24,0,200
+50,BinaryMap,BinaryMap_50 (fn: Mul),,199,,,200,,,1,,,1,,1,96,96,24,0,200
+51,BinaryMap,BinaryMap_51 (fn: Mul),202.0,199,-3.0,203.0,200,-3.0,1.0,1,0.0,1.0,1,1.0,1,96,96,24,0,200
+52,BinaryMap,BinaryMap_52 (fn: Mul),210.0,199,-11.0,211.0,200,-11.0,1.0,1,0.0,1.0,1,1.0,1,96,96,24,0,200
+53,LinearOffChipLoadRef,LinearOffChipLoadRef_53 (rank=0),46.0,27,-19.0,106.0,102,-4.0,60.0,75,15.0,1.0,1,60.0,0,75,75,24,0,102
+54,LinearOffChipLoadRef,LinearOffChipLoadRef_54 (rank=0),,27,,,102,,,75,,,1,,0,75,75,24,0,102
+55,LinearOffChipLoadRef,LinearOffChipLoadRef_55 (rank=0),45.0,27,-18.0,99.0,102,3.0,54.0,75,21.0,1.0,1,54.0,0,75,75,24,0,102
+56,LinearOffChipLoadRef,LinearOffChipLoadRef_56 (rank=0),49.0,27,-22.0,105.0,102,-3.0,56.0,75,19.0,1.0,1,56.0,0,75,75,24,0,102
+57,Flatten,"Flatten_57 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+58,Flatten,"Flatten_58 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+59,Flatten,"Flatten_59 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+60,Flatten,"Flatten_60 (0 D, 1 D)",,102,,,102,,,0,,,1,,0,75,75,24,0,102
+61,BinaryMapAccum,BinaryMapAccum_61 (fn: Matmul(transposed=False)),208.0,200,-8.0,304.0,296,-8.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,296
+62,BinaryMapAccum,BinaryMapAccum_62 (fn: Matmul(transposed=False)),,200,,,296,,,96,,,1,,96,96,96,24,0,296
+63,BinaryMapAccum,BinaryMapAccum_63 (fn: Matmul(transposed=False)),204.0,200,-4.0,300.0,296,-4.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,296
+64,BinaryMapAccum,BinaryMapAccum_64 (fn: Matmul(transposed=False)),212.0,200,-12.0,308.0,296,-12.0,96.0,96,0.0,1.0,1,96.0,96,96,96,24,0,296
+65,RetileStreamify,RetileStreamify_65,,296,,,296,,,0,,,2,,0,96,24,24,0,296
+66,RetileStreamify,RetileStreamify_66,,296,,,296,,,0,,,2,,0,96,24,24,0,296
+67,RetileStreamify,RetileStreamify_67,,296,,,296,,,0,,,2,,0,96,24,24,0,296
+68,RetileStreamify,RetileStreamify_68,,296,,,296,,,0,,,2,,0,96,24,24,0,296
+69,FlatPartition,FlatPartition_69 (0 D),6.0,6,0.0,322.0,49,-273.0,316.0,43,-273.0,8.0,8,38.125,1,6,24,0,0,7
+70,BinaryMap,BinaryMap_70 (fn: Mul),315.0,296,-19.0,320.0,321,1.0,5.0,25,20.0,2.0,2,1.0,1,24,24,24,0,297
+71,BinaryMap,BinaryMap_71 (fn: Mul),,296,,,321,,,25,,,2,,1,24,24,24,0,297
+72,BinaryMap,BinaryMap_72 (fn: Mul),302.0,296,-6.0,318.0,321,3.0,16.0,25,9.0,2.0,2,1.0,1,24,24,24,0,297
+73,BinaryMap,BinaryMap_73 (fn: Mul),310.0,296,-14.0,324.0,321,-3.0,14.0,25,11.0,4.0,2,1.0,1,24,24,24,0,297
+74,SelectGen,SelectGen_74,,0,,,0,,,0,,,8,,0,0,0,0,0,0
+75,FlatReassemble,FlatReassemble_75 (0 D),304.0,297,-7.0,334.0,339,5.0,30.0,42,12.0,8.0,8,4.875,0,6,6,24,0,297
+76,Accum,Accum_76 (1 D) (fn: Add),314.0,297,-17.0,343.0,340,-3.0,29.0,43,14.0,8.0,8,1.0,1,6,6,24,0,298
+77,OffChipStore,OffChipStore_77,316.0,298,-18.0,356.0,346,-10.0,40.0,48,8.0,8.0,8,5.0,0,6,6,6,0,304
+78,Broadcast,Broadcast_78,,27,,,27,,,0,,,1,,0,24,24,0,0,27
+79,Broadcast,Broadcast_79,,27,,,27,,,0,,,1,,0,24,24,0,0,27
+80,Broadcast,Broadcast_80,,27,,,27,,,0,,,1,,0,24,24,0,0,27
+81,Broadcast,Broadcast_81,,27,,,27,,,0,,,1,,0,24,24,0,0,27
+82,Broadcast,Broadcast_82,,27,,,27,,,0,,,1,,0,24,24,24,0,27
+83,Broadcast,Broadcast_83,,27,,,27,,,0,,,1,,0,24,24,24,0,27
+84,Broadcast,Broadcast_84,,27,,,27,,,0,,,1,,0,24,24,24,0,27
+85,Broadcast,Broadcast_85,,27,,,27,,,0,,,1,,0,24,24,24,0,27

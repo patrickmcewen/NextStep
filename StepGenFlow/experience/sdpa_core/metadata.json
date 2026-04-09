@@ -1,0 +1,5 @@
+{
+  "kernel": "sdpa_core",
+  "preset": "small",
+  "cycles": null
+}

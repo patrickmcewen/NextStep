@@ -1,0 +1,10 @@
+name,id,start_ns,end_ns,is_stop
+LinearOffChipLoad,354,0,51,False
+RepeatStatic,355,51,51,False
+RepeatStatic,355,51,51,False
+LinearOffChipLoad,356,0,47,False
+LinearOffChipLoad,356,47,94,False
+BinaryMap,357,51,307,False
+BinaryMap,357,307,563,False
+OffChipStore,358,307,316,False
+OffChipStore,358,316,572,False

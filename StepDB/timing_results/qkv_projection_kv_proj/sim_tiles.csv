@@ -1,0 +1,8 @@
+context_id,name,id,start_ns,end_ns,is_stop,duration
+33,LinearOffChipLoad,354,0,37,True,37
+36,LinearOffChipLoad,356,0,37,False,37
+36,LinearOffChipLoad,356,37,73,True,36
+35,BinaryMap,357,39,295,False,256
+35,BinaryMap,357,295,551,True,256
+37,OffChipStore,358,296,304,False,8
+37,OffChipStore,358,552,560,False,8

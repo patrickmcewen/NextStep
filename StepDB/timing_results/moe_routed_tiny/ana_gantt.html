@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytical: moe_routed/tiny (132 cycles)</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; overflow: hidden; }
+        h1 { margin-top: 0; }
+        #container { width: 100%; height: calc(100vh - 120px); overflow: auto; position: relative; }
+        #timeline { position: relative; margin-top: 40px; }
+        .file-row { height: 50px; margin-bottom: 5px; position: relative; border-bottom: 1px solid #eee; }
+        .file-label { position: absolute; left: 0; top: 10px; width: 300px; font-weight: bold;
+                       text-align: right; padding-right: 10px; overflow: visible; word-wrap: break-word; line-height: 1.2; }
+        .timeline-container { margin-left: 320px; position: relative; height: 100%; }
+        .block { position: absolute; height: 30px; top: 10px; border-radius: 3px; text-align: center;
+                  font-size: 10px; overflow: hidden; white-space: nowrap; color: white; display: flex;
+                  align-items: center; justify-content: center; cursor: pointer; transition: opacity 0.2s; }
+        .block:hover { opacity: 0.8; }
+        .event-normal { background-color: #33A8FF; }
+        .event-stop { background-color: #FF5733; }
+        .timeline-marker { position: absolute; width: 1px; height: 100%; background-color: rgba(0,0,0,0.1); top: 0; }
+        .timeline-label { position: absolute; font-size: 10px; color: #666; top: -20px; transform: translateX(-50%); }
+        .controls { margin-bottom: 20px; }
+        .tooltip { position: absolute; background-color: rgba(0,0,0,0.8); color: white; padding: 8px;
+                    border-radius: 4px; font-size: 12px; z-index: 100; pointer-events: none; display: none; }
+        button { margin-right: 10px; padding: 5px 10px; cursor: pointer; }
+        #scale-slider { width: 200px; display: inline-block; vertical-align: middle; }
+        .legend { margin-top: 10px; display: flex; align-items: center; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; margin-right: 20px; margin-bottom: 5px; }
+        .legend-color { width: 15px; height: 15px; border-radius: 3px; margin-right: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Analytical: moe_routed/tiny (132 cycles)</h1>
+    <div class="controls">
+        <button id="zoom-in">Zoom In</button>
+        <button id="zoom-out">Zoom Out</button>
+        <button id="reset">Reset</button>
+        <label for="scale-slider">Scale: </label>
+        <input type="range" id="scale-slider" min="1" max="100" value="10">
+        <span id="scale-value">1x</span>
+    </div>
+    <div class="legend">
+        <div class="legend-item"><div class="legend-color event-normal"></div><span>Normal Event</span></div>
+        <div class="legend-item"><div class="legend-color event-stop"></div><span>Stop Event</span></div>
+    </div>
+    <div id="container"><div id="timeline"></div></div>
+    <div id="tooltip" class="tooltip"></div>
+    <script>
+        const data = [{"file_id": "LinearOffChipLoad_364", "name": "LinearOffChipLoad", "id": "364", "prefix": "event", "identifier": "event_LinearOffChipLoad_364_1", "start": 0.0, "end": 6.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_364", "name": "LinearOffChipLoad", "id": "364", "prefix": "event", "identifier": "event_LinearOffChipLoad_364_2", "start": 6.0, "end": 12.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_364", "name": "LinearOffChipLoad", "id": "364", "prefix": "event", "identifier": "event_LinearOffChipLoad_364_3", "start": 12.0, "end": 18.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_364", "name": "LinearOffChipLoad", "id": "364", "prefix": "event", "identifier": "event_LinearOffChipLoad_364_4", "start": 18.0, "end": 24.0, "is_stop": false}, {"file_id": "SelectGen_365", "name": "SelectGen", "id": "365", "prefix": "event", "identifier": "event_SelectGen_365_1", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_365", "name": "SelectGen", "id": "365", "prefix": "event", "identifier": "event_SelectGen_365_2", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_365", "name": "SelectGen", "id": "365", "prefix": "event", "identifier": "event_SelectGen_365_3", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_365", "name": "SelectGen", "id": "365", "prefix": "event", "identifier": "event_SelectGen_365_4", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_366", "name": "SelectGen", "id": "366", "prefix": "event", "identifier": "event_SelectGen_366_1", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_366", "name": "SelectGen", "id": "366", "prefix": "event", "identifier": "event_SelectGen_366_2", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_366", "name": "SelectGen", "id": "366", "prefix": "event", "identifier": "event_SelectGen_366_3", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_366", "name": "SelectGen", "id": "366", "prefix": "event", "identifier": "event_SelectGen_366_4", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_367", "name": "LinearOffChipLoad", "id": "367", "prefix": "event", "identifier": "event_LinearOffChipLoad_367_1", "start": 0.0, "end": 6.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_367", "name": "LinearOffChipLoad", "id": "367", "prefix": "event", "identifier": "event_LinearOffChipLoad_367_2", "start": 6.0, "end": 12.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_367", "name": "LinearOffChipLoad", "id": "367", "prefix": "event", "identifier": "event_LinearOffChipLoad_367_3", "start": 12.0, "end": 18.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_367", "name": "LinearOffChipLoad", "id": "367", "prefix": "event", "identifier": "event_LinearOffChipLoad_367_4", "start": 18.0, "end": 24.0, "is_stop": false}, {"file_id": "FlatPartition_368", "name": "FlatPartition", "id": "368", "prefix": "event", "identifier": "event_FlatPartition_368_1", "start": 6.0, "end": 7.0, "is_stop": false}, {"file_id": "FlatPartition_368", "name": "FlatPartition", "id": "368", "prefix": "event", "identifier": "event_FlatPartition_368_2", "start": 12.0, "end": 13.0, "is_stop": false}, {"file_id": "Reshape_369", "name": "Reshape", "id": "369", "prefix": "event", "identifier": "event_Reshape_369_1", "start": 7.0, "end": 7.0, "is_stop": false}, {"file_id": "Reshape_369", "name": "Reshape", "id": "369", "prefix": "event", "identifier": "event_Reshape_369_2", "start": 18.0, "end": 19.0, "is_stop": false}, {"file_id": "Reshape_369", "name": "Reshape", "id": "369", "prefix": "event", "identifier": "event_Reshape_369_3", "start": 30.0, "end": 31.0, "is_stop": false}, {"file_id": "Reshape_369", "name": "Reshape", "id": "369", "prefix": "event", "identifier": "event_Reshape_369_4", "start": 42.0, "end": 43.0, "is_stop": false}, {"file_id": "Flatten_370", "name": "Flatten", "id": "370", "prefix": "event", "identifier": "event_Flatten_370_1", "start": 7.0, "end": 7.0, "is_stop": false}, {"file_id": "Flatten_370", "name": "Flatten", "id": "370", "prefix": "event", "identifier": "event_Flatten_370_2", "start": 9.0, "end": 10.0, "is_stop": false}, {"file_id": "Flatten_370", "name": "Flatten", "id": "370", "prefix": "event", "identifier": "event_Flatten_370_3", "start": 12.0, "end": 13.0, "is_stop": false}, {"file_id": "Flatten_370", "name": "Flatten", "id": "370", "prefix": "event", "identifier": "event_Flatten_370_4", "start": 15.0, "end": 16.0, "is_stop": false}, {"file_id": "Accum_371", "name": "Accum", "id": "371", "prefix": "event", "identifier": "event_Accum_371_1", "start": 16.0, "end": 17.0, "is_stop": false}, {"file_id": "Reshape_372", "name": "Reshape", "id": "372", "prefix": "event", "identifier": "event_Reshape_372_1", "start": 7.0, "end": 7.0, "is_stop": false}, {"file_id": "Reshape_372", "name": "Reshape", "id": "372", "prefix": "event", "identifier": "event_Reshape_372_2", "start": 18.0, "end": 19.0, "is_stop": false}, {"file_id": "Reshape_372", "name": "Reshape", "id": "372", "prefix": "event", "identifier": "event_Reshape_372_3", "start": 30.0, "end": 31.0, "is_stop": false}, {"file_id": "Reshape_372", "name": "Reshape", "id": "372", "prefix": "event", "identifier": "event_Reshape_372_4", "start": 42.0, "end": 43.0, "is_stop": false}, {"file_id": "Flatten_373", "name": "Flatten", "id": "373", "prefix": "event", "identifier": "event_Flatten_373_1", "start": 7.0, "end": 7.0, "is_stop": false}, {"file_id": "Flatten_373", "name": "Flatten", "id": "373", "prefix": "event", "identifier": "event_Flatten_373_2", "start": 9.0, "end": 10.0, "is_stop": false}, {"file_id": "Flatten_373", "name": "Flatten", "id": "373", "prefix": "event", "identifier": "event_Flatten_373_3", "start": 12.0, "end": 13.0, "is_stop": false}, {"file_id": "Flatten_373", "name": "Flatten", "id": "373", "prefix": "event", "identifier": "event_Flatten_373_4", "start": 15.0, "end": 16.0, "is_stop": false}, {"file_id": "Accum_374", "name": "Accum", "id": "374", "prefix": "event", "identifier": "event_Accum_374_1", "start": 16.0, "end": 17.0, "is_stop": false}, {"file_id": "RepeatStatic_375", "name": "RepeatStatic", "id": "375", "prefix": "event", "identifier": "event_RepeatStatic_375_1", "start": 17.0, "end": 17.0, "is_stop": false}, {"file_id": "RepeatStatic_376", "name": "RepeatStatic", "id": "376", "prefix": "event", "identifier": "event_RepeatStatic_376_1", "start": 17.0, "end": 17.0, "is_stop": false}, {"file_id": "LinearOffChipLoadRef_377", "name": "LinearOffChipLoadRef", "id": "377", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_377_1", "start": 17.0, "end": 40.0, "is_stop": false}, {"file_id": "LinearOffChipLoadRef_378", "name": "LinearOffChipLoadRef", "id": "378", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_378_1", "start": 17.0, "end": 40.0, "is_stop": false}, {"file_id": "Flatten_379", "name": "Flatten", "id": "379", "prefix": "event", "identifier": "event_Flatten_379_1", "start": 40.0, "end": 40.0, "is_stop": false}, {"file_id": "Flatten_380", "name": "Flatten", "id": "380", "prefix": "event", "identifier": "event_Flatten_380_1", "start": 40.0, "end": 40.0, "is_stop": false}, {"file_id": "BinaryMap_381", "name": "BinaryMap", "id": "381", "prefix": "event", "identifier": "event_BinaryMap_381_1", "start": 40.0, "end": 72.0, "is_stop": false}, {"file_id": "BinaryMap_382", "name": "BinaryMap", "id": "382", "prefix": "event", "identifier": "event_BinaryMap_382_1", "start": 40.0, "end": 72.0, "is_stop": false}, {"file_id": "LinearOffChipLoadRef_383", "name": "LinearOffChipLoadRef", "id": "383", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_383_1", "start": 17.0, "end": 40.0, "is_stop": false}, {"file_id": "LinearOffChipLoadRef_384", "name": "LinearOffChipLoadRef", "id": "384", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_384_1", "start": 17.0, "end": 40.0, "is_stop": false}, {"file_id": "Flatten_385", "name": "Flatten", "id": "385", "prefix": "event", "identifier": "event_Flatten_385_1", "start": 40.0, "end": 40.0, "is_stop": false}, {"file_id": "Flatten_386", "name": "Flatten", "id": "386", "prefix": "event", "identifier": "event_Flatten_386_1", "start": 40.0, "end": 40.0, "is_stop": false}, {"file_id": "BinaryMap_387", "name": "BinaryMap", "id": "387", "prefix": "event", "identifier": "event_BinaryMap_387_1", "start": 40.0, "end": 72.0, "is_stop": false}, {"file_id": "BinaryMap_388", "name": "BinaryMap", "id": "388", "prefix": "event", "identifier": "event_BinaryMap_388_1", "start": 40.0, "end": 72.0, "is_stop": false}, {"file_id": "UnaryMap_389", "name": "UnaryMap", "id": "389", "prefix": "event", "identifier": "event_UnaryMap_389_1", "start": 72.0, "end": 73.0, "is_stop": false}, {"file_id": "UnaryMap_390", "name": "UnaryMap", "id": "390", "prefix": "event", "identifier": "event_UnaryMap_390_1", "start": 72.0, "end": 73.0, "is_stop": false}, {"file_id": "BinaryMap_391", "name": "BinaryMap", "id": "391", "prefix": "event", "identifier": "event_BinaryMap_391_1", "start": 73.0, "end": 74.0, "is_stop": false}, {"file_id": "BinaryMap_392", "name": "BinaryMap", "id": "392", "prefix": "event", "identifier": "event_BinaryMap_392_1", "start": 73.0, "end": 74.0, "is_stop": false}, {"file_id": "LinearOffChipLoadRef_393", "name": "LinearOffChipLoadRef", "id": "393", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_393_1", "start": 17.0, "end": 40.0, "is_stop": false}, {"file_id": "LinearOffChipLoadRef_394", "name": "LinearOffChipLoadRef", "id": "394", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_394_1", "start": 17.0, "end": 40.0, "is_stop": false}, {"file_id": "Flatten_395", "name": "Flatten", "id": "395", "prefix": "event", "identifier": "event_Flatten_395_1", "start": 40.0, "end": 40.0, "is_stop": false}, {"file_id": "Flatten_396", "name": "Flatten", "id": "396", "prefix": "event", "identifier": "event_Flatten_396_1", "start": 40.0, "end": 40.0, "is_stop": false}, {"file_id": "BinaryMapAccum_397", "name": "BinaryMapAccum", "id": "397", "prefix": "event", "identifier": "event_BinaryMapAccum_397_1", "start": 74.0, "end": 106.0, "is_stop": false}, {"file_id": "BinaryMapAccum_398", "name": "BinaryMapAccum", "id": "398", "prefix": "event", "identifier": "event_BinaryMapAccum_398_1", "start": 74.0, "end": 106.0, "is_stop": false}, {"file_id": "RetileStreamify_399", "name": "RetileStreamify", "id": "399", "prefix": "event", "identifier": "event_RetileStreamify_399_1", "start": 106.0, "end": 106.0, "is_stop": false}, {"file_id": "RetileStreamify_400", "name": "RetileStreamify", "id": "400", "prefix": "event", "identifier": "event_RetileStreamify_400_1", "start": 106.0, "end": 106.0, "is_stop": false}, {"file_id": "FlatPartition_401", "name": "FlatPartition", "id": "401", "prefix": "event", "identifier": "event_FlatPartition_401_1", "start": 6.0, "end": 7.0, "is_stop": false}, {"file_id": "FlatPartition_401", "name": "FlatPartition", "id": "401", "prefix": "event", "identifier": "event_FlatPartition_401_2", "start": 12.0, "end": 13.0, "is_stop": false}, {"file_id": "BinaryMap_402", "name": "BinaryMap", "id": "402", "prefix": "event", "identifier": "event_BinaryMap_402_1", "start": 106.0, "end": 107.0, "is_stop": false}, {"file_id": "BinaryMap_403", "name": "BinaryMap", "id": "403", "prefix": "event", "identifier": "event_BinaryMap_403_1", "start": 106.0, "end": 107.0, "is_stop": false}, {"file_id": "SelectGen_404", "name": "SelectGen", "id": "404", "prefix": "event", "identifier": "event_SelectGen_404_1", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_404", "name": "SelectGen", "id": "404", "prefix": "event", "identifier": "event_SelectGen_404_2", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_404", "name": "SelectGen", "id": "404", "prefix": "event", "identifier": "event_SelectGen_404_3", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "SelectGen_404", "name": "SelectGen", "id": "404", "prefix": "event", "identifier": "event_SelectGen_404_4", "start": 0.0, "end": 0.0, "is_stop": false}, {"file_id": "FlatReassemble_405", "name": "FlatReassemble", "id": "405", "prefix": "event", "identifier": "event_FlatReassemble_405_1", "start": 107.0, "end": 107.0, "is_stop": false}, {"file_id": "FlatReassemble_405", "name": "FlatReassemble", "id": "405", "prefix": "event", "identifier": "event_FlatReassemble_405_2", "start": 107.0, "end": 107.0, "is_stop": false}, {"file_id": "FlatReassemble_405", "name": "FlatReassemble", "id": "405", "prefix": "event", "identifier": "event_FlatReassemble_405_3", "start": 107.0, "end": 107.0, "is_stop": false}, {"file_id": "FlatReassemble_405", "name": "FlatReassemble", "id": "405", "prefix": "event", "identifier": "event_FlatReassemble_405_4", "start": 107.0, "end": 107.0, "is_stop": false}, {"file_id": "Accum_406", "name": "Accum", "id": "406", "prefix": "event", "identifier": "event_Accum_406_1", "start": 107.0, "end": 108.0, "is_stop": false}, {"file_id": "Accum_406", "name": "Accum", "id": "406", "prefix": "event", "identifier": "event_Accum_406_2", "start": 108.0, "end": 109.0, "is_stop": false}, {"file_id": "Accum_406", "name": "Accum", "id": "406", "prefix": "event", "identifier": "event_Accum_406_3", "start": 109.0, "end": 110.0, "is_stop": false}, {"file_id": "Accum_406", "name": "Accum", "id": "406", "prefix": "event", "identifier": "event_Accum_406_4", "start": 110.0, "end": 111.0, "is_stop": false}, {"file_id": "OffChipStore_407", "name": "OffChipStore", "id": "407", "prefix": "event", "identifier": "event_OffChipStore_407_1", "start": 108.0, "end": 114.0, "is_stop": false}, {"file_id": "OffChipStore_407", "name": "OffChipStore", "id": "407", "prefix": "event", "identifier": "event_OffChipStore_407_2", "start": 114.0, "end": 120.0, "is_stop": false}, {"file_id": "OffChipStore_407", "name": "OffChipStore", "id": "407", "prefix": "event", "identifier": "event_OffChipStore_407_3", "start": 120.0, "end": 126.0, "is_stop": false}, {"file_id": "OffChipStore_407", "name": "OffChipStore", "id": "407", "prefix": "event", "identifier": "event_OffChipStore_407_4", "start": 126.0, "end": 132.0, "is_stop": false}, {"file_id": "Broadcast_408", "name": "Broadcast", "id": "408", "prefix": "event", "identifier": "event_Broadcast_408_1", "start": 17.0, "end": 17.0, "is_stop": false}, {"file_id": "Broadcast_409", "name": "Broadcast", "id": "409", "prefix": "event", "identifier": "event_Broadcast_409_1", "start": 17.0, "end": 17.0, "is_stop": false}, {"file_id": "Broadcast_410", "name": "Broadcast", "id": "410", "prefix": "event", "identifier": "event_Broadcast_410_1", "start": 17.0, "end": 17.0, "is_stop": false}, {"file_id": "Broadcast_411", "name": "Broadcast", "id": "411", "prefix": "event", "identifier": "event_Broadcast_411_1", "start": 17.0, "end": 17.0, "is_stop": false}];
+        const nameIdList = ["LinearOffChipLoad_364", "SelectGen_365", "SelectGen_366", "LinearOffChipLoad_367", "FlatPartition_368", "Reshape_369", "Flatten_370", "Accum_371", "Reshape_372", "Flatten_373", "Accum_374", "RepeatStatic_375", "RepeatStatic_376", "LinearOffChipLoadRef_377", "LinearOffChipLoadRef_378", "Flatten_379", "Flatten_380", "BinaryMap_381", "BinaryMap_382", "LinearOffChipLoadRef_383", "LinearOffChipLoadRef_384", "Flatten_385", "Flatten_386", "BinaryMap_387", "BinaryMap_388", "UnaryMap_389", "UnaryMap_390", "BinaryMap_391", "BinaryMap_392", "LinearOffChipLoadRef_393", "LinearOffChipLoadRef_394", "Flatten_395", "Flatten_396", "BinaryMapAccum_397", "BinaryMapAccum_398", "RetileStreamify_399", "RetileStreamify_400", "FlatPartition_401", "BinaryMap_402", "BinaryMap_403", "SelectGen_404", "FlatReassemble_405", "Accum_406", "OffChipStore_407", "Broadcast_408", "Broadcast_409", "Broadcast_410", "Broadcast_411"];
+        const minTime = 0.0;
+        const maxTime = 132.0;
+        let scale = 0.5;
+        let timelineEl = document.getElementById('timeline');
+        let containerEl = document.getElementById('container');
+        let tooltipEl = document.getElementById('tooltip');
+        let scaleSlider = document.getElementById('scale-slider');
+        let scaleValue = document.getElementById('scale-value');
+
+        function renderTimeline() {
+            timelineEl.innerHTML = '';
+            const timelineWidth = (maxTime - minTime) * scale;
+            nameIdList.forEach(nameId => {
+                const fileRow = document.createElement('div');
+                fileRow.className = 'file-row';
+                const fileLabel = document.createElement('div');
+                fileLabel.className = 'file-label';
+                fileLabel.textContent = nameId;
+                fileLabel.title = nameId;
+                const tc = document.createElement('div');
+                tc.className = 'timeline-container';
+                tc.style.width = `${timelineWidth}px`;
+                fileRow.appendChild(fileLabel);
+                fileRow.appendChild(tc);
+                timelineEl.appendChild(fileRow);
+                const items = data.filter(item => item.file_id === nameId);
+                items.forEach(item => {
+                    const block = document.createElement('div');
+                    block.className = item.is_stop ? 'block event-stop' : 'block event-normal';
+                    const left = (item.start - minTime) * scale;
+                    const width = (item.end - item.start) * scale;
+                    block.style.left = `${left}px`;
+                    block.style.width = `${Math.max(width, 1)}px`;
+                    if (width > 40) block.textContent = item.identifier;
+                    block.dataset.identifier = item.identifier;
+                    block.dataset.name = item.name;
+                    block.dataset.id = item.id;
+                    block.dataset.start = item.start;
+                    block.dataset.end = item.end;
+                    block.dataset.isStop = item.is_stop;
+                    block.addEventListener('mouseover', showTooltip);
+                    block.addEventListener('mousemove', moveTooltip);
+                    block.addEventListener('mouseout', hideTooltip);
+                    tc.appendChild(block);
+                });
+            });
+            const stepSize = calculateStepSize(maxTime - minTime);
+            for (let t = minTime; t <= maxTime; t += stepSize) {
+                const marker = document.createElement('div');
+                marker.className = 'timeline-marker';
+                marker.style.left = `${(t - minTime) * scale + 320}px`;
+                const label = document.createElement('div');
+                label.className = 'timeline-label';
+                label.textContent = t.toFixed(0) + ' cyc';
+                marker.appendChild(label);
+                timelineEl.appendChild(marker);
+            }
+        }
+
+        function calculateStepSize(range) {
+            const roughStep = range / 10;
+            const mag = Math.pow(10, Math.floor(Math.log10(roughStep)));
+            const norm = roughStep / mag;
+            if (norm < 1.5) return mag;
+            if (norm < 3.5) return 2 * mag;
+            if (norm < 7.5) return 5 * mag;
+            return 10 * mag;
+        }
+
+        function showTooltip(e) {
+            const b = e.target;
+            tooltipEl.innerHTML = `
+                Name: ${b.dataset.name}<br>
+                ID: ${b.dataset.id}<br>
+                Start: ${parseFloat(b.dataset.start).toFixed(0)} cyc<br>
+                End: ${parseFloat(b.dataset.end).toFixed(0)} cyc<br>
+                Duration: ${(parseFloat(b.dataset.end) - parseFloat(b.dataset.start)).toFixed(0)} cyc<br>
+                Type: ${b.dataset.isStop === 'true' ? 'Stop' : 'Normal'}
+            `;
+            tooltipEl.style.display = 'block';
+            moveTooltip(e);
+        }
+        function moveTooltip(e) { tooltipEl.style.left = `${e.pageX + 10}px`; tooltipEl.style.top = `${e.pageY + 10}px`; }
+        function hideTooltip() { tooltipEl.style.display = 'none'; }
+
+        document.getElementById('zoom-in').addEventListener('click', () => { scale *= 1.5; updateScale(); renderTimeline(); });
+        document.getElementById('zoom-out').addEventListener('click', () => { scale /= 1.5; updateScale(); renderTimeline(); });
+        document.getElementById('reset').addEventListener('click', () => { scale = 0.5; updateScale(); renderTimeline(); containerEl.scrollLeft = 0; });
+        scaleSlider.addEventListener('input', () => { scale = scaleSlider.value / 10; updateScale(); renderTimeline(); });
+        function updateScale() { scaleValue.textContent = `${scale.toFixed(2)}x`; scaleSlider.value = Math.round(scale * 10); }
+
+        updateScale();
+        renderTimeline();
+    </script>
+</body>
+</html>

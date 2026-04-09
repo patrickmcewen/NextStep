@@ -1,0 +1,10 @@
+op_id,op_name,op_str,sim_start,ana_start,delta_start,sim_end,ana_end,delta_end,sim_duration,ana_duration,delta_duration,sim_tiles,ana_N_fire,sim_avg_tile_dur,ana_T_fire,ana_OCI,ana_OTI,ana_ICI,ana_ICD,ana_fto
+135,LinearOffChipLoad,LinearOffChipLoad_135,0.0,0,0.0,434.0,240,-194.0,434.0,240,-194.0,16.0,16,12.625,0,15,15,0,0,15
+136,UnaryMap,UnaryMap_136 (fn: Square),14.0,15,1.0,603.0,527,-76.0,589.0,512,-77.0,16.0,16,32.0,32,32,32,0,0,47
+137,UnaryMap,UnaryMap_137 (fn: MulImmediate),47.0,47,0.0,605.0,528,-77.0,558.0,481,-77.0,16.0,16,1.0,1,32,32,0,0,48
+138,UnaryMap,UnaryMap_138 (fn: RowWiseSum),49.0,48,-1.0,607.0,529,-78.0,558.0,481,-77.0,16.0,16,1.0,1,32,32,0,0,49
+139,UnaryMap,UnaryMap_139 (fn: AddImmediate),51.0,49,-2.0,609.0,530,-79.0,558.0,481,-77.0,16.0,16,1.0,1,32,32,0,0,50
+140,UnaryMap,UnaryMap_140 (fn: Rsqrt),53.0,50,-3.0,611.0,531,-80.0,558.0,481,-77.0,16.0,16,1.0,1,32,32,0,0,51
+141,BinaryMap,BinaryMap_141 (fn: Mul),55.0,51,-4.0,644.0,563,-81.0,589.0,512,-77.0,16.0,16,32.0,32,32,32,0,0,83
+142,OffChipStore,OffChipStore_142,88.0,83,-5.0,657.0,578,-79.0,569.0,495,-74.0,16.0,16,12.625,0,32,32,32,0,98
+143,Broadcast,Broadcast_143,,15,,,240,,,225,,,16,,0,15,15,0,0,15

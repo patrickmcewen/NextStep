@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulator: gemm_tile_mnk/small (789 cycles)</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; overflow: hidden; }
+        h1 { margin-top: 0; }
+        #container { width: 100%; height: calc(100vh - 120px); overflow: auto; position: relative; }
+        #timeline { position: relative; margin-top: 40px; }
+        .file-row { height: 50px; margin-bottom: 5px; position: relative; border-bottom: 1px solid #eee; }
+        .file-label { position: absolute; left: 0; top: 10px; width: 300px; font-weight: bold;
+                       text-align: right; padding-right: 10px; overflow: visible; word-wrap: break-word; line-height: 1.2; }
+        .timeline-container { margin-left: 320px; position: relative; height: 100%; }
+        .block { position: absolute; height: 30px; top: 10px; border-radius: 3px; text-align: center;
+                  font-size: 10px; overflow: hidden; white-space: nowrap; color: white; display: flex;
+                  align-items: center; justify-content: center; cursor: pointer; transition: opacity 0.2s; }
+        .block:hover { opacity: 0.8; }
+        .event-normal { background-color: #33A8FF; }
+        .event-stop { background-color: #FF5733; }
+        .timeline-marker { position: absolute; width: 1px; height: 100%; background-color: rgba(0,0,0,0.1); top: 0; }
+        .timeline-label { position: absolute; font-size: 10px; color: #666; top: -20px; transform: translateX(-50%); }
+        .controls { margin-bottom: 20px; }
+        .tooltip { position: absolute; background-color: rgba(0,0,0,0.8); color: white; padding: 8px;
+                    border-radius: 4px; font-size: 12px; z-index: 100; pointer-events: none; display: none; }
+        button { margin-right: 10px; padding: 5px 10px; cursor: pointer; }
+        #scale-slider { width: 200px; display: inline-block; vertical-align: middle; }
+        .legend { margin-top: 10px; display: flex; align-items: center; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; margin-right: 20px; margin-bottom: 5px; }
+        .legend-color { width: 15px; height: 15px; border-radius: 3px; margin-right: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Simulator: gemm_tile_mnk/small (789 cycles)</h1>
+    <div class="controls">
+        <button id="zoom-in">Zoom In</button>
+        <button id="zoom-out">Zoom Out</button>
+        <button id="reset">Reset</button>
+        <label for="scale-slider">Scale: </label>
+        <input type="range" id="scale-slider" min="1" max="100" value="10">
+        <span id="scale-value">1x</span>
+    </div>
+    <div class="legend">
+        <div class="legend-item"><div class="legend-color event-normal"></div><span>Normal Event</span></div>
+        <div class="legend-item"><div class="legend-color event-stop"></div><span>Stop Event</span></div>
+    </div>
+    <div id="container"><div id="timeline"></div></div>
+    <div id="tooltip" class="tooltip"></div>
+    <script>
+        const data = [{"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_1", "start": 0.0, "end": 9.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_2", "start": 9.0, "end": 18.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_3", "start": 18.0, "end": 27.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_4", "start": 43.0, "end": 52.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_5", "start": 75.0, "end": 84.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_6", "start": 107.0, "end": 116.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_7", "start": 139.0, "end": 148.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_8", "start": 171.0, "end": 180.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_9", "start": 203.0, "end": 212.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_10", "start": 235.0, "end": 244.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_11", "start": 267.0, "end": 276.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_12", "start": 299.0, "end": 308.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_13", "start": 331.0, "end": 340.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_14", "start": 363.0, "end": 372.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_15", "start": 395.0, "end": 404.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_16", "start": 427.0, "end": 436.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_17", "start": 459.0, "end": 468.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_18", "start": 491.0, "end": 500.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_19", "start": 523.0, "end": 532.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_20", "start": 555.0, "end": 564.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_21", "start": 587.0, "end": 596.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_22", "start": 619.0, "end": 628.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_23", "start": 651.0, "end": 660.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_52", "name": "LinearOffChipLoad", "id": "52", "prefix": "event", "identifier": "event_LinearOffChipLoad_52_24", "start": 683.0, "end": 692.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_1", "start": 0.0, "end": 9.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_2", "start": 9.0, "end": 18.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_3", "start": 18.0, "end": 27.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_4", "start": 43.0, "end": 52.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_5", "start": 75.0, "end": 84.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_6", "start": 107.0, "end": 116.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_7", "start": 139.0, "end": 148.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_8", "start": 171.0, "end": 180.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_9", "start": 203.0, "end": 212.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_10", "start": 235.0, "end": 244.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_11", "start": 267.0, "end": 276.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_12", "start": 299.0, "end": 308.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_13", "start": 331.0, "end": 340.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_14", "start": 363.0, "end": 372.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_15", "start": 395.0, "end": 404.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_16", "start": 427.0, "end": 436.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_17", "start": 459.0, "end": 468.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_18", "start": 491.0, "end": 500.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_19", "start": 523.0, "end": 532.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_20", "start": 555.0, "end": 564.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_21", "start": 587.0, "end": 596.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_22", "start": 619.0, "end": 628.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_23", "start": 651.0, "end": 660.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_53", "name": "LinearOffChipLoad", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoad_53_24", "start": 683.0, "end": 692.0, "is_stop": true}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_1", "start": 10.0, "end": 42.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_2", "start": 42.0, "end": 74.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_3", "start": 74.0, "end": 106.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_4", "start": 106.0, "end": 138.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_5", "start": 138.0, "end": 170.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_6", "start": 170.0, "end": 202.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_7", "start": 202.0, "end": 234.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_8", "start": 234.0, "end": 266.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_9", "start": 266.0, "end": 298.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_10", "start": 298.0, "end": 330.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_11", "start": 330.0, "end": 362.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_12", "start": 362.0, "end": 394.0, "is_stop": true}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_13", "start": 394.0, "end": 426.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_14", "start": 426.0, "end": 458.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_15", "start": 458.0, "end": 490.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_16", "start": 490.0, "end": 522.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_17", "start": 522.0, "end": 554.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_18", "start": 554.0, "end": 586.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_19", "start": 586.0, "end": 618.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_20", "start": 618.0, "end": 650.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_21", "start": 650.0, "end": 682.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_22", "start": 682.0, "end": 714.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_23", "start": 714.0, "end": 746.0, "is_stop": false}, {"file_id": "BinaryMapAccum_54", "name": "BinaryMapAccum", "id": "54", "prefix": "event", "identifier": "event_BinaryMapAccum_54_24", "start": 746.0, "end": 778.0, "is_stop": true}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_1", "start": 107.0, "end": 115.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_2", "start": 203.0, "end": 211.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_3", "start": 299.0, "end": 307.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_4", "start": 395.0, "end": 403.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_5", "start": 491.0, "end": 499.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_6", "start": 587.0, "end": 595.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_7", "start": 683.0, "end": 691.0, "is_stop": false}, {"file_id": "OffChipStore_55", "name": "OffChipStore", "id": "55", "prefix": "event", "identifier": "event_OffChipStore_55_8", "start": 779.0, "end": 787.0, "is_stop": false}];
+        const nameIdList = ["LinearOffChipLoad_52", "LinearOffChipLoad_53", "BinaryMapAccum_54", "OffChipStore_55"];
+        const minTime = 0.0;
+        const maxTime = 787.0;
+        let scale = 0.5;
+        let timelineEl = document.getElementById('timeline');
+        let containerEl = document.getElementById('container');
+        let tooltipEl = document.getElementById('tooltip');
+        let scaleSlider = document.getElementById('scale-slider');
+        let scaleValue = document.getElementById('scale-value');
+
+        function renderTimeline() {
+            timelineEl.innerHTML = '';
+            const timelineWidth = (maxTime - minTime) * scale;
+            nameIdList.forEach(nameId => {
+                const fileRow = document.createElement('div');
+                fileRow.className = 'file-row';
+                const fileLabel = document.createElement('div');
+                fileLabel.className = 'file-label';
+                fileLabel.textContent = nameId;
+                fileLabel.title = nameId;
+                const tc = document.createElement('div');
+                tc.className = 'timeline-container';
+                tc.style.width = `${timelineWidth}px`;
+                fileRow.appendChild(fileLabel);
+                fileRow.appendChild(tc);
+                timelineEl.appendChild(fileRow);
+                const items = data.filter(item => item.file_id === nameId);
+                items.forEach(item => {
+                    const block = document.createElement('div');
+                    block.className = item.is_stop ? 'block event-stop' : 'block event-normal';
+                    const left = (item.start - minTime) * scale;
+                    const width = (item.end - item.start) * scale;
+                    block.style.left = `${left}px`;
+                    block.style.width = `${Math.max(width, 1)}px`;
+                    if (width > 40) block.textContent = item.identifier;
+                    block.dataset.identifier = item.identifier;
+                    block.dataset.name = item.name;
+                    block.dataset.id = item.id;
+                    block.dataset.start = item.start;
+                    block.dataset.end = item.end;
+                    block.dataset.isStop = item.is_stop;
+                    block.addEventListener('mouseover', showTooltip);
+                    block.addEventListener('mousemove', moveTooltip);
+                    block.addEventListener('mouseout', hideTooltip);
+                    tc.appendChild(block);
+                });
+            });
+            const stepSize = calculateStepSize(maxTime - minTime);
+            for (let t = minTime; t <= maxTime; t += stepSize) {
+                const marker = document.createElement('div');
+                marker.className = 'timeline-marker';
+                marker.style.left = `${(t - minTime) * scale + 320}px`;
+                const label = document.createElement('div');
+                label.className = 'timeline-label';
+                label.textContent = t.toFixed(0) + ' cyc';
+                marker.appendChild(label);
+                timelineEl.appendChild(marker);
+            }
+        }
+
+        function calculateStepSize(range) {
+            const roughStep = range / 10;
+            const mag = Math.pow(10, Math.floor(Math.log10(roughStep)));
+            const norm = roughStep / mag;
+            if (norm < 1.5) return mag;
+            if (norm < 3.5) return 2 * mag;
+            if (norm < 7.5) return 5 * mag;
+            return 10 * mag;
+        }
+
+        function showTooltip(e) {
+            const b = e.target;
+            tooltipEl.innerHTML = `
+                Name: ${b.dataset.name}<br>
+                ID: ${b.dataset.id}<br>
+                Start: ${parseFloat(b.dataset.start).toFixed(0)} cyc<br>
+                End: ${parseFloat(b.dataset.end).toFixed(0)} cyc<br>
+                Duration: ${(parseFloat(b.dataset.end) - parseFloat(b.dataset.start)).toFixed(0)} cyc<br>
+                Type: ${b.dataset.isStop === 'true' ? 'Stop' : 'Normal'}
+            `;
+            tooltipEl.style.display = 'block';
+            moveTooltip(e);
+        }
+        function moveTooltip(e) { tooltipEl.style.left = `${e.pageX + 10}px`; tooltipEl.style.top = `${e.pageY + 10}px`; }
+        function hideTooltip() { tooltipEl.style.display = 'none'; }
+
+        document.getElementById('zoom-in').addEventListener('click', () => { scale *= 1.5; updateScale(); renderTimeline(); });
+        document.getElementById('zoom-out').addEventListener('click', () => { scale /= 1.5; updateScale(); renderTimeline(); });
+        document.getElementById('reset').addEventListener('click', () => { scale = 0.5; updateScale(); renderTimeline(); containerEl.scrollLeft = 0; });
+        scaleSlider.addEventListener('input', () => { scale = scaleSlider.value / 10; updateScale(); renderTimeline(); });
+        function updateScale() { scaleValue.textContent = `${scale.toFixed(2)}x`; scaleSlider.value = Math.round(scale * 10); }
+
+        updateScale();
+        renderTimeline();
+    </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+op_id,op_name,op_str,sim_start,ana_start,delta_start,sim_end,ana_end,delta_end,sim_duration,ana_duration,delta_duration,sim_tiles,ana_N_fire,sim_avg_tile_dur,ana_T_fire,ana_OCI,ana_OTI,ana_ICI,ana_ICD,ana_fto
+0,LinearOffChipLoad,LinearOffChipLoad_0,0,0,0,66,54,-12,66,54,-12,6,6,8.0,0,9,9,0,0,9
+1,UnaryMap,UnaryMap_1 (fn: Square),9,9,0,105,105,0,96,96,0,6,6,16.0,16,16,16,0,0,25
+2,Bufferize,Bufferize_2(1 D),26,25,-1,106,105,-1,80,80,0,2,2,32.0,0,48,48,0,32,57
+3,Streamify,Streamify_3 (1 D),59,57,-2,112,76,-36,53,19,-34,2,2,5.0,3,48,16,0,0,60
+4,UnaryMap,UnaryMap_4 (fn: Silu),60,60,0,114,141,27,54,81,27,6,6,2.0,1,16,16,0,0,61
+5,Bufferize,Bufferize_5(1 D),63,61,-2,115,141,26,52,80,28,2,2,4.0,0,48,48,0,32,93
+6,Streamify,Streamify_6 (1 D),68,93,25,127,112,-15,59,19,-40,2,2,11.0,3,48,16,0,0,96
+7,OffChipStore,OffChipStore_7,69,96,27,141,185,44,72,89,17,6,6,8.0,0,16,16,16,0,105

@@ -1,0 +1,15 @@
+op_id,op_name,op_str,sim_start,ana_start,delta_start,sim_end,ana_end,delta_end,sim_duration,ana_duration,delta_duration,sim_tiles,ana_N_fire,sim_avg_tile_dur,ana_T_fire,ana_OCI,ana_OTI,ana_ICI,ana_ICD,ana_fto
+172,LinearOffChipLoad,LinearOffChipLoad_172,0.0,0,0.0,134.0,96,-38.0,134.0,96,-38.0,4.0,4,6.5,0,24,24,0,0,24
+173,LinearOffChipLoad,LinearOffChipLoad_173,0.0,0,0.0,158.0,188,30.0,158.0,188,30.0,4.0,4,29.0,0,47,47,0,0,47
+174,BinaryMapAccum,BinaryMapAccum_174 (fn: Matmul(transposed=False)),30.0,47,17.0,422.0,439,17.0,392.0,392,0.0,4.0,4,98.0,98,98,98,0,0,145
+175,LinearOffChipLoad,LinearOffChipLoad_175,0.0,0,0.0,134.0,96,-38.0,134.0,96,-38.0,4.0,4,6.0,0,24,24,0,0,24
+176,LinearOffChipLoad,LinearOffChipLoad_176,0.0,0,0.0,158.0,188,30.0,158.0,188,30.0,4.0,4,29.0,0,47,47,0,0,47
+177,BinaryMapAccum,BinaryMapAccum_177 (fn: Matmul(transposed=False)),30.0,47,17.0,422.0,439,17.0,392.0,392,0.0,4.0,4,98.0,98,98,98,0,0,145
+178,UnaryMap,UnaryMap_178 (fn: Silu),129.0,145,16.0,424.0,440,16.0,295.0,295,0.0,4.0,4,1.0,1,98,98,0,0,146
+179,BinaryMap,BinaryMap_179 (fn: Mul),131.0,146,15.0,426.0,441,15.0,295.0,295,0.0,4.0,4,1.0,1,98,98,0,0,147
+180,Bufferize,Bufferize_180(1 D),133.0,147,14.0,427.0,441,14.0,294.0,294,0.0,4.0,4,0.0,0,98,98,0,0,147
+181,Streamify,Streamify_181 (1 D),134.0,147,13.0,429.0,441,12.0,295.0,294,-1.0,4.0,4,1.0,0,98,98,0,0,147
+182,Reshape,Reshape_182 (1 D) (chunk: 1),,147,,,444,,,297,,,4,,3,98,98,0,0,150
+183,LinearOffChipLoad,LinearOffChipLoad_183,0.0,0,0.0,261.0,188,-73.0,261.0,188,-73.0,4.0,4,28.75,0,47,47,0,0,47
+184,BinaryMapAccum,BinaryMapAccum_184 (fn: Matmul(transposed=False)),136.0,150,14.0,526.0,540,14.0,390.0,390,0.0,4.0,4,96.0,96,98,98,0,0,246
+185,OffChipStore,OffChipStore_185,233.0,246,13.0,532.0,546,14.0,299.0,300,1.0,4.0,4,5.0,0,98,98,98,0,252

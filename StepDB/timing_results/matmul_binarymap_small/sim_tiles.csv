@@ -1,0 +1,15 @@
+context_id,name,id,start_ns,end_ns,is_stop,duration
+33,LinearOffChipLoad,68,0,21,True,21
+33,LinearOffChipLoad,68,21,41,True,20
+36,LinearOffChipLoad,70,0,37,False,37
+36,LinearOffChipLoad,70,37,73,True,36
+36,LinearOffChipLoad,70,73,109,False,36
+36,LinearOffChipLoad,70,231,267,True,36
+35,BinaryMap,71,38,230,False,192
+35,BinaryMap,71,230,422,True,192
+35,BinaryMap,71,422,614,False,192
+35,BinaryMap,71,614,806,True,192
+37,OffChipStore,72,231,244,False,13
+37,OffChipStore,72,423,435,False,12
+37,OffChipStore,72,615,627,False,12
+37,OffChipStore,72,807,819,False,12

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulator: moe_routed/small (359 cycles)</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; overflow: hidden; }
+        h1 { margin-top: 0; }
+        #container { width: 100%; height: calc(100vh - 120px); overflow: auto; position: relative; }
+        #timeline { position: relative; margin-top: 40px; }
+        .file-row { height: 50px; margin-bottom: 5px; position: relative; border-bottom: 1px solid #eee; }
+        .file-label { position: absolute; left: 0; top: 10px; width: 300px; font-weight: bold;
+                       text-align: right; padding-right: 10px; overflow: visible; word-wrap: break-word; line-height: 1.2; }
+        .timeline-container { margin-left: 320px; position: relative; height: 100%; }
+        .block { position: absolute; height: 30px; top: 10px; border-radius: 3px; text-align: center;
+                  font-size: 10px; overflow: hidden; white-space: nowrap; color: white; display: flex;
+                  align-items: center; justify-content: center; cursor: pointer; transition: opacity 0.2s; }
+        .block:hover { opacity: 0.8; }
+        .event-normal { background-color: #33A8FF; }
+        .event-stop { background-color: #FF5733; }
+        .timeline-marker { position: absolute; width: 1px; height: 100%; background-color: rgba(0,0,0,0.1); top: 0; }
+        .timeline-label { position: absolute; font-size: 10px; color: #666; top: -20px; transform: translateX(-50%); }
+        .controls { margin-bottom: 20px; }
+        .tooltip { position: absolute; background-color: rgba(0,0,0,0.8); color: white; padding: 8px;
+                    border-radius: 4px; font-size: 12px; z-index: 100; pointer-events: none; display: none; }
+        button { margin-right: 10px; padding: 5px 10px; cursor: pointer; }
+        #scale-slider { width: 200px; display: inline-block; vertical-align: middle; }
+        .legend { margin-top: 10px; display: flex; align-items: center; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; margin-right: 20px; margin-bottom: 5px; }
+        .legend-color { width: 15px; height: 15px; border-radius: 3px; margin-right: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Simulator: moe_routed/small (359 cycles)</h1>
+    <div class="controls">
+        <button id="zoom-in">Zoom In</button>
+        <button id="zoom-out">Zoom Out</button>
+        <button id="reset">Reset</button>
+        <label for="scale-slider">Scale: </label>
+        <input type="range" id="scale-slider" min="1" max="100" value="10">
+        <span id="scale-value">1x</span>
+    </div>
+    <div class="legend">
+        <div class="legend-item"><div class="legend-color event-normal"></div><span>Normal Event</span></div>
+        <div class="legend-item"><div class="legend-color event-stop"></div><span>Stop Event</span></div>
+    </div>
+    <div id="container"><div id="timeline"></div></div>
+    <div id="tooltip" class="tooltip"></div>
+    <script>
+        const data = [{"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_1", "start": 0.0, "end": 5.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_2", "start": 5.0, "end": 10.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_3", "start": 10.0, "end": 15.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_4", "start": 15.0, "end": 20.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_5", "start": 20.0, "end": 25.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_6", "start": 25.0, "end": 30.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_7", "start": 30.0, "end": 35.0, "is_stop": false}, {"file_id": "LinearOffChipLoad_0", "name": "LinearOffChipLoad", "id": "0", "prefix": "event", "identifier": "event_LinearOffChipLoad_0_8", "start": 35.0, "end": 40.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_1", "start": 0.0, "end": 5.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_2", "start": 5.0, "end": 10.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_3", "start": 10.0, "end": 15.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_4", "start": 15.0, "end": 20.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_5", "start": 20.0, "end": 25.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_6", "start": 25.0, "end": 30.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_7", "start": 30.0, "end": 35.0, "is_stop": true}, {"file_id": "LinearOffChipLoad_3", "name": "LinearOffChipLoad", "id": "3", "prefix": "event", "identifier": "event_LinearOffChipLoad_3_8", "start": 314.0, "end": 319.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_1", "start": 6.0, "end": 9.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_2", "start": 11.0, "end": 14.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_3", "start": 16.0, "end": 19.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_4", "start": 21.0, "end": 24.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_5", "start": 26.0, "end": 29.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_6", "start": 31.0, "end": 34.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_7", "start": 36.0, "end": 39.0, "is_stop": true}, {"file_id": "FlatPartition_4", "name": "FlatPartition", "id": "4", "prefix": "event", "identifier": "event_FlatPartition_4_8", "start": 41.0, "end": 44.0, "is_stop": true}, {"file_id": "Accum_7", "name": "Accum", "id": "7", "prefix": "event", "identifier": "event_Accum_7_1", "start": 44.0, "end": 44.0, "is_stop": true}, {"file_id": "Accum_13", "name": "Accum", "id": "13", "prefix": "event", "identifier": "event_Accum_13_1", "start": 43.0, "end": 43.0, "is_stop": true}, {"file_id": "Accum_16", "name": "Accum", "id": "16", "prefix": "event", "identifier": "event_Accum_16_1", "start": 47.0, "end": 47.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_21", "name": "LinearOffChipLoadRef", "id": "21", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_21_1", "start": 46.0, "end": 103.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_23", "name": "LinearOffChipLoadRef", "id": "23", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_23_1", "start": 45.0, "end": 102.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_24", "name": "LinearOffChipLoadRef", "id": "24", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_24_1", "start": 49.0, "end": 110.0, "is_stop": true}, {"file_id": "BinaryMap_29", "name": "BinaryMap", "id": "29", "prefix": "event", "identifier": "event_BinaryMap_29_1", "start": 105.0, "end": 201.0, "is_stop": true}, {"file_id": "BinaryMap_31", "name": "BinaryMap", "id": "31", "prefix": "event", "identifier": "event_BinaryMap_31_1", "start": 104.0, "end": 200.0, "is_stop": true}, {"file_id": "BinaryMap_32", "name": "BinaryMap", "id": "32", "prefix": "event", "identifier": "event_BinaryMap_32_1", "start": 112.0, "end": 208.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_33", "name": "LinearOffChipLoadRef", "id": "33", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_33_1", "start": 46.0, "end": 104.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_35", "name": "LinearOffChipLoadRef", "id": "35", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_35_1", "start": 45.0, "end": 100.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_36", "name": "LinearOffChipLoadRef", "id": "36", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_36_1", "start": 49.0, "end": 108.0, "is_stop": true}, {"file_id": "BinaryMap_41", "name": "BinaryMap", "id": "41", "prefix": "event", "identifier": "event_BinaryMap_41_1", "start": 106.0, "end": 202.0, "is_stop": true}, {"file_id": "BinaryMap_43", "name": "BinaryMap", "id": "43", "prefix": "event", "identifier": "event_BinaryMap_43_1", "start": 102.0, "end": 198.0, "is_stop": true}, {"file_id": "BinaryMap_44", "name": "BinaryMap", "id": "44", "prefix": "event", "identifier": "event_BinaryMap_44_1", "start": 110.0, "end": 206.0, "is_stop": true}, {"file_id": "UnaryMap_45", "name": "UnaryMap", "id": "45", "prefix": "event", "identifier": "event_UnaryMap_45_1", "start": 203.0, "end": 205.0, "is_stop": true}, {"file_id": "UnaryMap_47", "name": "UnaryMap", "id": "47", "prefix": "event", "identifier": "event_UnaryMap_47_1", "start": 199.0, "end": 201.0, "is_stop": true}, {"file_id": "UnaryMap_48", "name": "UnaryMap", "id": "48", "prefix": "event", "identifier": "event_UnaryMap_48_1", "start": 207.0, "end": 209.0, "is_stop": true}, {"file_id": "BinaryMap_49", "name": "BinaryMap", "id": "49", "prefix": "event", "identifier": "event_BinaryMap_49_1", "start": 206.0, "end": 207.0, "is_stop": true}, {"file_id": "BinaryMap_51", "name": "BinaryMap", "id": "51", "prefix": "event", "identifier": "event_BinaryMap_51_1", "start": 202.0, "end": 203.0, "is_stop": true}, {"file_id": "BinaryMap_52", "name": "BinaryMap", "id": "52", "prefix": "event", "identifier": "event_BinaryMap_52_1", "start": 210.0, "end": 211.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_53", "name": "LinearOffChipLoadRef", "id": "53", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_53_1", "start": 46.0, "end": 106.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_55", "name": "LinearOffChipLoadRef", "id": "55", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_55_1", "start": 45.0, "end": 99.0, "is_stop": true}, {"file_id": "LinearOffChipLoadRef_56", "name": "LinearOffChipLoadRef", "id": "56", "prefix": "event", "identifier": "event_LinearOffChipLoadRef_56_1", "start": 49.0, "end": 105.0, "is_stop": true}, {"file_id": "BinaryMapAccum_61", "name": "BinaryMapAccum", "id": "61", "prefix": "event", "identifier": "event_BinaryMapAccum_61_1", "start": 208.0, "end": 304.0, "is_stop": false}, {"file_id": "BinaryMapAccum_63", "name": "BinaryMapAccum", "id": "63", "prefix": "event", "identifier": "event_BinaryMapAccum_63_1", "start": 204.0, "end": 300.0, "is_stop": false}, {"file_id": "BinaryMapAccum_64", "name": "BinaryMapAccum", "id": "64", "prefix": "event", "identifier": "event_BinaryMapAccum_64_1", "start": 212.0, "end": 308.0, "is_stop": false}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_1", "start": 6.0, "end": 8.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_2", "start": 11.0, "end": 13.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_3", "start": 16.0, "end": 18.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_4", "start": 21.0, "end": 312.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_5", "start": 312.0, "end": 314.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_6", "start": 314.0, "end": 316.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_7", "start": 316.0, "end": 318.0, "is_stop": true}, {"file_id": "FlatPartition_69", "name": "FlatPartition", "id": "69", "prefix": "event", "identifier": "event_FlatPartition_69_8", "start": 320.0, "end": 322.0, "is_stop": true}, {"file_id": "BinaryMap_70", "name": "BinaryMap", "id": "70", "prefix": "event", "identifier": "event_BinaryMap_70_1", "start": 315.0, "end": 316.0, "is_stop": false}, {"file_id": "BinaryMap_70", "name": "BinaryMap", "id": "70", "prefix": "event", "identifier": "event_BinaryMap_70_2", "start": 319.0, "end": 320.0, "is_stop": false}, {"file_id": "BinaryMap_72", "name": "BinaryMap", "id": "72", "prefix": "event", "identifier": "event_BinaryMap_72_1", "start": 302.0, "end": 303.0, "is_stop": false}, {"file_id": "BinaryMap_72", "name": "BinaryMap", "id": "72", "prefix": "event", "identifier": "event_BinaryMap_72_2", "start": 317.0, "end": 318.0, "is_stop": false}, {"file_id": "BinaryMap_73", "name": "BinaryMap", "id": "73", "prefix": "event", "identifier": "event_BinaryMap_73_1", "start": 310.0, "end": 311.0, "is_stop": false}, {"file_id": "BinaryMap_73", "name": "BinaryMap", "id": "73", "prefix": "event", "identifier": "event_BinaryMap_73_2", "start": 311.0, "end": 312.0, "is_stop": false}, {"file_id": "BinaryMap_73", "name": "BinaryMap", "id": "73", "prefix": "event", "identifier": "event_BinaryMap_73_3", "start": 313.0, "end": 314.0, "is_stop": false}, {"file_id": "BinaryMap_73", "name": "BinaryMap", "id": "73", "prefix": "event", "identifier": "event_BinaryMap_73_4", "start": 323.0, "end": 324.0, "is_stop": false}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_1", "start": 304.0, "end": 313.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_2", "start": 312.0, "end": 313.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_3", "start": 313.0, "end": 316.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_4", "start": 315.0, "end": 317.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_5", "start": 317.0, "end": 319.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_6", "start": 319.0, "end": 324.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_7", "start": 321.0, "end": 329.0, "is_stop": true}, {"file_id": "FlatReassemble_75", "name": "FlatReassemble", "id": "75", "prefix": "event", "identifier": "event_FlatReassemble_75_8", "start": 325.0, "end": 334.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_1", "start": 314.0, "end": 315.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_2", "start": 315.0, "end": 316.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_3", "start": 317.0, "end": 318.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_4", "start": 322.0, "end": 323.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_5", "start": 327.0, "end": 328.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_6", "start": 332.0, "end": 333.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_7", "start": 337.0, "end": 338.0, "is_stop": true}, {"file_id": "Accum_76", "name": "Accum", "id": "76", "prefix": "event", "identifier": "event_Accum_76_8", "start": 342.0, "end": 343.0, "is_stop": true}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_1", "start": 316.0, "end": 321.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_2", "start": 321.0, "end": 326.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_3", "start": 326.0, "end": 331.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_4", "start": 331.0, "end": 336.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_5", "start": 336.0, "end": 341.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_6", "start": 341.0, "end": 346.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_7", "start": 346.0, "end": 351.0, "is_stop": false}, {"file_id": "OffChipStore_77", "name": "OffChipStore", "id": "77", "prefix": "event", "identifier": "event_OffChipStore_77_8", "start": 351.0, "end": 356.0, "is_stop": false}];
+        const nameIdList = ["LinearOffChipLoad_0", "LinearOffChipLoad_3", "FlatPartition_4", "Accum_7", "Accum_13", "Accum_16", "LinearOffChipLoadRef_21", "LinearOffChipLoadRef_23", "LinearOffChipLoadRef_24", "BinaryMap_29", "BinaryMap_31", "BinaryMap_32", "LinearOffChipLoadRef_33", "LinearOffChipLoadRef_35", "LinearOffChipLoadRef_36", "BinaryMap_41", "BinaryMap_43", "BinaryMap_44", "UnaryMap_45", "UnaryMap_47", "UnaryMap_48", "BinaryMap_49", "BinaryMap_51", "BinaryMap_52", "LinearOffChipLoadRef_53", "LinearOffChipLoadRef_55", "LinearOffChipLoadRef_56", "BinaryMapAccum_61", "BinaryMapAccum_63", "BinaryMapAccum_64", "FlatPartition_69", "BinaryMap_70", "BinaryMap_72", "BinaryMap_73", "FlatReassemble_75", "Accum_76", "OffChipStore_77"];
+        const minTime = 0.0;
+        const maxTime = 356.0;
+        let scale = 0.5;
+        let timelineEl = document.getElementById('timeline');
+        let containerEl = document.getElementById('container');
+        let tooltipEl = document.getElementById('tooltip');
+        let scaleSlider = document.getElementById('scale-slider');
+        let scaleValue = document.getElementById('scale-value');
+
+        function renderTimeline() {
+            timelineEl.innerHTML = '';
+            const timelineWidth = (maxTime - minTime) * scale;
+            nameIdList.forEach(nameId => {
+                const fileRow = document.createElement('div');
+                fileRow.className = 'file-row';
+                const fileLabel = document.createElement('div');
+                fileLabel.className = 'file-label';
+                fileLabel.textContent = nameId;
+                fileLabel.title = nameId;
+                const tc = document.createElement('div');
+                tc.className = 'timeline-container';
+                tc.style.width = `${timelineWidth}px`;
+                fileRow.appendChild(fileLabel);
+                fileRow.appendChild(tc);
+                timelineEl.appendChild(fileRow);
+                const items = data.filter(item => item.file_id === nameId);
+                items.forEach(item => {
+                    const block = document.createElement('div');
+                    block.className = item.is_stop ? 'block event-stop' : 'block event-normal';
+                    const left = (item.start - minTime) * scale;
+                    const width = (item.end - item.start) * scale;
+                    block.style.left = `${left}px`;
+                    block.style.width = `${Math.max(width, 1)}px`;
+                    if (width > 40) block.textContent = item.identifier;
+                    block.dataset.identifier = item.identifier;
+                    block.dataset.name = item.name;
+                    block.dataset.id = item.id;
+                    block.dataset.start = item.start;
+                    block.dataset.end = item.end;
+                    block.dataset.isStop = item.is_stop;
+                    block.addEventListener('mouseover', showTooltip);
+                    block.addEventListener('mousemove', moveTooltip);
+                    block.addEventListener('mouseout', hideTooltip);
+                    tc.appendChild(block);
+                });
+            });
+            const stepSize = calculateStepSize(maxTime - minTime);
+            for (let t = minTime; t <= maxTime; t += stepSize) {
+                const marker = document.createElement('div');
+                marker.className = 'timeline-marker';
+                marker.style.left = `${(t - minTime) * scale + 320}px`;
+                const label = document.createElement('div');
+                label.className = 'timeline-label';
+                label.textContent = t.toFixed(0) + ' cyc';
+                marker.appendChild(label);
+                timelineEl.appendChild(marker);
+            }
+        }
+
+        function calculateStepSize(range) {
+            const roughStep = range / 10;
+            const mag = Math.pow(10, Math.floor(Math.log10(roughStep)));
+            const norm = roughStep / mag;
+            if (norm < 1.5) return mag;
+            if (norm < 3.5) return 2 * mag;
+            if (norm < 7.5) return 5 * mag;
+            return 10 * mag;
+        }
+
+        function showTooltip(e) {
+            const b = e.target;
+            tooltipEl.innerHTML = `
+                Name: ${b.dataset.name}<br>
+                ID: ${b.dataset.id}<br>
+                Start: ${parseFloat(b.dataset.start).toFixed(0)} cyc<br>
+                End: ${parseFloat(b.dataset.end).toFixed(0)} cyc<br>
+                Duration: ${(parseFloat(b.dataset.end) - parseFloat(b.dataset.start)).toFixed(0)} cyc<br>
+                Type: ${b.dataset.isStop === 'true' ? 'Stop' : 'Normal'}
+            `;
+            tooltipEl.style.display = 'block';
+            moveTooltip(e);
+        }
+        function moveTooltip(e) { tooltipEl.style.left = `${e.pageX + 10}px`; tooltipEl.style.top = `${e.pageY + 10}px`; }
+        function hideTooltip() { tooltipEl.style.display = 'none'; }
+
+        document.getElementById('zoom-in').addEventListener('click', () => { scale *= 1.5; updateScale(); renderTimeline(); });
+        document.getElementById('zoom-out').addEventListener('click', () => { scale /= 1.5; updateScale(); renderTimeline(); });
+        document.getElementById('reset').addEventListener('click', () => { scale = 0.5; updateScale(); renderTimeline(); containerEl.scrollLeft = 0; });
+        scaleSlider.addEventListener('input', () => { scale = scaleSlider.value / 10; updateScale(); renderTimeline(); });
+        function updateScale() { scaleValue.textContent = `${scale.toFixed(2)}x`; scaleSlider.value = Math.round(scale * 10); }
+
+        updateScale();
+        renderTimeline();
+    </script>
+</body>
+</html>

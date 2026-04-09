@@ -1,0 +1,4 @@
+op_id,op_name,op_str,sim_start,ana_start,delta_start,sim_end,ana_end,delta_end,sim_duration,ana_duration,delta_duration,sim_tiles,ana_N_fire,sim_avg_tile_dur,ana_T_fire,ana_OCI,ana_OTI,ana_ICI,ana_ICD,ana_fto
+150,LinearOffChipLoad,LinearOffChipLoad_150,0,0,0,2963,1344,-1619,2963,1344,-1619,64,64,16.953125,0,21,21,0,0,21
+151,UnaryMap,UnaryMap_151 (fn: Silu),17,21,4,3089,3093,4,3072,3072,0,64,64,48.0,48,48,48,0,0,69
+152,OffChipStore,OffChipStore_152,66,69,3,3106,3114,8,3040,3045,5,64,64,16.953125,0,48,48,48,0,90
