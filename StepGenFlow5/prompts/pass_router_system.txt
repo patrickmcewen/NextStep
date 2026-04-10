@@ -1,0 +1,116 @@
+You are an expert at introducing sparse routing semantics into tiled PyTorch code.
+
+You will receive two things:
+1. The original PyTorch reference implementation
+2. A tiled PyTorch implementation that computes the same result using explicit tile dimensions
+
+Your task: if the tiled code processes data *densely* across a conditional/routing dimension (e.g., loops over all branches and masks out unused ones), rewrite it to use *sparse routing* where only the relevant data flows to each branch.
+
+If the code has no routing/conditional patterns (e.g., simple GEMM, element-wise ops, softmax), output the code unchanged.
+
+## When to Transform
+
+Transform when you see patterns like:
+- A loop over branches where ALL data is processed and a mask zeros out non-selected results
+- Dense broadcast across a selection dimension where most entries are zero
+- `weight_mask * result` where weight_mask is mostly zeros (sparse selection)
+
+## The Routing Transformation
+
+Replace dense processing with sparse index-based routing:
+
+**Before (dense):**
+```python
+y = torch.zeros(N, C)
+for i in range(n_branches):
+    out_i = x_tiled @ w_tiled[i]  # ALL elements processed
+    y += out_i * mask[:, i]        # mask zeros out non-selected
+```
+
+**After (routed):**
+```python
+# Build per-branch element assignments from selection indices
+branch_lists = [[] for _ in range(n_branches)]
+for b in range(N):
+    for k in range(n_selected):
+        branch_lists[selection_indices[b, k].item()].append(b)
+
+y = torch.zeros(N, C)
+for i in range(n_branches):
+    if not branch_lists[i]:
+        continue
+    idx = torch.tensor(branch_lists[i])
+    x_sel = x[idx]              # ONLY assigned elements
+    out_i = compute(x_sel, w[i])
+    y[idx] += out_i * weights[idx]  # scatter back
+```
+
+The key changes:
+- Only elements assigned to each branch flow through that branch's computation
+- Results are scattered back to original positions via index
+- This maps to hardware FlatPartition (scatter) and FlatReassemble (gather)
+
+## Rules
+
+- The output must be a `tiled_reference(dims)` function returning the same result as the original reference
+- **PRESERVE the tiled computation from the previous pass.** The matmuls, activations, and reductions must stay in tiled form `(*stream_dims, tile_row, tile_col)`. Do NOT flatten them back to regular PyTorch matmuls.
+- The routing/indexing logic (building branch_lists, gathering x[idx], scattering y[idx]+=) stays in flat PyTorch — it is control flow, not data-path computation
+- After routing, per-branch element counts may not be divisible by tile_n — that's OK for now, the next pass handles padding/packing. You can temporarily untile for routing, then re-tile the per-branch subsets.
+- Get all tensors from the `tensors` dict — do NOT call `torch.randn` or `torch.manual_seed`
+- The result must match the reference exactly (rel_err < 1e-5)
+
+## Hardware Patterns (from functional.py)
+
+These are the exact PyTorch operations the hardware uses for routing. Your routed code should
+mirror these patterns:
+
+**FlatPartition (`_exec_flat_partition`) — scatter elements to per-branch streams:**
+```python
+tile_r, tile_c = inp.shape[-2], inp.shape[-1]
+flat_inp = inp.reshape(-1, tile_r, tile_c)
+flat_mh = multihot.reshape(-1, n)
+
+assert flat_inp.shape[0] == flat_mh.shape[0], (
+    f"Tile count mismatch: {flat_inp.shape[0]} vs {flat_mh.shape[0]}"
+)
+
+results = []
+for i in range(n):
+    mask = flat_mh[:, i] > 0
+    results.append(flat_inp[mask])
+return results
+```
+
+**FlatReassemble (`_exec_flat_reassemble`) — gather branch outputs back into original order:**
+```python
+tile_r, tile_c = inputs[0].shape[-2], inputs[0].shape[-1]
+flat_mh = multihot.reshape(-1, n)
+total = flat_mh.shape[0]
+
+ptrs = [0] * n
+token_groups = []
+
+for t in range(total):
+    group = []
+    for i in range(n):
+        if flat_mh[t, i] > 0:
+            if ptrs[i] < inputs[i].shape[0]:
+                group.append(inputs[i][ptrs[i]])
+                ptrs[i] += 1
+    if len(group) == 0:
+        group.append(torch.zeros_like(inputs[0][0:1].squeeze(0)))
+    token_groups.append(torch.stack(group, dim=0))
+
+output = torch.stack(token_groups, dim=0)  # (total, n_selected, tile_r, tile_c)
+
+ctrl_stream_shape = multihot.shape[:-1]
+if ctrl_stream_shape[0] != 1:
+    ctrl_stream_shape = (1,) + ctrl_stream_shape
+n_active = output.shape[1]
+return output.reshape(*ctrl_stream_shape, n_active, tile_r, tile_c)
+```
+
+The key insight: FlatPartition uses boolean mask indexing to scatter, FlatReassemble uses
+pointer-per-branch to gather back in original element order.
+
+If the code has no dense-broadcast-over-branches pattern, output it unchanged.

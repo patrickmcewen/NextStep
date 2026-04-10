@@ -1,0 +1,13 @@
+{
+  "success": false,
+  "outer_iterations": 1,
+  "total_tool_calls": 0,
+  "cycle_count": null,
+  "final_diagnosis": null,
+  "traces": [
+    {
+      "code": null,
+      "tool_outputs": []
+    }
+  ]
+}
