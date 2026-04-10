@@ -1,0 +1,320 @@
+You are an expert at converting raw PyTorch shape operations into DSL function calls that map 1:1 to hardware structural nodes.
+
+You will receive code where loads use `offchip_load`, compute uses `binary_*`/`unary_*`, but shape manipulation is still raw PyTorch (`.unsqueeze()`, `.squeeze()`, `.expand()`, `.reshape()`, `.permute()` on tiled data tensors).
+
+Your task: replace raw shape operations on **tiled data tensors** with DSL shape function calls. **Keep all other DSL calls, routing patterns, accumulation, and control flow exactly as-is.**
+
+If shape ops are already in DSL form, output the code unchanged.
+
+## DSL Functions for This Pass
+
+These functions are pre-imported and available at runtime. Here are their exact implementations:
+
+```python
+def promote(x, rank=1):
+    """Insert a size-1 dimension into a tiled tensor.
+    Inserts at position -(2 + rank). Last 2 dims are tile dims [tr, tc].
+
+        rank=1 → dim -3: just before tr     (new innermost stream dim) ← MOST COMMON
+        rank=2 → dim -4: one slot into stream dims
+        rank=0 → dim -2: between tr and tc  (rarely used)
+
+    Examples:
+        x shape              rank   result shape
+        (A, B, [tr, tc])     1      (A, B, 1, [tr, tc])     ← most common
+        (A, B, [tr, tc])     2      (A, 1, B, [tr, tc])
+        (A, [tr, tc])        1      (A, 1, [tr, tc])
+        (A, [tr, tc])        2      (1, A, [tr, tc])
+    """
+    return x.unsqueeze(-(2 + rank))
+
+
+def promote_outer(x):
+    """Insert a size-1 dimension at dim 0 (outermost).
+    Simpler alternative when you just need an outer singleton."""
+    return x.unsqueeze(0)
+
+
+def flatten(x, min_rank, max_rank):
+    """Merge stream dims from min_rank to max_rank (counting from rightmost).
+    Mirrors Flatten(graph, input, min_rank, max_rank).
+
+    Ranks count from the right: rank 0 = rightmost stream dim.
+    CONSTRAINT: max_rank must be < number of stream dims.
+
+    Examples (last 2 dims are tile dims [tr, tc]):
+        x shape                  min_rank  max_rank  result shape
+        (A, B, C, [tr, tc])      0         1         (A, B*C, [tr, tc])    ← merge 2 rightmost stream
+        (A, B, C, [tr, tc])      1         2         (A*B, C, [tr, tc])    ← merge 2 leftmost stream
+        (1, A, B, [tr, tc])      1         2         (1*A, B, [tr, tc]) = (A, B, [tr, tc])  ← strip leading 1
+        (1, A, [tr, tc])         0         1         (1*A, [tr, tc]) = (A, [tr, tc])  ← strip leading 1
+
+    Common mistake: (1, A, B, [tr, tc]) has 3 stream dims → ranks 0,1,2.
+    Do NOT use max_rank=3 — that's out of bounds!
+    """
+    tile_r, tile_c = x.shape[-2], x.shape[-1]
+    stream_shape = list(x.shape[:-2])
+    n = len(stream_shape)
+    min_idx = n - 1 - max_rank
+    max_idx = n - 1 - min_rank
+    merged = 1
+    for i in range(min_idx, max_idx + 1):
+        merged *= stream_shape[i]
+    new_stream = stream_shape[:min_idx] + [merged] + stream_shape[max_idx + 1:]
+    return x.reshape(*new_stream, tile_r, tile_c)
+
+
+def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
+    """Split one stream dim into two by a chunk size. Inverse of flatten.
+    Mirrors Reshape(graph, input, chunk_size, ...).
+
+    Args:
+        x: Tiled tensor, shape (*stream, tile_r, tile_c).
+        chunk_size: Size of each chunk after splitting.
+        rank: Which stream dim to split, counting from the right (0 = rightmost).
+        add_outer_dim: If True, prepend a leading singleton dim.
+
+    Examples (last 2 dims are tile dims [tr, tc]):
+        x shape              chunk_size  rank  result shape
+        (6, [tr, tc])        2           0     (3, 2, [tr, tc])
+        (A, 12, [tr, tc])    4           0     (A, 3, 4, [tr, tc])
+        (12, B, [tr, tc])    3           1     (4, 3, B, [tr, tc])
+
+    Pads with zeros if the dim is not evenly divisible by chunk_size.
+    """
+    tile_r, tile_c = x.shape[-2], x.shape[-1]
+    stream_shape = list(x.shape[:-2])
+    n = len(stream_shape)
+    rank_pos = n - 1 - rank
+    D = stream_shape[rank_pos]
+    padded_D = ((D + chunk_size - 1) // chunk_size) * chunk_size
+    if padded_D != D:
+        pad_sizes = [0] * (2 * len(x.shape))
+        pad_idx = 2 * (len(x.shape) - 1 - rank_pos)
+        pad_sizes[pad_idx + 1] = padded_D - D
+        x = F.pad(x, pad_sizes, value=0.0)
+        stream_shape[rank_pos] = padded_D
+    pre = stream_shape[:rank_pos]
+    post = stream_shape[rank_pos + 1:]
+    new_count = padded_D // chunk_size
+    if add_outer_dim:
+        new_shape = [1] + pre + [new_count, chunk_size] + post + [tile_r, tile_c]
+    else:
+        new_shape = pre + [new_count, chunk_size] + post + [tile_r, tile_c]
+    return x.reshape(new_shape)
+
+
+def retile_streamify(x, chunk, split_row=True):
+    """Split tile rows (or cols) into stream chunks. Inverse of accum_retile_row/col.
+    Mirrors RetileStreamify(graph, input, chunk, ...).
+
+    Splits tile_r (or tile_c) by chunk, merging the new chunk count
+    into the last stream dim.
+
+    Examples (split_row=True):
+        x shape                  chunk  result shape
+        (A, B, 64, tc)           32     (A, B*2, 32, tc)     ← tile_r=64 split into 2×32
+        (A, 128, tc)             32     (A*4, 32, tc)        ← tile_r=128 split into 4×32
+
+    USE THIS instead of .permute().reshape() when you need to move data
+    from tile dims into stream dims. This is the correct DSL operation for
+    de-tiling (splitting large tiles into smaller tiles with a stream dim).
+    """
+    if split_row:
+        batch = x.shape[:-2]
+        last = batch[-1]
+        pre = batch[:-1]
+        tile_r, tile_c = x.shape[-2], x.shape[-1]
+        num_chunks = tile_r // chunk
+        reshaped = x.reshape(*pre, last, num_chunks, chunk, tile_c)
+        return reshaped.reshape(*pre, last * num_chunks, chunk, tile_c)
+    # split_col
+    batch = x.shape[:-2]
+    last = batch[-1]
+    pre = batch[:-1]
+    tile_r, tile_c = x.shape[-2], x.shape[-1]
+    num_chunks = tile_c // chunk
+    reshaped = x.reshape(*pre, last, tile_r, num_chunks, chunk)
+    perm = list(range(len(pre))) + [len(pre), len(pre)+2, len(pre)+1, len(pre)+3]
+    reshaped = reshaped.permute(perm)
+    return reshaped.reshape(*pre, last * num_chunks, tile_r, chunk)
+
+
+def expand_ref(x, ref):
+    """Broadcast singleton stream dims to match ref's stream shape.
+    Mirrors ExpandRef(graph, input, ref).
+
+    PREREQUISITE: x and ref must have the SAME number of stream dims (same ndim).
+    x must have singleton (size-1) stream dims where ref has larger dims.
+    The tile dims (last 2) are preserved from x.
+
+    If x and ref have DIFFERENT numbers of stream dims, use repeat_ref instead.
+    """
+    ref_shape = list(ref.shape[:-2])
+    expand_shape = ref_shape + list(x.shape[-2:])
+    return x.expand(expand_shape).contiguous()
+
+
+def repeat_ref(x, ref):
+    """Broadcast x to match ref's stream shape, auto-inserting singletons.
+    Mirrors RepeatRef(graph, input, ref).
+
+    Like expand_ref but handles DIFFERENT numbers of stream dims automatically.
+    Inserts singleton dims where ref has dims that x doesn't, then expands.
+
+    Example:
+        x: (F_g, [tr, tc]),  ref: (B, F_g, [tr', tc'])
+        → auto-inserts singleton → (1, F_g, [tr, tc])
+        → expands to (B, F_g, [tr, tc])
+
+    Use this instead of expand_ref when ndims don't match.
+    """
+    ref_stream = list(ref.shape[:-2])
+    inp_stream = list(x.shape[:-2])
+    tile_dims = list(x.shape[-2:])
+    aligned = tile_dims[:]
+    ri = len(ref_stream) - 1
+    ii = len(inp_stream) - 1
+    while ri >= 0:
+        if ii >= 0 and (inp_stream[ii] == ref_stream[ri] or inp_stream[ii] == 1):
+            aligned.insert(0, inp_stream[ii])
+            ri -= 1
+            ii -= 1
+        else:
+            aligned.insert(0, 1)
+            ri -= 1
+    result = x.reshape(aligned)
+    expand_shape = ref_stream + tile_dims
+    return result.expand(expand_shape).contiguous()
+
+
+def repeat_static(x, factor):
+    """Insert new stream dim at -3 and repeat factor times.
+    Mirrors RepeatStatic(graph, input, repeat_factor).
+
+    Adds a new dimension just before the tile dims and fills it
+    with `factor` copies of the data.
+    """
+    result = x.unsqueeze(-3)
+    shape = list(result.shape)
+    shape[-3] = factor
+    return result.expand(shape).contiguous()
+
+
+def streamify(x, repeat_factors, rank=0):
+    """Insert multiple new stream dims and repeat along each.
+    Mirrors Streamify(graph, input, rank, repeat_factor).
+
+    Generalized repeat_static: inserts multiple new dimensions.
+
+    Example:
+        x: (A, [tr, tc]), repeat_factors=[3, 4], rank=0
+        → (A, 4, 3, [tr, tc])
+    """
+    result = x
+    offset = 2 + rank
+    for rf in repeat_factors:
+        result = result.unsqueeze(-offset)
+        shape = list(result.shape)
+        shape[-offset] = rf
+        result = result.expand(shape).contiguous()
+        offset += 1
+    return result
+```
+
+## Conversion Rules
+
+| PyTorch | DSL | When to use |
+|---|---|---|
+| `x.unsqueeze(0)` | `promote_outer(x)` | Add outermost singleton |
+| `x.unsqueeze(-3)` | `promote(x, rank=1)` | Add singleton just before tile_r (most common) |
+| `x.unsqueeze(-(2+r))` | `promote(x, rank=r)` | Add singleton; rank=1 is just before tile dims |
+| `x.expand(ref_shape + tile_shape)` | `expand_ref(x, ref)` | Broadcast singletons to match ref (SAME ndim) |
+| `x.expand(...)` different ndim | `repeat_ref(x, ref)` | Broadcast with auto-alignment (DIFFERENT ndim) |
+| `x.unsqueeze(-3).expand(..., N, ...)` | `repeat_static(x, N)` | Insert and repeat a new stream dim |
+| `.reshape()` merging stream dims | `flatten(x, min_rank, max_rank)` | Merge adjacent stream dims |
+| `.reshape()` splitting a stream dim | `reshape_stream(x, chunk_size, rank)` | Split one stream dim into two |
+| `.squeeze(d)` on size-1 stream dim | `flatten(x, r, r)` where r is that dim's rank | Collapse a singleton |
+| `.permute().reshape()` de-tiling | `retile_streamify(x, chunk)` | Split tile_r/tile_c into stream chunks |
+
+**Important distinctions:**
+- `promote` / `promote_outer` = insert singleton (`.unsqueeze`)
+- `expand_ref` = broadcast singletons, SAME ndim required (`.expand`)
+- `repeat_ref` = broadcast with auto-alignment, DIFFERENT ndim OK (`.expand` with dim insertion)
+- `repeat_static` = insert AND fill a new stream dim (`.unsqueeze` + `.expand`)
+- `flatten` = merge adjacent stream dims (`.reshape` on stream dims, or `.squeeze`)
+- `reshape_stream` = split one stream dim into two (inverse of `flatten`)
+- `retile_streamify` = move data from tile dims to stream dims (inverse of `accum_retile_row/col`)
+
+**Note on `.squeeze(0)` after `offchip_load`:** The leading 1 from `offchip_load` is the load convention. To remove it, merge it with the next stream dim using `flatten`. Ranks count from the RIGHT, so the leading 1 is the HIGHEST-numbered rank, not rank 0.
+
+Example: `offchip_load` returns `(1, A, B, [tr, tc])` — stream dims are `[1, A, B]`, so rank 0 = B, rank 1 = A, rank 2 = 1. To strip the leading 1:
+```python
+x = flatten(x, 1, 2)  # merge ranks 1 and 2: (1*A, B, [tr, tc]) = (A, B, [tr, tc])
+```
+**Common mistake:** `flatten(x, 0, 0)` does NOT remove the leading 1 — rank 0 is the rightmost stream dim!
+
+## CRITICAL: `.permute().reshape()` for de-tiling → use `retile_streamify`
+
+If you see a pattern like:
+```python
+x.permute(0, 2, 1, 3).reshape(B, D_g, tn)  # merging B_g * tn into B
+```
+This is **de-tiling**: moving data from tile_r into the stream. Use `retile_streamify`:
+```python
+retile_streamify(x, chunk=tn, split_row=True)  # splits tile_r, merges chunks into last stream dim
+```
+
+If no DSL function fits a particular `.permute()` or `.reshape()`, leave it as-is. It will be addressed in the next pass.
+
+## CRITICAL: `expand_ref` vs `repeat_ref`
+
+- Use `expand_ref(x, ref)` when x and ref have the **same number of stream dims** (same ndim). x must have singletons where ref is larger.
+- Use `repeat_ref(x, ref)` when x and ref have **different numbers of stream dims**. It auto-inserts singletons to align before expanding.
+
+Example: weight `(F_g, [tr, tc])` needs to broadcast to match activation `(B, F_g, [tr, tc])`:
+```python
+# WRONG — expand_ref fails because ndim differs (3 vs 4):
+expand_ref(weight, activation)
+
+# CORRECT — repeat_ref auto-inserts singleton for B:
+repeat_ref(weight, activation)  # (F_g, [tr, tc]) → (1, F_g, [tr, tc]) → (B, F_g, [tr, tc])
+```
+
+## CRITICAL: Tiled data vs control tensors
+
+**Tiled data** — outputs of `offchip_load`, `binary_*`, `unary_*`. Shape `(*stream, tile_r, tile_c)` with last 2 dims being tile dims. Convert shape ops on these to DSL calls (`promote`, `flatten`, `expand_ref`, `repeat_static`).
+
+**Control tensors** — outputs of `select_gen`. Arbitrary shapes like `(B, n_active)` or `(B, n_experts)`. These are NOT tiled. **Leave shape ops on control tensors as raw PyTorch** (`.unsqueeze()`, `.expand()`, `.to()`, slicing). The DSL shape functions assume tiled form and will produce wrong results on non-tiled tensors.
+
+Example: if `weights` comes from `select_gen` with shape `(B, n_active)`:
+```python
+# OK — control tensor, raw PyTorch shape ops allowed
+weights_3d = weights.unsqueeze(-1)  # (B, n_active, 1)
+```
+
+But if `x_tiled` comes from `offchip_load` with shape `(1, batch_tiles, tile_n, D)`:
+```python
+# MUST use DSL
+x_promoted = promote(x_tiled, rank=1)  # inserts singleton just before tile_r: (1, batch_tiles, 1, tile_n, D)
+```
+
+## What NOT to Change
+
+- **Loads**: Keep `offchip_load(...)`, `select_gen(...)`, `offchip_store(...)` as-is
+- **Compute**: Keep `binary_*`, `unary_*` DSL calls as-is
+- **Accumulation**: Keep `.sum(dim=-3)`, `.prod(dim=-3)` as-is (converted in next pass)
+- **Routing**: Keep gather/scatter, `torch.nonzero`, boolean masking as-is (converted in next pass)
+- **Control flow**: Keep `for`, `if`, `range()`, list ops as-is
+- **Metadata prep**: Keep `tensors["key"].reshape(...)` or `.to(...)` for `select_gen`/`offchip_load` as-is
+- **Shape ops on control tensors**: Keep `.unsqueeze()`, `.expand()`, `.to()` on `select_gen` outputs as-is
+- **`.view()` for scalar reshaping**: `.view(-1)`, `.view(-1, 1)` etc. on scalars/1D tensors — leave as-is
+- **Any remaining `.permute()` or `.reshape()` with no DSL equivalent**: If no DSL function fits, leave as-is
+
+## Function Signature
+
+```python
+def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
+```
+
+The result must match the reference exactly (rel_err < 1e-5).

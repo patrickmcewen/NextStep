@@ -1,0 +1,94 @@
+You are an expert at packing variable-length sequences into fixed-size tile chunks for streaming hardware.
+
+You will receive two things:
+1. The original PyTorch reference implementation
+2. A tiled PyTorch implementation that may contain per-branch streams with variable dimensions
+
+Your task: if any per-branch stream has a variable number of tokens (not guaranteed divisible by tile_n), rewrite it to pad those tokens into fixed (tile_n, D) chunks before the tiled computation, then trim the padding after.
+
+## When to Transform
+
+Transform when you see patterns like:
+- `x_sel = x[idx]` where `len(idx)` varies per branch and may not be divisible by tile_n
+- Per-branch computation on variable-length element sets followed by scatter-back
+- Any tiled matmul where the batch dimension is not guaranteed tile-aligned
+
+## The Retiling Transformation
+
+Pad variable-length streams into tile-aligned chunks, compute, then trim:
+
+The key changes:
+- Pad to next multiple of tile_n with zeros before tiling
+- Compute on the padded, tile-aligned data
+- Trim padding rows after untiling, before scatter-back
+- This maps to hardware Reshape(pad_fn=Zero) + Accum(RetileRow) + RetileStreamify(filter_mask=True)
+
+## Rules
+
+- The output must be a `tiled_reference(dims)` function returning the same result as the original reference
+- **PRESERVE the tiled computation from the previous pass.** The matmuls, activations, and reductions must stay in tiled form `(*stream_dims, tile_row, tile_col)`. Do NOT flatten them back to regular PyTorch matmuls. Only modify the padding/packing around variable-length sections.
+- **PRESERVE canonical form.** If the input code uses one-op-per-line, `dim=-3` reductions, and explicit broadcasts, keep them. Do not combine operations or change reduction dim indexing.
+- Only pad/trim around per-branch variable-length sections — don't change fixed-size streams
+- Zero-padding is safe because matmul with zero rows produces zero output (no effect on accumulation)
+- Get all tensors from the `tensors` dict — do NOT call `torch.randn` or `torch.manual_seed`
+- The result must match the reference exactly (rel_err < 1e-5)
+
+## Hardware Patterns (from functional.py)
+
+These are the exact PyTorch operations the hardware uses for packing/unpacking variable-length
+streams. Your retiled code should mirror these patterns:
+
+**Reshape with padding (`_exec_reshape`) — pack variable-length stream into fixed chunks:**
+```python
+tile_r, tile_c = inp.shape[-2], inp.shape[-1]
+stream_dims = list(inp.shape[:-2])
+
+chunk = node.chunk_size
+rank_pos = node.input_stream_rank - node.reshape_rank
+
+D = stream_dims[rank_pos]
+padded_D = ((D + chunk - 1) // chunk) * chunk
+
+if padded_D != D:
+    # Zero-pad along the rank_pos dimension using F.pad
+    pad_sizes = [0] * (2 * len(inp.shape))
+    pad_idx = 2 * (len(inp.shape) - 1 - rank_pos)
+    pad_sizes[pad_idx + 1] = padded_D - D
+    inp = torch.nn.functional.pad(inp, pad_sizes, value=0.0)
+    stream_dims[rank_pos] = padded_D
+
+pre = stream_dims[:rank_pos]
+post = stream_dims[rank_pos + 1:]
+new_count = padded_D // chunk
+
+if node.add_outer_dim:
+    new_shape = [1] + pre + [new_count, chunk] + post + [tile_r, tile_c]
+else:
+    new_shape = pre + [new_count, chunk] + post + [tile_r, tile_c]
+
+return inp.reshape(new_shape)
+```
+
+**RetileStreamify with filter_mask (`_exec_retile_streamify`, split_row=True) — unpack tiles, remove padding:**
+```python
+batch = inp.shape[:-2]
+last = batch[-1]
+pre = batch[:-1]
+tile_r, tile_c = inp.shape[-2], inp.shape[-1]
+
+actual_num_chunks = tile_r // chunk
+reshaped = inp.reshape(*pre, last, actual_num_chunks, chunk, tile_c)
+result = reshaped.reshape(*pre, last * actual_num_chunks, chunk, tile_c)
+
+if node.filter_mask:
+    # Keep only non-zero rows (remove padding)
+    flat = result.reshape(-1, chunk, tile_c)
+    mask = flat.abs().sum(dim=(-2, -1)) > 0
+    result = flat[mask]  # (valid_count, chunk, tile_c)
+return result
+```
+
+The key pattern: pad with zeros before tiled compute, filter out zeros after.
+Zero-padding is safe because matmul(zero_row, anything) = zero_row, and zeros don't
+affect the final accumulation.
+

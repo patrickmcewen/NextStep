@@ -1,0 +1,115 @@
+You are an expert at converting PyTorch compute operations into DSL function calls that map 1:1 to hardware compute nodes.
+
+You will receive code where tensor loads already use `offchip_load` and the output uses `offchip_store`, but compute operations are still raw PyTorch (`torch.matmul`, `F.silu`, `*`, `+`, etc.).
+
+Your task: replace ALL compute operations with the corresponding DSL function calls. **Keep all control flow, routing logic, and accumulation (.sum(dim=-3)) exactly as-is.**
+
+If compute is already in DSL form, output the code unchanged.
+
+## DSL Functions for This Pass
+
+These functions are pre-imported and available at runtime. Here are their exact implementations:
+
+### Binary compute (two tensor inputs)
+```python
+def binary_matmul(a, b, weight_transposed=False):
+    """Tiled matrix multiply. Mirrors BinaryMap(map_fn.Matmul)."""
+    if weight_transposed:
+        return torch.matmul(a, b.transpose(-2, -1))
+    return torch.matmul(a, b)
+
+def binary_mul(a, b):
+    """Element-wise multiply. Mirrors BinaryMap(map_fn.Mul)."""
+    return a * b
+
+def binary_add(a, b):
+    """Element-wise add. Mirrors BinaryMap(map_fn.Add)."""
+    return a + b
+
+def binary_div(a, b):
+    """Element-wise divide. Mirrors BinaryMap(map_fn.Div)."""
+    return a / b
+
+def binary_is_equal(a, b):
+    """Element-wise equality. Mirrors BinaryMap(map_fn.IsEqual)."""
+    return (a == b).float()
+```
+
+### Unary compute (single tensor input)
+```python
+def unary_silu(x):
+    """SiLU activation. Mirrors UnaryMap(map_fn.Silu)."""
+    return F.silu(x)
+
+def unary_square(x):
+    """Element-wise square. Mirrors UnaryMap(map_fn.Square)."""
+    return x ** 2
+
+def unary_exp(x):
+    """Element-wise exp. Mirrors UnaryMap(map_fn.Exp)."""
+    return torch.exp(x)
+
+def unary_rsqrt(x):
+    """Reciprocal square root. Mirrors UnaryMap(map_fn.Rsqrt)."""
+    return torch.rsqrt(x)
+
+def unary_pow2(x):
+    """2^x element-wise. Mirrors UnaryMap(map_fn.Pow2)."""
+    return torch.pow(2.0, x)
+
+def unary_mul_imm(x, constant):
+    """Multiply by scalar constant. Mirrors UnaryMap(map_fn.MulImmediate)."""
+    return x * constant
+
+def unary_add_imm(x, constant):
+    """Add scalar constant. Mirrors UnaryMap(map_fn.AddImmediate)."""
+    return x + constant
+
+def unary_sub_imm(x, constant):
+    """Subtract scalar constant. Mirrors UnaryMap(map_fn.SubImmediate)."""
+    return x - constant
+
+def unary_rowwise_sum(x):
+    """Sum each row, keep dim. Mirrors UnaryMap(map_fn.RowWiseSum)."""
+    return x.sum(dim=-1, keepdim=True)
+```
+
+## Conversion Rules
+
+Replace each PyTorch compute operation with its DSL equivalent:
+
+| PyTorch | DSL |
+|---|---|
+| `torch.matmul(a, b)` | `binary_matmul(a, b)` |
+| `a * b` (both tensors) | `binary_mul(a, b)` |
+| `a + b` (both tensors) | `binary_add(a, b)` |
+| `a / b` (both tensors) | `binary_div(a, b)` |
+| `(a == b).float()` | `binary_is_equal(a, b)` |
+| `F.silu(x)` | `unary_silu(x)` |
+| `x ** 2` | `unary_square(x)` |
+| `torch.exp(x)` | `unary_exp(x)` |
+| `torch.rsqrt(x)` | `unary_rsqrt(x)` |
+| `torch.pow(2.0, x)` | `unary_pow2(x)` |
+| `x * scalar` | `unary_mul_imm(x, scalar)` |
+| `x + scalar` | `unary_add_imm(x, scalar)` |
+| `x - scalar` | `unary_sub_imm(x, scalar)` |
+| `x.sum(dim=-1, keepdim=True)` | `unary_rowwise_sum(x)` |
+
+**Distinguishing binary vs unary**: If BOTH operands are tensors (results of previous DSL calls or loads), use `binary_*`. If one operand is a Python scalar/number, use `unary_*_imm`.
+
+## What NOT to Change
+
+- **Loads**: Keep `offchip_load(...)` and `select_gen(...)` calls as-is
+- **Store**: Keep `offchip_store(...)` call as-is
+- **Accumulation**: Keep `.sum(dim=-3)` and `.prod(dim=-3)` as-is — these become DSL in the next pass
+- **Control flow**: Keep `for` loops, `if` statements, `range()` as-is
+- **Routing**: Keep boolean indexing, scatter-gather, list operations as-is
+- **Metadata**: Keep `tensors["key"].reshape(...)` for control signal prep as-is
+
+## Function Signature
+
+```python
+def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
+```
+
+The result must match the reference exactly (rel_err < 1e-5).
