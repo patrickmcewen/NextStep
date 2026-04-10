@@ -153,47 +153,98 @@ _CORRECTNESS_CHECKERS = {
 # ---------------------------------------------------------------------------
 
 # What each pass eliminates. After a pass, its patterns (and all prior) are banned.
-_PASS_BANS = {
-    "translate_load": [
-        ("torch.randn",        "use tensors dict + LinearOffChipLoad"),
-        ("torch.manual_seed",  "tensors are pre-computed"),
-        ("torch.rand(",        "use tensors dict + LinearOffChipLoad"),
-    ],
-    "translate_compute": [
-        ("torch.matmul",  "use BinaryMap(map_fn.Matmul) or BinaryMapAccum(map_accum_fn.Matmul)"),
-        ("F.silu(",       "use UnaryMap(map_fn.Silu)"),
-        ("torch.exp(",    "use UnaryMap(map_fn.Exp)"),
-        ("torch.rsqrt(",  "use UnaryMap(map_fn.Rsqrt)"),
-    ],
-    "translate_routing": [
-        # Routing patterns are structurally complex — hard to detect with string matching.
-        # Correctness check handles this; compliance is best-effort.
-    ],
+_TRANSLATION_ORDER = ["translate_load", "translate_compute", "translate_routing", "translate_accum"]
+
+# Allowed torch.XXX() and F.XXX() calls in the OUTPUT of each pass.
+# None = unrestricted (this pass doesn't constrain torch/F calls).
+# set() = nothing allowed.
+# Effective allowlist at each stage = the last non-None up to that point.
+_PASS_ALLOWED_TORCH = {
+    "translate_load": None,  # loads translated; all compute/routing/accum torch still OK
+    "translate_compute": {
+        # Only utility + routing + accum ops remain after compute is STeP
+        "torch.tensor", "torch.stack", "torch.cat", "torch.arange",
+        "torch.where", "torch.zeros", "torch.no_grad", "torch.long",
+    },
+    "translate_routing": {
+        # Only utility + accum ops remain after routing is STeP
+        "torch.tensor", "torch.stack", "torch.cat", "torch.arange",
+        "torch.zeros",
+    },
+    "translate_accum": {
+        # Final graph code — minimal torch for metadata only
+        "torch.tensor", "torch.arange",
+    },
+}
+
+# Extra string patterns banned at each stage (cumulative).
+_PASS_EXTRA_BANS = {
     "translate_accum": [
-        (".sum(dim=",       "use Accum(accum_fn.Add)"),
-        ("execute_values",  "remove mid-function execution; return (graph, output_op)"),
+        (".sum(",          "use Accum(accum_fn.Add)"),
+        ("execute_values", "remove mid-function execution; return (graph, output_op)"),
     ],
 }
 
-_TRANSLATION_ORDER = ["translate_load", "translate_compute", "translate_routing", "translate_accum"]
+# STeP ops that MUST appear in code after this pass (cumulative).
+_PASS_REQUIRES = {
+    "translate_load":    ["LinearOffChipLoad"],
+    "translate_compute": ["BinaryMap"],
+    "translate_accum":   ["OffChipStore"],
+}
+
+# Regex to find torch.XXX( and F.XXX( calls
+_TORCH_CALL_RE = re.compile(r'\btorch\.(\w+)\s*\(')
+_F_CALL_RE = re.compile(r'\bF\.(\w+)\s*\(')
 
 
 def _check_banned_ops(code: str, pass_name: str) -> list[str]:
-    """Check if code contains ops that should have been translated by this pass.
+    """Check if code complies with this pass's output constraints.
 
     Returns list of violation messages. Empty = compliant.
-    Cumulative: bans everything from this pass and all prior translation passes.
+    Checks:
+      1. All torch.XXX()/F.XXX() calls against the allowlist
+      2. Extra banned patterns (like .sum(, execute_values)
+      3. Required STeP ops (must be present after this pass)
     """
     if pass_name not in _TRANSLATION_ORDER:
         return []
 
     pass_idx = _TRANSLATION_ORDER.index(pass_name)
     violations = []
+
+    # 1. Find the effective torch allowlist (last non-None up to this pass)
+    allowed = None
     for i in range(pass_idx + 1):
-        for pattern, fix in _PASS_BANS.get(_TRANSLATION_ORDER[i], []):
+        stage_allowed = _PASS_ALLOWED_TORCH.get(_TRANSLATION_ORDER[i])
+        if stage_allowed is not None:
+            allowed = stage_allowed
+
+    if allowed is not None:
+        # Scan for torch.XXX( calls
+        for match in _TORCH_CALL_RE.finditer(code):
+            call = f"torch.{match.group(1)}"
+            if call not in allowed:
+                violations.append(f"- `{call}()` is not allowed — must be a STeP graph node")
+
+        # F.XXX( calls — banned once compute is translated
+        for match in _F_CALL_RE.finditer(code):
+            call = f"F.{match.group(1)}"
+            violations.append(f"- `{call}()` is not allowed — must be a STeP graph node")
+
+    # 2. Extra banned patterns (cumulative)
+    for i in range(pass_idx + 1):
+        for pattern, fix in _PASS_EXTRA_BANS.get(_TRANSLATION_ORDER[i], []):
             if pattern in code:
                 violations.append(f"- `{pattern}` still present — {fix}")
-    return violations
+
+    # 3. Required ops (cumulative)
+    for i in range(pass_idx + 1):
+        for required in _PASS_REQUIRES.get(_TRANSLATION_ORDER[i], []):
+            if required not in code:
+                violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
+
+    # Deduplicate
+    return list(dict.fromkeys(violations))
 
 
 # ---------------------------------------------------------------------------
