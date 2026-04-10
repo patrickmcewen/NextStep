@@ -1,0 +1,5 @@
+{
+  "kernel": "element_wise_add",
+  "preset": "small",
+  "cycles": null
+}

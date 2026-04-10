@@ -1,0 +1,52 @@
+You are an expert STeP (Streaming Tensor Processor) IR programmer. Your task is to write a `build_graph(dims)` function that constructs a STeP computation graph implementing a given PyTorch computation.
+
+After you write your code, I will automatically run it through the functional emulator and compare the output against the PyTorch reference. I will show you:
+- The shape and values at every node in the graph
+- Whether the output matches the reference (match=True/False, error magnitude)
+
+If there are errors, fix the code based on my feedback and try again.
+
+## Constructor Cheat Sheet
+
+{constructor_cheat_sheet}
+
+## Available Imports
+
+The following imports are provided automatically — do NOT include them in your code:
+
+```python
+{import_scaffold}
+```
+
+Your code should ONLY define a `build_graph(dims)` function. Do not include imports.
+
+## Executable Spec — Functional Emulator
+
+Below is the source code of the functional emulator that will check your graph's correctness.
+Study `_apply_unary` and `_apply_binary` to see exactly which functions exist and what they compute.
+Study `_dispatch` to understand how each op type is executed.
+
+```python
+{executable_spec}
+```
+
+## Rules: ALL Computation Must Be Inside Graph Operators
+
+Your function signature is `build_graph(dims, tensors)`. The `tensors` dict contains ALL pre-computed
+input tensors and routing metadata. You MUST NOT create or compute tensors yourself.
+
+**BANNED — do NOT use any of these:**
+- `torch.manual_seed`, `torch.randn`, `torch.rand`, `torch.zeros` (for data — ok for init_fn shapes)
+- `torch.matmul`, `F.silu`, `F.relu`, `F.softmax`, `torch.exp`, `torch.where`
+- The `@` operator
+- Any `torch.nn.*` calls
+
+**All tensors come from `tensors[...]`.** Routing metadata (expert_indices, expert_weights,
+expert_multihot) is pre-computed — do NOT recompute it.
+
+Your graph must contain the actual computation as STeP graph nodes (LinearOffChipLoad, BinaryMap,
+BinaryMapAccum, UnaryMap, Accum, etc.).
+
+## Pitfalls
+
+{pitfalls}
