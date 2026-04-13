@@ -1,159 +1,176 @@
-def build_graph(dims: dict, tensors: dict):
-    # --------------------------------------------------------------
-    # 1️⃣  Dimensions & tile sizes
-    # --------------------------------------------------------------
+def build_graph(dims, tensors):
+    # ------------------------------------------------------------
+    # Dimensions & tiling parameters
+    # ------------------------------------------------------------
     M = dims["M"]
     N = dims["N"]
     D = dims["D"]
-    tile_m = dims["tile_m"]
-    tile_n = dims["tile_n"]
+    tile_m = dims["tile_m"]          # rows of Q / output tiles
+    tile_n = dims["tile_n"]          # rows of K/V tiles (also N‑tile size)
 
-    M_grid = M // tile_m        # 2
-    N_grid = N // tile_n        # 8
+    # Number of tiles along each logical dimension
+    grid_m = M // tile_m              # = 2  (tiles over M)
+    grid_n = N // tile_n              # = 8  (tiles over N)
 
-    # --------------------------------------------------------------
-    # 2️⃣  Graph + LinearOffChipLoad nodes (adds leading singleton)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Graph construction
+    # ------------------------------------------------------------
     graph = Graph()
 
-    # Q : (M, D) → tiled (1, M_grid, N_grid, tile_m, D)
-    #   – stride (1, 0) broadcasts Q across the N_grid dimension.
-    Q_load = LinearOffChipLoad(
-        underlying=tensors["Q"],
-        stride=(1, 0),                     # broadcast over N_grid
-        out_shape_tiled=(M_grid, N_grid),
+    # ------------------------------------------------------------
+    # Load dense tensors into tiled stream form
+    # ------------------------------------------------------------
+    Q = LinearOffChipLoad(
+        tensors["Q"],
+        stride=(1, 0),                     # advance 1 tile per grid_m step, broadcast over grid_n
+        out_shape_tiled=(grid_m, grid_n),
         tile_row=tile_m,
         tile_col=D,
-        par_dispatch=4,
-        transposed=False,
+        par_dispatch=1,
     )
-    graph.add_node(Q_load)
+    graph.add_node(Q)
 
-    # K : (N, D) → tiled (1, M_grid, N_grid, D, tile_n)  (tiles transposed)
-    #   – stride (0, 1) broadcasts K across the M_grid dimension.
-    K_load = LinearOffChipLoad(
-        underlying=tensors["K"],
-        stride=(0, 1),                     # broadcast over M_grid
-        out_shape_tiled=(M_grid, N_grid),
+    K = LinearOffChipLoad(
+        tensors["K"],
+        stride=(0, 1),                     # broadcast over grid_m, advance 1 tile per grid_n step
+        out_shape_tiled=(grid_m, grid_n),
         tile_row=tile_n,
         tile_col=D,
-        par_dispatch=4,
-        transposed=True,                   # produce (D, tile_n) tiles
+        par_dispatch=1,
     )
-    graph.add_node(K_load)
+    graph.add_node(K)
 
-    # V : (N, D) → tiled (1, M_grid, N_grid, tile_n, D)  (no transposition)
-    V_load = LinearOffChipLoad(
-        underlying=tensors["V"],
-        stride=(0, 1),                     # broadcast over M_grid
-        out_shape_tiled=(M_grid, N_grid),
+    V = LinearOffChipLoad(
+        tensors["V"],
+        stride=(0, 1),                     # same broadcasting pattern as K
+        out_shape_tiled=(grid_m, grid_n),
         tile_row=tile_n,
         tile_col=D,
-        par_dispatch=4,
-        transposed=False,
+        par_dispatch=1,
     )
-    graph.add_node(V_load)
+    graph.add_node(V)
 
-    # --------------------------------------------------------------
-    # 3️⃣  Stream‑aligned tensors (no extra repeat/expand needed)
-    # --------------------------------------------------------------
-    Q_grid = Q_load          # (1, M_grid, N_grid, tile_m, D)
-    K_grid = K_load          # (1, M_grid, N_grid, D, tile_n)
-    V_grid = V_load          # (1, M_grid, N_grid, tile_n, D)
-
-    # --------------------------------------------------------------
-    # 4️⃣  scores = Q @ Kᵀ   (tile‑level matmul)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Scores = Q @ Kᵀ   (tiled matmul, weight_transposed=True)
+    # ------------------------------------------------------------
     scores = BinaryMap(
         graph,
-        Q_grid,
-        K_grid,
-        map_fn.Matmul(weight_transposed=False),
+        Q,
+        K,
+        map_fn.Matmul(weight_transposed=True),
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, N_grid, tile_m, tile_n)
+    )
 
-    # --------------------------------------------------------------
-    # 5️⃣  exp_scores = exp(scores)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # exp_scores = exp(scores)
+    # ------------------------------------------------------------
     exp_scores = UnaryMap(
         graph,
         scores,
         map_fn.Exp(),
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, N_grid, tile_m, tile_n)
+    )
 
-    # --------------------------------------------------------------
-    # 6️⃣  context = exp_scores @ V   (matmul + reduction over N_grid)
-    # --------------------------------------------------------------
-    context_tile = BinaryMap(
+    # ------------------------------------------------------------
+    # context = exp_scores @ V   (tiled matmul, no transpose)
+    # ------------------------------------------------------------
+    context_tiles = BinaryMap(
         graph,
         exp_scores,
-        V_grid,
+        V,
         map_fn.Matmul(weight_transposed=False),
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, N_grid, tile_m, D)
+    )
 
-    # Reduce over N_grid (rank=1)
+    # ------------------------------------------------------------
+    # Reduce over the N‑tiles (grid_n) to obtain per‑query results
+    # ------------------------------------------------------------
+    # 1) sum over the streaming dimension that represents grid_n
     context_sum = Accum(
         graph,
-        context_tile,
-        output_stream_dtype=Tile(Float32(), shape=(tile_m, D)),
-        fn=accum_fn.Add(),
-        init_fn=init_fn.Zero(shape=(tile_m, D), dtype=Float32()),
+        context_tiles,
+        Tile(Float32(), shape=(tile_m, D)),
+        accum_fn.Add(),
+        init_fn=None,
         accum_rank=1,
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, tile_m, D)
+    )
 
-    # --------------------------------------------------------------
-    # 7️⃣  norm = sum(exp_scores) over N_grid (and tile_n)
-    # --------------------------------------------------------------
-    row_sum = UnaryMap(
+    # 2) merge that stream dim into the tiled‑row dimension → full M dimension
+    context = Accum(
+        graph,
+        context_sum,
+        Tile(Float32(), shape=(tile_m, D)),
+        accum_fn.RetileRow(),
+        init_fn=None,
+        accum_rank=1,
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+
+    # ------------------------------------------------------------
+    # Compute the normalisation term   norm = Σₙ exp(QKᵀ)
+    # ------------------------------------------------------------
+    # Sum over N‑tiles (grid_n) first
+    exp_sum_stream = Accum(
         graph,
         exp_scores,
+        Tile(Float32(), shape=(tile_m, tile_n)),
+        accum_fn.Add(),
+        init_fn=None,
+        accum_rank=1,
+        write_back_mu=False,
+        compute_bw=1024,
+    )
+
+    # Then sum inside each tile across the N‑tile columns
+    norm_tile = UnaryMap(
+        graph,
+        exp_sum_stream,
         map_fn.RowWiseSum(),
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, N_grid, tile_m, 1)
+    )
 
+    # Merge stream dim into rows to get (1, M, 1)
     norm = Accum(
         graph,
-        row_sum,
-        output_stream_dtype=Tile(Float32(), shape=(tile_m, 1)),
-        fn=accum_fn.Add(),
-        init_fn=init_fn.Zero(shape=(tile_m, 1), dtype=Float32()),
+        norm_tile,
+        Tile(Float32(), shape=(tile_m, 1)),
+        accum_fn.RetileRow(),
+        init_fn=None,
         accum_rank=1,
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, tile_m, 1)
+    )
 
-    # --------------------------------------------------------------
-    # 8️⃣  output = context / norm   (broadcast norm over D)
-    # --------------------------------------------------------------
-    output_tiled = BinaryMap(
+    # ------------------------------------------------------------
+    # Final output = context / norm   (broadcast division)
+    # ------------------------------------------------------------
+    out_tiled = BinaryMap(
         graph,
-        context_sum,
+        context,
         norm,
         map_fn.Div(),
         write_back_mu=False,
         compute_bw=1024,
-    )                       # (1, M_grid, tile_m, D)
-
-    # --------------------------------------------------------------
-    # 9️⃣  Untile back to flat (M, D) and return
-    # --------------------------------------------------------------
-    output_store = OffChipStore(
-        graph,
-        output_tiled,
-        par_dispatch=4,
-        store_file_name="output",
     )
 
-    # --------------------------------------------------------------
-    # Infer broadcast & finish
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Convert tiled tensor back to dense matrix (M × D)
+    # ------------------------------------------------------------
+    out = OffChipStore(
+        graph,
+        out_tiled,
+        par_dispatch=1,
+    )
+
+    # ------------------------------------------------------------
+    # Finalise graph
+    # ------------------------------------------------------------
     graph = infer_broadcast(graph)
-    return graph, output_store
+    return graph, out

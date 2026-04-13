@@ -1,7 +1,7 @@
 """Prompt construction for StepGenFlow5 — progressive translation pipeline.
 
-Phase 1: PyTorch lowering passes (tiler, router, retiler, canonicalize)
-Phase 2: STeP translation passes (translate_load, translate_compute, translate_final)
+Phase 1: PyTorch lowering passes (tiler, refactor_final)
+Phase 2: STeP translation (single pass — DSL calls map 1:1 to STeP graph nodes)
 
 Each phase produces verifiable intermediate code that matches gold.
 """
@@ -138,7 +138,7 @@ def _load_stepdb_config() -> dict:
 # Phase 1: PyTorch lowering passes
 # ---------------------------------------------------------------------------
 LOWERING_PASSES = [
-    {"name": "tiler", "template": "decomposer_system.txt"},
+    #{"name": "tiler", "template": "decomposer_system.txt"},
     #{"name": "router", "template": "pass_router_system.txt"},
     #{"name": "retiler", "template": "pass_retiler_system.txt"},
     #{"name": "canonicalize", "template": "canonicalize_system.txt"},
@@ -149,14 +149,10 @@ LOWERING_PASSES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Phase 2: STeP translation passes
+# Phase 2: STeP translation (single pass — DSL calls map 1:1 to STeP nodes)
 # ---------------------------------------------------------------------------
 TRANSLATOR_PASSES = [
-    {"name": "translate_load", "template": "translate_load_system.txt",
-     "func_name": "build_graph", "executor": "hybrid"},
-    {"name": "translate_compute", "template": "translate_compute_system.txt",
-     "func_name": "build_graph", "executor": "hybrid"},
-    {"name": "translate_final", "template": "translate_final_system.txt",
+    {"name": "translate", "template": "translate_system.txt",
      "func_name": "build_graph", "executor": "graph"},
 ]
 
@@ -187,8 +183,7 @@ _JUDGE_TEMPLATES = {
     #"refactor_compute": "refactor_compute_judge_system.txt",
     #"refactor_shape": "refactor_shape_judge_system.txt",
     "refactor_final": "refactor_final_judge_system.txt",
-    "translate_load": "translate_load_judge_system.txt",
-    "translate_final": "translate_final_judge_system.txt",
+    "translate": "translate_judge_system.txt",
 }
 
 
@@ -351,7 +346,7 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
             f"Rewrite this as a `{sig}` function that computes the same result using tiled tensors.",
         ])
 
-    lines.append("I will automatically run your code and compare the output against the reference.")
+    lines.append("I will automatically run your code and compare the output against the reference. Above the function definition, include a comment detailing your thought process for your implementation or fix.")
 
     if is_translator:
         lines.extend([

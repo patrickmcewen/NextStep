@@ -91,6 +91,5 @@ If non-DSL tensor computation is found:
 VERDICT: REJECT
 
 VIOLATIONS:
-- Line N: `proj = gate * up_out` — raw tensor multiply; use binary_mul(gate, up_out)
-- Line M: `x_sel = x[idx]` — gather routing; use flat_partition(x, control, n)
+- [specific violation with line reference and suggested fix]
 ```

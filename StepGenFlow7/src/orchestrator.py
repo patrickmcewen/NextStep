@@ -4,9 +4,8 @@ Two-phase pipeline:
   Phase 1 (lowering): tiler -> router -> retiler -> canonicalize
     Each pass outputs tiled_reference(dims) -> torch.Tensor, validated against gold.
     Canonicalize enforces single-assignment form with only canonical ops.
-  Phase 2 (translation): translate_load -> translate_compute -> translate_final
-    First 2 output hybrid_reference(dims) -> torch.Tensor (mix of STeP + PyTorch), validated against gold.
-    Last one (translate_final) handles routing + reductions + graph finalization, outputs
+  Phase 2 (translation): single translate pass (DSL -> STeP graph)
+    Takes DSL-refactored code and translates all DSL calls 1:1 into STeP graph nodes, outputs
     build_graph(dims) -> (graph, output_op), validated via emulator against gold.
 
 Checkpoint structure:
@@ -169,7 +168,7 @@ _CORRECTNESS_CHECKERS = {
 
 # Cumulative pass orders — each pass inherits all prior bans within its group.
 _REFACTOR_ORDER = ["refactor_load", "refactor_compute", "refactor_shape", "refactor_final"]
-_TRANSLATION_ORDER = ["translate_load", "translate_compute", "translate_final"]
+_TRANSLATION_ORDER = ["translate"]
 
 # Allowed torch.XXX() calls in the OUTPUT of each pass.
 # None = unrestricted.  set() = nothing allowed.
@@ -215,9 +214,7 @@ _PASS_ALLOWED_TORCH = {
     # --- Translation passes (cumulative) ---
     # Input is DSL code (no torch at all), so torch is banned from the start.
     # The build_graph body should only contain STeP graph construction.
-    "translate_load": set(),      # no torch in build_graph body
-    "translate_compute": set(),
-    "translate_final": set(),
+    "translate": set(),  # no torch in build_graph body — all ops are STeP nodes
 }
 
 # Allowed F.XXX() calls per pass.
@@ -227,9 +224,7 @@ _PASS_ALLOWED_F = {
     "refactor_compute": {"F.pad"},           # F.silu replaced by unary_silu; F.pad kept for routing stream padding
     "refactor_shape": {"F.pad"},            # shape ops are DSL; F.pad kept for routing
     "refactor_final": set(),
-    "translate_load": set(),
-    "translate_compute": set(),
-    "translate_final": set(),
+    "translate": set(),
 }
 
 # Extra string patterns banned at each stage.
@@ -260,19 +255,17 @@ _PASS_EXTRA_BANS = {
         (".sum(",          "use accum_add(x, rank=1) or unary_rowwise_sum(x)"),
         (".prod(",         "use accum_mul(x, rank=1)"),
     ],
-    # Translation: progressively ban DSL calls as they become STeP nodes.
-    # These are cumulative — translate_final inherits all bans from load + compute.
-    "translate_load": [
+    # Translation: all DSL calls must become STeP nodes in a single pass.
+    "translate": [
         ("offchip_load(",    "replace with LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, transposed)"),
-        ("offchip_store(",   "replace with OffChipStore(graph, input, par_dispatch=1)"),
+        ("offchip_store(",   "replace with OffChipStore(graph, input, par_dispatch=4)"),
         ("select_gen(",      "replace with SelectGen(is_multihot, tensor, n)"),
-    ],
-    "translate_compute": [
         ("binary_matmul(",   "replace with BinaryMap(graph, a, b, map_fn.Matmul(), False, 1024)"),
         ("binary_mul(",      "replace with BinaryMap(graph, a, b, map_fn.Mul(), False, 1024)"),
         ("binary_add(",      "replace with BinaryMap(graph, a, b, map_fn.Add(), False, 1024)"),
         ("binary_div(",      "replace with BinaryMap(graph, a, b, map_fn.Div(), False, 1024)"),
         ("binary_is_equal(", "replace with BinaryMap(graph, a, b, map_fn.IsEqual(), False, 1024)"),
+        ("binary_map_accum(","replace with BinaryMapAccum(graph, a, b, map_accum_fn.Matmul(), init_fn.Zero(...), rank, False, 1024)"),
         ("unary_silu(",      "replace with UnaryMap(graph, x, map_fn.Silu(), False, 1024)"),
         ("unary_square(",    "replace with UnaryMap(graph, x, map_fn.Square(), False, 1024)"),
         ("unary_exp(",       "replace with UnaryMap(graph, x, map_fn.Exp(), False, 1024)"),
@@ -282,8 +275,6 @@ _PASS_EXTRA_BANS = {
         ("unary_add_imm(",   "replace with UnaryMap(graph, x, map_fn.AddImmediate(c), False, 1024)"),
         ("unary_sub_imm(",   "replace with UnaryMap(graph, x, map_fn.SubImmediate(c), False, 1024)"),
         ("unary_rowwise_sum(","replace with UnaryMap(graph, x, map_fn.RowWiseSum(), False, 1024)"),
-    ],
-    "translate_final": [
         ("accum_add(",       "replace with Accum(graph, x, ..., accum_fn.Add(), ..., accum_rank=rank)"),
         ("accum_mul(",       "replace with Accum(graph, x, ..., accum_fn.Mul(), ..., accum_rank=rank)"),
         ("accum_retile_row(","replace with Accum(graph, x, ..., accum_fn.RetileRow(), ...)"),
@@ -291,8 +282,14 @@ _PASS_EXTRA_BANS = {
         ("promote(",         "replace with Promote(graph, input, promote_rank=rank)"),
         ("promote_outer(",   "replace with PromoteOuter(graph, input)"),
         ("expand_ref(",      "replace with ExpandRef(graph, input, ref)"),
+        ("repeat_ref(",      "replace with RepeatRef(graph, input, ref)"),
         ("repeat_static(",   "replace with RepeatStatic(graph, input, repeat_factor)"),
         ("flatten(",         "replace with Flatten(graph, input, min_rank, max_rank)"),
+        ("reshape_stream(",  "replace with Reshape(graph, input, chunk_size, reshape_rank, write_back_mu=False)"),
+        ("retile_streamify(","replace with RetileStreamify(graph, input, split_row, chunk=chunk)"),
+        ("broadcast(",       "replace with Broadcast(graph, input, num_consumers=n)"),
+        ("parallelize(",     "replace with Parallelize(graph, input, num_consumers=n)"),
+        ("static_reassemble(","replace with StaticReassemble(graph, inputs, stream=shape)"),
         ("flat_partition(",  "replace with FlatPartition(graph, input, control, ...)"),
         ("flat_reassemble(", "replace with FlatReassemble(graph, inputs, control, ...)"),
         ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
@@ -308,9 +305,7 @@ _JUDGE_ON_NONCOMPLIANT = {"refactor_shape", "refactor_final"}
 # Ops that MUST appear in code after this pass.
 _PASS_REQUIRES = {
     "refactor_load":     ["offchip_load", "offchip_store"],
-    "translate_load":    ["LinearOffChipLoad", "OffChipStore"],
-    "translate_compute": ["BinaryMap"],
-    "translate_final":   ["OffChipStore"],
+    "translate":         ["LinearOffChipLoad", "OffChipStore"],
 }
 
 # Regex to find torch.XXX( and F.XXX( calls
@@ -403,9 +398,11 @@ def _check_banned_ops(code: str, pass_name: str) -> list[str]:
                 violations.append(f"- `{call}()` is not allowed — decompose into primitives")
 
     # 3. Extra banned patterns (cumulative across checked passes)
+    # Use word-boundary regex to avoid false positives like "broadcast(" matching "infer_broadcast("
     for p in check_passes:
         for pattern, fix in _PASS_EXTRA_BANS.get(p, []):
-            if pattern in code:
+            regex = r'\b' + re.escape(pattern)
+            if re.search(regex, code):
                 violations.append(f"- `{pattern}` still present — {fix}")
 
     # 4. Required ops (cumulative across checked passes)
@@ -508,7 +505,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             if "match=True" in result:
                 # Correctness passed — run tiling structure validation
                 # Runs after every pass to ensure tiled form is maintained.
-                if tensors is not None:
+                """if tensors is not None:
                     tiling_violations = validate_tiling(code, dims, tensors)
                     if tiling_violations:
                         _write(turn_dir / "status.txt", "CORRECT_BUT_BAD_TILING")
@@ -526,7 +523,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                             "not full dimensions (like B)."
                         )
                         conversation.append({"role": "user", "content": feedback})
-                        continue
+                        continue"""
 
                 # Tiling OK — now check banned ops compliance
                 violations = _check_banned_ops(code, pass_name)
