@@ -10,7 +10,7 @@ EASY_KERNELS = ["element_wise_add", "copy_2d", "silu_activation", "chained_unary
 MEDIUM_KERNELS = ["gemm", "rms_norm", "layernorm", "residual_add_norm"]
 
 
-async def run_batch(llm_config, kernels, preset, max_outer, max_turns, results_dir, experience_dir, checkpoint_dir):
+async def run_batch(llm_config, kernels, preset, max_outer, max_turns, results_dir, experience_dir, checkpoint_dir, pipeline="standard"):
     results = {}
     for kernel in kernels:
         print(f"\n{'='*60}")
@@ -25,6 +25,7 @@ async def run_batch(llm_config, kernels, preset, max_outer, max_turns, results_d
             results_dir=results_dir,
             experience_dir=experience_dir,
             checkpoint_dir=checkpoint_dir,
+            pipeline=pipeline,
         )
         results[kernel] = result
 
@@ -55,6 +56,8 @@ def main():
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--experience-dir", default="experience")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory")
+    parser.add_argument("--pipeline", default="standard", choices=["standard", "direct"],
+                        help="Pipeline mode: 'standard' or 'direct'")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -71,6 +74,7 @@ def main():
         args.max_outer, args.max_turns,
         args.results_dir, args.experience_dir,
         args.checkpoint_dir,
+        pipeline=args.pipeline,
     ))
 
 

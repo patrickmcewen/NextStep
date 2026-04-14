@@ -57,6 +57,26 @@ LinearOffChipLoad(underlying: torch.Tensor, stride: Tuple[int,...], out_shape_ti
     A (M,K): stride=(K//tk, 0, 1)    — 0 on N dim means A is broadcast across N
     B (K,N): stride=(0, 1, N//tn)    — 0 on M dim means B is broadcast across M
 
+LinearOffChipLoadRef(graph, ref, underlying: torch.Tensor, stride: Tuple[int,...],
+    out_shape_tiled: Tuple[int,...], tile_row: int, tile_col: int, par_dispatch: int,
+    transposed: bool = False, trigger_rank: int = 0)
+  Like LinearOffChipLoad but inherits outer stream dims from a `ref` node.
+  Output stream shape: ref.stream.shape[:-trigger_rank] + out_shape_tiled
+  IMPORTANT: Unlike LinearOffChipLoad, this takes `graph` as first arg and auto-registers.
+  Use this when loading weights that must match a DYNAMIC stream shape (e.g., from FlatPartition).
+  ExpandRef CANNOT bridge static→dynamic shapes, so when the DSL code does:
+      w = offchip_load(weight, ...)       # static shape
+      w_exp = expand_ref(w, dynamic_ref)  # expand to match dynamic partition
+  The correct STeP translation is a SINGLE LinearOffChipLoadRef:
+      w = LinearOffChipLoadRef(graph, dynamic_ref, weight, ...)  # inherits dynamic shape
+  Example from MoE (loading gate weights per expert):
+      gate_w = LinearOffChipLoadRef(graph, ref=expert_feature_stream,
+          underlying=gate_weights[i], stride=(1, 1),
+          out_shape_tiled=(F_dim // tile_f, 1),
+          tile_row=D, tile_col=tile_f, par_dispatch=4)
+      # Then Flatten to merge ref's dynamic dim with out_shape_tiled:
+      gate_w_ready = Flatten(graph, gate_w, min_rank=0, max_rank=1)
+
 SelectGen(is_multihot: bool, tensor: torch.Tensor, n: int)
   SOURCE. Generates a selection stream from a pre-computed routing tensor.
   Used to drive FlatPartition / FlatReassemble for expert routing.
@@ -84,10 +104,19 @@ OffChipStore(graph, input, par_dispatch: int, store_file_name: str = "output")
 
 Broadcast(graph, input, num_consumers: int)
 Promote(graph, input, promote_rank: int)
+PromoteOuter(graph, input)
 Flatten(graph, input, min_rank, max_rank)
 Reshape(graph, input, chunk_size, reshape_rank, write_back_mu, add_outer_dim=False, pad_fn=None)
 RepeatStatic(graph, input, repeat_factor: int)
 RetileStreamify(graph, input, split_row: bool, filter_mask: bool = False, chunk: int = 1)
+ExpandRef(graph, input, ref, expand_rank: int)
+  Broadcast last `expand_rank` singleton stream dims of input to match ref's stream shape.
+  Constraints: input's last expand_rank stream dims must all be 1, and
+  input's leading stream dims must exactly match ref's leading stream dims.
+  CANNOT bridge static→dynamic shapes — use LinearOffChipLoadRef instead.
+RepeatRef(graph, input, ref)
+  Broadcast input by appending ref's innermost stream dim.
+  Constraint: input.stream.shape must equal ref.stream.shape[:-1].
 
 ### Routing Operators
 
@@ -156,6 +185,26 @@ TRANSLATOR_PASSES = [
      "func_name": "build_graph", "executor": "graph"},
 ]
 
+# ---------------------------------------------------------------------------
+# Direct pipeline: skip lowering, go straight from PyTorch to STeP graph
+# ---------------------------------------------------------------------------
+DIRECT_TRANSLATOR_PASSES = [
+    {"name": "translate_full", "template": "translate_system_full.txt",
+     "func_name": "build_graph", "executor": "graph"},
+]
+
+# Pipeline configurations
+PIPELINES = {
+    "standard": {
+        "lowering": LOWERING_PASSES,
+        "translation": TRANSLATOR_PASSES,
+    },
+    "direct": {
+        "lowering": [],
+        "translation": DIRECT_TRANSLATOR_PASSES,
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Public API — pass prompt builders
@@ -163,7 +212,7 @@ TRANSLATOR_PASSES = [
 
 def build_pass_system_prompt(pass_name: str) -> str:
     """Build a lowering/translator pass agent's system prompt from its template."""
-    all_passes = LOWERING_PASSES + TRANSLATOR_PASSES
+    all_passes = LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES
     pass_info = None
     for p in all_passes:
         if p["name"] == pass_name:
@@ -184,6 +233,7 @@ _JUDGE_TEMPLATES = {
     #"refactor_shape": "refactor_shape_judge_system.txt",
     "refactor_final": "refactor_final_judge_system.txt",
     "translate": "translate_judge_system.txt",
+    "translate_full": "translate_judge_system.txt",
 }
 
 
@@ -239,7 +289,7 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
 
     # Determine which function name this pass expects
     pass_info = None
-    for p in LOWERING_PASSES + TRANSLATOR_PASSES:
+    for p in LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES:
         if p["name"] == pass_name:
             pass_info = p
             break
@@ -303,6 +353,7 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
                 "| DSL call | STeP node |",
                 "|---|---|",
                 "| `offchip_load(...)` | `LinearOffChipLoad(...)` |",
+                "| `offchip_load_ref(ref, w, ...)` | `LinearOffChipLoadRef(graph, ref, w, ...)` |",
                 "| `select_gen(...)` | `SelectGen(...)` |",
                 "| `binary_matmul(a, b)` | `BinaryMap(graph, a, b, map_fn.Matmul(), ...)` |",
                 "| `binary_mul(a, b)` | `BinaryMap(graph, a, b, map_fn.Mul(), ...)` |",
@@ -321,9 +372,12 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
                 "| `accum_retile_col(x)` | `Accum(graph, x, ..., accum_fn.RetileCol(), ...)` |",
                 "| `promote(x, rank)` | `Promote(graph, x, promote_rank=rank)` |",
                 "| `promote_outer(x)` | `PromoteOuter(graph, x)` |",
-                "| `expand_ref(x, ref)` | `ExpandRef(graph, x, ref)` |",
+                "| `expand_ref(x, ref)` | `ExpandRef(graph, x, ref, expand_rank=...)` — static shapes only |",
+                "| `repeat_ref(x, ref)` | `RepeatRef(graph, x, ref)` |",
                 "| `repeat_static(x, factor)` | `RepeatStatic(graph, x, repeat_factor=factor)` |",
                 "| `flatten(x, min_r, max_r)` | `Flatten(graph, x, min_rank=min_r, max_rank=max_r)` |",
+                "| `reshape_stream(x, chunk, rank)` | `Reshape(graph, x, chunk_size=chunk, reshape_rank=rank, ...)` |",
+                "| `retile_streamify(x, chunk, split_row)` | `RetileStreamify(graph, x, split_row=split_row, chunk=chunk)` |",
                 "| `flat_partition(x, ctrl, n)` | `FlatPartition(graph, x, ctrl, ...)` |",
                 "| `flat_reassemble(ins, ctrl)` | `FlatReassemble(graph, ins, ctrl, ...)` |",
                 "| `offchip_store(x)` | `OffChipStore(graph, x, ...)` |",
@@ -340,10 +394,10 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
             f"Output a `{sig}` function."
         )
     else:
-        sig = "tiled_reference(dims, tensors)" if tensors is not None else "tiled_reference(dims)"
+        sig = f"{func_name}(dims, tensors)" if tensors is not None else f"{func_name}(dims)"
         lines.extend([
             "",
-            f"Rewrite this as a `{sig}` function that computes the same result using tiled tensors.",
+            f"Rewrite this as a `{sig}` function that computes the same result.",
         ])
 
     lines.append("I will automatically run your code and compare the output against the reference. Above the function definition, include a comment detailing your thought process for your implementation or fix.")

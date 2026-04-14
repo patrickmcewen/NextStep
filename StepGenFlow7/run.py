@@ -13,11 +13,13 @@ def main():
     parser.add_argument("kernel", help="Kernel name from StepDB (e.g., element_wise_add)")
     parser.add_argument("preset", help="Preset name (e.g., small)")
     parser.add_argument("--config", default="config.json", help="Path to LLM config JSON")
-    parser.add_argument("--max-outer", type=int, default=5, help="Max outer loop iterations")
+    parser.add_argument("--max-outer", type=int, default=1, help="Max outer loop iterations")
     parser.add_argument("--max-turns", type=int, default=11, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory (default: checkpoints/<timestamp>)")
+    parser.add_argument("--pipeline", default="standard", choices=["standard", "direct"],
+                        help="Pipeline mode: 'standard' (lowering + translate) or 'direct' (PyTorch → STeP in one step)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -32,6 +34,7 @@ def main():
         results_dir=args.results_dir,
         experience_dir=args.experience_dir,
         checkpoint_dir=args.checkpoint_dir,
+        pipeline=args.pipeline,
     ))
 
     if result["success"]:

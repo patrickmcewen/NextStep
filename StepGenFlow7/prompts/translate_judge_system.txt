@@ -52,7 +52,6 @@ If any check fails:
 VERDICT: REJECT
 
 VIOLATIONS:
-- [specific violation with line reference and suggested fix]
+- [specific violation with line reference]
 ```
-
-Be specific about each violation: name the offending line, what it does wrong, and what the correct STeP equivalent should be.
+Do not suggest any fixes. That will be handled by the implementer.

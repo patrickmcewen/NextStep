@@ -28,6 +28,7 @@ from agents import Runner
 from src.agents import make_judge_agent, make_pass_agent
 from src.precompute import precompute_tensors
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
+                         DIRECT_TRANSLATOR_PASSES, PIPELINES,
                          build_pass_system_prompt, build_pass_user_prompt,
                          _format_tensors_description)
 from src.tools import (_exec_build_graph, _exec_tiled_ref, _exec_hybrid_ref,
@@ -168,7 +169,7 @@ _CORRECTNESS_CHECKERS = {
 
 # Cumulative pass orders — each pass inherits all prior bans within its group.
 _REFACTOR_ORDER = ["refactor_load", "refactor_compute", "refactor_shape", "refactor_final"]
-_TRANSLATION_ORDER = ["translate"]
+_TRANSLATION_ORDER = ["translate", "translate_full"]
 
 # Allowed torch.XXX() calls in the OUTPUT of each pass.
 # None = unrestricted.  set() = nothing allowed.
@@ -215,6 +216,7 @@ _PASS_ALLOWED_TORCH = {
     # Input is DSL code (no torch at all), so torch is banned from the start.
     # The build_graph body should only contain STeP graph construction.
     "translate": set(),  # no torch in build_graph body — all ops are STeP nodes
+    "translate_full": set(),
 }
 
 # Allowed F.XXX() calls per pass.
@@ -225,6 +227,7 @@ _PASS_ALLOWED_F = {
     "refactor_shape": {"F.pad"},            # shape ops are DSL; F.pad kept for routing
     "refactor_final": set(),
     "translate": set(),
+    "translate_full": set(),
 }
 
 # Extra string patterns banned at each stage.
@@ -294,6 +297,10 @@ _PASS_EXTRA_BANS = {
         ("flat_reassemble(", "replace with FlatReassemble(graph, inputs, control, ...)"),
         ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
     ],
+    # Direct pipeline: same bans as translate (no DSL, no PyTorch, only STeP nodes)
+    "translate_full": [
+        ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
+    ],
 }
 
 # Passes where the judge should also run on NONCOMPLIANT code (not just after
@@ -306,6 +313,7 @@ _JUDGE_ON_NONCOMPLIANT = {"refactor_shape", "refactor_final"}
 _PASS_REQUIRES = {
     "refactor_load":     ["offchip_load", "offchip_store"],
     "translate":         ["LinearOffChipLoad", "OffChipStore"],
+    "translate_full":    ["LinearOffChipLoad", "OffChipStore"],
 }
 
 # Regex to find torch.XXX( and F.XXX( calls
@@ -505,7 +513,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             if "match=True" in result:
                 # Correctness passed — run tiling structure validation
                 # Runs after every pass to ensure tiled form is maintained.
-                """if tensors is not None:
+                if tensors is not None:
                     tiling_violations = validate_tiling(code, dims, tensors)
                     if tiling_violations:
                         _write(turn_dir / "status.txt", "CORRECT_BUT_BAD_TILING")
@@ -523,7 +531,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                             "not full dimensions (like B)."
                         )
                         conversation.append({"role": "user", "content": feedback})
-                        continue"""
+                        continue
 
                 # Tiling OK — now check banned ops compliance
                 violations = _check_banned_ops(code, pass_name)
@@ -621,6 +629,12 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                     "Do NOT index `partitioned[i]` or iterate `for x in partitioned`."
                 )
 
+        feedback += (
+            "\n\n**Fix the specific error above by making targeted changes to your "
+            "previous code. Do NOT rewrite the entire implementation from scratch.** "
+            "Identify the exact lines that caused the failure, explain what went wrong, "
+            "and output the full corrected code with only those lines changed."
+        )
         conversation.append({"role": "user", "content": feedback})
 
     return {"success": success, "code": last_code}
@@ -639,8 +653,18 @@ async def run_kernel(
     results_dir: str = "results",
     experience_dir: str = "experience",
     checkpoint_dir: str = None,
+    pipeline: str = "standard",
 ) -> dict:
-    """Run the full pipeline for a single kernel + preset."""
+    """Run the full pipeline for a single kernel + preset.
+
+    Args:
+        pipeline: "standard" (lowering + translate) or "direct" (PyTorch → STeP in one step).
+    """
+    assert pipeline in PIPELINES, f"Unknown pipeline '{pipeline}'. Known: {sorted(PIPELINES.keys())}"
+    pipeline_config = PIPELINES[pipeline]
+    lowering_passes = pipeline_config["lowering"]
+    translator_passes = pipeline_config["translation"]
+
     config = _load_stepdb_config()
     assert kernel_name in config, f"Kernel '{kernel_name}' not found"
     assert preset in config[kernel_name]["presets"], f"Preset '{preset}' not found"
@@ -649,9 +673,10 @@ async def run_kernel(
     # Pre-compute all tensors externally — functions receive these, can't create their own
     tensors = precompute_tensors(kernel_name, dims)
     print(f"Pre-computed tensors: {sorted(tensors.keys())}")
+    print(f"Pipeline: {pipeline} ({len(lowering_passes)} lowering + {len(translator_passes)} translation passes)")
 
     # Create agents for all passes
-    all_passes = LOWERING_PASSES + TRANSLATOR_PASSES
+    all_passes = lowering_passes + translator_passes
     pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in all_passes}
 
     # Create judge agents for passes that have one
@@ -683,6 +708,8 @@ async def run_kernel(
             i, max_outer, outer_dir, kernel_name, dims, tensors,
             pass_agents, judge_agents,
             max_turns, ckpt_root, preset, experience_dir,
+            lowering_passes=lowering_passes,
+            translator_passes=translator_passes,
         ))
 
     results = await asyncio.gather(*tasks)
@@ -705,6 +732,7 @@ async def _run_outer_iteration(
     pass_agents: dict, judge_agents: dict,
     max_turns: int,
     ckpt_root: Path, preset: str, experience_dir: str,
+    lowering_passes: list = None, translator_passes: list = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -729,10 +757,15 @@ async def _run_outer_iteration(
     # The refactor passes progressively rewrite canonical PyTorch into
     # DSL function calls that map 1:1 to STeP graph nodes.
     # ============================================================
+    if lowering_passes is None:
+        lowering_passes = LOWERING_PASSES
+    if translator_passes is None:
+        translator_passes = TRANSLATOR_PASSES
+
     lowered_code = None
     dsl_code = None  # output of refactor_final, used as translation guide
     pipeline_ok = True
-    for pass_info in LOWERING_PASSES:
+    for pass_info in lowering_passes:
         pass_name = pass_info["name"]
         executor = pass_info.get("executor", "tiled")
 
@@ -769,20 +802,24 @@ async def _run_outer_iteration(
             pipeline_ok = False
             break
 
-    if not pipeline_ok or lowered_code is None:
-        log(f"Lowering pipeline failed")
-        print(f"{tag} Lowering FAILED")
-        log_file.close()
-        return {
-            "success": False,
-            "outer_iteration": i,
-            "outer_iterations": max_outer,
-            "total_tool_calls": 0,
-            "cycle_count": None,
-        }
+    if lowering_passes:
+        if not pipeline_ok or lowered_code is None:
+            log(f"Lowering pipeline failed")
+            print(f"{tag} Lowering FAILED")
+            log_file.close()
+            return {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "cycle_count": None,
+            }
 
-    log(f"Lowering pipeline succeeded")
-    print(f"{tag} Lowering OK")
+        log(f"Lowering pipeline succeeded")
+        print(f"{tag} Lowering OK")
+    else:
+        log(f"No lowering passes (direct pipeline)")
+        print(f"{tag} Direct pipeline — skipping lowering")
 
     # ============================================================
     # Phase 2: STeP translation passes
@@ -791,15 +828,16 @@ async def _run_outer_iteration(
     # ============================================================
     translated_code = dsl_code if dsl_code is not None else lowered_code
     translation_ok = True
-    for pass_info in TRANSLATOR_PASSES:
+    for pass_info in translator_passes:
         pass_name = pass_info["name"]
         executor = pass_info["executor"]
 
         # Skip if input already complies with this pass's requirements
-        violations = _check_banned_ops(translated_code, pass_name)
-        if not violations:
-            log(f"  Translation pass: {pass_name} -> SKIP (already compliant)")
-            continue
+        if translated_code is not None:
+            violations = _check_banned_ops(translated_code, pass_name)
+            if not violations:
+                log(f"  Translation pass: {pass_name} -> SKIP (already compliant)")
+                continue
 
         log(f"  Translation pass: {pass_name} (executor={executor})")
         pass_result = await _run_pass_loop(

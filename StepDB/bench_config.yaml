@@ -686,7 +686,7 @@ moe_routed:
       F: 48
       n_experts: 4
       n_active: 1
-      tile_n: 4
+      tile_n: 1
       tile_f: 48
     small_topk2:
       B: 8
@@ -718,7 +718,7 @@ moe_routed:
       F: 2048
       n_experts: 8
       n_active: 2
-      tile_n: 32
+      tile_n: 1
       tile_f: 256
     large_d4k:
       B: 128

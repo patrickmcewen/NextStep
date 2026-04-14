@@ -73,6 +73,39 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
     return result.unsqueeze(0)  # prepend leading 1
 
 
+def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
+    """Load tiles and expand to match ref's stream shape.
+    Mirrors LinearOffChipLoadRef(graph, ref, underlying, ...).
+
+    Fused equivalent of offchip_load(...) + expand_ref(..., ref).
+    Use this instead of that two-step pattern when ref has a dynamic stream
+    shape (e.g., from flat_partition), because ExpandRef in STeP IR cannot
+    bridge static→dynamic shapes.
+
+    Args:
+        ref: Reference tiled tensor whose stream shape to match.
+        underlying: Dense tensor to load, shape (..., R, C).
+        stride: Tuple of ints, one per dim in out_shape_tiled.
+        out_shape_tiled: Tuple of ints defining the weight tile grid.
+        tile_row: Tile height.
+        tile_col: Tile width.
+        transposed: If True, transpose each tile.
+
+    Returns:
+        Tiled tensor with shape (*ref_stream, *out_shape_tiled, tile_row, tile_col).
+        Mirrors LinearOffChipLoadRef output stream: ref_stream + out_shape_tiled.
+    """
+    loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed)
+    # loaded: (1, *out_shape_tiled, tile_row, tile_col)
+    # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
+    ref_stream = list(ref.shape[:-2])
+    target = ref_stream + list(out_shape_tiled) + [loaded.shape[-2], loaded.shape[-1]]
+    # Prepend singleton dims so loaded is broadcastable to target
+    while loaded.ndim < len(target):
+        loaded = loaded.unsqueeze(0)
+    return loaded.expand(target).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Source: SelectGen → select_gen
 # Mirrors: SelectGen dispatch (L146) from functional.py
@@ -82,6 +115,9 @@ def select_gen(underlying):
     """Return a pre-computed selection/control tensor as-is.
 
     Used to provide multihot control tensors for flat_partition / flat_reassemble.
+    The input should be a raw (untiled) tensor with shape (*stream_shape, n),
+    NOT the output of offchip_load (which adds tile_r/tile_c dimensions that
+    flat_partition / flat_reassemble will misinterpret as extra stream dims).
     """
     return underlying
 
@@ -91,8 +127,20 @@ def select_gen(underlying):
 # Mirrors: _apply_binary (L471) from functional.py
 # ---------------------------------------------------------------------------
 
+def _assert_stream_match(a, b, op_name):
+    """Assert both operands have identical stream shapes (all dims except last 2)."""
+    a_stream = a.shape[:-2]
+    b_stream = b.shape[:-2]
+    assert a_stream == b_stream, (
+        f"{op_name}: stream shape mismatch — a has stream {tuple(a_stream)} "
+        f"(shape {tuple(a.shape)}) but b has stream {tuple(b_stream)} "
+        f"(shape {tuple(b.shape)}). Both operands must have identical stream shapes."
+    )
+
+
 def binary_matmul(a, b, weight_transposed=False):
     """Tiled matrix multiply. Mirrors BinaryMap(map_fn.Matmul)."""
+    _assert_stream_match(a, b, "binary_matmul")
     if weight_transposed:
         return torch.matmul(a, b.transpose(-2, -1))
     return torch.matmul(a, b)
@@ -100,21 +148,25 @@ def binary_matmul(a, b, weight_transposed=False):
 
 def binary_mul(a, b):
     """Element-wise multiply. Mirrors BinaryMap(map_fn.Mul)."""
+    _assert_stream_match(a, b, "binary_mul")
     return a * b
 
 
 def binary_add(a, b):
     """Element-wise add. Mirrors BinaryMap(map_fn.Add)."""
+    _assert_stream_match(a, b, "binary_add")
     return a + b
 
 
 def binary_div(a, b):
     """Element-wise divide. Mirrors BinaryMap(map_fn.Div)."""
+    _assert_stream_match(a, b, "binary_div")
     return a / b
 
 
 def binary_is_equal(a, b):
     """Element-wise equality. Mirrors BinaryMap(map_fn.IsEqual)."""
+    _assert_stream_match(a, b, "binary_is_equal")
     return (a == b).float()
 
 
@@ -213,19 +265,43 @@ def accum_retile_col(x, rank=1):
 def flat_partition(x, control, n):
     """Partition tiles by multihot control signal.
 
+    Routing is per-tile: each stream element (tile) in x is routed as a
+    whole unit based on one row of the control signal. If you need to route
+    individual rows independently, each row must be its own tile (tile_row=1).
+
     Args:
         x: Tiled tensor, shape (*stream_shape, tile_r, tile_c).
         control: Multihot tensor, shape (*stream_shape, n).
+                 NOT a tiled tensor — has no tile_r/tile_c dims.
+                 Typically provided via select_gen() on a raw tensor.
         n: Number of output partitions (one per consumer).
+
+    Critical constraint:
+        product(x.shape[:-2]) == product(control.shape[:-1])
+        i.e., total number of tiles in x == total rows in control.
+        The control tensor's row count determines the required tile count
+        for x. Choose x's tiling (tile_row, tile_col, out_shape_tiled) so
+        that it produces exactly that many stream elements.
 
     Returns:
         List of n tensors, each containing tiles routed to that partition.
+
+    Examples (tile dims shown in [brackets]):
+        x shape          control shape    n    result
+        (64, [1, D])     (64, 8)          8    list of 8 tensors, each (count_i, 1, D)
+        (4, 16, [1, D])  (4, 16, 8)       8    same (64 tiles total)
+
+        WRONG: x=(1, 2, 4, [32, 256]), control=(64, 8), n=8
+               → x has 8 tiles, control has 64 rows → MISMATCH
+               (tiling x into large tiles reduces the tile count)
+        RIGHT: x=(1, 64, [1, D]), control=(64, 8), n=8
+               → x has 64 tiles, control has 64 rows → OK
     """
     tile_r, tile_c = x.shape[-2], x.shape[-1]
     flat_inp = x.reshape(-1, tile_r, tile_c)
     flat_mh = control.reshape(-1, n)
     assert flat_inp.shape[0] == flat_mh.shape[0], \
-        f"Tile count mismatch: {flat_inp.shape[0]} vs {flat_mh.shape[0]}"
+        f"Tile count mismatch: input has {flat_inp.shape[0]} vs selector with {flat_mh.shape[0]}. The input stream and selector stream must have the same number of stream elements, meaning that x.reshape(-1, tile_r, tile_c) and control.reshape(-1, n) must resolve to the same number of elements in the upper (-1) dimensions."
 
     results = []
     for i in range(n):
@@ -235,11 +311,16 @@ def flat_partition(x, control, n):
 
 
 def flat_reassemble(inputs, control):
-    """Reassemble data using multihot control signal.
+    """Reassemble partitioned data using multihot control signal.
+
+    Inverse of flat_partition. The control tensor must have the same shape
+    and values used in the corresponding flat_partition call.
 
     Args:
-        inputs: List of tensors, each (num_routed, tile_r, tile_c).
+        inputs: List of n tensors, each (num_routed, tile_r, tile_c).
         control: Multihot tensor, shape (*stream_shape, n).
+                 NOT a tiled tensor — has no tile_r/tile_c dims.
+                 Typically provided via select_gen() on a raw tensor.
 
     Returns:
         Reassembled tensor, shape (*ctrl_stream_shape, n_active, tile_r, tile_c).
@@ -358,7 +439,13 @@ def flatten(x, min_rank, max_rank):
 
 def expand_ref(x, ref):
     """Broadcast singleton stream dims to match ref's stream shape.
-    Mirrors ExpandRef(graph, input, ref)."""
+    Mirrors ExpandRef(graph, input, ref).
+
+    WARNING: In STeP IR, ExpandRef requires that the leading (non-expanded)
+    stream dims match exactly. It CANNOT bridge static→dynamic shapes.
+    If you need to expand an offchip_load result to match a dynamic ref
+    (e.g., from flat_partition), use offchip_load_ref instead.
+    """
     ref_shape = list(ref.shape[:-2])
     expand_shape = ref_shape + list(x.shape[-2:])
     return x.expand(expand_shape).contiguous()
@@ -626,6 +713,15 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False):
         rank: Number of innermost stream dims to reduce.
         weight_transposed: If True, transpose b's tile dims before matmul.
     """
+    a_stream = a.shape[:-2]
+    b_stream = b.shape[:-2]
+    assert a_stream == b_stream, (
+        f"binary_map_accum: stream shape mismatch — a has stream {tuple(a_stream)} "
+        f"but b has stream {tuple(b_stream)}. Both operands must have identical "
+        f"stream shapes. If a came from flat_partition (shape {tuple(a.shape)}) and "
+        f"b came from offchip_load_ref (shape {tuple(b.shape)}), you likely need "
+        f"promote(a, rank=1) to add a matching stream dim before the matmul."
+    )
     if weight_transposed:
         mapped = torch.matmul(a, b.transpose(-2, -1))
     else:

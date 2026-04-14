@@ -85,7 +85,7 @@ dependencies:
       - starlette==1.0.0
       - sympy==1.14.0
       - tabulate==0.10.0
-      - torch==2.11.0+cpu
+      - torch==2.11.0
       - tqdm==4.67.3
       - types-requests==2.33.0.20260408
       - typing-extensions==4.15.0

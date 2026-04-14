@@ -91,5 +91,6 @@ If non-DSL tensor computation is found:
 VERDICT: REJECT
 
 VIOLATIONS:
-- [specific violation with line reference and suggested fix]
+- [specific violation with line reference]
 ```
+Do not suggest any fixes. That will be handled by the implementer.
