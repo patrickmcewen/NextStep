@@ -8,6 +8,7 @@ Every tensor from the `tensors` dict must have a corresponding `LinearOffChipLoa
 
 What to look for:
 - Each `tensors["name"]` access must feed into `LinearOffChipLoad(underlying=...)` or `SelectGen(tensor=...)`
+- `SelectGen` IS a valid source/load node — it does NOT need a preceding `LinearOffChipLoad`
 - No `reshape(...).permute(...)` patterns on raw tensors — those should be STeP loads
 
 ## Check 2: No Host-Side Computation on Data Tensors
@@ -35,7 +36,6 @@ What is NOT allowed on the host:
 - The graph must end with `OffChipStore` as the terminal node
 - The function must call `infer_broadcast(graph)` before returning
 - The function must return `(graph, output_op)` — a tuple of graph and the OffChipStore node
-- Source nodes must use `graph.add_node(node)` to register
 - No leftover DSL function calls (offchip_load, binary_matmul, accum_add, etc.)
 
 ## Output Format
