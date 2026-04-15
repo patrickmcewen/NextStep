@@ -69,17 +69,10 @@ LinearOffChipLoadRef(graph, ref, underlying: torch.Tensor, stride: Tuple[int,...
       w_exp = expand_ref(w, dynamic_ref)  # expand to match dynamic partition
   The correct STeP translation is a SINGLE LinearOffChipLoadRef:
       w = LinearOffChipLoadRef(graph, dynamic_ref, weight, ...)  # inherits dynamic shape
-  Example from MoE (loading gate weights per expert):
-      gate_w = LinearOffChipLoadRef(graph, ref=expert_feature_stream,
-          underlying=gate_weights[i], stride=(1, 1),
-          out_shape_tiled=(F_dim // tile_f, 1),
-          tile_row=D, tile_col=tile_f, par_dispatch=4)
-      # Then Flatten to merge ref's dynamic dim with out_shape_tiled:
-      gate_w_ready = Flatten(graph, gate_w, min_rank=0, max_rank=1)
 
 SelectGen(is_multihot: bool, tensor: torch.Tensor, n: int)
   SOURCE. Generates a selection stream from a pre-computed routing tensor.
-  Used to drive FlatPartition / FlatReassemble for expert routing.
+  Used to drive FlatPartition / FlatReassemble for routing.
 
 MetadataGen(tensor: torch.Tensor)
   SOURCE. Streams out a tensor as scalar Uint64 tiles.
@@ -122,8 +115,12 @@ RepeatRef(graph, input, ref)
 
 FlatPartition(graph, input, control, partition_rank: int,
     switch_cycles: List[int], write_back_mu: bool, num_consumers: int)
+  partition_rank: number of trailing input stream dims to KEEP in each output.
+    Output stream per consumer: (DynDim,) + input.stream.shape[-partition_rank:]
+    The DSL flat_partition always flattens the entire stream, so use partition_rank=0.
 FlatReassemble(graph, inputs: List, control, reassemble_rank: int,
     switch_cycles: List[int], write_back_mu: bool)
+  reassemble_rank: same concept as partition_rank — use 0 to match DSL flat_reassemble.
 
 ### Data Types
 
@@ -211,7 +208,14 @@ PIPELINES = {
 # ---------------------------------------------------------------------------
 
 def build_pass_system_prompt(pass_name: str) -> str:
-    """Build a lowering/translator pass agent's system prompt from its template."""
+    """Build a lowering/translator pass agent's system prompt from its template.
+
+    Templates contain {placeholder} tokens that are filled from source files:
+      {ops_code}        — step_tl/src/step_py/ops.py
+      {functional_code} — step_tl/src/step_py/functional.py
+      {dsl_code}        — StepGenFlow7/src/step_dsl.py
+    This keeps the prompts in sync with the actual source code automatically.
+    """
     all_passes = LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES
     pass_info = None
     for p in all_passes:
@@ -222,7 +226,26 @@ def build_pass_system_prompt(pass_name: str) -> str:
 
     template_path = _PROMPTS_DIR / pass_info["template"]
     assert template_path.exists(), f"Template not found: {template_path}"
-    return template_path.read_text()
+    template = template_path.read_text()
+
+    # Inject source code from canonical files into placeholders
+    replacements = {}
+    if "{ops_code}" in template:
+        ops_path = _STEP_TL_SRC / "step_py" / "ops.py"
+        assert ops_path.exists(), f"ops.py not found: {ops_path}"
+        replacements["ops_code"] = ops_path.read_text()
+    if "{functional_code}" in template:
+        assert _FUNCTIONAL_PY.exists(), f"functional.py not found: {_FUNCTIONAL_PY}"
+        replacements["functional_code"] = _FUNCTIONAL_PY.read_text()
+    if "{dsl_code}" in template:
+        dsl_path = _PROJECT_ROOT / "src" / "step_dsl.py"
+        assert dsl_path.exists(), f"step_dsl.py not found: {dsl_path}"
+        replacements["dsl_code"] = dsl_path.read_text()
+
+    if replacements:
+        template = template.format(**replacements)
+
+    return template
 
 
 # Judge prompt templates — keyed by pass name
