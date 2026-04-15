@@ -20,6 +20,10 @@ def main():
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory (default: checkpoints/<timestamp>)")
     parser.add_argument("--pipeline", default="standard", choices=["standard", "direct"],
                         help="Pipeline mode: 'standard' (lowering + translate) or 'direct' (PyTorch → STeP in one step)")
+    parser.add_argument("--resume", default=None, metavar="PATH",
+                        help="Resume from a checkpoint where refactor_final succeeded. "
+                             "Accepts: path to dsl_code.py, outer_N dir, or checkpoint root dir. "
+                             "Skips lowering and starts directly from translation.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -35,6 +39,7 @@ def main():
         experience_dir=args.experience_dir,
         checkpoint_dir=args.checkpoint_dir,
         pipeline=args.pipeline,
+        resume_from=args.resume,
     ))
 
     if result["success"]:

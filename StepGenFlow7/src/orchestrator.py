@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+from src.dsl_transforms import fuse_load_ref
 from agents import Runner
 
 from src.agents import make_judge_agent, make_pass_agent
@@ -631,13 +633,52 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
         feedback += (
             "\n\n**Fix the specific error above by making targeted changes to your "
-            "previous code. Do NOT rewrite the entire implementation from scratch.** "
-            "Identify the exact lines that caused the failure, explain what went wrong, "
-            "and output the full corrected code with only those lines changed."
+            "previous code."
         )
         conversation.append({"role": "user", "content": feedback})
 
     return {"success": success, "code": last_code}
+
+
+# ---------------------------------------------------------------------------
+# Resume from checkpoint
+# ---------------------------------------------------------------------------
+
+def _resolve_resume_dsl(resume_from: str, kernel_name: str) -> str:
+    """Resolve a resume_from path to a DSL code string.
+
+    Accepts:
+        - Direct path to a .py file (e.g., .../outer_0/dsl_code.py)
+        - Path to an outer_N directory containing dsl_code.py
+        - Path to a checkpoint root (e.g., checkpoints/2026-04-14-035721)
+          — searches for <kernel_name>/outer_*/dsl_code.py
+    """
+    p = Path(resume_from)
+
+    # Case 1: direct path to a .py file
+    if p.suffix == ".py" and p.is_file():
+        return p.read_text()
+
+    # Case 2: directory containing dsl_code.py
+    if p.is_dir() and (p / "dsl_code.py").is_file():
+        return (p / "dsl_code.py").read_text()
+
+    # Case 3: checkpoint root — search under kernel_name/outer_*/
+    if p.is_dir():
+        candidates = sorted((p / kernel_name).glob("outer_*/dsl_code.py"))
+        assert candidates, (
+            f"No dsl_code.py found under {p / kernel_name}/outer_*/. "
+            f"Ensure refactor_final succeeded in the checkpoint you're resuming from."
+        )
+        chosen = candidates[0]
+        print(f"  Resolved resume path: {chosen}")
+        return chosen.read_text()
+
+    raise FileNotFoundError(
+        f"Cannot resolve resume_from='{resume_from}'. "
+        f"Expected a .py file, a directory with dsl_code.py, "
+        f"or a checkpoint root directory."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -654,11 +695,18 @@ async def run_kernel(
     experience_dir: str = "experience",
     checkpoint_dir: str = None,
     pipeline: str = "standard",
+    resume_from: str = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
     Args:
         pipeline: "standard" (lowering + translate) or "direct" (PyTorch → STeP in one step).
+        resume_from: Path to resume from a previous checkpoint. Accepts:
+            - Path to a dsl_code.py file directly
+            - Path to an outer_N directory containing dsl_code.py
+            - Path to a checkpoint root (e.g. checkpoints/2026-04-14-035721)
+              — will search for <kernel_name>/outer_*/dsl_code.py
+            When set, lowering is skipped and translation starts from the saved DSL code.
     """
     assert pipeline in PIPELINES, f"Unknown pipeline '{pipeline}'. Known: {sorted(PIPELINES.keys())}"
     pipeline_config = PIPELINES[pipeline]
@@ -670,14 +718,24 @@ async def run_kernel(
     assert preset in config[kernel_name]["presets"], f"Preset '{preset}' not found"
     dims = config[kernel_name]["presets"][preset]
 
+    # Resolve resume checkpoint — load saved DSL code if resuming
+    resume_dsl_code = None
+    if resume_from is not None:
+        resume_dsl_code = _resolve_resume_dsl(resume_from, kernel_name)
+        print(f"Resuming from checkpoint — loaded dsl_code ({len(resume_dsl_code)} chars)")
+        print(f"Skipping lowering passes, starting from translation")
+
     # Pre-compute all tensors externally — functions receive these, can't create their own
     tensors = precompute_tensors(kernel_name, dims)
     print(f"Pre-computed tensors: {sorted(tensors.keys())}")
     print(f"Pipeline: {pipeline} ({len(lowering_passes)} lowering + {len(translator_passes)} translation passes)")
 
-    # Create agents for all passes
-    all_passes = lowering_passes + translator_passes
-    pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in all_passes}
+    # Create agents — when resuming, only need translator agents
+    if resume_dsl_code is not None:
+        pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in translator_passes}
+    else:
+        all_passes = lowering_passes + translator_passes
+        pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in all_passes}
 
     # Create judge agents for passes that have one
     from src.prompts import _JUDGE_TEMPLATES
@@ -698,6 +756,7 @@ async def run_kernel(
         "dims": dims,
         "max_outer": max_outer,
         "max_turns": max_turns,
+        "resume_from": resume_from,
     }, indent=2))
 
     # Run all outer iterations in parallel — they are independent attempts
@@ -710,6 +769,7 @@ async def run_kernel(
             max_turns, ckpt_root, preset, experience_dir,
             lowering_passes=lowering_passes,
             translator_passes=translator_passes,
+            resume_dsl_code=resume_dsl_code,
         ))
 
     results = await asyncio.gather(*tasks)
@@ -733,10 +793,16 @@ async def _run_outer_iteration(
     max_turns: int,
     ckpt_root: Path, preset: str, experience_dir: str,
     lowering_passes: list = None, translator_passes: list = None,
+    resume_dsl_code: str = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
     All detailed output goes to outer_dir/log.txt. Only summary lines go to terminal.
+
+    Args:
+        resume_dsl_code: If set, skip all lowering passes and use this as the
+            DSL code for translation. Used when resuming from a checkpoint where
+            refactor_final succeeded but translate failed.
     """
     log_path = outer_dir / "log.txt"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -750,13 +816,6 @@ async def _run_outer_iteration(
     print(f"{tag} Started — log: {log_path}")
     log(f"--- Outer iteration {i + 1}/{max_outer} ---")
 
-    # ============================================================
-    # Phase 1: Lowering passes
-    #   tiler -> router -> retiler -> canonicalize ->
-    #   refactor_load -> refactor_compute -> refactor_final
-    # The refactor passes progressively rewrite canonical PyTorch into
-    # DSL function calls that map 1:1 to STeP graph nodes.
-    # ============================================================
     if lowering_passes is None:
         lowering_passes = LOWERING_PASSES
     if translator_passes is None:
@@ -765,61 +824,111 @@ async def _run_outer_iteration(
     lowered_code = None
     dsl_code = None  # output of refactor_final, used as translation guide
     pipeline_ok = True
-    for pass_info in lowering_passes:
-        pass_name = pass_info["name"]
-        executor = pass_info.get("executor", "tiled")
 
-        # Skip refactor passes if code already complies AND no judge needs to verify
-        if pass_name in _REFACTOR_ORDER and lowered_code is not None:
-            violations = _check_banned_ops(lowered_code, pass_name)
-            has_judge = pass_name in judge_agents
-            if not violations and not has_judge:
-                log(f"  Lowering pass: {pass_name} -> SKIP (already compliant)")
+    # ============================================================
+    # Resume mode: skip lowering, use provided DSL code directly
+    # ============================================================
+    if resume_dsl_code is not None:
+        dsl_code = resume_dsl_code
+        _write(outer_dir / "dsl_code_raw.py", dsl_code)
+        # Re-apply AST transforms (user may have changed prompts/code
+        # that produced dsl_code_raw, or the transforms themselves may
+        # have been updated since the original checkpoint was created)
+        dsl_code, fusions = fuse_load_ref(dsl_code)
+        if fusions:
+            log(f"  Post-process: {len(fusions)} load_ref fusion(s)")
+            for f in fusions:
+                log(f"    {f}")
+            # Verify the transform didn't break correctness
+            verify = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
+            if "match=True" not in verify:
+                log(f"  Post-process BROKE correctness — reverting to raw code")
+                log(f"    {verify.splitlines()[0]}")
+                dsl_code = resume_dsl_code
+        lowered_code = dsl_code
+        _write(outer_dir / "dsl_code.py", dsl_code)
+        log(f"  Resumed from checkpoint — using saved dsl_code ({len(dsl_code)} chars)")
+        print(f"{tag} Resumed — skipping lowering")
+
+    # ============================================================
+    # Phase 1: Lowering passes (skipped when resuming)
+    #   tiler -> router -> retiler -> canonicalize ->
+    #   refactor_load -> refactor_compute -> refactor_final
+    # The refactor passes progressively rewrite canonical PyTorch into
+    # DSL function calls that map 1:1 to STeP graph nodes.
+    # ============================================================
+    else:
+        for pass_info in lowering_passes:
+            pass_name = pass_info["name"]
+            executor = pass_info.get("executor", "tiled")
+
+            # Skip refactor passes if code already complies AND no judge needs to verify
+            if pass_name in _REFACTOR_ORDER and lowered_code is not None:
+                violations = _check_banned_ops(lowered_code, pass_name)
+                has_judge = pass_name in judge_agents
+                if not violations and not has_judge:
+                    log(f"  Lowering pass: {pass_name} -> SKIP (already compliant)")
+                    if pass_name == "refactor_final":
+                        dsl_code = lowered_code
+                        _write(outer_dir / "dsl_code.py", dsl_code)
+                    continue
+
+            log(f"  Lowering pass: {pass_name}")
+            pass_result = await _run_pass_loop(
+                pass_agents[pass_name], pass_name, kernel_name, dims, max_turns,
+                ckpt_dir=outer_dir,
+                prev_code=lowered_code,
+                executor=executor,
+                tensors=tensors,
+                log=log,
+                judge_agent=judge_agents.get(pass_name),
+            )
+            if pass_result["success"]:
+                lowered_code = pass_result["code"]
+                log(f"  -> {pass_name} OK")
+                # Save refactor_final output as DSL code for translation guidance
                 if pass_name == "refactor_final":
                     dsl_code = lowered_code
+                    _write(outer_dir / "dsl_code_raw.py", dsl_code)
+                    # Post-process: fuse offchip_load + repeat_ref/expand_ref
+                    # into offchip_load_ref for STeP IR compatibility
+                    dsl_code, fusions = fuse_load_ref(dsl_code)
+                    if fusions:
+                        log(f"  Post-process: {len(fusions)} load_ref fusion(s)")
+                        for f in fusions:
+                            log(f"    {f}")
+                        # Verify the transform didn't break correctness
+                        verify = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
+                        if "match=True" in verify:
+                            lowered_code = dsl_code
+                        else:
+                            log(f"  Post-process BROKE correctness — reverting to raw code")
+                            log(f"    {verify.splitlines()[0]}")
+                            dsl_code = lowered_code
                     _write(outer_dir / "dsl_code.py", dsl_code)
-                continue
+            else:
+                log(f"  -> {pass_name} FAILED, stopping lowering pipeline")
+                pipeline_ok = False
+                break
 
-        log(f"  Lowering pass: {pass_name}")
-        pass_result = await _run_pass_loop(
-            pass_agents[pass_name], pass_name, kernel_name, dims, max_turns,
-            ckpt_dir=outer_dir,
-            prev_code=lowered_code,
-            executor=executor,
-            tensors=tensors,
-            log=log,
-            judge_agent=judge_agents.get(pass_name),
-        )
-        if pass_result["success"]:
-            lowered_code = pass_result["code"]
-            log(f"  -> {pass_name} OK")
-            # Save refactor_final output as DSL code for translation guidance
-            if pass_name == "refactor_final":
-                dsl_code = lowered_code
-                _write(outer_dir / "dsl_code.py", dsl_code)
+        if lowering_passes:
+            if not pipeline_ok or lowered_code is None:
+                log(f"Lowering pipeline failed")
+                print(f"{tag} Lowering FAILED")
+                log_file.close()
+                return {
+                    "success": False,
+                    "outer_iteration": i,
+                    "outer_iterations": max_outer,
+                    "total_tool_calls": 0,
+                    "cycle_count": None,
+                }
+
+            log(f"Lowering pipeline succeeded")
+            print(f"{tag} Lowering OK")
         else:
-            log(f"  -> {pass_name} FAILED, stopping lowering pipeline")
-            pipeline_ok = False
-            break
-
-    if lowering_passes:
-        if not pipeline_ok or lowered_code is None:
-            log(f"Lowering pipeline failed")
-            print(f"{tag} Lowering FAILED")
-            log_file.close()
-            return {
-                "success": False,
-                "outer_iteration": i,
-                "outer_iterations": max_outer,
-                "total_tool_calls": 0,
-                "cycle_count": None,
-            }
-
-        log(f"Lowering pipeline succeeded")
-        print(f"{tag} Lowering OK")
-    else:
-        log(f"No lowering passes (direct pipeline)")
-        print(f"{tag} Direct pipeline — skipping lowering")
+            log(f"No lowering passes (direct pipeline)")
+            print(f"{tag} Direct pipeline — skipping lowering")
 
     # ============================================================
     # Phase 2: STeP translation passes

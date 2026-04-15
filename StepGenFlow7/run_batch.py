@@ -10,7 +10,7 @@ EASY_KERNELS = ["element_wise_add", "copy_2d", "silu_activation", "chained_unary
 MEDIUM_KERNELS = ["gemm", "rms_norm", "layernorm", "residual_add_norm"]
 
 
-async def run_batch(llm_config, kernels, preset, max_outer, max_turns, results_dir, experience_dir, checkpoint_dir, pipeline="standard"):
+async def run_batch(llm_config, kernels, preset, max_outer, max_turns, results_dir, experience_dir, checkpoint_dir, pipeline="standard", resume_from=None):
     results = {}
     for kernel in kernels:
         print(f"\n{'='*60}")
@@ -26,6 +26,7 @@ async def run_batch(llm_config, kernels, preset, max_outer, max_turns, results_d
             experience_dir=experience_dir,
             checkpoint_dir=checkpoint_dir,
             pipeline=pipeline,
+            resume_from=resume_from,
         )
         results[kernel] = result
 
@@ -58,6 +59,9 @@ def main():
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory")
     parser.add_argument("--pipeline", default="standard", choices=["standard", "direct"],
                         help="Pipeline mode: 'standard' or 'direct'")
+    parser.add_argument("--resume", default=None, metavar="PATH",
+                        help="Resume from a checkpoint where refactor_final succeeded. "
+                             "Skips lowering and starts directly from translation.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -75,6 +79,7 @@ def main():
         args.results_dir, args.experience_dir,
         args.checkpoint_dir,
         pipeline=args.pipeline,
+        resume_from=args.resume,
     ))
 
 
