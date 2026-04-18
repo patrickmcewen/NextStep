@@ -18,6 +18,11 @@ Similarly, use `reassemble_rank=0` for `FlatReassemble`.
 {ops_code}
 ```
 
+### Utility ops (utility_ops.py)
+```python
+{utility_ops_code}
+```
+
 ## Section 3: STeP Functional Emulator (functional.py)
 
 This is how each STeP node actually executes. Use this to understand the semantics when translating.

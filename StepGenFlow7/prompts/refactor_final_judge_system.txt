@@ -8,7 +8,7 @@ These are the ONLY functions allowed for tensor computation:
 
 DSL_FUNCTIONS = {
     # Source
-    "offchip_load", "select_gen",
+    "offchip_load", "offchip_load_ref", "select_gen", "metadata_gen",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
     # Fused compute
@@ -76,6 +76,9 @@ proj = gate * up_out
 idx = torch.nonzero(mask).squeeze(1)
 x_sel = x[idx]
 ```
+
+## Other Rules
+1. Pytorch tensors can ONLY be passed into source operators from the DSL_FUNCTIONS. They cannot be used directly in functions like repeat_ref, but must first go through a source node; the output of the source node can be passed into anything.
 
 ## Output Format
 

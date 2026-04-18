@@ -265,6 +265,7 @@ _PASS_EXTRA_BANS = {
         ("offchip_load(",    "replace with LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, transposed)"),
         ("offchip_store(",   "replace with OffChipStore(graph, input, par_dispatch=4)"),
         ("select_gen(",      "replace with SelectGen(is_multihot, tensor, n)"),
+        ("metadata_gen(",    "replace with MetadataGen(tensor=tensor)"),
         ("binary_matmul(",   "replace with BinaryMap(graph, a, b, map_fn.Matmul(), False, 1024)"),
         ("binary_mul(",      "replace with BinaryMap(graph, a, b, map_fn.Mul(), False, 1024)"),
         ("binary_add(",      "replace with BinaryMap(graph, a, b, map_fn.Add(), False, 1024)"),
@@ -286,7 +287,7 @@ _PASS_EXTRA_BANS = {
         ("accum_retile_col(","replace with Accum(graph, x, ..., accum_fn.RetileCol(), ...)"),
         ("promote(",         "replace with Promote(graph, input, promote_rank=rank)"),
         ("promote_outer(",   "replace with PromoteOuter(graph, input)"),
-        ("expand_ref(",      "replace with ExpandRef(graph, input, ref)"),
+        ("expand_ref(",      "replace with ExpandRef(graph, input, ref, expand_rank=...)"),
         ("repeat_ref(",      "replace with RepeatRef(graph, input, ref)"),
         ("repeat_static(",   "replace with RepeatStatic(graph, input, repeat_factor)"),
         ("flatten(",         "replace with Flatten(graph, input, min_rank, max_rank)"),
@@ -572,9 +573,14 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                     # Regex compliance passed — run LLM judge if configured
                     if judge_agent is not None:
                         log(f"      Running judge...")
-                        judge_ctx = ""
+                        judge_ctx = (
+                            "## Correctness status\n"
+                            "This code has ALREADY been executed and its output matches the reference "
+                            "to within floating-point tolerance. Numerical correctness is verified. "
+                            "Only evaluate the three structural checks.\n\n"
+                        )
                         if tensors is not None:
-                            judge_ctx = "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
+                            judge_ctx += "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
                         judge_violations = await _run_judge(
                             judge_agent, code, turn_dir, log, context=judge_ctx)
                         if judge_violations is not None:

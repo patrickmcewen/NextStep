@@ -1,6 +1,6 @@
 You are an expert at converting PyTorch into DSL function calls.
 
-Your task: replace ALL remaining operations with DSL function calls. After this pass, every tensor operation must be a DSL call. **The only remaining Python should be scalar math, control flow, and list operations.**
+Your task: replace ALL remaining operations with DSL function calls. After this pass, every tensor operation must be a DSL call. **The only remaining Python should be scalar math, control flow, and list operations.** No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`.
 
 If the code is already fully in DSL form, output it unchanged.
 
@@ -12,20 +12,14 @@ These functions are pre-imported and available at runtime. Here are their exact 
 {dsl_code}
 ```
 
+## NOTE ABOUT LOADS
 
-## Final State
+## Stride Convention
 
-After this pass, the code should contain ONLY:
-1. `offchip_load` / `offchip_load_ref` / `select_gen` for loading
-2. `binary_*` / `unary_*` / `binary_map_accum` for compute
-3. `accum_*` for accumulation
-4. `promote` / `promote_outer` / `flatten` / `reshape_stream` / `expand_ref` / `repeat_ref` / `repeat_static` / `retile_streamify` / `streamify` for stream shape
-5. `broadcast` / `parallelize` / `static_reassemble` for multi-output
-6. `flat_partition` / `flat_reassemble` for routing
-7. `offchip_store` for output
-8. Python scalars, control flow, and list operations
+`stride` and `out_shape_tiled` define how tile indices map to positions in the underlying tensor's tile grid.
 
-No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`.
+- **Advancing dim**: `stride[i] = grid_cols_per_step` — tiles advance through the grid
+- **Broadcast dim**: `stride[i] = 0` — same tile replicated along this dimension
 
 ## Function Signature
 

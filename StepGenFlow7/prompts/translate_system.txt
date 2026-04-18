@@ -79,6 +79,11 @@ static→dynamic shapes. The DSL enforces this by using `offchip_load_ref` for d
 {ops_code}
 ```
 
+### Utility ops (utility_ops.py)
+```python
+{utility_ops_code}
+```
+
 ## Section 3: STeP Functional Emulator (functional.py)
 
 This is how each STeP node actually executes. Use this to understand the semantics when translating.

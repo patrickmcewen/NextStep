@@ -1,38 +1,12 @@
-"""STeP DSL — executable Python functions mirroring functional.py's node executors.
-
-Each function corresponds 1:1 to a STeP graph node. The refactoring pass rewrites
-canonicalized PyTorch into calls to these functions, making translation to STeP
-graph construction trivial (mechanical substitution).
-
-All functions operate on tiled tensors with shape (*stream_shape, tile_r, tile_c).
-The leading dimension is typically 1 (prepended by offchip_load).
+"""
+STeP DSL
 """
 
 import torch
 import torch.nn.functional as F
 
-
-# ---------------------------------------------------------------------------
-# Source: LinearOffChipLoad → offchip_load
-# Mirrors: _materialize_tiles (L90) + unsqueeze(0) from functional.py
-# ---------------------------------------------------------------------------
-
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
-    """Load an untiled tensor into tiled stream form.
-
-    Args:
-        underlying: Dense tensor, shape (..., R, C).
-        stride: Tuple of ints, one per dim in out_shape_tiled.
-                Each element says how many tile-columns to advance per step.
-                Use 0 to broadcast (tensor doesn't vary along that axis).
-        out_shape_tiled: Tuple of ints defining the output stream shape.
-        tile_row: Tile height.
-        tile_col: Tile width.
-        transposed: If True, transpose each tile (swap tile_row, tile_col).
-
-    Returns:
-        Tiled tensor with shape (1, *out_shape_tiled, tile_row, tile_col).
-    """
+    assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
     R, C = underlying.shape[-2], underlying.shape[-1]
 
     # ---- Tiling invariant: must actually stream, not load as one giant tile ----
@@ -74,27 +48,7 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
 
 
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
-    """Load tiles and expand to match ref's stream shape.
-    Mirrors LinearOffChipLoadRef(graph, ref, underlying, ...).
-
-    Fused equivalent of offchip_load(...) + expand_ref(..., ref).
-    Use this instead of that two-step pattern when ref has a dynamic stream
-    shape (e.g., from flat_partition), because ExpandRef in STeP IR cannot
-    bridge static→dynamic shapes.
-
-    Args:
-        ref: Reference tiled tensor whose stream shape to match.
-        underlying: Dense tensor to load, shape (..., R, C).
-        stride: Tuple of ints, one per dim in out_shape_tiled.
-        out_shape_tiled: Tuple of ints defining the weight tile grid.
-        tile_row: Tile height.
-        tile_col: Tile width.
-        transposed: If True, transpose each tile.
-
-    Returns:
-        Tiled tensor with shape (*ref_stream, *out_shape_tiled, tile_row, tile_col).
-        Mirrors LinearOffChipLoadRef output stream: ref_stream + out_shape_tiled.
-    """
+    assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float32 or float16, got {underlying.dtype}"
     loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed)
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
@@ -105,30 +59,13 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
         loaded = loaded.unsqueeze(0)
     return loaded.expand(target).contiguous()
 
-
-# ---------------------------------------------------------------------------
-# Source: SelectGen → select_gen
-# Mirrors: SelectGen dispatch (L146) from functional.py
-# ---------------------------------------------------------------------------
-
 def select_gen(underlying):
-    """Return a pre-computed selection/control tensor as-is.
-
-    Used to provide multihot control tensors for flat_partition / flat_reassemble.
-    The input should be a raw (untiled) tensor with shape (*stream_shape, n),
-    NOT the output of offchip_load (which adds tile_r/tile_c dimensions that
-    flat_partition / flat_reassemble will misinterpret as extra stream dims).
-    """
     return underlying
 
-
-# ---------------------------------------------------------------------------
-# Binary compute: BinaryMap → binary_*
-# Mirrors: _apply_binary (L471) from functional.py
-# ---------------------------------------------------------------------------
+def metadata_gen(tensor):
+    return tensor.float().reshape(1, *tensor.shape, 1, 1)
 
 def _assert_stream_match(a, b, op_name):
-    """Assert both operands have identical stream shapes (all dims except last 2)."""
     a_stream = a.shape[:-2]
     b_stream = b.shape[:-2]
     assert a_stream == b_stream, (
@@ -139,7 +76,6 @@ def _assert_stream_match(a, b, op_name):
 
 
 def binary_matmul(a, b, weight_transposed=False):
-    """Tiled matrix multiply. Mirrors BinaryMap(map_fn.Matmul)."""
     _assert_stream_match(a, b, "binary_matmul")
     if weight_transposed:
         return torch.matmul(a, b.transpose(-2, -1))
@@ -147,25 +83,21 @@ def binary_matmul(a, b, weight_transposed=False):
 
 
 def binary_mul(a, b):
-    """Element-wise multiply. Mirrors BinaryMap(map_fn.Mul)."""
     _assert_stream_match(a, b, "binary_mul")
     return a * b
 
 
 def binary_add(a, b):
-    """Element-wise add. Mirrors BinaryMap(map_fn.Add)."""
     _assert_stream_match(a, b, "binary_add")
     return a + b
 
 
 def binary_div(a, b):
-    """Element-wise divide. Mirrors BinaryMap(map_fn.Div)."""
     _assert_stream_match(a, b, "binary_div")
     return a / b
 
 
 def binary_is_equal(a, b):
-    """Element-wise equality. Mirrors BinaryMap(map_fn.IsEqual)."""
     _assert_stream_match(a, b, "binary_is_equal")
     return (a == b).float()
 
@@ -176,127 +108,63 @@ def binary_is_equal(a, b):
 # ---------------------------------------------------------------------------
 
 def unary_silu(x):
-    """SiLU activation. Mirrors UnaryMap(map_fn.Silu)."""
     return F.silu(x)
 
 
 def unary_square(x):
-    """Element-wise square. Mirrors UnaryMap(map_fn.Square)."""
     return x ** 2
 
 
 def unary_exp(x):
-    """Element-wise exp. Mirrors UnaryMap(map_fn.Exp)."""
     return torch.exp(x)
 
 
 def unary_rsqrt(x):
-    """Reciprocal square root. Mirrors UnaryMap(map_fn.Rsqrt)."""
     return torch.rsqrt(x)
 
 
 def unary_pow2(x):
-    """2^x element-wise. Mirrors UnaryMap(map_fn.Pow2)."""
     return torch.pow(2.0, x)
 
 
 def unary_mul_imm(x, constant):
-    """Multiply by scalar constant. Mirrors UnaryMap(map_fn.MulImmediate)."""
     return x * constant
 
 
 def unary_add_imm(x, constant):
-    """Add scalar constant. Mirrors UnaryMap(map_fn.AddImmediate)."""
     return x + constant
 
 
 def unary_sub_imm(x, constant):
-    """Subtract scalar constant. Mirrors UnaryMap(map_fn.SubImmediate)."""
     return x - constant
 
 
 def unary_rowwise_sum(x):
-    """Sum each row, keep dim. Mirrors UnaryMap(map_fn.RowWiseSum)."""
     return x.sum(dim=-1, keepdim=True)
 
-
-# ---------------------------------------------------------------------------
-# Accumulation: Accum → accum_*
-# Mirrors: _exec_accum (L528) from functional.py
-# ---------------------------------------------------------------------------
-
 def accum_add(x, rank=1):
-    """Sum-reduce over the innermost `rank` stream dims (dim -3).
-    Mirrors Accum(accum_fn.Add)."""
     for _ in range(rank):
         x = x.sum(dim=-3)
     return x
 
-
 def accum_mul(x, rank=1):
-    """Product-reduce over the innermost `rank` stream dims (dim -3).
-    Mirrors Accum(accum_fn.Mul)."""
     for _ in range(rank):
         x = x.prod(dim=-3)
     return x
 
-
 def accum_retile_row(x, rank=1):
-    """Merge stream dim into tile rows. Mirrors Accum(accum_fn.RetileRow)."""
     for _ in range(rank):
         s = x.shape
         x = x.reshape(*s[:-3], s[-3] * s[-2], s[-1])
     return x
 
-
 def accum_retile_col(x, rank=1):
-    """Merge stream dim into tile cols. Mirrors Accum(accum_fn.RetileCol)."""
     for _ in range(rank):
         s = x.shape
         x = x.reshape(*s[:-3], s[-2], s[-3] * s[-1])
     return x
 
-
-# ---------------------------------------------------------------------------
-# Routing: FlatPartition / FlatReassemble
-# Mirrors: _exec_flat_partition (L852), _exec_flat_reassemble (L872)
-# ---------------------------------------------------------------------------
-
 def flat_partition(x, control, n):
-    """Partition tiles by multihot control signal.
-
-    Routing is per-tile: each stream element (tile) in x is routed as a
-    whole unit based on one row of the control signal. If you need to route
-    individual rows independently, each row must be its own tile (tile_row=1).
-
-    Args:
-        x: Tiled tensor, shape (*stream_shape, tile_r, tile_c).
-        control: Multihot tensor, shape (*stream_shape, n).
-                 NOT a tiled tensor — has no tile_r/tile_c dims.
-                 Typically provided via select_gen() on a raw tensor.
-        n: Number of output partitions (one per consumer).
-
-    Critical constraint:
-        product(x.shape[:-2]) == product(control.shape[:-1])
-        i.e., total number of tiles in x == total rows in control.
-        The control tensor's row count determines the required tile count
-        for x. Choose x's tiling (tile_row, tile_col, out_shape_tiled) so
-        that it produces exactly that many stream elements.
-
-    Returns:
-        List of n tensors, each containing tiles routed to that partition.
-
-    Examples (tile dims shown in [brackets]):
-        x shape          control shape    n    result
-        (64, [1, D])     (64, 8)          8    list of 8 tensors, each (count_i, 1, D)
-        (4, 16, [1, D])  (4, 16, 8)       8    same (64 tiles total)
-
-        WRONG: x=(1, 2, 4, [32, 256]), control=(64, 8), n=8
-               → x has 8 tiles, control has 64 rows → MISMATCH
-               (tiling x into large tiles reduces the tile count)
-        RIGHT: x=(1, 64, [1, D]), control=(64, 8), n=8
-               → x has 64 tiles, control has 64 rows → OK
-    """
     tile_r, tile_c = x.shape[-2], x.shape[-1]
     flat_inp = x.reshape(-1, tile_r, tile_c)
     flat_mh = control.reshape(-1, n)
@@ -311,20 +179,6 @@ def flat_partition(x, control, n):
 
 
 def flat_reassemble(inputs, control):
-    """Reassemble partitioned data using multihot control signal.
-
-    Inverse of flat_partition. The control tensor must have the same shape
-    and values used in the corresponding flat_partition call.
-
-    Args:
-        inputs: List of n tensors, each (num_routed, tile_r, tile_c).
-        control: Multihot tensor, shape (*stream_shape, n).
-                 NOT a tiled tensor — has no tile_r/tile_c dims.
-                 Typically provided via select_gen() on a raw tensor.
-
-    Returns:
-        Reassembled tensor, shape (*ctrl_stream_shape, n_active, tile_r, tile_c).
-    """
     n = len(inputs)
     tile_r, tile_c = inputs[0].shape[-2], inputs[0].shape[-1]
     flat_mh = control.reshape(-1, n)
@@ -352,37 +206,7 @@ def flat_reassemble(inputs, control):
     n_active = output.shape[1]
     return output.reshape(*ctrl_stream_shape, n_active, tile_r, tile_c)
 
-
-# ---------------------------------------------------------------------------
-# Stream shape: Promote, Flatten, ExpandRef, RepeatStatic
-# Mirrors: _exec_promote (L818), _exec_flatten (L622),
-#          _exec_expand_ref (L771), _exec_repeat_static (L585)
-# ---------------------------------------------------------------------------
-
 def promote(x, rank=1):
-    """Insert a size-1 dimension into a tiled tensor.
-    Mirrors Promote(graph, input, promote_rank).
-
-    Inserts at position -(2 + rank). The last 2 dims are tile dims [tr, tc].
-    `rank` counts from the right edge of the tensor:
-
-        rank=0 → dim -2: between tr and tc  (rarely used)
-        rank=1 → dim -3: just before tr     (new innermost stream dim)
-        rank=2 → dim -4: one slot into stream dims
-
-    Examples with actual shapes:
-        x shape              rank   result shape
-        (A, B, [tr, tc])     1      (A, B, 1, [tr, tc])     ← most common
-        (A, B, [tr, tc])     2      (A, 1, B, [tr, tc])
-        (A, B, [tr, tc])     3      (1, A, B, [tr, tc])
-        (A, [tr, tc])        1      (A, 1, [tr, tc])
-        (A, [tr, tc])        2      (1, A, [tr, tc])
-
-    For most use cases, rank=1 is what you want — it inserts a new
-    innermost stream dimension just before the tile dims.
-
-    CONSTRAINT: rank must be <= ndim - 1 (number of stream dims + 1).
-    """
     max_rank = x.ndim - 1
     assert rank <= max_rank, (
         f"promote(rank={rank}): tensor has {x.ndim} dims ({tuple(x.shape)}), "
@@ -392,29 +216,10 @@ def promote(x, rank=1):
 
 
 def promote_outer(x):
-    """Insert a size-1 dimension at dim 0 (outermost position).
-    Mirrors PromoteOuter(graph, input).
-
-    Equivalent to promote(x, rank=ndim-2) but simpler to use.
-    """
     return x.unsqueeze(0)
 
 
 def flatten(x, min_rank, max_rank):
-    """Merge stream dims from min_rank to max_rank (counting from rightmost).
-    Mirrors Flatten(graph, input, min_rank, max_rank).
-
-    Ranks count from the right: rank 0 = rightmost stream dim.
-
-    Examples with actual shapes (tile dims = last 2):
-        x shape                  min_rank  max_rank  result shape
-        (1, 2, 4, [tr, tc])      1         2         (1, 2*4, [tr, tc]) = (1, 8, [tr, tc])
-        (1, 2, 4, [tr, tc])      0         1         (1, 2, 4*1, [tr, tc])  ← wait, that's wrong
-        (1, A, B, [tr, tc])      0         1         (1, A*B, [tr, tc])
-        (1, A, [tr, tc])         0         0         (A, [tr, tc])   ← squeeze leading 1
-
-    CONSTRAINT: max_rank must be < number of stream dims.
-    """
     tile_r, tile_c = x.shape[-2], x.shape[-1]
     stream_shape = list(x.shape[:-2])
     n = len(stream_shape)
@@ -437,56 +242,27 @@ def flatten(x, min_rank, max_rank):
     return x.reshape(*new_stream, tile_r, tile_c)
 
 
-def expand_ref(x, ref):
-    """Broadcast singleton stream dims to match ref's stream shape.
-    Mirrors ExpandRef(graph, input, ref).
-
-    WARNING: In STeP IR, ExpandRef requires that the leading (non-expanded)
-    stream dims match exactly. It CANNOT bridge static→dynamic shapes.
-    If you need to expand an offchip_load result to match a dynamic ref
-    (e.g., from flat_partition), use offchip_load_ref instead.
-    """
-    ref_shape = list(ref.shape[:-2])
-    expand_shape = ref_shape + list(x.shape[-2:])
+def expand_ref(x, ref, expand_rank):
+    ref_stream = list(ref.shape[:-2])
+    inp_stream = list(x.shape[:-2])
+    assert expand_rank > 0, f"expand_rank must be > 0, got {expand_rank}"
+    assert inp_stream[-expand_rank:] == [1] * expand_rank, (
+        f"expand_ref: trailing {expand_rank} stream dims must be 1, got {inp_stream}"
+    )
+    assert inp_stream[:-expand_rank] == ref_stream[:-expand_rank], (
+        f"expand_ref: leading stream dims must match: {inp_stream[:-expand_rank]} vs {ref_stream[:-expand_rank]}"
+    )
+    expand_shape = ref_stream + list(x.shape[-2:])
     return x.expand(expand_shape).contiguous()
 
 
 def repeat_static(x, factor):
-    """Insert a new stream dim at -3 and repeat `factor` times.
-    Mirrors RepeatStatic(graph, input, repeat_factor)."""
     result = x.unsqueeze(-3)
     shape = list(result.shape)
     shape[-3] = factor
     return result.expand(shape).contiguous()
 
-
-# ---------------------------------------------------------------------------
-# Stream shape: Reshape (split stream dim)
-# Mirrors: _exec_reshape (L643) from functional.py
-# ---------------------------------------------------------------------------
-
 def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
-    """Split one stream dim into two by a chunk size.
-    Mirrors Reshape(graph, input, chunk_size, input_stream_rank, reshape_rank).
-
-    This is the inverse of flatten: flatten merges adjacent stream dims,
-    reshape_stream splits one stream dim into (new_count, chunk_size).
-
-    Args:
-        x: Tiled tensor, shape (*stream, tile_r, tile_c).
-        chunk_size: Size of each chunk after splitting.
-        rank: Which stream dim to split, counting from the right
-              (rank 0 = rightmost stream dim).
-        add_outer_dim: If True, prepend a leading singleton dim.
-
-    Examples (last 2 dims are tile dims [tr, tc]):
-        x shape              chunk_size  rank  result shape
-        (6, [tr, tc])        2           0     (3, 2, [tr, tc])
-        (A, 12, [tr, tc])    4           0     (A, 3, 4, [tr, tc])
-        (12, B, [tr, tc])    3           1     (4, 3, B, [tr, tc])
-
-    Pads with zeros if the dim is not evenly divisible by chunk_size.
-    """
     tile_r, tile_c = x.shape[-2], x.shape[-1]
     stream_shape = list(x.shape[:-2])
     n = len(stream_shape)
@@ -520,38 +296,11 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
 
     return x.reshape(new_shape)
 
-
-# ---------------------------------------------------------------------------
-# Stream shape: RetileStreamify (split tile dim into stream)
-# Mirrors: _exec_retile_streamify (L725) from functional.py
-# ---------------------------------------------------------------------------
-
 def retile_streamify(x, chunk, split_row=True):
-    """Split tile rows (or cols) into stream chunks.
-    Mirrors RetileStreamify(graph, input, chunk, num_chunks, split_row).
-
-    This is the inverse of accum_retile_row / accum_retile_col.
-    Splits tile_r (or tile_c) by chunk, merging the new chunk count
-    into the last stream dim.
-
-    Args:
-        x: Tiled tensor, shape (*stream, last, tile_r, tile_c).
-        chunk: New tile_r (or tile_c) after splitting.
-        split_row: If True, split tile_r. If False, split tile_c.
-
-    Examples (split_row=True):
-        x shape                  chunk  result shape
-        (A, B, 64, tc)           32     (A, B*2, 32, tc)     ← tile_r=64 split into 2 chunks of 32
-        (A, 128, tc)             32     (A*4, 32, tc)        ← tile_r=128 split into 4 chunks of 32
-
-    Examples (split_row=False):
-        x shape                  chunk  result shape
-        (A, B, tr, 64)           32     (A, B*2, tr, 32)     ← tile_c=64 split into 2 chunks of 32
-    """
     if split_row:
-        batch = x.shape[:-2]
-        last = batch[-1]
-        pre = batch[:-1]
+        stream_shape = x.shape[:-2]
+        last = stream_shape[-1]
+        pre = stream_shape[:-1]
         tile_r, tile_c = x.shape[-2], x.shape[-1]
 
         actual_num_chunks = tile_r // chunk
@@ -562,9 +311,9 @@ def retile_streamify(x, chunk, split_row=True):
         return reshaped.reshape(*pre, last * actual_num_chunks, chunk, tile_c)
 
     # split_col
-    batch = x.shape[:-2]
-    last = batch[-1]
-    pre = batch[:-1]
+    stream_shape = x.shape[:-2]
+    last = stream_shape[-1]
+    pre = stream_shape[:-1]
     tile_r, tile_c = x.shape[-2], x.shape[-1]
 
     actual_num_chunks = tile_c // chunk
@@ -576,74 +325,23 @@ def retile_streamify(x, chunk, split_row=True):
     reshaped = reshaped.permute(perm)
     return reshaped.reshape(*pre, last * actual_num_chunks, tile_r, chunk)
 
-
-# ---------------------------------------------------------------------------
-# Stream shape: RepeatRef (expand with auto-alignment)
-# Mirrors: _exec_repeat_ref (L784) from functional.py
-# ---------------------------------------------------------------------------
-
 def repeat_ref(x, ref):
-    """Broadcast x to match ref's stream shape, auto-inserting singletons.
-    Mirrors RepeatRef(graph, input, ref).
-
-    Like expand_ref but automatically aligns stream dims by inserting
-    singleton dims where ref has dims that x doesn't. This means x and ref
-    do NOT need the same number of stream dims — repeat_ref handles the
-    alignment.
-
-    Args:
-        x: Tiled tensor, shape (*x_stream, tile_r, tile_c).
-        ref: Reference tiled tensor, shape (*ref_stream, tile_r', tile_c').
-
-    Example:
-        x shape: (F_g, [tr, tc]), ref shape: (B, F_g, [tr', tc'])
-        → inserts singleton for B dim → (1, F_g, [tr, tc])
-        → expands to (B, F_g, [tr, tc])
-    """
     ref_stream = list(ref.shape[:-2])
     inp_stream = list(x.shape[:-2])
     tile_dims = list(x.shape[-2:])
 
-    # Align from the right: match dims, insert singletons where needed
-    aligned = tile_dims[:]
-    ri = len(ref_stream) - 1
-    ii = len(inp_stream) - 1
-    while ri >= 0:
-        if ii >= 0 and (inp_stream[ii] == ref_stream[ri] or inp_stream[ii] == 1):
-            aligned.insert(0, inp_stream[ii])
-            ri -= 1
-            ii -= 1
-        else:
-            aligned.insert(0, 1)
-            ri -= 1
+    assert inp_stream == ref_stream[:-1], (
+        f"x stream shape must equal ref stream shape minus its trailing dim: "
+        f"{inp_stream} vs {ref_stream[:-1]}"
+    )
 
-    result = x.reshape(aligned)
+    last_stream_dim = -3
+
+    result = x.unsqueeze(last_stream_dim)
     expand_shape = ref_stream + tile_dims
     return result.expand(expand_shape).contiguous()
 
-
-# ---------------------------------------------------------------------------
-# Stream shape: Streamify (generalized repeat_static)
-# Mirrors: _exec_streamify (L596) from functional.py
-# ---------------------------------------------------------------------------
-
 def streamify(x, repeat_factors, rank=0):
-    """Insert new stream dims and repeat along each.
-    Mirrors Streamify(graph, input, rank, repeat_factor).
-
-    Generalized version of repeat_static: inserts multiple new dimensions
-    and repeats along each one.
-
-    Args:
-        x: Tiled tensor, shape (*stream, tile_r, tile_c).
-        repeat_factors: List of ints, one per new dim to insert.
-        rank: Number of buffer dims to skip (from the right, before tile dims).
-
-    Example:
-        x shape: (A, [tr, tc]), repeat_factors=[3, 4], rank=0
-        → unsqueeze(-3), expand to 3 → (A, 3, [tr, tc])
-        → unsqueeze(-4), expand to 4 → (A, 4, 3, [tr, tc])
-    """
     result = x
     offset = 2 + rank  # skip buffer dims + tile_r + tile_c
     for rf in repeat_factors:
@@ -654,37 +352,13 @@ def streamify(x, repeat_factors, rank=0):
         offset += 1  # account for newly inserted dim
     return result
 
-
-# ---------------------------------------------------------------------------
-# Multi-output: Broadcast, Parallelize, StaticReassemble
-# Mirrors: dispatch (L199-222) from functional.py
-# ---------------------------------------------------------------------------
-
 def broadcast(x, n):
-    """Clone input tensor n times (fan-out).
-    Mirrors Broadcast(graph, input, num_consumers).
-
-    Returns a list of n references to x (or clones for safety).
-    """
     return [x.clone() for _ in range(n)]
 
-
 def parallelize(x, n):
-    """Split input along dim 0 into n equal chunks.
-    Mirrors Parallelize(graph, input, num_consumers).
-    """
     return list(torch.chunk(x, n, dim=0))
 
-
 def static_reassemble(inputs, target_stream_shape=None):
-    """Concatenate inputs along dim 0 and reshape to target stream shape.
-    Mirrors StaticReassemble(graph, inputs, stream).
-
-    Args:
-        inputs: List of tensors to concatenate.
-        target_stream_shape: Optional tuple for the desired stream shape.
-                             If None, just concatenates.
-    """
     result = torch.cat(inputs, dim=0)
     if target_stream_shape is not None:
         tile_r, tile_c = result.shape[-2], result.shape[-1]
@@ -693,35 +367,8 @@ def static_reassemble(inputs, target_stream_shape=None):
             result = result.reshape(target)
     return result
 
-
-# ---------------------------------------------------------------------------
-# Fused compute: BinaryMapAccum → binary_map_accum
-# Mirrors: _exec_binary_map_accum (L497) from functional.py
-# ---------------------------------------------------------------------------
-
 def binary_map_accum(a, b, rank=1, weight_transposed=False):
-    """Fused matmul + sum-reduce over innermost stream dims.
-    Mirrors BinaryMapAccum(graph, in1, in2, fn, rank).
-
-    Performs binary_matmul then accum_add in one call.
-    This is the most common compute pattern: matmul over tiled stream dims
-    then reduce.
-
-    Args:
-        a: Left operand, shape (*stream, tile_r, tile_k).
-        b: Right operand, shape (*stream, tile_k, tile_c).
-        rank: Number of innermost stream dims to reduce.
-        weight_transposed: If True, transpose b's tile dims before matmul.
-    """
-    a_stream = a.shape[:-2]
-    b_stream = b.shape[:-2]
-    assert a_stream == b_stream, (
-        f"binary_map_accum: stream shape mismatch — a has stream {tuple(a_stream)} "
-        f"but b has stream {tuple(b_stream)}. Both operands must have identical "
-        f"stream shapes. If a came from flat_partition (shape {tuple(a.shape)}) and "
-        f"b came from offchip_load_ref (shape {tuple(b.shape)}), you likely need "
-        f"promote(a, rank=1) to add a matching stream dim before the matmul."
-    )
+    _assert_stream_match(a, b, "binary_map_accum")
     if weight_transposed:
         mapped = torch.matmul(a, b.transpose(-2, -1))
     else:
@@ -730,57 +377,35 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False):
         mapped = mapped.sum(dim=-3)
     return mapped
 
-
-# ---------------------------------------------------------------------------
-# Sink: OffChipStore → offchip_store
-# Mirrors: OffChipStore dispatch (L173) + _untile_store (L948)
-# ---------------------------------------------------------------------------
-
 def offchip_store(x):
-    """Untile a tiled tensor back to dense 2-D form.
-
-    Mirrors the combined behavior of OffChipStore + _untile_store in execute().
-
-    Args:
-        x: Tiled tensor, shape (*stream_shape, tile_r, tile_c).
-           Leading dim is typically 1 (from offchip_load convention).
-
-    Returns:
-        Dense 2-D tensor, shape (total_rows, total_cols).
-    """
     tile_r, tile_c = x.shape[-2], x.shape[-1]
 
     # Strip leading 1 if present
     if x.shape[0] == 1:
         x = x[0]
 
-    tiled = x.shape[:-2]
+    stream_shape = x.shape[:-2]
 
-    if len(tiled) == 0:
+    if len(stream_shape) == 0:
         return x  # single tile
 
-    if len(tiled) == 1:
-        return x.reshape(tiled[0] * tile_r, tile_c)
+    if len(stream_shape) == 1:
+        return x.reshape(stream_shape[0] * tile_r, tile_c)
 
-    # 2-D+ tiled: last two tiled dims are row/col tile counts
-    Tc = tiled[-1]
+    # 2-D+ stream_shape: last two stream_shape dims are row/col tile counts
+    Tc = stream_shape[-1]
     ndim = len(x.shape)
     perm = list(range(ndim - 4)) + [ndim - 4, ndim - 2, ndim - 3, ndim - 1]
     x = x.permute(*perm).contiguous()
 
     total_rows = tile_r
-    for d in tiled[:-1]:
+    for d in stream_shape[:-1]:
         total_rows *= d
     return x.reshape(int(total_rows), int(Tc * tile_c))
 
-
-# ---------------------------------------------------------------------------
-# Full DSL vocabulary for compliance checking
-# ---------------------------------------------------------------------------
-
 DSL_FUNCTIONS = {
     # Source
-    "offchip_load", "select_gen",
+    "offchip_load", "offchip_load_ref", "select_gen", "metadata_gen",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
     # Fused compute
