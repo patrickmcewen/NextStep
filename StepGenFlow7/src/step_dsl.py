@@ -65,6 +65,73 @@ def select_gen(underlying):
 def metadata_gen(tensor):
     return tensor.float().reshape(1, *tensor.shape, 1, 1)
 
+
+def cache_read_addr_gen(idx, seq_len, row_offset):
+    assert idx.shape[-2:] == (1, 1), (
+        f"cache_read_addr_gen: idx tile shape must be (1,1), got {tuple(idx.shape[-2:])}"
+    )
+    assert seq_len.shape == idx.shape, (
+        f"cache_read_addr_gen: idx {tuple(idx.shape)} and seq_len {tuple(seq_len.shape)} must match"
+    )
+    idx_flat = idx.reshape(-1).long()
+    seq_len_flat = seq_len.reshape(-1).long()
+    out = []
+    for b in range(idx_flat.shape[0]):
+        base = int(idx_flat[b]) * int(row_offset)
+        n = int(seq_len_flat[b])
+        assert n >= 0, f"cache_read_addr_gen: seq_len[{b}]={n} must be >= 0"
+        out.append(torch.arange(base, base + n, dtype=torch.float32).reshape(1, n, 1, 1))
+    return out
+
+
+def filter_last_tile(seq_len):
+    assert seq_len.shape[-2:] == (1, 1), (
+        f"filter_last_tile: input tile shape must be (1,1), got {tuple(seq_len.shape[-2:])}"
+    )
+    stream_shape = seq_len.shape[:-2]
+    flat = seq_len.reshape(-1).long()
+    assert (flat >= 1).all(), (
+        f"filter_last_tile: seq_len must be >= 1 (Rust ref assumes >=1), got min={int(flat.min())}"
+    )
+    max_seq = int(flat.max().item())
+
+    out = torch.zeros(flat.shape[0], max_seq, 2)
+    for i in range(flat.shape[0]):
+        n = int(flat[i])
+        out[i, :n - 1, 1] = 1.0  # non-last -> column 1
+        out[i, n - 1, 0] = 1.0   # last     -> column 0
+    return out.reshape(*stream_shape, max_seq, 2)
+
+
+def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False):
+    assert underlying.dtype in [torch.float32, torch.float16], (
+        f"random_offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    )
+    assert raddr.shape[-2:] == (1, 1), (
+        f"random_offchip_load: raddr tile shape must be (1,1), got {tuple(raddr.shape[-2:])}"
+    )
+    R, C = underlying.shape[-2], underlying.shape[-1]
+    assert R % tile_row == 0 and C % tile_col == 0, (
+        f"random_offchip_load: ({R},{C}) not divisible by tile ({tile_row},{tile_col})"
+    )
+    grid_r, grid_c = R // tile_row, C // tile_col
+    batch_shape = underlying.shape[:-2]
+    tiled = underlying.reshape(*batch_shape, grid_r, tile_row, grid_c, tile_col)
+    ndim = tiled.ndim
+    perm = list(range(len(batch_shape))) + [ndim - 4, ndim - 2, ndim - 3, ndim - 1]
+    flat = tiled.permute(*perm).reshape(-1, tile_row, tile_col)
+
+    stream_shape = raddr.shape[:-2]
+    addrs = raddr.reshape(-1).long()
+    assert (addrs >= 0).all() and (addrs < flat.shape[0]).all(), (
+        f"random_offchip_load: address out of range [0, {flat.shape[0]}), "
+        f"got min={int(addrs.min())}, max={int(addrs.max())}"
+    )
+    result = flat[addrs].reshape(*stream_shape, tile_row, tile_col)
+    if transposed:
+        result = result.transpose(-2, -1)
+    return result
+
 def _assert_stream_match(a, b, op_name):
     a_stream = a.shape[:-2]
     b_stream = b.shape[:-2]
@@ -143,28 +210,36 @@ def unary_rowwise_sum(x):
     return x.sum(dim=-1, keepdim=True)
 
 def accum_add(x, rank=1):
+    assert rank > 0, f"accum_add: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.sum(dim=-3)
     return x
 
 def accum_mul(x, rank=1):
+    assert rank > 0, f"accum_mul: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.prod(dim=-3)
     return x
 
 def accum_retile_row(x, rank=1):
+    assert rank > 0, f"accum_retile_row: rank must be > 0, got {rank}"
     for _ in range(rank):
         s = x.shape
         x = x.reshape(*s[:-3], s[-3] * s[-2], s[-1])
     return x
 
 def accum_retile_col(x, rank=1):
+    assert rank > 0, f"accum_retile_col: rank must be > 0, got {rank}"
     for _ in range(rank):
         s = x.shape
         x = x.reshape(*s[:-3], s[-2], s[-3] * s[-1])
     return x
 
 def flat_partition(x, control, n):
+    assert control.shape[-1] == n, (
+        f"flat_partition: control's last dim must equal n={n} (num consumers), "
+        f"got control shape {tuple(control.shape)}."
+    )
     tile_r, tile_c = x.shape[-2], x.shape[-1]
     flat_inp = x.reshape(-1, tile_r, tile_c)
     flat_mh = control.reshape(-1, n)
@@ -208,6 +283,7 @@ def flat_reassemble(inputs, control):
 
 def promote(x, rank=1):
     max_rank = x.ndim - 1
+    assert rank >= 0, f"promote(rank={rank}): rank must be >= 0"
     assert rank <= max_rank, (
         f"promote(rank={rank}): tensor has {x.ndim} dims ({tuple(x.shape)}), "
         f"max valid rank is {max_rank}."
@@ -266,16 +342,27 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
     tile_r, tile_c = x.shape[-2], x.shape[-1]
     stream_shape = list(x.shape[:-2])
     n = len(stream_shape)
-    assert n >= 1, (
-        f"reshape_stream: tensor {tuple(x.shape)} has no stream dims."
-    )
-    assert rank < n, (
-        f"reshape_stream(rank={rank}): tensor {tuple(x.shape)} has {n} stream dims, "
-        f"max valid rank is {n - 1}."
-    )
+    assert rank >= 0, f"reshape_stream(rank={rank}): rank must be >= 0"
+    if add_outer_dim:
+        assert n == 0, (
+            f"reshape_stream(add_outer_dim=True): input stream rank must be 0 "
+            f"(a single tile, x.ndim==2), got shape {tuple(x.shape)}."
+        )
+    else:
+        assert n >= 1, (
+            f"reshape_stream: tensor {tuple(x.shape)} has no stream dims."
+        )
+        assert rank < n, (
+            f"reshape_stream(rank={rank}): tensor {tuple(x.shape)} has {n} stream dims, "
+            f"max valid rank is {n - 1}."
+        )
 
     rank_pos = n - 1 - rank
     D = stream_shape[rank_pos]
+    assert D % chunk_size == 0 or rank == 0, (
+        f"reshape_stream: shape[{rank_pos}]={D} not divisible by chunk_size={chunk_size}. "
+        f"Automatic padding is only allowed when rank==0, got rank={rank}."
+    )
     padded_D = ((D + chunk_size - 1) // chunk_size) * chunk_size
 
     if padded_D != D:
@@ -368,6 +455,7 @@ def static_reassemble(inputs, target_stream_shape=None):
     return result
 
 def binary_map_accum(a, b, rank=1, weight_transposed=False):
+    assert rank > 0, f"binary_map_accum: rank must be > 0, got {rank}"
     _assert_stream_match(a, b, "binary_map_accum")
     if weight_transposed:
         mapped = torch.matmul(a, b.transpose(-2, -1))
@@ -377,7 +465,42 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False):
         mapped = mapped.sum(dim=-3)
     return mapped
 
+def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col):
+    assert underlying.dtype in [torch.float32, torch.float16], (
+        f"random_offchip_store: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    )
+    assert underlying.ndim == 2, (
+        f"random_offchip_store: underlying must be 2D (flatten any batch dims first), "
+        f"got shape {tuple(underlying.shape)}"
+    )
+    assert waddr.shape[-2:] == (1, 1), (
+        f"random_offchip_store: waddr tile shape must be (1,1), got {tuple(waddr.shape[-2:])}"
+    )
+    assert wdata.shape[-2:] == (tile_row, tile_col), (
+        f"random_offchip_store: wdata tile {tuple(wdata.shape[-2:])} != ({tile_row},{tile_col})"
+    )
+    assert wdata.shape[:-2] == waddr.shape[:-2], (
+        f"random_offchip_store: wdata stream {tuple(wdata.shape[:-2])} != waddr stream {tuple(waddr.shape[:-2])}"
+    )
+    R, C = underlying.shape
+    assert R % tile_row == 0 and C % tile_col == 0, (
+        f"random_offchip_store: ({R},{C}) not divisible by tile ({tile_row},{tile_col})"
+    )
+    grid_c = C // tile_col
+    addrs = waddr.reshape(-1).long().tolist()
+    wflat = wdata.reshape(-1, tile_row, tile_col)
+    for i, a in enumerate(addrs):
+        gr, gc = a // grid_c, a % grid_c
+        underlying[gr * tile_row:(gr + 1) * tile_row, gc * tile_col:(gc + 1) * tile_col] = wflat[i]
+    stream_shape = waddr.shape[:-2]
+    return torch.ones(*stream_shape, 1, 1, dtype=torch.float32)
+
+
 def offchip_store(x):
+    assert x.ndim >= 2, (
+        f"offchip_store: input must be a tile stream (at least 2D for tile_r, tile_c), "
+        f"got shape {tuple(x.shape)}."
+    )
     tile_r, tile_c = x.shape[-2], x.shape[-1]
 
     # Strip leading 1 if present
@@ -406,6 +529,7 @@ def offchip_store(x):
 DSL_FUNCTIONS = {
     # Source
     "offchip_load", "offchip_load_ref", "select_gen", "metadata_gen",
+    "cache_read_addr_gen", "random_offchip_load", "filter_last_tile",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
     # Fused compute
@@ -424,5 +548,5 @@ DSL_FUNCTIONS = {
     # Routing
     "flat_partition", "flat_reassemble",
     # Sink
-    "offchip_store",
+    "offchip_store", "random_offchip_store",
 }
