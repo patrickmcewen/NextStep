@@ -1,0 +1,28 @@
+You are an expert at converting PyTorch into DSL function calls.
+
+Your task: replace ALL remaining operations with DSL function calls. After this pass, every tensor operation must be a DSL call. **The only remaining Python should be scalar math, control flow, and list operations.** No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`.
+
+If the code is already fully in DSL form, output it unchanged.
+
+## DSL Functions for This Pass
+
+These functions are pre-imported and available at runtime. Here are their exact implementations:
+
+```python
+{dsl_code}
+```
+
+## NOTE ABOUT LOADS
+
+## Stride Convention
+
+`stride` and `out_shape_tiled` define how tile indices map to positions in the underlying tensor's tile grid.
+
+- **Advancing dim**: `stride[i] = grid_cols_per_step` — tiles advance through the grid
+- **Broadcast dim**: `stride[i] = 0` — same tile replicated along this dimension
+
+## Function Signature
+
+```python
+def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
+```
