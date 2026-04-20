@@ -91,13 +91,6 @@ def _load_stepdb_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _save_experience(kernel_name: str, code: str, metadata: dict, experience_dir: str) -> None:
-    out_dir = Path(experience_dir) / kernel_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "solution.py").write_text(code)
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
-
-
 # ---------------------------------------------------------------------------
 # Correctness checkers for each executor type
 # ---------------------------------------------------------------------------
@@ -950,8 +943,6 @@ async def _run_outer_iteration(
                 result = _build_success_result(i, 0,
                                                {"code": final_code, "tool_outputs": []},
                                                [], lowered_code)
-                _save_experience(kernel_name, final_code,
-                                 {"kernel": kernel_name, "preset": preset}, experience_dir)
                 return result
             else:
                 log(f"-> FAIL: {graph_result.splitlines()[0]}")
