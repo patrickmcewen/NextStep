@@ -228,6 +228,9 @@ _PASS_EXTRA_BANS = {
         ("F.layer_norm",   "decompose into mean-subtract, variance, rsqrt, scale"),
         ("F.gelu",         "decompose into primitives or use F.silu"),
     ],
+    "refactor_load": [
+        ("out_shape_tiled=(1,)", "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
+    ],
     "refactor_compute": [
         ("torch.matmul",   "use binary_matmul(a, b)"),
         ("torch.exp",      "use unary_exp(x)"),
