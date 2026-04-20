@@ -199,41 +199,6 @@ _TRANSLATION_ORDER = ["translate", "translate_full"]
 # Within a cumulative group: effective allowlist = last non-None up to that point.
 # Standalone passes (canonicalize, tiler, etc.): checked independently.
 _PASS_ALLOWED_TORCH = {
-    # --- Lowering: canonicalize (standalone) ---
-    "canonicalize": {
-        "torch.matmul", "torch.exp", "torch.rsqrt", "torch.pow",
-        "torch.zeros", "torch.zeros_like", "torch.ones", "torch.ones_like",
-        "torch.arange", "torch.tensor",
-        "torch.stack", "torch.cat",
-        "torch.where", "torch.nonzero",
-        "torch.no_grad",
-    },
-    # --- Refactor passes (cumulative) ---
-    "refactor_load": {
-        # Loads are DSL, but compute + routing still PyTorch
-        "torch.matmul", "torch.exp", "torch.rsqrt", "torch.pow",
-        "torch.zeros", "torch.zeros_like", "torch.ones", "torch.ones_like",
-        "torch.arange", "torch.tensor",
-        "torch.stack", "torch.cat",
-        "torch.where", "torch.nonzero",
-        "torch.no_grad",
-    },
-    "refactor_compute": {
-        # Compute ops removed — only routing/accum/utility remains
-        "torch.zeros", "torch.zeros_like", "torch.ones", "torch.ones_like",
-        "torch.arange", "torch.tensor",
-        "torch.stack", "torch.cat",
-        "torch.where", "torch.nonzero",
-        "torch.no_grad",
-    },
-    "refactor_shape": {
-        # Shape ops now DSL — same torch allowed as refactor_compute (routing still PyTorch)
-        "torch.zeros", "torch.zeros_like", "torch.ones", "torch.ones_like",
-        "torch.arange", "torch.tensor",
-        "torch.stack", "torch.cat",
-        "torch.where", "torch.nonzero",
-        "torch.no_grad",
-    },
     "refactor_final": set(),  # everything must be DSL — no torch at all
     # --- Translation passes (cumulative) ---
     # Input is DSL code (no torch at all), so torch is banned from the start.
@@ -262,9 +227,6 @@ _PASS_EXTRA_BANS = {
         ("F.softmax",      "decompose into exp, row-wise sum, div"),
         ("F.layer_norm",   "decompose into mean-subtract, variance, rsqrt, scale"),
         ("F.gelu",         "decompose into primitives or use F.silu"),
-    ],
-    "refactor_load": [
-        ("out_shape_tiled=(1,)", "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
     ],
     "refactor_compute": [
         ("torch.matmul",   "use binary_matmul(a, b)"),

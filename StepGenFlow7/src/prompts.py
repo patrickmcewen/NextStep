@@ -40,55 +40,6 @@ _vf_spec.loader.exec_module(_validate_functional_mod)
 
 IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 
-
-# ---------------------------------------------------------------------------
-# Helper: strip ops.py boilerplate for LLM consumption
-# ---------------------------------------------------------------------------
-def _strip_ops_boilerplate(source: str) -> str:
-    """Reduce ops.py to its API surface: imports, class attrs, and __init__ sigs.
-
-    Drops internal machinery (cost-model methods, stream/input accessors,
-    __str__, replace_input, module-level helpers and constants) so the LLM
-    sees only what matters for constructing STeP graph nodes.
-    """
-    tree = ast.parse(source)
-    kept_module = []
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            kept_module.append(node)
-            continue
-        if not isinstance(node, ast.ClassDef):
-            continue
-
-        kept_cls = []
-        for child in node.body:
-            if isinstance(child, ast.AnnAssign):
-                kept_cls.append(child)
-            elif (isinstance(child, ast.Expr)
-                  and isinstance(child.value, ast.Constant)
-                  and isinstance(child.value.value, str)):
-                kept_cls.append(child)  # class docstring
-            elif isinstance(child, ast.FunctionDef) and child.name == "__init__":
-                new_body = []
-                if (child.body
-                        and isinstance(child.body[0], ast.Expr)
-                        and isinstance(child.body[0].value, ast.Constant)
-                        and isinstance(child.body[0].value.value, str)):
-                    new_body.append(child.body[0])  # preserve __init__ docstring
-                new_body.append(ast.Expr(value=ast.Constant(value=...)))
-                child.body = new_body
-                kept_cls.append(child)
-
-        if not kept_cls:
-            kept_cls = [ast.Expr(value=ast.Constant(value=...))]
-        node.body = kept_cls
-        kept_module.append(node)
-
-    tree.body = kept_module
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree)
-
-
 # ---------------------------------------------------------------------------
 # Helper: load StepDB config
 # ---------------------------------------------------------------------------
@@ -103,13 +54,6 @@ def _load_stepdb_config() -> dict:
 # Phase 1: PyTorch lowering passes
 # ---------------------------------------------------------------------------
 LOWERING_PASSES = [
-    #{"name": "tiler", "template": "decomposer_system.txt"},
-    #{"name": "router", "template": "pass_router_system.txt"},
-    #{"name": "retiler", "template": "pass_retiler_system.txt"},
-    #{"name": "canonicalize", "template": "canonicalize_system.txt"},
-    #{"name": "refactor_load", "template": "refactor_load_system.txt", "executor": "dsl"},
-    #{"name": "refactor_compute", "template": "refactor_compute_system.txt", "executor": "dsl"},
-    #{"name": "refactor_shape", "template": "refactor_shape_system.txt", "executor": "dsl"},
     {"name": "refactor_final", "template": "refactor_final_system.txt", "executor": "dsl"},
 ]
 
@@ -193,10 +137,6 @@ def build_pass_system_prompt(pass_name: str) -> str:
 
 # Judge prompt templates — keyed by pass name
 _JUDGE_TEMPLATES = {
-    #"canonicalize": "canonicalize_judge_system.txt",
-    #"refactor_load": "refactor_load_judge_system.txt",
-    #"refactor_compute": "refactor_compute_judge_system.txt",
-    #"refactor_shape": "refactor_shape_judge_system.txt",
     "refactor_final": "refactor_final_judge_system.txt",
     "translate": "translate_judge_system.txt",
     "translate_full": "translate_judge_system.txt",
@@ -208,13 +148,6 @@ def build_judge_system_prompt(pass_name: str) -> str:
     assert pass_name in _JUDGE_TEMPLATES, f"No judge template for pass '{pass_name}'"
     template_path = _PROMPTS_DIR / _JUDGE_TEMPLATES[pass_name]
     assert template_path.exists(), f"Judge template not found: {template_path}"
-    return template_path.read_text()
-
-
-def build_annotator_system_prompt() -> str:
-    """Build the annotator agent's system prompt."""
-    template_path = _PROMPTS_DIR / "annotate_system.txt"
-    assert template_path.exists(), f"Annotator template not found: {template_path}"
     return template_path.read_text()
 
 
@@ -307,53 +240,6 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
             "```",
             "",
         ])
-
-        # Include DSL code as translation guide for translator passes
-        if dsl_code is not None and is_translator:
-            lines.extend([
-                "### DSL Translation Guide (verified correct, each call = one STeP node)",
-                "",
-                "Each DSL function call below maps 1:1 to a STeP graph node. "
-                "Use this as your blueprint for constructing the STeP graph:",
-                "",
-                "| DSL call | STeP node |",
-                "|---|---|",
-                "| `offchip_load(...)` | `LinearOffChipLoad(...)` |",
-                "| `offchip_load_ref(ref, w, ...)` | `LinearOffChipLoadRef(graph, ref, w, ...)` |",
-                "| `select_gen(...)` | `SelectGen(...)` |",
-                "| `metadata_gen(tensor)` | `MetadataGen(tensor=tensor)` |",
-                "| `binary_matmul(a, b)` | `BinaryMap(graph, a, b, map_fn.Matmul(), ...)` |",
-                "| `binary_mul(a, b)` | `BinaryMap(graph, a, b, map_fn.Mul(), ...)` |",
-                "| `binary_add(a, b)` | `BinaryMap(graph, a, b, map_fn.Add(), ...)` |",
-                "| `binary_div(a, b)` | `BinaryMap(graph, a, b, map_fn.Div(), ...)` |",
-                "| `unary_silu(x)` | `UnaryMap(graph, x, map_fn.Silu(), ...)` |",
-                "| `unary_square(x)` | `UnaryMap(graph, x, map_fn.Square(), ...)` |",
-                "| `unary_exp(x)` | `UnaryMap(graph, x, map_fn.Exp(), ...)` |",
-                "| `unary_rsqrt(x)` | `UnaryMap(graph, x, map_fn.Rsqrt(), ...)` |",
-                "| `unary_mul_imm(x, c)` | `UnaryMap(graph, x, map_fn.MulImmediate(c), ...)` |",
-                "| `unary_add_imm(x, c)` | `UnaryMap(graph, x, map_fn.AddImmediate(c), ...)` |",
-                "| `unary_sub_imm(x, c)` | `UnaryMap(graph, x, map_fn.SubImmediate(c), ...)` |",
-                "| `unary_rowwise_sum(x)` | `UnaryMap(graph, x, map_fn.RowWiseSum(), ...)` |",
-                "| `accum_add(x, rank)` | `Accum(graph, x, ..., accum_fn.Add(), ..., accum_rank=rank)` |",
-                "| `accum_retile_row(x)` | `Accum(graph, x, ..., accum_fn.RetileRow(), ...)` |",
-                "| `accum_retile_col(x)` | `Accum(graph, x, ..., accum_fn.RetileCol(), ...)` |",
-                "| `promote(x, rank)` | `Promote(graph, x, promote_rank=rank)` |",
-                "| `promote_outer(x)` | `PromoteOuter(graph, x)` |",
-                "| `expand_ref(x, ref, expand_rank)` | `ExpandRef(graph, x, ref, expand_rank=...)` — static shapes only |",
-                "| `repeat_ref(x, ref)` | `RepeatRef(graph, x, ref)` |",
-                "| `repeat_static(x, factor)` | `RepeatStatic(graph, x, repeat_factor=factor)` |",
-                "| `flatten(x, min_r, max_r)` | `Flatten(graph, x, min_rank=min_r, max_rank=max_r)` |",
-                "| `reshape_stream(x, chunk, rank)` | `Reshape(graph, x, chunk_size=chunk, reshape_rank=rank, ...)` |",
-                "| `retile_streamify(x, chunk, split_row)` | `RetileStreamify(graph, x, split_row=split_row, chunk=chunk)` |",
-                "| `flat_partition(x, ctrl, n)` | `FlatPartition(graph, x, ctrl, ...)` |",
-                "| `flat_reassemble(ins, ctrl)` | `FlatReassemble(graph, ins, ctrl, ...)` |",
-                "| `offchip_store(x)` | `OffChipStore(graph, x, ...)` |",
-                "",
-                "```python",
-                dsl_code.rstrip(),
-                "```",
-                "",
-            ])
 
         sig = f"{func_name}(dims, tensors)" if tensors is not None else f"{func_name}(dims)"
         lines.append(

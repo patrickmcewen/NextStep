@@ -400,40 +400,6 @@ def _enhance_hybrid_error(exc: Exception, user_code: str, scaffold_lines: int) -
 
     return type(exc)("\n".join(parts))
 
-
-def _format_node_values(values: dict, graph) -> str:
-    """Format per-node tensor info for all nodes in topological order."""
-    lines = []
-    for node in networkx.topological_sort(graph):
-        nid = node.instance_id
-        op_type = node.__class__.__name__
-        val = values.get(nid)
-
-        if val is None:
-            lines.append(f"[{nid}] {op_type}: None (sink node)")
-            continue
-
-        if isinstance(val, list):
-            # Multi-output node
-            parts = []
-            for i, t in enumerate(val):
-                parts.append(f"  output[{i}]: shape={tuple(t.shape)}")
-                if t.is_floating_point():
-                    parts.append(f"    min={t.min().item():.6f} max={t.max().item():.6f} mean={t.mean().item():.6f}")
-            lines.append(f"[{nid}] {op_type}: {len(val)} outputs")
-            lines.extend(parts)
-            continue
-
-        # Single tensor output
-        shape_str = f"shape={tuple(val.shape)}"
-        stats = ""
-        if val.is_floating_point():
-            stats = f" min={val.min().item():.6f} max={val.max().item():.6f} mean={val.mean().item():.6f}"
-        lines.append(f"[{nid}] {op_type}: {shape_str}{stats}")
-
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # @function_tool wrappers
 # ---------------------------------------------------------------------------
