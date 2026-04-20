@@ -252,3 +252,137 @@ def _precompute_moe_routed(dims):
         "expert_multihot": expert_multihot,
         "expert_onehot": expert_onehot,
     }
+
+
+# ---------------------------------------------------------------------------
+# End-to-end transformer layer (attention + MoE)
+# ---------------------------------------------------------------------------
+
+@register("end_to_end")
+def _precompute_end_to_end(dims):
+    """Precompute tensors for the end-to-end transformer layer kernel.
+
+    Matches the RNG order in seed_kernels/end_to_end/reference.py:
+      torch.manual_seed(5); random.seed(42)
+      input_tensor, q_proj, k_proj, v_proj, cos, sin,
+      expert_weights (softmax of randn), w_gate_list, w_up_list, w_down_list,
+      per-element k_cache[i] / v_cache[i] fills, o_proj_weight
+    """
+    import sys
+    import random
+    from pathlib import Path
+    import numpy as np
+
+    # step_tl root derivation mirrors reference.py — needed for model_configs
+    # import and for locating routing / trace data files.
+    import step_py as _sp
+    _STEP_TL_ROOT = str(Path(_sp.__file__).resolve().parent.parent.parent)
+    if _STEP_TL_ROOT not in sys.path:
+        sys.path.insert(0, _STEP_TL_ROOT)
+    from end_to_end.model_configs import (
+        Mixtral8x7B, SmallerMixtral8x7B, Qwen30B, SmallerQwen30B,
+    )
+
+    _EXPERT_ROUTING = {
+        ("mixtral", 64): (8, 10),
+        ("mixtral", 1024): (19, 9),
+        ("qwen", 64): (32, 12),
+        ("qwen", 1024): (22, 16),
+    }
+
+    model_name = dims["model_name"]
+    batch = dims.get("batch", 64)
+    scale_seq = dims.get("scale_seq", 1)
+    is_small = dims.get("is_small", False)
+    stdev = dims["stdev"]
+    start = dims["start"]
+    end = dims["end"]
+
+    torch.manual_seed(5)
+    random.seed(42)
+
+    if model_name == "mixtral":
+        mc = SmallerMixtral8x7B() if is_small else Mixtral8x7B()
+    elif model_name == "qwen":
+        mc = SmallerQwen30B() if is_small else Qwen30B()
+    else:
+        assert False, f"Unknown model_name: {model_name}"
+
+    input_tensor = torch.randn(batch, mc.hidden_dim)
+    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
+    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    cos = torch.randn(batch, 1, mc.head_dim)
+    sin = torch.randn(batch, 1, mc.head_dim)
+
+    maxN = 4096 * scale_seq
+    k_cache = torch.zeros(batch, maxN, mc.num_kv_heads, mc.head_dim)
+    v_cache = torch.zeros(batch, maxN, mc.num_kv_heads, mc.head_dim)
+
+    routing_key = (model_name, batch)
+    assert routing_key in _EXPERT_ROUTING, f"No expert routing for {routing_key}"
+    iter_idx, layer_idx = _EXPERT_ROUTING[routing_key]
+    routing_path = (
+        Path(_STEP_TL_ROOT)
+        / f"dyn_tiling/expert_routing/{model_name}_b{batch}"
+        / f"iter_{iter_idx:03d}_layer_{layer_idx:03d}.npz"
+    )
+    assert routing_path.exists(), f"Expert routing file not found: {routing_path}"
+    expert_indices = torch.from_numpy(np.load(str(routing_path))["data"])
+
+    expert_weights = torch.softmax(
+        torch.randn(batch, mc.n_activated_experts), dim=-1
+    )
+    w_gate_list = [
+        torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
+        .weight.T.detach().clone().contiguous()
+        for _ in range(mc.n_routed_experts)
+    ]
+    w_up_list = [
+        torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
+        .weight.T.detach().clone().contiguous()
+        for _ in range(mc.n_routed_experts)
+    ]
+    w_down_list = [
+        torch.nn.Linear(mc.moe_inter_dim, mc.dim, bias=False)
+        .weight.T.detach().clone().contiguous()
+        for _ in range(mc.n_routed_experts)
+    ]
+
+    assert batch == end - start + 1, f"batch={batch} != end-start+1={end - start + 1}"
+    trace_path = (
+        Path(_STEP_TL_ROOT)
+        / f"dynamic_par/azure_trace/b{batch}"
+        / f"conv_stdev{stdev:04d}_{start:04d}_{end:04d}.npy"
+    )
+    assert trace_path.exists(), f"Trace file not found: {trace_path}"
+    num_token_list = np.load(str(trace_path)).astype(np.int64).tolist()
+    num_token_list = [x * scale_seq for x in num_token_list]
+
+    for i in range(batch):
+        k_cache[i, :num_token_list[i]] = torch.randn(
+            num_token_list[i], mc.num_kv_heads, mc.head_dim
+        )
+        v_cache[i, :num_token_list[i]] = torch.randn(
+            num_token_list[i], mc.num_kv_heads, mc.head_dim
+        )
+
+    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
+
+    return {
+        "input_tensor": input_tensor,
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
+        "cos": cos,
+        "sin": sin,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "expert_indices": expert_indices,
+        "expert_weights": expert_weights,
+        "w_gate_list": w_gate_list,
+        "w_up_list": w_up_list,
+        "w_down_list": w_down_list,
+        "num_token_list": num_token_list,
+        "o_proj_weight": o_proj_weight,
+    }

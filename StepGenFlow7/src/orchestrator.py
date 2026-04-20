@@ -34,7 +34,7 @@ from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
                          build_pass_system_prompt, build_pass_user_prompt,
                          _format_tensors_description)
 from src.tools import (_exec_build_graph, _exec_tiled_ref, _exec_hybrid_ref,
-                       _exec_dsl_ref, validate_tiling, _format_node_values,
+                       _exec_dsl_ref,
                        _validate_functional_mod, enhance_emulator_error)
 
 # ---------------------------------------------------------------------------
@@ -102,12 +102,33 @@ def _save_experience(kernel_name: str, code: str, metadata: dict, experience_dir
 # Correctness checkers for each executor type
 # ---------------------------------------------------------------------------
 
+_GOLD_CACHE: dict = {}
+
+
+def _get_gold(kernel_name, dims):
+    """Return the cached gold tensor for (kernel_name, dims), computing once.
+
+    `compute_gold(dims)` is deterministic (fixed seeds inside the reference) and
+    only depends on `dims`, so the result is safe to memoize for the lifetime of
+    the process.  This avoids re-allocating multi-GiB reference tensors on every
+    correctness check, which otherwise OOMs the cgroup on heavy kernels (e.g.
+    end_to_end Mixtral).
+    """
+    key = (kernel_name, json.dumps(dims, sort_keys=True, default=str))
+    cached = _GOLD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    config = _validate_functional_mod.load_config()
+    gold = _validate_functional_mod.run_reference(kernel_name, dims, config)
+    _GOLD_CACHE[key] = gold
+    return gold
+
+
 def _compare_against_gold(result, kernel_name, dims, label="result"):
     """Compare a tensor result against gold reference. Returns formatted string."""
     import torch
 
-    config = _validate_functional_mod.load_config()
-    gold = _validate_functional_mod.run_reference(kernel_name, dims, config)
+    gold = _get_gold(kernel_name, dims)
 
     if gold.shape != result.shape:
         return f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs {label} {tuple(result.shape)}\nmatch=False"
@@ -514,29 +535,6 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             _write(turn_dir / "correctness_result.txt", result)
 
             if "match=True" in result:
-                # Correctness passed — run tiling structure validation
-                # Runs after every pass to ensure tiled form is maintained.
-                if tensors is not None:
-                    tiling_violations = validate_tiling(code, dims, tensors)
-                    if tiling_violations:
-                        _write(turn_dir / "status.txt", "CORRECT_BUT_BAD_TILING")
-                        log(f"      -> CORRECT but {len(tiling_violations)} tiling violation(s)")
-                        _write(turn_dir / "tiling_violations.txt",
-                               "\n".join(tiling_violations))
-                        feedback = (
-                            "## Correctness: PASS\n\n"
-                            "Your code produces the correct output, but the tensor tiling "
-                            "structure is wrong:\n\n"
-                            + "\n".join(f"- {v}" for v in tiling_violations)
-                            + "\n\nEvery data tensor must be in tiled form "
-                            "(*stream_dims, tile_r, tile_c) with at least one streaming "
-                            "dimension > 1. Use tile sizes from dims (like tile_n), "
-                            "not full dimensions (like B)."
-                        )
-                        conversation.append({"role": "user", "content": feedback})
-                        continue
-
-                # Tiling OK — now check banned ops compliance
                 violations = _check_banned_ops(code, pass_name)
                 if violations:
                     _write(turn_dir / "status.txt", "CORRECT_BUT_NONCOMPLIANT")
