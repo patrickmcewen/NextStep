@@ -232,6 +232,11 @@ def accum_retile_col(x, rank=1):
     assert rank > 0, f"accum_retile_col: rank must be > 0, got {rank}"
     for _ in range(rank):
         s = x.shape
+        # Permute the accum dim (dim -3) next to the tile-col dim (dim -1)
+        # so the row-major reshape produces col-concatenated tiles.
+        ndim = x.ndim
+        perm = list(range(ndim - 3)) + [ndim - 2, ndim - 3, ndim - 1]
+        x = x.permute(perm).contiguous()
         x = x.reshape(*s[:-3], s[-2], s[-3] * s[-1])
     return x
 
@@ -383,6 +388,16 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
 
     return x.reshape(new_shape)
 
+def reshape_pad_stream(x, chunk_size, reshape_rank=0):
+    """Split the stream dim at ``reshape_rank`` into (new_count, chunk_size).
+
+    Mirrors ReshapePadStream in step_tl/ops.py: reshape_rank counts from the
+    right (0 = rightmost stream dim). Auto-pads with zeros when the dim size
+    isn't divisible by ``chunk_size`` and ``reshape_rank == 0``.
+    """
+    return reshape_stream(x, chunk_size=chunk_size, rank=reshape_rank)
+
+
 def retile_streamify(x, chunk, split_row=True):
     if split_row:
         stream_shape = x.shape[:-2]
@@ -443,10 +458,19 @@ def broadcast(x, n):
     return [x.clone() for _ in range(n)]
 
 def parallelize(x, n):
-    return list(torch.chunk(x, n, dim=0))
+    # Cycle-level round-robin (matches Rust parallelize.rs semantics with
+    # switch_cycles=[1,...]): consumer i gets tokens i, n+i, 2n+i, ...
+    # rather than a contiguous chunk.
+    return [x[i::n].contiguous() for i in range(n)]
 
 def static_reassemble(inputs, target_stream_shape=None):
-    result = torch.cat(inputs, dim=0)
+    # Inverse of parallelize: interleave tokens across inputs so
+    # output[k*n + i] = inputs[i][k]. Matches Rust static_reassemble
+    # round-robin dequeue.
+    n = len(inputs)
+    S = inputs[0].shape[0]
+    stacked = torch.stack(list(inputs), dim=1)  # (S, n, *rest)
+    result = stacked.reshape(S * n, *inputs[0].shape[1:])
     if target_stream_shape is not None:
         tile_r, tile_c = result.shape[-2], result.shape[-1]
         target = tuple(target_stream_shape) + (tile_r, tile_c)
@@ -540,7 +564,7 @@ DSL_FUNCTIONS = {
     # Accumulation
     "accum_add", "accum_mul", "accum_retile_row", "accum_retile_col",
     # Stream shape
-    "promote", "promote_outer", "flatten", "reshape_stream",
+    "promote", "promote_outer", "flatten", "reshape_stream", "reshape_pad_stream",
     "expand_ref", "repeat_ref", "repeat_static", "streamify",
     "retile_streamify",
     # Multi-output

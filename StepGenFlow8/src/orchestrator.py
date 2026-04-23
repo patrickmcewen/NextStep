@@ -28,7 +28,6 @@ from src.dsl_transforms import fuse_load_ref
 from agents import Runner
 
 from src.agents import make_judge_agent, make_pass_agent
-from src.precompute import precompute_tensors
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
                          DIRECT_TRANSLATOR_PASSES, PIPELINES,
                          build_pass_system_prompt, build_pass_user_prompt,
@@ -45,10 +44,12 @@ _STEPDB_DIR = _DEIO_ROOT / "StepDB"
 _STEP_TL_SRC = _DEIO_ROOT / "step_tl" / "src"
 _STEP_TL_PROTO = _STEP_TL_SRC / "proto"
 
-for p in (_STEP_TL_SRC, _STEP_TL_PROTO):
+for p in (_STEPDB_DIR, _STEP_TL_SRC, _STEP_TL_PROTO):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
+
+from precompute import precompute_tensors  # noqa: E402  (StepDB/precompute.py)
 
 
 # ---------------------------------------------------------------------------

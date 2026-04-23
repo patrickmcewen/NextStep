@@ -264,6 +264,38 @@ def _precompute_mla_paged_decode(dims):
 
 
 # ---------------------------------------------------------------------------
+# Rotary position embedding (Q/K rotation block from end_to_end reference)
+# ---------------------------------------------------------------------------
+
+@register("rope")
+def _precompute_rope(dims):
+    torch.manual_seed(SEED)
+    batch = dims["batch"]
+    num_q_heads = dims["num_q_heads"]
+    num_kv_heads = dims["num_kv_heads"]
+    head_dim = dims["head_dim"]
+    assert head_dim % 2 == 0, "head_dim must be even for rotate_half"
+
+    Q = torch.randn(batch, num_q_heads, head_dim)
+    K = torch.randn(batch, num_kv_heads, head_dim)
+    cos = torch.randn(batch, 1, head_dim)
+    sin = torch.randn(batch, 1, head_dim)
+    return {"Q": Q, "K": K, "cos": cos, "sin": sin}
+
+
+@register("rotate_half")
+def _precompute_rotate_half(dims):
+    torch.manual_seed(SEED)
+    batch = dims["batch"]
+    num_heads = dims["num_heads"]
+    head_dim = dims["head_dim"]
+    assert head_dim % 2 == 0, "head_dim must be even for rotate_half"
+
+    x = torch.randn(batch, num_heads, head_dim)
+    return {"x": x}
+
+
+# ---------------------------------------------------------------------------
 # Vector reduce
 # ---------------------------------------------------------------------------
 

@@ -1556,3 +1556,85 @@ mla_paged_decode:
       batch_size: 64
       kv_len: 2048
   origin: seed
+rope:
+  problem: seed_kernels/rope/reference.py
+  step_impl: null
+  params:
+  - batch
+  - num_q_heads
+  - num_kv_heads
+  - head_dim
+  presets:
+    tiny:
+      batch: 8
+      num_q_heads: 8
+      num_kv_heads: 2
+      head_dim: 16
+    small_qwen:
+      batch: 16
+      num_q_heads: 8
+      num_kv_heads: 2
+      head_dim: 16
+    small_mixtral:
+      batch: 16
+      num_q_heads: 16
+      num_kv_heads: 4
+      head_dim: 32
+    qwen_b64:
+      batch: 64
+      num_q_heads: 32
+      num_kv_heads: 4
+      head_dim: 64
+    qwen_b1024:
+      batch: 1024
+      num_q_heads: 32
+      num_kv_heads: 4
+      head_dim: 64
+    mixtral_b64:
+      batch: 64
+      num_q_heads: 32
+      num_kv_heads: 8
+      head_dim: 128
+    mixtral_b1024:
+      batch: 1024
+      num_q_heads: 32
+      num_kv_heads: 8
+      head_dim: 128
+  origin: seed
+rotate_half:
+  problem: seed_kernels/rotate_half/reference.py
+  step_impl: seed_kernels/rotate_half/step_impl.py
+  params:
+  - batch
+  - num_heads
+  - head_dim
+  presets:
+    tiny:
+      batch: 8
+      num_heads: 8
+      head_dim: 16
+    small_qwen:
+      batch: 16
+      num_heads: 8
+      head_dim: 16
+    small_mixtral:
+      batch: 16
+      num_heads: 16
+      head_dim: 32
+    qwen_b64:
+      batch: 64
+      num_heads: 32
+      head_dim: 64
+    qwen_b1024:
+      batch: 1024
+      num_heads: 32
+      head_dim: 64
+    mixtral_b64:
+      batch: 64
+      num_heads: 32
+      head_dim: 128
+    mixtral_b1024:
+      batch: 1024
+      num_heads: 32
+      head_dim: 128
+  origin: seed
