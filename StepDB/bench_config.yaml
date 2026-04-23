@@ -1471,3 +1471,88 @@ end_to_end:
       start: 1
       end: 64
   origin: seed
+gqa_ragged_prefill:
+  problem: seed_kernels/gqa_ragged_prefill/reference.py
+  step_impl: null
+  params:
+  - batch_size
+  - q_len
+  - kv_len
+  presets:
+    tiny:
+      batch_size: 1
+      q_len: 8
+      kv_len: 8
+    small:
+      batch_size: 2
+      q_len: 16
+      kv_len: 32
+    single_seq_256:
+      batch_size: 1
+      q_len: 256
+      kv_len: 256
+    batch4_ctx512:
+      batch_size: 4
+      q_len: 128
+      kv_len: 512
+    batch8_ctx1k:
+      batch_size: 8
+      q_len: 256
+      kv_len: 1024
+    long_ctx_2k:
+      batch_size: 2
+      q_len: 512
+      kv_len: 2048
+  origin: seed
+gqa_paged_decode:
+  problem: seed_kernels/gqa_paged_decode/reference.py
+  step_impl: null
+  params:
+  - batch_size
+  - kv_len
+  presets:
+    tiny:
+      batch_size: 1
+      kv_len: 16
+    small:
+      batch_size: 4
+      kv_len: 32
+    batch8_ctx256:
+      batch_size: 8
+      kv_len: 256
+    batch16_ctx512:
+      batch_size: 16
+      kv_len: 512
+    batch32_ctx1k:
+      batch_size: 32
+      kv_len: 1024
+    batch64_ctx2k:
+      batch_size: 64
+      kv_len: 2048
+  origin: seed
+mla_paged_decode:
+  problem: seed_kernels/mla_paged_decode/reference.py
+  step_impl: null
+  params:
+  - batch_size
+  - kv_len
+  presets:
+    tiny:
+      batch_size: 1
+      kv_len: 16
+    small:
+      batch_size: 4
+      kv_len: 32
+    batch8_ctx256:
+      batch_size: 8
+      kv_len: 256
+    batch16_ctx512:
+      batch_size: 16
+      kv_len: 512
+    batch32_ctx1k:
+      batch_size: 32
+      kv_len: 1024
+    batch64_ctx2k:
+      batch_size: 64
+      kv_len: 2048
+  origin: seed
