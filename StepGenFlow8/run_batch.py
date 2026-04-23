@@ -2,8 +2,8 @@
 
 import argparse
 import asyncio
-import json
 
+from src.config_loader import load_llm_config
 from src.orchestrator import run_kernel
 
 EASY_KERNELS = ["element_wise_add", "copy_2d", "silu_activation", "chained_unary"]
@@ -51,7 +51,11 @@ def main():
     parser = argparse.ArgumentParser(description="Batch run StepGenFlow")
     parser.add_argument("--tier", choices=["easy", "medium", "all"], default="all")
     parser.add_argument("--preset", default="small")
-    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--model", default="gpt-oss120b",
+                        help="Profile name under configs/ (loads configs/<name>.json). "
+                             "Ignored if --config is given.")
+    parser.add_argument("--config", default=None,
+                        help="Explicit path to an LLM config JSON (overrides --model).")
     parser.add_argument("--max-outer", type=int, default=3)
     parser.add_argument("--max-turns", type=int, default=5)
     parser.add_argument("--results-dir", default="results")
@@ -64,8 +68,7 @@ def main():
                              "Skips lowering and starts directly from translation.")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        llm_config = json.load(f)
+    llm_config = load_llm_config(args.config, args.model)
 
     kernels = []
     if args.tier in ("easy", "all"):

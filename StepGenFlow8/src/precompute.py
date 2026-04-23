@@ -165,6 +165,105 @@ def _precompute_multi_query_attn(dims):
 
 
 # ---------------------------------------------------------------------------
+# flashinfer_trace-derived attention kernels (bfloat16 inputs, fixed constants)
+# RNG order must match seed_kernels/<kernel>/reference.py exactly.
+# ---------------------------------------------------------------------------
+
+@register("gqa_ragged_prefill")
+def _precompute_gqa_ragged_prefill(dims):
+    import math
+
+    # Constants baked into the source JSON (gqa_ragged_prefill_causal_h32_kv16_d128)
+    NUM_QO_HEADS = 32
+    NUM_KV_HEADS = 16
+    HEAD_DIM = 128
+
+    torch.manual_seed(SEED)
+    batch_size = dims["batch_size"]
+    q_len = dims["q_len"]
+    kv_len = dims["kv_len"]
+    assert kv_len >= q_len, "kv_len must be >= q_len for the causal mask"
+
+    total_q = batch_size * q_len
+    total_kv = batch_size * kv_len
+
+    q = torch.randn(total_q, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16)
+    k = torch.randn(total_kv, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16)
+    v = torch.randn(total_kv, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * q_len
+    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    return {
+        "q": q, "k": k, "v": v,
+        "qo_indptr": qo_indptr, "kv_indptr": kv_indptr,
+        "sm_scale": sm_scale,
+    }
+
+
+@register("gqa_paged_decode")
+def _precompute_gqa_paged_decode(dims):
+    import math
+
+    # Constants from gqa_paged_decode_h32_kv16_d128_ps1
+    NUM_QO_HEADS = 32
+    NUM_KV_HEADS = 16
+    HEAD_DIM = 128
+    PAGE_SIZE = 1
+
+    torch.manual_seed(SEED)
+    batch_size = dims["batch_size"]
+    kv_len = dims["kv_len"]
+    num_pages = batch_size * kv_len
+
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16)
+    k_cache = torch.randn(
+        num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn(
+        num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16
+    )
+    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
+    kv_indices = torch.arange(num_pages, dtype=torch.int32)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    return {
+        "q": q, "k_cache": k_cache, "v_cache": v_cache,
+        "kv_indptr": kv_indptr, "kv_indices": kv_indices,
+        "sm_scale": sm_scale,
+    }
+
+
+@register("mla_paged_decode")
+def _precompute_mla_paged_decode(dims):
+    import math
+
+    # Constants from mla_paged_decode_h16_ckv512_kpe64_ps1 (DeepSeek-V3 TP=8)
+    NUM_QO_HEADS = 16
+    HEAD_DIM_CKV = 512
+    HEAD_DIM_KPE = 64
+    PAGE_SIZE = 1
+
+    torch.manual_seed(SEED)
+    batch_size = dims["batch_size"]
+    kv_len = dims["kv_len"]
+    num_pages = batch_size * kv_len
+
+    q_nope = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM_CKV, dtype=torch.bfloat16)
+    q_pe = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM_KPE, dtype=torch.bfloat16)
+    ckv_cache = torch.randn(num_pages, PAGE_SIZE, HEAD_DIM_CKV, dtype=torch.bfloat16)
+    kpe_cache = torch.randn(num_pages, PAGE_SIZE, HEAD_DIM_KPE, dtype=torch.bfloat16)
+    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
+    kv_indices = torch.arange(num_pages, dtype=torch.int32)
+    # Per JSON: sm_scale = 1/sqrt(128 + 64), using pre-absorption head dims
+    sm_scale = 1.0 / math.sqrt(128 + HEAD_DIM_KPE)
+    return {
+        "q_nope": q_nope, "q_pe": q_pe,
+        "ckv_cache": ckv_cache, "kpe_cache": kpe_cache,
+        "kv_indptr": kv_indptr, "kv_indices": kv_indices,
+        "sm_scale": sm_scale,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Vector reduce
 # ---------------------------------------------------------------------------
 

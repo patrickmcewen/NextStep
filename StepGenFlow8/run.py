@@ -2,9 +2,9 @@
 
 import argparse
 import asyncio
-import json
 import sys
 
+from src.config_loader import load_llm_config
 from src.orchestrator import run_kernel
 
 
@@ -12,8 +12,12 @@ def main():
     parser = argparse.ArgumentParser(description="StepGenFlow — generate STeP programs from PyTorch references")
     parser.add_argument("kernel", help="Kernel name from StepDB (e.g., element_wise_add)")
     parser.add_argument("preset", help="Preset name (e.g., small)")
-    parser.add_argument("--config", default="config.json", help="Path to LLM config JSON")
-    parser.add_argument("--max-outer", type=int, default=3, help="Max outer loop iterations")
+    parser.add_argument("--model", default="gpt-oss120b",
+                        help="Profile name under configs/ (loads configs/<name>.json). "
+                             "Ignored if --config is given.")
+    parser.add_argument("--config", default=None,
+                        help="Explicit path to an LLM config JSON (overrides --model).")
+    parser.add_argument("--max-outer", type=int, default=1, help="Max outer loop iterations")
     parser.add_argument("--max-turns", type=int, default=11, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
@@ -26,8 +30,7 @@ def main():
                              "Skips lowering and starts directly from translation.")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        llm_config = json.load(f)
+    llm_config = load_llm_config(args.config, args.model)
 
     result = asyncio.run(run_kernel(
         kernel_name=args.kernel,

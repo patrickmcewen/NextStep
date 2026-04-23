@@ -61,6 +61,23 @@ def _extract_code(text: str) -> str:
     return blocks[-1].strip() if blocks else ""
 
 
+def _reasoning_text(run_result) -> str:
+    """Concatenate any reasoning summaries attached to a RunResult.
+
+    Returns "" when the model produced no reasoning items (non-reasoning
+    models, or a turn where the provider didn't return the `reasoning`
+    field). The orchestrator writes this separately from `response.txt`
+    so chain-of-thought never contaminates code extraction.
+    """
+    from agents import ReasoningItem
+    chunks: list[str] = []
+    for item in run_result.new_items:
+        if isinstance(item, ReasoningItem):
+            for summary in item.raw_item.summary:
+                chunks.append(summary.text)
+    return "\n\n".join(chunks)
+
+
 def _error_summary(err: str) -> str:
     """Extract a meaningful one-line summary from a traceback string."""
     for line in err.splitlines():
@@ -417,6 +434,9 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
     result = await Runner.run(judge_agent, [{"role": "user", "content": judge_prompt}])
     judge_text = result.final_output or ""
     _write(turn_dir / "judge_response.txt", judge_text)
+    judge_reasoning = _reasoning_text(result)
+    if judge_reasoning:
+        _write(turn_dir / "judge_reasoning.txt", judge_reasoning)
 
     if "VERDICT: PASS" in judge_text:
         return None
@@ -470,6 +490,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         assistant_text = run_result.final_output or ""
         conversation.append({"role": "assistant", "content": assistant_text})
         _write(turn_dir / "response.txt", assistant_text)
+        reasoning = _reasoning_text(run_result)
+        if reasoning:
+            _write(turn_dir / "reasoning.txt", reasoning)
 
         code = _extract_code(assistant_text)
         if not code:

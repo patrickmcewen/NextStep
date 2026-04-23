@@ -24,6 +24,7 @@ _STEPDB_DIR = _DEIO_ROOT / "StepDB"
 _STEP_TL_SRC = _DEIO_ROOT / "step_tl" / "src"
 _STEP_TL_PROTO = _STEP_TL_SRC / "proto"
 _FUNCTIONAL_PY = _STEP_TL_SRC / "step_py" / "functional.py"
+_TIMING_PY = _STEP_TL_SRC / "step_py" / "timing.py"
 
 for p in (_STEP_TL_SRC, _STEP_TL_PROTO):
     sp = str(p)
@@ -141,6 +142,81 @@ _JUDGE_TEMPLATES = {
     "translate": "translate_judge_system.txt",
     "translate_full": "translate_judge_system.txt",
 }
+
+
+def build_autotune_system_prompt(hw_constraints: dict,
+                                  template_name: str = "autotune_system.txt") -> str:
+    """Build the autotuner agent's system prompt.
+
+    Injects the full source of step_py/timing.py at {timing_code} so the LLM
+    knows exactly how each knob maps to total_cycles, and the caller-supplied
+    `hw_constraints` dict (rendered as JSON) at {hw_constraints}.
+
+    `template_name` selects which autotune prompt to use (e.g.,
+    "autotune_system.txt" for the generalist, "autotune_parallel_system.txt"
+    for the parallelism specialist). All templates share the same placeholder
+    set so injection logic is identical.
+    """
+    template_path = _PROMPTS_DIR / template_name
+    assert template_path.exists(), f"autotune prompt not found: {template_path}"
+    assert _TIMING_PY.exists(), f"timing.py not found: {_TIMING_PY}"
+    template = template_path.read_text()
+    replacements = {}
+    if "{ops_code}" in template:
+        ops_path = _STEP_TL_SRC / "step_py" / "ops.py"
+        assert ops_path.exists(), f"ops.py not found: {ops_path}"
+        replacements["ops_code"] = ops_path.read_text()
+    if "{utility_ops_code}" in template:
+        utility_ops_path = _STEP_TL_SRC / "step_py" / "utility_ops.py"
+        assert utility_ops_path.exists(), f"utility_ops.py not found: {utility_ops_path}"
+        replacements["utility_ops_code"] = utility_ops_path.read_text()
+    if "{functional_code}" in template:
+        assert _FUNCTIONAL_PY.exists(), f"functional.py not found: {_FUNCTIONAL_PY}"
+        replacements["functional_code"] = _FUNCTIONAL_PY.read_text()
+    if "{timing_code}" in template:
+        assert _TIMING_PY.exists(), f"timing.py not found: {_TIMING_PY}"
+        replacements["timing_code"] = _TIMING_PY.read_text()
+    if "{hw_constraints}" in template:
+        replacements["hw_constraints"] = json.dumps(hw_constraints, indent=2)
+    return template.format(**replacements)
+
+
+def build_autotune_user_prompt(kernel_name: str, dims: dict, build_graph_code: str,
+                                timing_report: str, baseline_cycles: int,
+                                best_cycles: int) -> str:
+    """Build the autotuner user prompt for a single turn.
+
+    `timing_report` is the pretty-printed analyze_timing() output for the
+    current build_graph. `baseline_cycles` is the cycle count at the start
+    of the tuning run; `best_cycles` is the best we've seen so far.
+    """
+    return "\n".join([
+        f"## Kernel: {kernel_name}",
+        "",
+        "### Dimensions",
+        "",
+        "```json",
+        json.dumps(dims, indent=2),
+        "```",
+        "",
+        f"### Baseline total_cycles: {baseline_cycles}",
+        f"### Best so far:          {best_cycles}",
+        "",
+        "### Current build_graph (correctness verified)",
+        "",
+        "```python",
+        build_graph_code.rstrip(),
+        "```",
+        "",
+        "### Current timing report",
+        "",
+        "```",
+        timing_report.rstrip(),
+        "```",
+        "",
+        "Propose a change that reduces total_cycles. Output the full updated "
+        "`build_graph(dims, tensors)` in a single ```python block.",
+    ])
 
 
 def build_judge_system_prompt(pass_name: str) -> str:
