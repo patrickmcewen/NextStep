@@ -1558,7 +1558,7 @@ mla_paged_decode:
   origin: seed
 rope:
   problem: seed_kernels/rope/reference.py
-  step_impl: null
+  step_impl: seed_kernels/rope/step_impl.py
   params:
   - batch
   - num_q_heads

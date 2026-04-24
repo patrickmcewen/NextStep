@@ -2,17 +2,39 @@ You are an expert at translating DSL-refactored PyTorch code into a complete STe
 
 You will receive DSL-refactored code where ALL operations are intermediate DSL function calls (from step_dsl.py). Each DSL call maps 1:1 to a STeP graph node. Your job: replace each DSL call with its STeP equivalent, wire them into a `Graph`, and return `(graph, output_op)`.
 
+## Runtime environment
+
+Your `build_graph` runs after the following scaffold is prepended. These names — and ONLY these — are in scope. Do not add `import` lines of your own; any import fails the exec.
+
+```python
+{import_scaffold}
+```
+
+Things that look like they should be in scope but are NOT:
+  - The DSL functions (`offchip_load`, `binary_matmul`, `select_gen`, `flat_partition`, …). They exist only in the refactor pass's scaffold. Calling them here raises `NameError`. Every DSL call in the input must become a node-class construction.
+  - `get_stream` from `ops.py`. To read a stream from a node: use `node.stream` on a `StepOps`, or `node.stream_idx(i)` on a tuple ref `(node, i)`.
+
 ## Section 1: DSL → STeP IR Mapping
 
-Each DSL function from step_dsl.py maps to a STeP graph node constructor. Source nodes (LinearOffChipLoad, SelectGen) do NOT take `graph` — you must call `graph.add_node(node)` manually. All other nodes take `graph` as the FIRST positional arg and auto-register.
+Each DSL call becomes a node-class construction. Two calling conventions:
 
-Source nodes require `graph.add_node(node)`. All other nodes take `graph` as first arg and auto-register.
+  (a) Source nodes — `LinearOffChipLoad`, `SelectGen`, `MetadataGen` — are constructed WITHOUT graph, then registered manually:
+          node = LinearOffChipLoad(underlying, ...)
+          graph.add_node(node)
+  (b) Every other node takes `graph` as its FIRST positional arg and auto-registers (and auto-wires edges from its input nodes):
+          out = BinaryMap(graph, a, b, fn=map_fn.Matmul(), ...)
+
+The table below lists the target class for each DSL call. Entries marked "+ `graph.add_node()`" follow convention (a); all others follow (b).
 
 | DSL function | STeP IR node | map_fn / accum_fn |
 |---|---|---|
 | `offchip_load` | `LinearOffChipLoad` + `graph.add_node()` | — |
 | `offchip_load_ref` | `LinearOffChipLoadRef` (takes `graph` as first arg) | — |
+| `random_offchip_load` | `RandomOffChipLoad` | — |
 | `select_gen` | `SelectGen` + `graph.add_node()` | — |
+| `metadata_gen` | `MetadataGen` + `graph.add_node()` | — |
+| `cache_read_addr_gen` | `CacheReadAddrGen` | — |
+| `filter_last_tile` | `FilterLastTile` | — |
 | `binary_matmul` | `BinaryMap` | `map_fn.Matmul` |
 | `binary_mul` | `BinaryMap` | `map_fn.Mul` |
 | `binary_add` | `BinaryMap` | `map_fn.Add` |
@@ -36,6 +58,7 @@ Source nodes require `graph.add_node(node)`. All other nodes take `graph` as fir
 | `promote_outer` | `PromoteOuter` | — |
 | `flatten` | `Flatten` | — |
 | `reshape_stream` | `Reshape` | — |
+| `reshape_pad_stream` | `ReshapePadStream` (pass `have_pad_stream=False`, `pad_fn=None` unless a pad mask is needed) | — |
 | `expand_ref` | `ExpandRef` (static shapes only — see note below) | — |
 | `repeat_ref` | `RepeatRef` | — |
 | `repeat_static` | `RepeatStatic` | — |
@@ -47,6 +70,7 @@ Source nodes require `graph.add_node(node)`. All other nodes take `graph` as fir
 | `flat_partition` | `FlatPartition` | `partition_rank=0` (DSL always flattens entire stream) |
 | `flat_reassemble` | `FlatReassemble` | `reassemble_rank=0` (matches partition_rank) |
 | `offchip_store` | `OffChipStore` | — |
+| `random_offchip_store` | `RandomOffChipStore` | — |
 
 Multi-output nodes (`Broadcast`, `Parallelize`, `FlatPartition`): access outputs as tuple refs `(node, i)`, NOT `node[i]`.
 
@@ -82,6 +106,30 @@ static→dynamic shapes. The DSL enforces this by using `offchip_load_ref` for d
 ### Utility ops (utility_ops.py)
 ```python
 {utility_ops_code}
+```
+
+### Map / Accum / Init function classes
+
+These are the `fn=` / `init_fn=` arguments passed into `BinaryMap`, `UnaryMap`, `Accum`, `BinaryMapAccum`, `ReshapePadStream`, etc. Their constructors are defined here, not in `ops.py`.
+
+#### init_fn.py
+```python
+{init_fn_code}
+```
+
+#### map_fn.py
+```python
+{map_fn_code}
+```
+
+#### accum_fn.py
+```python
+{accum_fn_code}
+```
+
+#### map_accum_fn.py
+```python
+{map_accum_fn_code}
 ```
 
 ## Section 3: STeP Functional Emulator (functional.py)

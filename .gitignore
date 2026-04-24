@@ -1,5 +1,7 @@
 **/checkpoints/**
+**/checkpoints_autotune/**
 **__pycache__**
 **/docs/**
 **/_work_**
 **/config.json
+**/configs/**

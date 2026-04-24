@@ -114,6 +114,8 @@ def build_pass_system_prompt(pass_name: str) -> str:
 
     # Inject source code from canonical files into placeholders
     replacements = {}
+    if "{import_scaffold}" in template:
+        replacements["import_scaffold"] = IMPORT_SCAFFOLD
     if "{ops_code}" in template:
         ops_path = _STEP_TL_SRC / "step_py" / "ops.py"
         assert ops_path.exists(), f"ops.py not found: {ops_path}"
@@ -122,6 +124,12 @@ def build_pass_system_prompt(pass_name: str) -> str:
         utility_ops_path = _STEP_TL_SRC / "step_py" / "utility_ops.py"
         assert utility_ops_path.exists(), f"utility_ops.py not found: {utility_ops_path}"
         replacements["utility_ops_code"] = utility_ops_path.read_text()#_strip_ops_boilerplate(utility_ops_path.read_text())
+    for fn_name in ("init_fn", "map_fn", "accum_fn", "map_accum_fn"):
+        placeholder = "{" + fn_name + "_code}"
+        if placeholder in template:
+            fn_path = _STEP_TL_SRC / "step_py" / "functions" / f"{fn_name}.py"
+            assert fn_path.exists(), f"{fn_name}.py not found: {fn_path}"
+            replacements[f"{fn_name}_code"] = fn_path.read_text()
     if "{functional_code}" in template:
         assert _FUNCTIONAL_PY.exists(), f"functional.py not found: {_FUNCTIONAL_PY}"
         replacements["functional_code"] = _FUNCTIONAL_PY.read_text()
@@ -227,6 +235,36 @@ def build_judge_system_prompt(pass_name: str) -> str:
     return template_path.read_text()
 
 
+def _get_precompute_source(kernel_name: str) -> str:
+    """Extract the source of the precompute.py function registered for `kernel_name`.
+
+    Finds the @register(kernel_name) decorator via AST and returns the full
+    function source including all of its @register(...) decorators (one
+    function may handle several kernels).
+    """
+    precompute_path = _STEPDB_DIR / "precompute.py"
+    assert precompute_path.exists(), f"precompute.py not found: {precompute_path}"
+    source = precompute_path.read_text()
+    source_lines = source.splitlines()
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for dec in node.decorator_list:
+            if (isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Name)
+                    and dec.func.id == "register"
+                    and len(dec.args) == 1
+                    and isinstance(dec.args[0], ast.Constant)
+                    and dec.args[0].value == kernel_name):
+                start = node.decorator_list[0].lineno
+                end = node.end_lineno
+                return "\n".join(source_lines[start - 1:end])
+
+    assert False, f"No @register('{kernel_name}') found in {precompute_path}"
+
+
 def _format_tensors_description(tensors: dict) -> str:
     """Format a human-readable description of the tensors dict for the prompt."""
     lines = []
@@ -291,6 +329,7 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
 
     # Add tensors dict description
     if tensors is not None:
+        precompute_src = _get_precompute_source(kernel_name)
         lines.extend([
             "",
             "### Pre-computed Tensors",
@@ -299,6 +338,12 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
             "",
             "```",
             _format_tensors_description(tensors),
+            "```",
+            "",
+            "These tensors are produced by the following precompute function (from `StepDB/precompute.py`):",
+            "",
+            "```python",
+            precompute_src,
             "```",
             "",
             "**You MUST NOT call `torch.manual_seed`, `torch.randn`, `torch.rand`, or use the `@` operator.**",

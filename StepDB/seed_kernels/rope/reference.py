@@ -10,8 +10,14 @@ where rotate_half(x) = concat([-x[..., D/2:], x[..., :D/2]], dim=-1).
 
 Operates on Q [batch, num_q_heads, head_dim] and K [batch, num_kv_heads,
 head_dim], with cos/sin of shape [batch, 1, head_dim] broadcasting over the
-head axis. compute_gold returns Q_rot and K_rot concatenated along the head
-axis so the reference has a single tensor output.
+head axis.
+
+compute_gold concatenates Q_out and K_out along the heads axis (dim=1),
+then flattens to (batch*(num_q_heads + num_kv_heads), head_dim). Rows are
+ordered per-batch: each batch contributes its num_q_heads Q rows followed
+by its num_kv_heads K rows. This is the natural layout produced by the
+STeP impl, which stacks Q and K vertically per batch and runs a single
+rotate_half + cos/sin pipeline over the combined tensor.
 """
 import torch
 import torch.nn as nn
@@ -32,7 +38,7 @@ class Model(nn.Module):
     def forward(self, Q, K, cos, sin):
         Q_out = Q * cos + _rotate_half(Q) * sin
         K_out = K * cos + _rotate_half(K) * sin
-        return torch.cat([Q_out, K_out], dim=1)
+        return Q_out, K_out
 
 
 def get_inputs(dims):
@@ -57,4 +63,7 @@ def get_init_inputs(dims):
 def compute_gold(dims):
     model = Model(*get_init_inputs(dims))
     inputs = get_inputs(dims)
-    return model(*inputs)
+    Q_out, K_out = model(*inputs)
+    head_dim = dims["head_dim"]
+    combined = torch.cat([Q_out, K_out], dim=1)
+    return combined.reshape(-1, head_dim)

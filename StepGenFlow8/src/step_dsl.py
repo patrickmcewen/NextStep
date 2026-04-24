@@ -60,6 +60,7 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     return loaded.expand(target).contiguous()
 
 def select_gen(underlying):
+    _assert_int(underlying, "select_gen")
     return underlying
 
 def metadata_gen(tensor):
@@ -142,7 +143,20 @@ def _assert_stream_match(a, b, op_name):
     )
 
 
+def _assert_float(x, op_name):
+    assert x.dtype in (torch.float32, torch.float16), (
+        f"{op_name}: input dtype must be float32 or float16, got {x.dtype}."
+    )
+
+def _assert_int(x, op_name):
+    assert x.dtype in (torch.int32, torch.int64), (
+        f"{op_name}: input dtype must be int32 or int64, got {x.dtype}."
+    )
+
+
 def binary_matmul(a, b, weight_transposed=False):
+    _assert_float(a, "binary_matmul")
+    _assert_float(b, "binary_matmul")
     _assert_stream_match(a, b, "binary_matmul")
     if weight_transposed:
         return torch.matmul(a, b.transpose(-2, -1))
@@ -150,21 +164,29 @@ def binary_matmul(a, b, weight_transposed=False):
 
 
 def binary_mul(a, b):
+    _assert_float(a, "binary_mul")
+    _assert_float(b, "binary_mul")
     _assert_stream_match(a, b, "binary_mul")
     return a * b
 
 
 def binary_add(a, b):
+    _assert_float(a, "binary_add")
+    _assert_float(b, "binary_add")
     _assert_stream_match(a, b, "binary_add")
     return a + b
 
 
 def binary_div(a, b):
+    _assert_float(a, "binary_div")
+    _assert_float(b, "binary_div")
     _assert_stream_match(a, b, "binary_div")
     return a / b
 
 
 def binary_is_equal(a, b):
+    _assert_float(a, "binary_is_equal")
+    _assert_float(b, "binary_is_equal")
     _assert_stream_match(a, b, "binary_is_equal")
     return (a == b).float()
 
@@ -175,47 +197,59 @@ def binary_is_equal(a, b):
 # ---------------------------------------------------------------------------
 
 def unary_silu(x):
+    _assert_float(x, "unary_silu")
     return F.silu(x)
 
 
 def unary_square(x):
+    _assert_float(x, "unary_square")
     return x ** 2
 
 
 def unary_exp(x):
+    _assert_float(x, "unary_exp")
     return torch.exp(x)
 
 
 def unary_rsqrt(x):
+    _assert_float(x, "unary_rsqrt")
     return torch.rsqrt(x)
 
 
 def unary_pow2(x):
+    _assert_float(x, "unary_pow2")
     return torch.pow(2.0, x)
 
 
 def unary_mul_imm(x, constant):
+    _assert_float(x, "unary_mul_imm")
+    assert constant != 0.0, "unary_mul_imm: constant must be nonzero."
     return x * constant
 
 
 def unary_add_imm(x, constant):
+    _assert_float(x, "unary_add_imm")
     return x + constant
 
 
 def unary_sub_imm(x, constant):
+    _assert_float(x, "unary_sub_imm")
     return x - constant
 
 
 def unary_rowwise_sum(x):
+    _assert_float(x, "unary_rowwise_sum")
     return x.sum(dim=-1, keepdim=True)
 
 def accum_add(x, rank=1):
+    _assert_float(x, "accum_add")
     assert rank > 0, f"accum_add: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.sum(dim=-3)
     return x
 
 def accum_mul(x, rank=1):
+    _assert_float(x, "accum_mul")
     assert rank > 0, f"accum_mul: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.prod(dim=-3)
@@ -479,6 +513,8 @@ def static_reassemble(inputs, target_stream_shape=None):
     return result
 
 def binary_map_accum(a, b, rank=1, weight_transposed=False):
+    _assert_float(a, "binary_map_accum")
+    _assert_float(b, "binary_map_accum")
     assert rank > 0, f"binary_map_accum: rank must be > 0, got {rank}"
     _assert_stream_match(a, b, "binary_map_accum")
     if weight_transposed:

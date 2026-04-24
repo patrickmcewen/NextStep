@@ -269,6 +269,11 @@ def _precompute_mla_paged_decode(dims):
 
 @register("rope")
 def _precompute_rope(dims):
+    """Inputs for the rope step_impl: Q and K are stacked along the heads dim
+    into one (batch, num_q_heads + num_kv_heads, head_dim) tensor `QK`, since
+    rotate_half + cos/sin multiply-add is per-head and applies identically to
+    Q and K rows. The step_impl runs a single rotate_half pipeline on QK.
+    """
     torch.manual_seed(SEED)
     batch = dims["batch"]
     num_q_heads = dims["num_q_heads"]
@@ -280,7 +285,8 @@ def _precompute_rope(dims):
     K = torch.randn(batch, num_kv_heads, head_dim)
     cos = torch.randn(batch, 1, head_dim)
     sin = torch.randn(batch, 1, head_dim)
-    return {"Q": Q, "K": K, "cos": cos, "sin": sin}
+    QK = torch.cat([Q, K], dim=1).contiguous()
+    return {"QK": QK, "cos": cos, "sin": sin}
 
 
 @register("rotate_half")
