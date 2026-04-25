@@ -1638,3 +1638,44 @@ rotate_half:
       num_heads: 32
       head_dim: 128
   origin: seed
+
+qkv_gen:
+  problem: seed_kernels/qkv_gen/reference.py
+  step_impl: seed_kernels/qkv_gen/step_impl.py
+  params:
+  - B
+  - D
+  - N_HEAD
+  - HEAD_DIM
+  presets:
+    tiny:
+      B: 8
+      D: 16
+      N_HEAD: 2
+      HEAD_DIM: 8
+    small:
+      B: 16
+      D: 64
+      N_HEAD: 4
+      HEAD_DIM: 16
+    medium:
+      B: 64
+      D: 512
+      N_HEAD: 8
+      HEAD_DIM: 64
+    llama_b64:
+      B: 64
+      D: 4096
+      N_HEAD: 32
+      HEAD_DIM: 128
+    qwen_b64:
+      B: 64
+      D: 5120
+      N_HEAD: 40
+      HEAD_DIM: 128
+    mixtral_b64:
+      B: 64
+      D: 4096
+      N_HEAD: 32
+      HEAD_DIM: 128
+  origin: seed

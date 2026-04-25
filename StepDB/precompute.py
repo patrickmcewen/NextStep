@@ -289,6 +289,31 @@ def _precompute_rope(dims):
     return {"QK": QK, "cos": cos, "sin": sin}
 
 
+@register("qkv_gen")
+def _precompute_qkv_gen(dims):
+    torch.manual_seed(SEED)
+    B = dims["B"]
+    D = dims["D"]
+    N_HEAD = dims["N_HEAD"]
+    HEAD_DIM = dims["HEAD_DIM"]
+    assert HEAD_DIM % 2 == 0, "HEAD_DIM must be even for rotate_half"
+
+    q_proj = torch.randn(D, N_HEAD * HEAD_DIM)
+    k_proj = torch.randn(D, N_HEAD * HEAD_DIM)
+    v_proj = torch.randn(D, N_HEAD * HEAD_DIM)
+    x = torch.randn(B, D)
+    cos = torch.randn(B, 1, HEAD_DIM)
+    sin = torch.randn(B, 1, HEAD_DIM)
+    return {
+        "x": x,
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
+        "cos": cos,
+        "sin": sin,
+    }
+
+
 @register("rotate_half")
 def _precompute_rotate_half(dims):
     torch.manual_seed(SEED)

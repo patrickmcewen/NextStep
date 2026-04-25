@@ -13,6 +13,7 @@ from pathlib import Path
 
 import torch
 import yaml
+import traceback
 
 STEPDB_DIR = str(Path(__file__).resolve().parent)
 STEP_TL_SRC = str(Path(__file__).resolve().parent.parent / "step_tl" / "src")
@@ -125,7 +126,7 @@ def build_graph_from_impl(kernel_name, dims, config):
     with open(impl_path) as f:
         impl_code = f.read()
 
-    full_code = IMPORT_SCAFFOLD + "\n" + _strip_imports(impl_code)
+    full_code = IMPORT_SCAFFOLD + "\n" + impl_code#+ _strip_imports(impl_code)
     namespace = {}
     exec(full_code, namespace)
     assert "build_graph" in namespace, f"build_graph not found in {impl_path}"
@@ -219,7 +220,7 @@ def main():
             results.append((kernel, preset, match, max_err, msg))
         except Exception as e:
             status = "ERR"
-            print(f"  {status:4s}  {kernel:30s} {preset:15s}  {e}")
+            print(f"  {status:4s}  {kernel:30s} {preset:15s}  {traceback.format_exc()}")
             results.append((kernel, preset, False, float("inf"), str(e)))
 
     # Summary
