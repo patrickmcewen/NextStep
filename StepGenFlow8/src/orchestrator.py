@@ -15,7 +15,10 @@ Checkpoint structure:
 """
 
 import asyncio
+import contextlib
+import io
 import json
+import os
 import re
 import sys
 import traceback
@@ -24,7 +27,13 @@ from pathlib import Path
 
 import yaml
 
+# Enable shape-trace logging in step_dsl ops before tools.py exec's the scaffold.
+# Each op prints its input/output shapes; the orchestrator captures the trace
+# and feeds it to the LLM alongside any error.
+os.environ.setdefault("STEP_DSL_TRACE", "1")
+
 from src.dsl_transforms import fuse_load_ref
+from src.dsl_to_step import translate as _dsl_to_step_translate
 from agents import Runner
 
 from src.agents import make_judge_agent, make_pass_agent
@@ -261,7 +270,7 @@ _PASS_EXTRA_BANS = {
     "translate": [
         ("offchip_load(",    "replace with LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, transposed)"),
         ("offchip_store(",   "replace with OffChipStore(graph, input, par_dispatch=4)"),
-        ("select_gen(",      "replace with SelectGen(is_multihot, tensor, n)"),
+        ("select_gen(",      "replace with SelectGen(is_multihot=..., tensor=..., n=...) - args match the DSL call"),
         ("metadata_gen(",    "replace with MetadataGen(tensor=tensor)"),
         ("binary_matmul(",   "replace with BinaryMap(graph, a, b, map_fn.Matmul(), False, 1024)"),
         ("binary_mul(",      "replace with BinaryMap(graph, a, b, map_fn.Mul(), False, 1024)"),
@@ -457,6 +466,33 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
     return judge_text
 
 
+def _run_deterministic_translate(dsl_code: str, kernel_name: str,
+                                 dims: dict, tensors: dict,
+                                 outer_dir: Path, log) -> dict:
+    """Translate DSL -> STeP build_graph deterministically (no LLM).
+
+    Mirrors the on-disk layout of ``_run_pass_loop`` so checkpoints are
+    interchangeable: ``<outer_dir>/translate/turn_0/{extracted_code.py,
+    correctness_result.txt, status.txt}``.
+    """
+    pass_dir = outer_dir / "translate"
+    turn_dir = pass_dir / "turn_0"
+    log(f"  Translation pass: translate (deterministic AST rewrite)")
+
+    step_code = _dsl_to_step_translate(dsl_code)
+    _write(turn_dir / "extracted_code.py", step_code)
+    log(f"      Generated code: {len(step_code)} chars")
+
+    log(f"      Running correctness check (graph)...")
+    result = _run_graph_correctness(step_code, kernel_name, dims, tensors)
+    _write(turn_dir / "correctness_result.txt", result)
+
+    success = "match=True" in result
+    _write(turn_dir / "status.txt", "PASS" if success else "MISMATCH")
+    log(f"  -> deterministic translate {'OK' if success else 'FAILED'}")
+    return {"success": success, "code": step_code}
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, prev_code=None,
                          executor="tiled", tensors=None, log=print,
@@ -509,11 +545,18 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         _write(turn_dir / "extracted_code.py", code)
         log(f"      Extracted code: {len(code)} chars")
 
-        # Run correctness check
+        # Run correctness check. Capture stdout so the per-op shape trace
+        # printed by step_dsl ops can be fed back to the model on failure.
         log(f"      Running correctness check ({executor})...")
         feedback = ""
+        shape_trace = ""
+        _trace_buf = io.StringIO()
         try:
-            result = check_correctness(code, kernel_name, dims, tensors)
+            with contextlib.redirect_stdout(_trace_buf):
+                result = check_correctness(code, kernel_name, dims, tensors)
+            shape_trace = _trace_buf.getvalue()
+            if shape_trace:
+                _write(turn_dir / "shape_trace.txt", shape_trace)
             _write(turn_dir / "correctness_result.txt", result)
 
             if "match=True" in result:
@@ -588,6 +631,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 log(f"      -> FAIL: {result.splitlines()[0]}")
                 feedback = f"## Correctness check result\n{result}"
         except Exception:
+            shape_trace = _trace_buf.getvalue()
+            if shape_trace:
+                _write(turn_dir / "shape_trace.txt", shape_trace)
             err = traceback.format_exc()
             _write(turn_dir / "correctness_result.txt", f"ERROR:\n{err}")
             log(f"      -> ERROR: {_error_summary(err)}")
@@ -616,6 +662,29 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                     "```\n"
                     "Do NOT index `partitioned[i]` or iterate `for x in partitioned`."
                 )
+
+        if shape_trace:
+            # Cap at the last MAX_LINES so the trace nearest the failure point
+            # is preserved without blowing up the context window on long runs.
+            lines = shape_trace.splitlines()
+            MAX_LINES = 200
+            if len(lines) > MAX_LINES:
+                trace_body = (
+                    f"... ({len(lines) - MAX_LINES} earlier lines elided) ...\n"
+                    + "\n".join(lines[-MAX_LINES:])
+                )
+            else:
+                trace_body = "\n".join(lines)
+            feedback += (
+                "\n\n## STeP DSL shape trace\n"
+                "Each line shows the input or output shape(s) of a step_dsl op "
+                "call, in execution order. `stream(...)×tile(R,C)` means the "
+                "tensor's stream shape is `(...)` and its tile shape is `(R,C)`. "
+                "Use this to verify shape invariants (binary ops require "
+                "identical stream shapes); when the run errored, the trace "
+                "ends just before the failing op.\n"
+                "```\n" + trace_body + "\n```"
+            )
 
         feedback += (
             "\n\n**Fix the specific error above by making targeted changes to your "
@@ -682,11 +751,15 @@ async def run_kernel(
     checkpoint_dir: str = None,
     pipeline: str = "standard",
     resume_from: str = None,
+    translator: str = "llm",
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
     Args:
         pipeline: "standard" (lowering + translate) or "direct" (PyTorch → STeP in one step).
+        translator: "llm" (default) runs the LLM translate pass; "auto" runs the
+            deterministic AST translator (``src.dsl_to_step.translate``). "auto"
+            requires the standard pipeline since it consumes refactor_final's DSL output.
         resume_from: Path to resume from a previous checkpoint. Accepts:
             - Path to a dsl_code.py file directly
             - Path to an outer_N directory containing dsl_code.py
@@ -695,6 +768,10 @@ async def run_kernel(
             When set, lowering is skipped and translation starts from the saved DSL code.
     """
     assert pipeline in PIPELINES, f"Unknown pipeline '{pipeline}'. Known: {sorted(PIPELINES.keys())}"
+    assert translator in ("llm", "auto"), f"Unknown translator '{translator}'. Known: llm, auto"
+    assert not (translator == "auto" and pipeline == "direct"), (
+        "translator='auto' requires pipeline='standard' (it consumes refactor_final's DSL output)"
+    )
     pipeline_config = PIPELINES[pipeline]
     lowering_passes = pipeline_config["lowering"]
     translator_passes = pipeline_config["translation"]
@@ -716,12 +793,15 @@ async def run_kernel(
     print(f"Pre-computed tensors: {sorted(tensors.keys())}")
     print(f"Pipeline: {pipeline} ({len(lowering_passes)} lowering + {len(translator_passes)} translation passes)")
 
-    # Create agents — when resuming, only need translator agents
-    if resume_dsl_code is not None:
-        pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in translator_passes}
+    # Create agents. When translator='auto' we don't need any LLM translator
+    # agents -- only the lowering ones (or none, if resuming).
+    if translator == "auto":
+        agent_passes = [] if resume_dsl_code is not None else lowering_passes
+    elif resume_dsl_code is not None:
+        agent_passes = translator_passes
     else:
-        all_passes = lowering_passes + translator_passes
-        pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in all_passes}
+        agent_passes = lowering_passes + translator_passes
+    pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in agent_passes}
 
     # Create judge agents for passes that have one
     from src.prompts import _JUDGE_TEMPLATES
@@ -743,6 +823,7 @@ async def run_kernel(
         "max_outer": max_outer,
         "max_turns": max_turns,
         "resume_from": resume_from,
+        "translator": translator,
     }, indent=2))
 
     # Run all outer iterations in parallel — they are independent attempts
@@ -756,6 +837,7 @@ async def run_kernel(
             lowering_passes=lowering_passes,
             translator_passes=translator_passes,
             resume_dsl_code=resume_dsl_code,
+            translator=translator,
         ))
 
     results = await asyncio.gather(*tasks)
@@ -780,6 +862,7 @@ async def _run_outer_iteration(
     ckpt_root: Path, preset: str, experience_dir: str,
     lowering_passes: list = None, translator_passes: list = None,
     resume_dsl_code: str = None,
+    translator: str = "llm",
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -923,6 +1006,23 @@ async def _run_outer_iteration(
     # ============================================================
     translated_code = dsl_code if dsl_code is not None else lowered_code
     translation_ok = True
+
+    if translator == "auto":
+        assert dsl_code is not None, (
+            "translator='auto' requires DSL code from refactor_final (or --resume); "
+            "got None — lowering must run before deterministic translation."
+        )
+        det_result = _run_deterministic_translate(
+            dsl_code, kernel_name, dims, tensors, outer_dir, log,
+        )
+        if det_result["success"]:
+            translated_code = det_result["code"]
+        else:
+            translation_ok = False
+            print(f"{tag} Translation FAILED (deterministic)")
+        # Skip the LLM translation loop entirely.
+        translator_passes = []
+
     for pass_info in translator_passes:
         pass_name = pass_info["name"]
         executor = pass_info["executor"]

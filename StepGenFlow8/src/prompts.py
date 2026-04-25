@@ -97,7 +97,7 @@ def build_pass_system_prompt(pass_name: str) -> str:
     Templates contain {placeholder} tokens that are filled from source files:
       {ops_code}        — step_tl/src/step_py/ops.py
       {functional_code} — step_tl/src/step_py/functional.py
-      {dsl_code}        — StepGenFlow7/src/step_dsl.py
+      {dsl_code}        — StepGenFlow8/src/step_dsl.py
     This keeps the prompts in sync with the actual source code automatically.
     """
     all_passes = LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES

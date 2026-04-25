@@ -59,8 +59,27 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
         loaded = loaded.unsqueeze(0)
     return loaded.expand(target).contiguous()
 
-def select_gen(underlying):
+def select_gen(underlying, is_multihot, n):
+    """Wrap an integer routing tensor for `flat_partition` / `flat_reassemble`.
+
+    Required before a control tensor is passed into a routing op. The args
+    carry the STeP `SelectGen` semantics so translation is deterministic.
+
+    Args:
+        underlying: int32/int64 tensor whose last dim is `n`.
+        is_multihot: True for a `flat_partition` control (mask with any number
+            of active bits per row); False for a `flat_reassemble` control
+            (one-hot selector picking a single consumer per row).
+        n: number of consumers; must equal `underlying.shape[-1]`.
+    """
     _assert_int(underlying, "select_gen")
+    assert isinstance(is_multihot, bool), (
+        f"select_gen: is_multihot must be bool, got {type(is_multihot).__name__}"
+    )
+    assert underlying.shape[-1] == n, (
+        f"select_gen: control's last dim must equal n={n}, "
+        f"got shape {tuple(underlying.shape)}"
+    )
     return underlying
 
 def metadata_gen(tensor):
@@ -610,3 +629,57 @@ DSL_FUNCTIONS = {
     # Sink
     "offchip_store", "random_offchip_store",
 }
+
+# ---------------------------------------------------------------------------
+# Shape trace (gated by env var STEP_DSL_TRACE=1).
+# When enabled, every DSL_FUNCTIONS op prints input/output shapes to stdout
+# so the orchestrator can capture and feed the trace back to the LLM.
+# ---------------------------------------------------------------------------
+
+import os as _step_dsl_os
+import functools as _step_dsl_ft
+import inspect as _step_dsl_isp
+
+_STEP_DSL_TRACE = _step_dsl_os.environ.get("STEP_DSL_TRACE", "") == "1"
+
+
+def _step_dsl_fmt(v):
+    if torch.is_tensor(v):
+        s = tuple(v.shape)
+        if len(s) >= 2:
+            tile = f"tile({s[-2]},{s[-1]})"
+            stream = s[:-2]
+            return f"stream{tuple(stream)}×{tile}" if stream else tile
+        return f"shape{s}"
+    if isinstance(v, (list, tuple)) and v and all(torch.is_tensor(x) for x in v):
+        opener, closer = ("[", "]") if isinstance(v, list) else ("(", ")")
+        return opener + ", ".join(_step_dsl_fmt(x) for x in v) + closer
+    return repr(v)
+
+
+def _step_dsl_log_shapes(_fn):
+    if not _STEP_DSL_TRACE:
+        return _fn
+    _name = _fn.__name__
+    _sig = _step_dsl_isp.signature(_fn)
+
+    @_step_dsl_ft.wraps(_fn)
+    def _wrapper(*args, **kwargs):
+        bound = _sig.bind(*args, **kwargs)
+        in_str = ", ".join(f"{k}={_step_dsl_fmt(v)}" for k, v in bound.arguments.items())
+        print(f"[step_dsl] {_name} input shape(s): {in_str}", flush=True)
+        result = _fn(*args, **kwargs)
+        print(f"[step_dsl] {_name} output shape(s): {_step_dsl_fmt(result)}", flush=True)
+        return result
+
+    return _wrapper
+
+
+if _STEP_DSL_TRACE:
+    _step_dsl_g = globals()
+    for _step_dsl_n in DSL_FUNCTIONS:
+        assert _step_dsl_n in _step_dsl_g, (
+            f"DSL_FUNCTIONS lists '{_step_dsl_n}' but it is not defined in step_dsl.py"
+        )
+        _step_dsl_g[_step_dsl_n] = _step_dsl_log_shapes(_step_dsl_g[_step_dsl_n])
+    del _step_dsl_g, _step_dsl_n

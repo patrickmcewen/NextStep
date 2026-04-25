@@ -17,13 +17,17 @@ def main():
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
-    parser.add_argument("--max-outer", type=int, default=1, help="Max outer loop iterations")
+    parser.add_argument("--max-outer", type=int, default=3, help="Max outer loop iterations")
     parser.add_argument("--max-turns", type=int, default=11, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory (default: checkpoints/<timestamp>)")
     parser.add_argument("--pipeline", default="standard", choices=["standard", "direct"],
                         help="Pipeline mode: 'standard' (lowering + translate) or 'direct' (PyTorch → STeP in one step)")
+    parser.add_argument("--translator", default="auto", choices=["llm", "auto"],
+                        help="Translation backend: 'auto' (default; deterministic AST rewrite "
+                             "from DSL to STeP) or 'llm' (LLM translate pass). "
+                             "'auto' requires --pipeline=standard.")
     parser.add_argument("--resume", default=None, metavar="PATH",
                         help="Resume from a checkpoint where refactor_final succeeded. "
                              "Accepts: path to dsl_code.py, outer_N dir, or checkpoint root dir. "
@@ -43,6 +47,7 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         pipeline=args.pipeline,
         resume_from=args.resume,
+        translator=args.translator,
     ))
 
     if result["success"]:
