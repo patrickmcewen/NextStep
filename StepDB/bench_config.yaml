@@ -1459,13 +1459,46 @@ end_to_end:
   - start
   - end
   presets:
-    mixtral_tile32:
+    mixtral_b64:
       model_name: mixtral
       tile_N: 32
       tile_F: 48
       batch: 64
       scale_seq: 1
       is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    mixtral_small_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 16
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_small_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
       par_factor: 4
       stdev: 1034
       start: 1
@@ -1678,4 +1711,94 @@ qkv_gen:
       D: 4096
       N_HEAD: 32
       HEAD_DIM: 128
+  origin: seed
+
+gqa_tiled_decode:
+  problem: seed_kernels/gqa_tiled_decode/reference.py
+  step_impl: null
+  params:
+  - batch_size
+  - num_kv_heads
+  - query_per_kvhead
+  - head_dim
+  - max_seq_len_tiles
+  - tile_N
+  presets:
+    tiny:
+      batch_size: 4
+      num_kv_heads: 2
+      query_per_kvhead: 2
+      head_dim: 8
+      max_seq_len_tiles: 4
+      tile_N: 4
+    small:
+      batch_size: 8
+      num_kv_heads: 2
+      query_per_kvhead: 4
+      head_dim: 16
+      max_seq_len_tiles: 8
+      tile_N: 8
+    qwen_small:
+      batch_size: 16
+      num_kv_heads: 4
+      query_per_kvhead: 8
+      head_dim: 32
+      max_seq_len_tiles: 16
+      tile_N: 16
+    qwen_b64:
+      batch_size: 64
+      num_kv_heads: 4
+      query_per_kvhead: 8
+      head_dim: 64
+      max_seq_len_tiles: 128
+      tile_N: 32
+    mixtral_b64:
+      batch_size: 64
+      num_kv_heads: 8
+      query_per_kvhead: 4
+      head_dim: 128
+      max_seq_len_tiles: 128
+      tile_N: 32
+  origin: seed
+
+kv_cache_tile_append:
+  problem: seed_kernels/kv_cache_tile_append/reference.py
+  step_impl: seed_kernels/kv_cache_tile_append/step_impl.py
+  params:
+  - batch_size
+  - num_kv_heads
+  - head_dim
+  - max_seq_len_tiles
+  - tile_N
+  presets:
+    tiny:
+      batch_size: 4
+      num_kv_heads: 2
+      head_dim: 8
+      max_seq_len_tiles: 4
+      tile_N: 4
+    small:
+      batch_size: 8
+      num_kv_heads: 2
+      head_dim: 16
+      max_seq_len_tiles: 8
+      tile_N: 8
+    qwen_small:
+      batch_size: 16
+      num_kv_heads: 4
+      head_dim: 32
+      max_seq_len_tiles: 16
+      tile_N: 16
+    qwen_b64:
+      batch_size: 64
+      num_kv_heads: 4
+      head_dim: 64
+      max_seq_len_tiles: 128
+      tile_N: 32
+    mixtral_b64:
+      batch_size: 64
+      num_kv_heads: 8
+      head_dim: 128
+      max_seq_len_tiles: 128
+      tile_N: 32
   origin: seed

@@ -211,6 +211,118 @@ def binary_is_equal(a, b):
 
 
 # ---------------------------------------------------------------------------
+# Offset-tracking binary maps (SetOffset / RowWiseAppend)
+# Mirror step-perf/src/functions/map_fn.rs::set_offset and ::row_wise_append.
+# ---------------------------------------------------------------------------
+# torch tensors don't carry the per-tile `offset` field that the Rust Tile
+# struct does, so binary_set_offset returns a small carrier that bundles the
+# tile data with per-stream-element offsets. binary_row_wise_append unwraps it.
+# At translation time both DSL calls map cleanly to a single 2-input BinaryMap.
+
+class _OffsetTile:
+    """Tile data + per-stream-element offsets, produced by binary_set_offset
+    and consumed by binary_row_wise_append. Exposes ``shape`` / ``dtype`` /
+    ``ndim`` so DSL code introspecting tensor metadata still works."""
+    __slots__ = ("data", "offsets")
+
+    def __init__(self, data, offsets):
+        self.data = data
+        self.offsets = offsets
+
+    @property
+    def shape(self):
+        return self.data.shape
+
+    @property
+    def ndim(self):
+        return self.data.ndim
+
+    @property
+    def dtype(self):
+        return self.data.dtype
+
+
+def binary_set_offset(a, b):
+    """Attach per-element offsets from ``b`` to tile ``a``.
+
+    The data is passed through unchanged; the offset metadata is carried in a
+    private wrapper that the next ``binary_row_wise_append`` consumes.
+
+    Args:
+        a: tile data, shape (*stream, tile_r, tile_c).
+        b: offset values, shape (*stream, 1, 1); float (cast to long internally).
+    """
+    _assert_float(a, "binary_set_offset")
+    _assert_float(b, "binary_set_offset")
+    _assert_stream_match(a, b, "binary_set_offset")
+    assert b.shape[-2:] == (1, 1), (
+        f"binary_set_offset: b tile shape must be (1,1), got {tuple(b.shape[-2:])}"
+    )
+    offsets = b[..., 0, 0].long()
+    return _OffsetTile(a, offsets)
+
+
+def binary_row_wise_append(a, b):
+    """Scatter rows of ``b`` into ``a`` starting at each element's offset.
+
+    ``a`` is normally the result of ``binary_set_offset``; a plain tensor is
+    accepted with an implicit offset of 0 for every stream element. Mirrors
+    step-perf/map_fn::row_wise_append.
+
+    Args:
+        a: _OffsetTile (preferred) or plain tile, shape (*stream, tile_r, tile_c).
+        b: rows to append, shape (*stream, M, tile_c). Typically M=1.
+
+    Returns:
+        torch.Tensor (*stream, tile_r, tile_c). Rows [offset..offset+M] of each
+        stream element are overwritten with ``b``; the rest is unchanged.
+    """
+    if isinstance(a, _OffsetTile):
+        data = a.data
+        offsets = a.offsets
+    else:
+        data = a
+        offsets = torch.zeros(data.shape[:-2], dtype=torch.long)
+    _assert_float(data, "binary_row_wise_append")
+    _assert_float(b, "binary_row_wise_append")
+    _assert_stream_match(data, b, "binary_row_wise_append")
+    tile_r, tile_c = data.shape[-2], data.shape[-1]
+    M = b.shape[-2]
+    assert b.shape[-1] == tile_c, (
+        f"binary_row_wise_append: column dim mismatch ({b.shape[-1]} vs {tile_c})"
+    )
+    assert (offsets + M <= tile_r).all(), (
+        f"binary_row_wise_append: not enough space to append {M} rows "
+        f"(tile_r={tile_r}, max offset={int(offsets.max())})"
+    )
+    stream_shape = data.shape[:-2]
+    row_idx = offsets.unsqueeze(-1) + torch.arange(M, dtype=torch.long, device=data.device)
+    row_idx = row_idx.unsqueeze(-1).expand(*stream_shape, M, tile_c)
+    result = data.clone()
+    result.scatter_(dim=-2, index=row_idx, src=b.to(data.dtype))
+    return result
+
+
+def binary_cache_write_addr_gen(idx, seq_len, row_offset):
+    """Compute KV-cache write address: ``idx * row_offset + seq_len``.
+
+    Mirrors step-perf/map_fn::cache_write_addr_gen. ``idx`` and ``seq_len`` are
+    (*stream, 1, 1) scalar tiles; ``row_offset`` is a Python int.
+    """
+    assert idx.shape[-2:] == (1, 1), (
+        f"binary_cache_write_addr_gen: idx tile shape must be (1,1), got {tuple(idx.shape[-2:])}"
+    )
+    assert seq_len.shape == idx.shape, (
+        f"binary_cache_write_addr_gen: idx {tuple(idx.shape)} and seq_len "
+        f"{tuple(seq_len.shape)} must match"
+    )
+    assert isinstance(row_offset, int), (
+        f"binary_cache_write_addr_gen: row_offset must be int, got {type(row_offset).__name__}"
+    )
+    return idx * row_offset + seq_len
+
+
+# ---------------------------------------------------------------------------
 # Unary compute: UnaryMap → unary_*
 # Mirrors: _apply_unary (L443) from functional.py
 # ---------------------------------------------------------------------------
@@ -611,6 +723,7 @@ DSL_FUNCTIONS = {
     "cache_read_addr_gen", "random_offchip_load", "filter_last_tile",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
+    "binary_set_offset", "binary_row_wise_append", "binary_cache_write_addr_gen",
     # Fused compute
     "binary_map_accum",
     # Unary compute

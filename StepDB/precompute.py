@@ -548,3 +548,70 @@ def _precompute_end_to_end(dims):
         "num_token_list": num_token_list,
         "o_proj_weight": o_proj_weight,
     }
+
+
+@register("gqa_tiled_decode")
+def _precompute_gqa_tiled_decode(dims):
+    torch.manual_seed(SEED)
+    batch_size = dims["batch_size"]
+    num_kv_heads = dims["num_kv_heads"]
+    query_per_kvhead = dims["query_per_kvhead"]
+    head_dim = dims["head_dim"]
+    max_seq_len_tiles = dims["max_seq_len_tiles"]
+    tile_N = dims["tile_N"]
+    max_seq_len = max_seq_len_tiles * tile_N
+
+    query = torch.randn(batch_size, num_kv_heads, query_per_kvhead, head_dim)
+    key = torch.randn(batch_size, num_kv_heads, head_dim)
+    value = torch.randn(batch_size, num_kv_heads, head_dim)
+    k_cache = torch.randn(batch_size, max_seq_len, num_kv_heads, head_dim)
+    v_cache = torch.randn(batch_size, max_seq_len, num_kv_heads, head_dim)
+
+    idx = torch.arange(batch_size, dtype=torch.int64)
+    seq_len_tiled = torch.randint(
+        low=1, high=max_seq_len_tiles + 1, size=(batch_size,), dtype=torch.int64
+    )
+    offset = torch.randint(low=0, high=tile_N, size=(batch_size,), dtype=torch.int64)
+    return {
+        "query": query,
+        "key": key,
+        "value": value,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "idx": idx,
+        "seq_len_tiled": seq_len_tiled,
+        "offset": offset,
+        "tile_N": tile_N,
+    }
+
+
+@register("kv_cache_tile_append")
+def _precompute_kv_cache_tile_append(dims):
+    torch.manual_seed(SEED)
+    batch_size = dims["batch_size"]
+    num_kv_heads = dims["num_kv_heads"]
+    head_dim = dims["head_dim"]
+    max_seq_len_tiles = dims["max_seq_len_tiles"]
+    tile_N = dims["tile_N"]
+    max_seq_len = max_seq_len_tiles * tile_N
+
+    key = torch.randn(batch_size, num_kv_heads, head_dim)
+    value = torch.randn(batch_size, num_kv_heads, head_dim)
+    k_cache = torch.randn(batch_size, max_seq_len, num_kv_heads, head_dim)
+    v_cache = torch.randn(batch_size, max_seq_len, num_kv_heads, head_dim)
+
+    idx = torch.arange(batch_size, dtype=torch.int64)
+    seq_len_tiled = torch.randint(
+        low=1, high=max_seq_len_tiles + 1, size=(batch_size,), dtype=torch.int64
+    )
+    offset = torch.randint(low=0, high=tile_N, size=(batch_size,), dtype=torch.int64)
+    return {
+        "key": key,
+        "value": value,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "idx": idx,
+        "seq_len_tiled": seq_len_tiled,
+        "offset": offset,
+        "tile_N": tile_N,
+    }
