@@ -75,11 +75,18 @@ def make_client(llm_config: dict) -> AsyncOpenAI:
     )
 
 
-def make_pass_agent(llm_config: dict, pass_name: str) -> Agent:
-    """Create an agent for any pass (lowering or translator)."""
+def make_pass_agent(llm_config: dict, pass_name: str,
+                    few_shot_examples=None) -> Agent:
+    """Create an agent for any pass (lowering or translator).
+
+    ``few_shot_examples`` is an optional list of resolved example dicts (see
+    ``resolve_few_shot_examples``); only passes whose template contains
+    ``{few_shot_examples}`` consume them.
+    """
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    system_prompt = build_pass_system_prompt(pass_name)
+    system_prompt = build_pass_system_prompt(
+        pass_name, few_shot_examples=few_shot_examples)
 
     return Agent(
         name=f"StepPass_{pass_name}",

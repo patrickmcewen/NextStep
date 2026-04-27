@@ -38,8 +38,9 @@ from agents import Runner
 from src.agents import make_diagnostician_agent, make_judge_agent, make_pass_agent
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
                          DIRECT_TRANSLATOR_PASSES, PIPELINES,
-                         build_pass_system_prompt, build_pass_user_prompt,
-                         _format_tensors_description)
+                         build_pass_user_prompt,
+                         _format_tensors_description,
+                         resolve_few_shot_examples)
 from src.tools import (_exec_build_graph, _exec_tiled_ref, _exec_hybrid_ref,
                        _exec_dsl_ref,
                        _validate_functional_mod, enhance_emulator_error)
@@ -574,7 +575,6 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
     Returns dict with success, code.
     """
-    system_prompt = build_pass_system_prompt(pass_name)
     user_prompt = build_pass_user_prompt(pass_name, kernel_name, dims,
                                          prev_code=prev_code,
                                          tensors=tensors,
@@ -582,7 +582,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     conversation = [{"role": "user", "content": user_prompt}]
 
     pass_dir = ckpt_dir / pass_name
-    _write(pass_dir / "system_prompt.txt", system_prompt)
+    # Save the system prompt actually used by the agent (agent.instructions
+    # already contains any {few_shot_examples} substitutions from make_pass_agent).
+    _write(pass_dir / "system_prompt.txt", agent.instructions)
 
     check_correctness = _CORRECTNESS_CHECKERS[executor]
 
@@ -837,6 +839,7 @@ async def run_kernel(
     pipeline: str = "standard",
     resume_from: str = None,
     translator: str = "llm",
+    few_shot_paths=None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -886,7 +889,17 @@ async def run_kernel(
         agent_passes = translator_passes
     else:
         agent_passes = lowering_passes + translator_passes
-    pass_agents = {p["name"]: make_pass_agent(llm_config, p["name"]) for p in agent_passes}
+    few_shot_examples = resolve_few_shot_examples(few_shot_paths)
+    if few_shot_examples:
+        print(
+            f"Few-shot examples: "
+            f"{[ex['kernel_name'] for ex in few_shot_examples]}"
+        )
+    pass_agents = {
+        p["name"]: make_pass_agent(
+            llm_config, p["name"], few_shot_examples=few_shot_examples)
+        for p in agent_passes
+    }
 
     # Create judge agents for passes that have one
     from src.prompts import _JUDGE_TEMPLATES
@@ -909,6 +922,7 @@ async def run_kernel(
         "max_turns": max_turns,
         "resume_from": resume_from,
         "translator": translator,
+        "few_shot_paths": list(few_shot_paths) if few_shot_paths else [],
     }, indent=2))
 
     # Run all outer iterations in parallel — they are independent attempts

@@ -32,3 +32,4 @@ These functions are pre-imported and available at runtime. Here are their exact 
 ```python
 def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
 ```
+{few_shot_examples}

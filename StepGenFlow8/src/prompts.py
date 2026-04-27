@@ -91,14 +91,127 @@ PIPELINES = {
 # Public API — pass prompt builders
 # ---------------------------------------------------------------------------
 
-def build_pass_system_prompt(pass_name: str) -> str:
+def _resolve_few_shot_example(path: str) -> dict:
+    """Resolve a path to a single PyTorch→DSL few-shot example.
+
+    Accepts:
+      - Path to a dsl_code.py file (e.g. .../outer_N/dsl_code.py)
+      - Path to an outer_N directory containing dsl_code.py
+      - Path to a checkpoint root containing config.json and
+        <kernel_name>/outer_*/dsl_code.py — picks the latest outer_N with a
+        dsl_code.py file.
+
+    Returns a dict ``{kernel_name, pytorch_ref, dsl_code}``. The PyTorch
+    reference is loaded from StepDB via the kernel's bench_config entry.
+    """
+    p = Path(path)
+    assert p.exists(), f"Few-shot path does not exist: {path}"
+
+    if p.suffix == ".py" and p.is_file():
+        dsl_path = p
+    elif p.is_dir() and (p / "dsl_code.py").is_file():
+        dsl_path = p / "dsl_code.py"
+    elif p.is_dir():
+        candidates = sorted(p.glob("*/outer_*/dsl_code.py"))
+        assert candidates, (
+            f"No <kernel>/outer_*/dsl_code.py found under {p}. "
+            f"Pass either a dsl_code.py file, an outer_N directory, "
+            f"or a checkpoint root directory."
+        )
+        dsl_path = candidates[-1]
+    else:
+        assert False, f"Cannot resolve few-shot path: {path}"
+
+    # Walk up from dsl_path to find a config.json with the kernel name.
+    kernel_name = None
+    cur = dsl_path.parent
+    for _ in range(5):
+        cfg = cur / "config.json"
+        if cfg.is_file():
+            cfg_data = json.loads(cfg.read_text())
+            if "kernel" in cfg_data:
+                kernel_name = cfg_data["kernel"]
+                break
+        cur = cur.parent
+    if kernel_name is None:
+        # Fallback: outer_N's parent dir is the kernel name.
+        kernel_name = dsl_path.parent.parent.name
+
+    config = _load_stepdb_config()
+    assert kernel_name in config, (
+        f"Kernel '{kernel_name}' (resolved from {path}) not in StepDB bench_config.yaml"
+    )
+    ref_path = _STEPDB_DIR / config[kernel_name]["problem"]
+    assert ref_path.exists(), f"PyTorch reference not found: {ref_path}"
+
+    return {
+        "kernel_name": kernel_name,
+        "pytorch_ref": ref_path.read_text(),
+        "dsl_code": dsl_path.read_text(),
+    }
+
+
+def resolve_few_shot_examples(paths) -> list:
+    """Resolve a list of path strings into few-shot example dicts.
+
+    Pass ``None`` or an empty list when no examples are configured.
+    """
+    if not paths:
+        return []
+    return [_resolve_few_shot_example(p) for p in paths]
+
+
+def _format_few_shot_examples(examples: list) -> str:
+    """Render few-shot example dicts as a markdown section for the prompt.
+
+    Returns "" when ``examples`` is empty so the placeholder collapses cleanly.
+    """
+    if not examples:
+        return ""
+    lines = [
+        "",
+        "## Few-shot examples",
+        "",
+        "Below are previously completed PyTorch → DSL translations for other "
+        "kernels. Use them as reference for how operations should be lowered "
+        "into DSL form. Each example shows the original PyTorch reference and "
+        "the resulting DSL code.",
+        "",
+    ]
+    for ex in examples:
+        lines.extend([
+            f"### Example: {ex['kernel_name']}",
+            "",
+            "PyTorch reference:",
+            "```python",
+            ex["pytorch_ref"].rstrip(),
+            "```",
+            "",
+            "DSL form:",
+            "```python",
+            ex["dsl_code"].rstrip(),
+            "```",
+            "",
+            "---",
+            "",
+        ])
+    return "\n".join(lines)
+
+
+def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
     """Build a lowering/translator pass agent's system prompt from its template.
 
     Templates contain {placeholder} tokens that are filled from source files:
-      {ops_code}        — step_tl/src/step_py/ops.py
-      {functional_code} — step_tl/src/step_py/functional.py
-      {dsl_code}        — StepGenFlow8/src/step_dsl.py
+      {ops_code}           — step_tl/src/step_py/ops.py
+      {functional_code}    — step_tl/src/step_py/functional.py
+      {dsl_code}           — StepGenFlow8/src/step_dsl.py
+      {few_shot_examples}  — optional PyTorch→DSL example pairs (refactor_final)
     This keeps the prompts in sync with the actual source code automatically.
+
+    ``few_shot_examples`` is an optional list of dicts as returned by
+    ``resolve_few_shot_examples`` — each containing ``kernel_name``,
+    ``pytorch_ref``, and ``dsl_code``. Templates without the
+    ``{few_shot_examples}`` placeholder ignore this argument.
     """
     all_passes = LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES
     pass_info = None
@@ -137,6 +250,9 @@ def build_pass_system_prompt(pass_name: str) -> str:
         dsl_path = _PROJECT_ROOT / "src" / "step_dsl.py"
         assert dsl_path.exists(), f"step_dsl.py not found: {dsl_path}"
         replacements["dsl_code"] = dsl_path.read_text()
+    if "{few_shot_examples}" in template:
+        replacements["few_shot_examples"] = _format_few_shot_examples(
+            few_shot_examples or [])
 
     if replacements:
         template = template.format(**replacements)
