@@ -142,6 +142,7 @@ def _precompute_outer_product_accum(dims):
 # ---------------------------------------------------------------------------
 
 @register("sdpa_core")
+@register("sdpa_core_max")
 @register("sdpa_two_pass")
 def _precompute_sdpa(dims):
     torch.manual_seed(SEED)

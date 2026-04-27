@@ -338,6 +338,13 @@ def accum_mul(x, rank=1):
         x = x.prod(dim=-3)
     return x
 
+def accum_max(x, rank=1):
+    _assert_float(x, "accum_max")
+    assert rank > 0, f"accum_max: rank must be > 0, got {rank}"
+    for _ in range(rank):
+        x = x.amax(dim=-3)
+    return x
+
 def accum_retile_row(x, rank=1):
     assert rank > 0, f"accum_retile_row: rank must be > 0, got {rank}"
     for _ in range(rank):
@@ -410,7 +417,7 @@ def promote(x, rank=1):
         f"promote(rank={rank}): tensor has {x.ndim} dims ({tuple(x.shape)}), "
         f"max valid rank is {max_rank}."
     )
-    return x.unsqueeze(-(2 + rank))
+    return x.unsqueeze(-(3 + rank))
 
 
 def promote_outer(x):
@@ -676,7 +683,7 @@ DSL_FUNCTIONS = {
     "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
     "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
     # Accumulation
-    "accum_add", "accum_mul", "accum_retile_row", "accum_retile_col",
+    "accum_add", "accum_mul", "accum_max", "accum_retile_row", "accum_retile_col",
     # Stream shape
     "promote", "promote_outer", "flatten", "reshape_stream", "reshape_pad_stream",
     "expand_ref", "repeat_ref", "repeat_static", "streamify",

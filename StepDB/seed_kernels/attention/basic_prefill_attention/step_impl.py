@@ -180,8 +180,45 @@ def _sdpa_streamed(graph, Q_stream, K_stream, V_stream, S, head_dim):
         fn=Matmul(weight_transposed=True),
         write_back_mu=False, compute_bw=1024,
     )
+    # Numerically-stable softmax: subtract per-row max before exp to avoid
+    # float32 overflow in `Exp(qkt)`.  Mirrors the
+    # sdpa_core_max DSL pattern: accum_max -> promote -> expand_ref.
+    # qkt has stream (1, S, S) tile (1, 1).  RetileStreamify is unnecessary
+    # because tile_n is already 1.
+    #   Accum(fn=accum_fn.Max(), accum_rank=1) reduces the innermost stream
+    #     dim -> stream (1, S) tile (1, 1)
+    #   Promote(promote_rank=1) adds a trailing stream-1 dim
+    #     -> stream (1, S, 1) tile (1, 1)
+    #   ExpandRef(ref=qkt, expand_rank=1) broadcasts back over qkt's inner
+    #     S dim -> stream (1, S, S) tile (1, 1)
+    qkt_b = Broadcast(graph, qkt, 3)
+    row_max = Accum(
+        graph=graph, input=(qkt_b, 0),
+        output_stream_dtype=Tile(tile_dtype=Float32(), shape=(1, 1)),
+        fn=accum_fn.Max(),
+        init_fn=Zero(shape=(1, 1), dtype=Float32()),
+        accum_rank=1, write_back_mu=False, compute_bw=1024,
+    )
+    neg_row_max = UnaryMap(
+        graph=graph, input=row_max,
+        fn=MulImmediate(constant=-1.0),
+        write_back_mu=False, compute_bw=1024,
+    )
+    # Promote inserts the new 1 at position `len(shape) - promote_rank`, so
+    # promote_rank=0 inserts at the END: (1, S) -> (1, S, 1).
+    neg_row_max_promoted = Promote(
+        graph=graph, input=neg_row_max, promote_rank=0,
+    )
+    neg_row_max_expanded = ExpandRef(
+        graph=graph, input=neg_row_max_promoted,
+        ref=(qkt_b, 2), expand_rank=1,
+    )
+    qkt_shifted = BinaryMap(
+        graph=graph, in1=(qkt_b, 1), in2=neg_row_max_expanded,
+        fn=Add(), write_back_mu=False, compute_bw=1024,
+    )
     exp_qkt = UnaryMap(
-        graph=graph, input=qkt, fn=Exp(),
+        graph=graph, input=qkt_shifted, fn=Exp(),
         write_back_mu=False, compute_bw=1024,
     )
     exp_b = Broadcast(graph, exp_qkt, 2)

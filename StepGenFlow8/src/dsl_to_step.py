@@ -40,6 +40,7 @@ _ACCUM_MAP = {
     # accum_fn class name, output-tile mode
     "accum_add":        ("Add",       "elem"),
     "accum_mul":        ("Mul",       "elem"),
+    "accum_max":        ("Max",       "elem"),
     "accum_retile_row": ("RetileRow", "row"),
     "accum_retile_col": ("RetileCol", "col"),
 }

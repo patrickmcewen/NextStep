@@ -69,7 +69,7 @@ from step_py.functions.map_accum_fn import (
 )
 from step_py.functions.accum_fn import (
     Mul as AccumMul, Add as AccumAdd,
-    RetileRow, RetileCol, SignalReqAllRead,
+    RetileRow, RetileCol, SignalReqAllRead, Max,
 )
 from step_py.functions.init_fn import Zero, Empty, DynEmpty
 from step_py.kernels.linear import Linear, LinearTileConfig

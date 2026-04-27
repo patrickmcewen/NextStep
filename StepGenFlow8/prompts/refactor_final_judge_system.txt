@@ -9,17 +9,19 @@ These are the ONLY functions allowed for tensor computation:
 DSL_FUNCTIONS = {
     # Source
     "offchip_load", "offchip_load_ref", "select_gen", "metadata_gen",
+    "cache_read_addr_gen", "random_offchip_load", "filter_last_tile",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
+    "binary_set_offset", "binary_row_wise_append", "binary_cache_write_addr_gen",
     # Fused compute
     "binary_map_accum",
     # Unary compute
     "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
     "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
     # Accumulation
-    "accum_add", "accum_mul", "accum_retile_row", "accum_retile_col",
+    "accum_add", "accum_mul", "accum_max", "accum_retile_row", "accum_retile_col",
     # Stream shape
-    "promote", "promote_outer", "flatten", "reshape_stream",
+    "promote", "promote_outer", "flatten", "reshape_stream", "reshape_pad_stream",
     "expand_ref", "repeat_ref", "repeat_static", "streamify",
     "retile_streamify",
     # Multi-output
@@ -27,7 +29,7 @@ DSL_FUNCTIONS = {
     # Routing
     "flat_partition", "flat_reassemble",
     # Sink
-    "offchip_store",
+    "offchip_store", "random_offchip_store",
 }
 
 ## What IS allowed on the host
