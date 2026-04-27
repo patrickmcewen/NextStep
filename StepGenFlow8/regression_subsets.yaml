@@ -1,0 +1,27 @@
+# Named groups for `python run_regression.py --subset <NAME>`.
+# Each group is a kernel -> preset mapping. A preset value may be a single
+# string or a list of preset names.
+
+quick_smoke:
+  silu_activation: small
+  chained_unary: small
+  vector_reduce_sum: small
+
+simple_benchmarks:
+  silu_activation: small
+  chained_unary: small
+  element_wise_add: small
+  copy_2d: small
+  vector_reduce_sum: small
+  broadcast_diamond: small
+  rms_norm: small
+  layernorm: small
+
+transformer_subparts:
+  gemm: large_4k
+  rope: qwen_b64
+  rms_norm: qwen_scale
+  sdpa_core: qwen_scale
+  gated_mlp: qwen_16x
+  moe_routed: large_d1k
+

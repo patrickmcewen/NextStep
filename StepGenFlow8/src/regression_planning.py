@@ -49,7 +49,23 @@ def plan_jobs(
             for preset in entry.get("presets", {})
         ]
     else:
-        jobs = []  # filled in by Task 3
+        assert isinstance(preset_config, dict) and preset_config, \
+            "preset_config must be a non-empty mapping"
+        jobs = []
+        for kernel, presets in preset_config.items():
+            if kernel not in bench_config:
+                _log.warning("preset_config: kernel %r not in bench_config; skipping", kernel)
+                continue
+            available = bench_config[kernel].get("presets", {})
+            wanted = [presets] if isinstance(presets, str) else list(presets)
+            for preset in wanted:
+                if preset not in available:
+                    _log.warning(
+                        "preset_config: preset %r not defined for kernel %r; skipping",
+                        preset, kernel,
+                    )
+                    continue
+                jobs.append(Job(kernel, preset))
 
     jobs.sort()
     assert jobs, "no jobs to run — check bench_config / preset_config"

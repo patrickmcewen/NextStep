@@ -1,5 +1,6 @@
 **/checkpoints/**
 **/checkpoints_autotune/**
+**/regression_results/**
 **__pycache__**
 **/docs/**
 **/_work_**

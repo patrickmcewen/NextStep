@@ -927,16 +927,13 @@ async def run_kernel(
 
     results = await asyncio.gather(*tasks)
 
-    # Return first success, or the last failure
-    for result in results:
-        if result["success"]:
-            _write(ckpt_root / "result.json", json.dumps(result, indent=2, default=str))
-            return result
+    per_outer = [{"outer": i, "success": bool(r["success"])} for i, r in enumerate(results)]
 
-    # All failed — return last result
-    result = results[-1]
-    _write(ckpt_root / "result.json", json.dumps(result, indent=2, default=str))
-    return result
+    # Return first success, or the last failure
+    chosen = next((r for r in results if r["success"]), results[-1])
+    chosen["per_outer"] = per_outer
+    _write(ckpt_root / "result.json", json.dumps(chosen, indent=2, default=str))
+    return chosen
 
 
 async def _run_outer_iteration(
