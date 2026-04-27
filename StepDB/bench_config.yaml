@@ -1,6 +1,6 @@
 gemm:
-  problem: seed_kernels/gemm/reference.py
-  step_impl: seed_kernels/gemm/step_impl.py
+  problem: seed_kernels/matmul/gemm/reference.py
+  step_impl: seed_kernels/matmul/gemm/step_impl.py
   params:
   - M
   - K
@@ -88,8 +88,8 @@ gemm:
       tile_n: 256
   origin: seed
 matmul_binarymap:
-  problem: seed_kernels/matmul_binarymap/reference.py
-  step_impl: seed_kernels/matmul_binarymap/step_impl.py
+  problem: seed_kernels/matmul/matmul_binarymap/reference.py
+  step_impl: seed_kernels/matmul/matmul_binarymap/step_impl.py
   params:
   - B
   - H
@@ -143,8 +143,8 @@ matmul_binarymap:
       tile_n: 256
   origin: seed
 copy_2d:
-  problem: seed_kernels/copy_2d/reference.py
-  step_impl: seed_kernels/copy_2d/step_impl.py
+  problem: seed_kernels/language_primitives/copy_2d/reference.py
+  step_impl: seed_kernels/language_primitives/copy_2d/step_impl.py
   params:
   - M
   - K
@@ -198,8 +198,8 @@ copy_2d:
       tile_k: 256
   origin: seed
 bufferize_roundtrip:
-  problem: seed_kernels/bufferize_roundtrip/reference.py
-  step_impl: seed_kernels/bufferize_roundtrip/step_impl.py
+  problem: seed_kernels/language_primitives/bufferize_roundtrip/reference.py
+  step_impl: seed_kernels/language_primitives/bufferize_roundtrip/step_impl.py
   params:
   - M
   - K
@@ -248,8 +248,8 @@ bufferize_roundtrip:
       tile_k: 256
   origin: seed
 rms_norm:
-  problem: seed_kernels/rms_norm/reference.py
-  step_impl: seed_kernels/rms_norm/step_impl.py
+  problem: seed_kernels/normalization/rms_norm/reference.py
+  step_impl: seed_kernels/normalization/rms_norm/step_impl.py
   params:
   - M
   - K
@@ -313,8 +313,8 @@ rms_norm:
       eps: 1.0e-06
   origin: seed
 silu_activation:
-  problem: seed_kernels/silu_activation/reference.py
-  step_impl: seed_kernels/silu_activation/step_impl.py
+  problem: seed_kernels/elementwise/silu_activation/reference.py
+  step_impl: seed_kernels/elementwise/silu_activation/step_impl.py
   params:
   - M
   - K
@@ -368,8 +368,8 @@ silu_activation:
       tile_k: 256
   origin: seed
 element_wise_add:
-  problem: seed_kernels/element_wise_add/reference.py
-  step_impl: seed_kernels/element_wise_add/step_impl.py
+  problem: seed_kernels/elementwise/element_wise_add/reference.py
+  step_impl: seed_kernels/elementwise/element_wise_add/step_impl.py
   params:
   - M
   - K
@@ -423,8 +423,8 @@ element_wise_add:
       tile_k: 256
   origin: seed
 gated_mlp:
-  problem: seed_kernels/gated_mlp/reference.py
-  step_impl: seed_kernels/gated_mlp/step_impl.py
+  problem: seed_kernels/mlp/gated_mlp/reference.py
+  step_impl: seed_kernels/mlp/gated_mlp/step_impl.py
   params:
   - B
   - D
@@ -529,8 +529,8 @@ moe_expert_single:
       tile_f: 256
   origin: seed
 sdpa_core:
-  problem: seed_kernels/sdpa_core/reference.py
-  step_impl: seed_kernels/sdpa_core/step_impl.py
+  problem: seed_kernels/attention/sdpa_core/reference.py
+  step_impl: seed_kernels/attention/sdpa_core/step_impl.py
   params:
   - M
   - N
@@ -594,8 +594,8 @@ sdpa_core:
       tile_n: 256
   origin: seed
 qkv_projection:
-  problem: seed_kernels/qkv_projection/reference.py
-  step_impl: seed_kernels/qkv_projection/step_impl.py
+  problem: seed_kernels/pre_attention/qkv_projection/reference.py
+  step_impl: seed_kernels/pre_attention/qkv_projection/step_impl.py
   params:
   - B
   - D
@@ -653,8 +653,8 @@ qkv_projection:
       tile_proj: 128
   origin: seed
 moe_routed:
-  problem: seed_kernels/moe_routed/reference.py
-  step_impl: seed_kernels/moe_routed/step_impl.py
+  problem: seed_kernels/mlp/moe_routed/reference.py
+  step_impl: seed_kernels/mlp/moe_routed/step_impl.py
   params:
   - B
   - D
@@ -842,8 +842,8 @@ moe_routed:
       tile_f: 256
   origin: seed
 vector_reduce_sum:
-  problem: seed_kernels/vector_reduce_sum/reference.py
-  step_impl: seed_kernels/vector_reduce_sum/step_impl.py
+  problem: seed_kernels/reductions/vector_reduce_sum/reference.py
+  step_impl: seed_kernels/reductions/vector_reduce_sum/step_impl.py
   params:
   - M
   - K
@@ -882,8 +882,8 @@ vector_reduce_sum:
       tile_k: 128
   origin: seed
 chained_unary:
-  problem: seed_kernels/chained_unary/reference.py
-  step_impl: seed_kernels/chained_unary/step_impl.py
+  problem: seed_kernels/elementwise/chained_unary/reference.py
+  step_impl: seed_kernels/elementwise/chained_unary/step_impl.py
   params:
   - M
   - K
@@ -917,8 +917,8 @@ chained_unary:
       tile_k: 128
   origin: seed
 softmax:
-  problem: seed_kernels/softmax/reference.py
-  step_impl: seed_kernels/softmax/step_impl.py
+  problem: seed_kernels/reductions/softmax/reference.py
+  step_impl: seed_kernels/reductions/softmax/step_impl.py
   params:
   - M
   - K
@@ -952,8 +952,8 @@ softmax:
       tile_k: 512
   origin: seed
 layernorm:
-  problem: seed_kernels/layernorm/reference.py
-  step_impl: seed_kernels/layernorm/step_impl.py
+  problem: seed_kernels/normalization/layernorm/reference.py
+  step_impl: seed_kernels/normalization/layernorm/step_impl.py
   params:
   - M
   - K
@@ -993,8 +993,8 @@ layernorm:
       eps: 1.0e-06
   origin: seed
 broadcast_diamond:
-  problem: seed_kernels/broadcast_diamond/reference.py
-  step_impl: seed_kernels/broadcast_diamond/step_impl.py
+  problem: seed_kernels/language_primitives/broadcast_diamond/reference.py
+  step_impl: seed_kernels/language_primitives/broadcast_diamond/step_impl.py
   params:
   - M
   - K
@@ -1063,8 +1063,8 @@ multi_load_compute:
       tile_k: 128
   origin: seed
 bufferize_chain:
-  problem: seed_kernels/bufferize_chain/reference.py
-  step_impl: seed_kernels/bufferize_chain/step_impl.py
+  problem: seed_kernels/language_primitives/bufferize_chain/reference.py
+  step_impl: seed_kernels/language_primitives/bufferize_chain/step_impl.py
   params:
   - M
   - K
@@ -1098,8 +1098,8 @@ bufferize_chain:
       tile_k: 128
   origin: seed
 outer_product_accum:
-  problem: seed_kernels/outer_product_accum/reference.py
-  step_impl: seed_kernels/outer_product_accum/step_impl.py
+  problem: seed_kernels/matmul/outer_product_accum/reference.py
+  step_impl: seed_kernels/matmul/outer_product_accum/step_impl.py
   params:
   - B
   - M
@@ -1139,8 +1139,8 @@ outer_product_accum:
       tile_n: 64
   origin: seed
 residual_add_norm:
-  problem: seed_kernels/residual_add_norm/reference.py
-  step_impl: seed_kernels/residual_add_norm/step_impl.py
+  problem: seed_kernels/normalization/residual_add_norm/reference.py
+  step_impl: seed_kernels/normalization/residual_add_norm/step_impl.py
   params:
   - M
   - K
@@ -1268,8 +1268,8 @@ sdpa_scaled:
       tile_n: 64
   origin: seed
 multi_query_attn:
-  problem: seed_kernels/multi_query_attn/reference.py
-  step_impl: seed_kernels/multi_query_attn/step_impl.py
+  problem: seed_kernels/attention/multi_query_attn/reference.py
+  step_impl: seed_kernels/attention/multi_query_attn/step_impl.py
   params:
   - H
   - M
@@ -1445,8 +1445,8 @@ flash_attn_reuse:
   origin: seed
 
 end_to_end:
-  problem: seed_kernels/end_to_end/reference.py
-  step_impl: seed_kernels/end_to_end/step_impl.py
+  problem: seed_kernels/transformer_layer/end_to_end/reference.py
+  step_impl: seed_kernels/transformer_layer/end_to_end/step_impl.py
   params:
   - model_name
   - tile_N
@@ -1505,7 +1505,7 @@ end_to_end:
       end: 64
   origin: seed
 gqa_ragged_prefill:
-  problem: seed_kernels/gqa_ragged_prefill/reference.py
+  problem: seed_kernels/attention/gqa_ragged_prefill/reference.py
   step_impl: null
   params:
   - batch_size
@@ -1538,7 +1538,7 @@ gqa_ragged_prefill:
       kv_len: 2048
   origin: seed
 gqa_paged_decode:
-  problem: seed_kernels/gqa_paged_decode/reference.py
+  problem: seed_kernels/attention/gqa_paged_decode/reference.py
   step_impl: null
   params:
   - batch_size
@@ -1564,7 +1564,7 @@ gqa_paged_decode:
       kv_len: 2048
   origin: seed
 mla_paged_decode:
-  problem: seed_kernels/mla_paged_decode/reference.py
+  problem: seed_kernels/attention/mla_paged_decode/reference.py
   step_impl: null
   params:
   - batch_size
@@ -1590,8 +1590,8 @@ mla_paged_decode:
       kv_len: 2048
   origin: seed
 rope:
-  problem: seed_kernels/rope/reference.py
-  step_impl: seed_kernels/rope/step_impl.py
+  problem: seed_kernels/pre_attention/rope/reference.py
+  step_impl: seed_kernels/pre_attention/rope/step_impl.py
   params:
   - batch
   - num_q_heads
@@ -1635,8 +1635,8 @@ rope:
       head_dim: 128
   origin: seed
 rotate_half:
-  problem: seed_kernels/rotate_half/reference.py
-  step_impl: seed_kernels/rotate_half/step_impl.py
+  problem: seed_kernels/pre_attention/rotate_half/reference.py
+  step_impl: seed_kernels/pre_attention/rotate_half/step_impl.py
   params:
   - batch
   - num_heads
@@ -1673,8 +1673,8 @@ rotate_half:
   origin: seed
 
 qkv_gen:
-  problem: seed_kernels/qkv_gen/reference.py
-  step_impl: seed_kernels/qkv_gen/step_impl.py
+  problem: seed_kernels/pre_attention/qkv_gen/reference.py
+  step_impl: seed_kernels/pre_attention/qkv_gen/step_impl.py
   params:
   - B
   - D
@@ -1714,7 +1714,7 @@ qkv_gen:
   origin: seed
 
 gqa_tiled_decode:
-  problem: seed_kernels/gqa_tiled_decode/reference.py
+  problem: seed_kernels/attention/gqa_tiled_decode/reference.py
   step_impl: null
   params:
   - batch_size
@@ -1762,8 +1762,8 @@ gqa_tiled_decode:
   origin: seed
 
 kv_cache_tile_append:
-  problem: seed_kernels/kv_cache_tile_append/reference.py
-  step_impl: seed_kernels/kv_cache_tile_append/step_impl.py
+  problem: seed_kernels/attention/kv_cache_tile_append/reference.py
+  step_impl: seed_kernels/attention/kv_cache_tile_append/step_impl.py
   params:
   - batch_size
   - num_kv_heads
@@ -1801,4 +1801,86 @@ kv_cache_tile_append:
       head_dim: 128
       max_seq_len_tiles: 128
       tile_N: 32
+  origin: seed
+prefill_transformer_simple:
+  problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
+  step_impl: seed_kernels/transformer_layer/prefill_transformer_simple/step_impl.py
+  params:
+  - model_name
+  - seq_len
+  - is_small
+  presets:
+    tiny:
+      model_name: mixtral
+      seq_len: 8
+      is_small: true
+    small:
+      model_name: mixtral
+      seq_len: 64
+      is_small: true
+    mixtral_small_s256:
+      model_name: mixtral
+      seq_len: 256
+      is_small: true
+    mixtral_s256:
+      model_name: mixtral
+      seq_len: 256
+      is_small: false
+    mixtral_s1024:
+      model_name: mixtral
+      seq_len: 1024
+      is_small: false
+    qwen_small_s64:
+      model_name: qwen
+      seq_len: 64
+      is_small: true
+    qwen_small_s256:
+      model_name: qwen
+      seq_len: 256
+      is_small: true
+    qwen_s256:
+      model_name: qwen
+      seq_len: 256
+      is_small: false
+  origin: seed
+basic_prefill_attention:
+  problem: seed_kernels/attention/basic_prefill_attention/reference.py
+  step_impl: seed_kernels/attention/basic_prefill_attention/step_impl.py
+  params:
+  - model_name
+  - seq_len
+  - is_small
+  presets:
+    tiny:
+      model_name: mixtral
+      seq_len: 8
+      is_small: true
+    small:
+      model_name: mixtral
+      seq_len: 64
+      is_small: true
+    mixtral_small_s256:
+      model_name: mixtral
+      seq_len: 256
+      is_small: true
+    mixtral_s256:
+      model_name: mixtral
+      seq_len: 256
+      is_small: false
+    mixtral_s1024:
+      model_name: mixtral
+      seq_len: 1024
+      is_small: false
+    qwen_small_s64:
+      model_name: qwen
+      seq_len: 64
+      is_small: true
+    qwen_small_s256:
+      model_name: qwen
+      seq_len: 256
+      is_small: true
+    qwen_s256:
+      model_name: qwen
+      seq_len: 256
+      is_small: false
   origin: seed

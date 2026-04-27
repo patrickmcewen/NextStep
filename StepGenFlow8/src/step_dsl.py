@@ -60,18 +60,6 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     return loaded.expand(target).contiguous()
 
 def select_gen(underlying, is_multihot, n):
-    """Wrap an integer routing tensor for `flat_partition` / `flat_reassemble`.
-
-    Required before a control tensor is passed into a routing op. The args
-    carry the STeP `SelectGen` semantics so translation is deterministic.
-
-    Args:
-        underlying: int32/int64 tensor whose last dim is `n`.
-        is_multihot: True for a `flat_partition` control (mask with any number
-            of active bits per row); False for a `flat_reassemble` control
-            (one-hot selector picking a single consumer per row).
-        n: number of consumers; must equal `underlying.shape[-1]`.
-    """
     _assert_int(underlying, "select_gen")
     assert isinstance(is_multihot, bool), (
         f"select_gen: is_multihot must be bool, got {type(is_multihot).__name__}"
@@ -209,20 +197,7 @@ def binary_is_equal(a, b):
     _assert_stream_match(a, b, "binary_is_equal")
     return (a == b).float()
 
-
-# ---------------------------------------------------------------------------
-# Offset-tracking binary maps (SetOffset / RowWiseAppend)
-# Mirror step-perf/src/functions/map_fn.rs::set_offset and ::row_wise_append.
-# ---------------------------------------------------------------------------
-# torch tensors don't carry the per-tile `offset` field that the Rust Tile
-# struct does, so binary_set_offset returns a small carrier that bundles the
-# tile data with per-stream-element offsets. binary_row_wise_append unwraps it.
-# At translation time both DSL calls map cleanly to a single 2-input BinaryMap.
-
 class _OffsetTile:
-    """Tile data + per-stream-element offsets, produced by binary_set_offset
-    and consumed by binary_row_wise_append. Exposes ``shape`` / ``dtype`` /
-    ``ndim`` so DSL code introspecting tensor metadata still works."""
     __slots__ = ("data", "offsets")
 
     def __init__(self, data, offsets):
@@ -243,15 +218,6 @@ class _OffsetTile:
 
 
 def binary_set_offset(a, b):
-    """Attach per-element offsets from ``b`` to tile ``a``.
-
-    The data is passed through unchanged; the offset metadata is carried in a
-    private wrapper that the next ``binary_row_wise_append`` consumes.
-
-    Args:
-        a: tile data, shape (*stream, tile_r, tile_c).
-        b: offset values, shape (*stream, 1, 1); float (cast to long internally).
-    """
     _assert_float(a, "binary_set_offset")
     _assert_float(b, "binary_set_offset")
     _assert_stream_match(a, b, "binary_set_offset")
@@ -263,20 +229,6 @@ def binary_set_offset(a, b):
 
 
 def binary_row_wise_append(a, b):
-    """Scatter rows of ``b`` into ``a`` starting at each element's offset.
-
-    ``a`` is normally the result of ``binary_set_offset``; a plain tensor is
-    accepted with an implicit offset of 0 for every stream element. Mirrors
-    step-perf/map_fn::row_wise_append.
-
-    Args:
-        a: _OffsetTile (preferred) or plain tile, shape (*stream, tile_r, tile_c).
-        b: rows to append, shape (*stream, M, tile_c). Typically M=1.
-
-    Returns:
-        torch.Tensor (*stream, tile_r, tile_c). Rows [offset..offset+M] of each
-        stream element are overwritten with ``b``; the rest is unchanged.
-    """
     if isinstance(a, _OffsetTile):
         data = a.data
         offsets = a.offsets
@@ -554,12 +506,6 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
     return x.reshape(new_shape)
 
 def reshape_pad_stream(x, chunk_size, reshape_rank=0):
-    """Split the stream dim at ``reshape_rank`` into (new_count, chunk_size).
-
-    Mirrors ReshapePadStream in step_tl/ops.py: reshape_rank counts from the
-    right (0 = rightmost stream dim). Auto-pads with zeros when the dim size
-    isn't divisible by ``chunk_size`` and ``reshape_rank == 0``.
-    """
     return reshape_stream(x, chunk_size=chunk_size, rank=reshape_rank)
 
 

@@ -615,3 +615,199 @@ def _precompute_kv_cache_tile_append(dims):
         "offset": offset,
         "tile_N": tile_N,
     }
+
+
+# ---------------------------------------------------------------------------
+# Simple prefill transformer layer (single sequence, no KV cache)
+# ---------------------------------------------------------------------------
+
+@register("prefill_transformer_simple")
+def _precompute_prefill_transformer_simple(dims):
+    """Precompute tensors for the simple prefill transformer kernel.
+
+    RNG order mirrors seed_kernels/transformer_layer/prefill_transformer_simple/
+    reference.py (no random.seed, no external files):
+      torch.manual_seed(SEED)
+      input_tensor, q_proj, k_proj, v_proj, cos, sin, o_proj_weight,
+      w_gate_list, w_up_list, w_down_list, router_w
+
+    The pre-attention pipeline (RMSNorm, QKV projection, per-head Q/K
+    RMSNorm, RoPE) and self-attention live in the step_impl dataflow
+    graph (single-tile-per-head sdpa).
+
+    Top-k routing tensors are emitted here because they depend on float64
+    attention output to match the reference exactly: tiny float32 noise in
+    a streaming float32 attention can flip topk decisions near boundary
+    logits, so we reproduce the reference's float64 attention here just
+    for the routing computation. The MoE block itself runs in dataflow.
+    """
+    import sys
+    from pathlib import Path
+
+    import step_py as _sp
+    _STEP_TL_ROOT = str(Path(_sp.__file__).resolve().parent.parent.parent)
+    if _STEP_TL_ROOT not in sys.path:
+        sys.path.insert(0, _STEP_TL_ROOT)
+    from end_to_end.model_configs import (
+        Mixtral8x7B, SmallerMixtral8x7B, Qwen30B, SmallerQwen30B,
+    )
+
+    model_name = dims["model_name"]
+    seq_len = dims["seq_len"]
+    is_small = dims.get("is_small", False)
+
+    if model_name == "mixtral":
+        mc = SmallerMixtral8x7B() if is_small else Mixtral8x7B()
+    elif model_name == "qwen":
+        mc = SmallerQwen30B() if is_small else Qwen30B()
+    else:
+        assert False, f"Unknown model_name: {model_name!r}"
+
+    torch.manual_seed(SEED)
+
+    input_tensor = torch.randn(seq_len, mc.hidden_dim)
+    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
+    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    cos = torch.randn(seq_len, 1, mc.head_dim)
+    sin = torch.randn(seq_len, 1, mc.head_dim)
+    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
+    w_gate_list = [
+        torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
+        .weight.T.detach().clone().contiguous()
+        for _ in range(mc.n_routed_experts)
+    ]
+    w_up_list = [
+        torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
+        .weight.T.detach().clone().contiguous()
+        for _ in range(mc.n_routed_experts)
+    ]
+    w_down_list = [
+        torch.nn.Linear(mc.moe_inter_dim, mc.dim, bias=False)
+        .weight.T.detach().clone().contiguous()
+        for _ in range(mc.n_routed_experts)
+    ]
+    router_w = torch.randn(mc.dim, mc.n_routed_experts)
+
+    # ---- Top-k routing tensors (need float64 attention to match reference) ----
+    def _rms_norm_t(x, eps=1e-6):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+    def _rotate_half_t(x):
+        half = x.shape[-1] // 2
+        return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+    with torch.no_grad():
+        normed = _rms_norm_t(input_tensor)
+        Q = (normed @ q_proj).view(seq_len, mc.num_heads, mc.head_dim)
+        K = (normed @ k_proj).view(seq_len, mc.num_kv_heads, mc.head_dim)
+        V = (normed @ v_proj).view(seq_len, mc.num_kv_heads, mc.head_dim)
+        Q = _rms_norm_t(Q); K = _rms_norm_t(K)
+        Q_post_rope = (Q * cos + _rotate_half_t(Q) * sin).contiguous()
+        K_post_rope = (K * cos + _rotate_half_t(K) * sin).contiguous()
+        V_post_rope = V.contiguous()
+
+        Qh = (
+            Q_post_rope
+            .view(seq_len, mc.num_kv_heads, mc.query_per_kvhead, mc.head_dim)
+            .permute(1, 2, 0, 3)
+            .double()
+        )
+        Kh = K_post_rope.permute(1, 0, 2).unsqueeze(1).double()
+        Vh = V_post_rope.permute(1, 0, 2).unsqueeze(1).double()
+        scores = Qh @ Kh.transpose(-1, -2)
+        e = torch.exp(scores)
+        attn = (e @ Vh / e.sum(dim=-1, keepdim=True)).float()
+        attn = attn.permute(2, 0, 1, 3).reshape(
+            seq_len, mc.num_heads, mc.head_dim
+        )
+        o_proj_out = attn.reshape(seq_len, mc.num_heads * mc.head_dim) @ o_proj_weight
+        normed_2 = _rms_norm_t(o_proj_out + input_tensor)
+
+        router_logits = normed_2 @ router_w
+        _, expert_indices = torch.topk(router_logits, mc.n_activated_experts, dim=-1)
+        expert_weights_raw, _ = torch.topk(router_logits, mc.n_activated_experts, dim=-1)
+        expert_weights = torch.softmax(expert_weights_raw, dim=-1)
+
+    expert_multihot = torch.zeros(
+        seq_len, mc.n_routed_experts, dtype=torch.int64,
+    )
+    for s in range(seq_len):
+        for k in range(mc.n_activated_experts):
+            expert_multihot[s, expert_indices[s, k]] = 1
+    expert_onehot = torch.zeros(
+        seq_len, mc.n_activated_experts, mc.n_routed_experts, dtype=torch.int64,
+    )
+    for s in range(seq_len):
+        for k in range(mc.n_activated_experts):
+            expert_onehot[s, k, expert_indices[s, k]] = 1
+
+    return {
+        "input_tensor": input_tensor,
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
+        "cos": cos,
+        "sin": sin,
+        "o_proj_weight": o_proj_weight,
+        "w_gate_list": w_gate_list,
+        "w_up_list": w_up_list,
+        "w_down_list": w_down_list,
+        "router_w": router_w,
+        "expert_weights": expert_weights,
+        "expert_multihot": expert_multihot,
+        "expert_onehot": expert_onehot,
+    }
+
+
+@register("basic_prefill_attention")
+def _precompute_basic_prefill_attention(dims):
+    """Precompute tensors for the attention-only prefill kernel.
+
+    Only raw RNG'd tensors — the full pre-attention pipeline (RMSNorm, QKV
+    projection, per-head Q/K RMSNorm, RoPE) lives in the step_impl as a
+    STeP sub-graph that's executed at build time to materialize Q/K/V
+    post-RoPE tensors, which then become off-chip underlyings for the
+    per-head sdpa main graph.
+    """
+    import sys
+    from pathlib import Path
+
+    import step_py as _sp
+    _STEP_TL_ROOT = str(Path(_sp.__file__).resolve().parent.parent.parent)
+    if _STEP_TL_ROOT not in sys.path:
+        sys.path.insert(0, _STEP_TL_ROOT)
+    from end_to_end.model_configs import (
+        Mixtral8x7B, SmallerMixtral8x7B, Qwen30B, SmallerQwen30B,
+    )
+
+    model_name = dims["model_name"]
+    seq_len = dims["seq_len"]
+    is_small = dims.get("is_small", False)
+
+    if model_name == "mixtral":
+        mc = SmallerMixtral8x7B() if is_small else Mixtral8x7B()
+    elif model_name == "qwen":
+        mc = SmallerQwen30B() if is_small else Qwen30B()
+    else:
+        assert False, f"Unknown model_name: {model_name!r}"
+
+    torch.manual_seed(SEED)
+
+    input_tensor = torch.randn(seq_len, mc.hidden_dim)
+    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
+    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    cos = torch.randn(seq_len, 1, mc.head_dim)
+    sin = torch.randn(seq_len, 1, mc.head_dim)
+    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
+
+    return {
+        "input_tensor": input_tensor,
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
+        "cos": cos,
+        "sin": sin,
+        "o_proj_weight": o_proj_weight,
+    }

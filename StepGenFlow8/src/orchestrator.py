@@ -32,11 +32,10 @@ import yaml
 # and feeds it to the LLM alongside any error.
 os.environ.setdefault("STEP_DSL_TRACE", "1")
 
-from src.dsl_transforms import fuse_load_ref
 from src.dsl_to_step import translate as _dsl_to_step_translate
 from agents import Runner
 
-from src.agents import make_judge_agent, make_pass_agent
+from src.agents import make_diagnostician_agent, make_judge_agent, make_pass_agent
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
                          DIRECT_TRANSLATOR_PASSES, PIPELINES,
                          build_pass_system_prompt, build_pass_user_prompt,
@@ -466,6 +465,73 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
     return judge_text
 
 
+def _make_translation_post_validator(kernel_name: str, dims: dict,
+                                     tensors: dict, log):
+    """Build a refactor_final post-validator that runs deterministic translation.
+
+    The validator returns ``None`` when the DSL code translates cleanly into a
+    correct STeP graph, or a feedback string describing what went wrong (raised
+    exception or graph mismatch). The returned string is appended to the next
+    user prompt of the refactor loop, so translator-side constraints (e.g.
+    ``select_gen`` must precede ``flat_partition``) get fixed by the refactor
+    agent rather than failing later in a separate pass.
+    """
+    def validator(code: str, turn_dir: Path) -> str | None:
+        check_dir = turn_dir / "translate_check"
+
+        log(f"      [translate-check] running deterministic translator...")
+        try:
+            step_code = _dsl_to_step_translate(code)
+        except Exception:
+            err = traceback.format_exc()
+            _write(check_dir / "error.txt", err)
+            log(f"      [translate-check] translation FAILED: {_error_summary(err)}")
+            return (
+                "## Correctness: PASS, but deterministic translation failed\n\n"
+                "Your DSL code is numerically correct, but the deterministic "
+                "DSL→STeP translator could not lower it. The translator expects "
+                "DSL primitives in their canonical, statically-analyzable forms — "
+                "see the assertion / error message below for the specific "
+                "constraint that is being violated.\n\n"
+                "```\n" + err + "```\n\n"
+                "Adjust the DSL code so this constraint is satisfied while "
+                "keeping the output correct."
+            )
+        _write(check_dir / "step_extracted_code.py", step_code)
+
+        log(f"      [translate-check] verifying STeP graph correctness...")
+        try:
+            result = _run_graph_correctness(step_code, kernel_name, dims, tensors)
+        except Exception:
+            err = traceback.format_exc()
+            _write(check_dir / "graph_error.txt", err)
+            log(f"      [translate-check] graph execution FAILED: {_error_summary(err)}")
+            return (
+                "## Correctness: PASS at DSL level, but STeP graph fails to execute\n\n"
+                "Your DSL code translated into STeP IR, but the resulting graph "
+                "fails to execute:\n\n"
+                "```\n" + err + "```\n\n"
+                "Adjust the DSL code so the lowered STeP graph executes correctly."
+            )
+        _write(check_dir / "graph_correctness.txt", result)
+
+        if "match=True" not in result:
+            log(f"      [translate-check] graph mismatch")
+            return (
+                "## Correctness: PASS at DSL level, but STeP graph is numerically wrong\n\n"
+                "Your DSL code translated and the graph executed, but the output "
+                "does not match the gold reference:\n\n"
+                + result
+                + "\n\nReview shape / stream invariants — usually this means a DSL "
+                "op is being used in a way that is correct under DSL semantics but "
+                "diverges from STeP IR semantics after deterministic lowering."
+            )
+        log(f"      [translate-check] OK")
+        return None
+
+    return validator
+
+
 def _run_deterministic_translate(dsl_code: str, kernel_name: str,
                                  dims: dict, tensors: dict,
                                  outer_dir: Path, log) -> dict:
@@ -496,8 +562,15 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, prev_code=None,
                          executor="tiled", tensors=None, log=print,
-                         judge_agent=None, dsl_code=None):
+                         judge_agent=None, dsl_code=None,
+                         post_validator=None):
     """Run a single pass agent (lowering or translator).
+
+    ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
+    that runs after correctness + regex compliance + judge all pass. Returning a
+    string treats the turn as failed and feeds that string back into the next
+    user prompt — this is how deterministic translation surfaces errors back to
+    the refactor pass.
 
     Returns dict with success, code.
     """
@@ -593,7 +666,13 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         + judge_feedback
                     )
                 else:
-                    # Regex compliance passed — run LLM judge if configured
+                    # Regex compliance passed. Run the LLM judge first (its
+                    # structural feedback is the most actionable signal we have
+                    # at this stage), then the deterministic post_validator —
+                    # the translator's errors are last because they're often
+                    # downstream symptoms of the same canonical-form issues the
+                    # judge catches.
+                    judge_violations = None
                     if judge_agent is not None:
                         log(f"      Running judge...")
                         judge_ctx = (
@@ -606,26 +685,32 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                             judge_ctx += "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
                         judge_violations = await _run_judge(
                             judge_agent, code, turn_dir, log, context=judge_ctx)
-                        if judge_violations is not None:
-                            _write(turn_dir / "status.txt", "CORRECT_BUT_JUDGE_REJECTED")
-                            log(f"      -> CORRECT but judge rejected")
-                            feedback = (
-                                "## Correctness: PASS\n\n"
-                                "Your code produces the correct output and uses allowed operations, "
-                                "but does not follow canonical form:\n\n"
-                                + judge_violations
-                                + "\n\nFix these structural issues while keeping the output correct."
-                            )
+
+                    if judge_violations is not None:
+                        _write(turn_dir / "status.txt", "CORRECT_BUT_JUDGE_REJECTED")
+                        log(f"      -> CORRECT but judge rejected")
+                        feedback = (
+                            "## Correctness: PASS\n\n"
+                            "Your code produces the correct output and uses allowed operations, "
+                            "but does not follow canonical form:\n\n"
+                            + judge_violations
+                            + "\n\nFix these structural issues while keeping the output correct."
+                        )
+                    else:
+                        post_feedback = None
+                        if post_validator is not None:
+                            log(f"      Running post-validator...")
+                            post_feedback = post_validator(code, turn_dir)
+
+                        if post_feedback is not None:
+                            _write(turn_dir / "status.txt", "CORRECT_BUT_POST_VALIDATOR_REJECTED")
+                            log(f"      -> CORRECT but post-validator rejected")
+                            feedback = post_feedback
                         else:
                             success = True
                             _write(turn_dir / "status.txt", "PASS")
-                            log(f"      -> PASS (judge approved)")
+                            log(f"      -> PASS{' (judge approved)' if judge_agent is not None else ''}")
                             break
-                    else:
-                        success = True
-                        _write(turn_dir / "status.txt", "PASS")
-                        log(f"      -> PASS")
-                        break
             else:
                 _write(turn_dir / "status.txt", f"FAIL: {result.splitlines()[0]}")
                 log(f"      -> FAIL: {result.splitlines()[0]}")
@@ -899,22 +984,6 @@ async def _run_outer_iteration(
     # ============================================================
     if resume_dsl_code is not None:
         dsl_code = resume_dsl_code
-        _write(outer_dir / "dsl_code_raw.py", dsl_code)
-        # Re-apply AST transforms (user may have changed prompts/code
-        # that produced dsl_code_raw, or the transforms themselves may
-        # have been updated since the original checkpoint was created)
-        dsl_code, fusions = fuse_load_ref(dsl_code)
-        if fusions:
-            log(f"  Post-process: {len(fusions)} load_ref fusion(s)")
-            for f in fusions:
-                log(f"    {f}")
-            # Verify the transform didn't break correctness
-            verify = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
-            if "match=True" not in verify:
-                log(f"  Post-process BROKE correctness — reverting to raw code")
-                log(f"    {verify.splitlines()[0]}")
-                dsl_code = resume_dsl_code
-        lowered_code = dsl_code
         _write(outer_dir / "dsl_code.py", dsl_code)
         log(f"  Resumed from checkpoint — using saved dsl_code ({len(dsl_code)} chars)")
         print(f"{tag} Resumed — skipping lowering")
@@ -931,16 +1000,31 @@ async def _run_outer_iteration(
             pass_name = pass_info["name"]
             executor = pass_info.get("executor", "tiled")
 
-            # Skip refactor passes if code already complies AND no judge needs to verify
+            # Skip refactor passes if code already complies AND no judge needs to
+            # verify. For refactor_final under translator='auto', also require that
+            # deterministic translation already succeeds — otherwise the skip
+            # would mask a translator-side failure that the loop is meant to fix.
             if pass_name in _REFACTOR_ORDER and lowered_code is not None:
                 violations = _check_banned_ops(lowered_code, pass_name)
                 has_judge = pass_name in judge_agents
-                if not violations and not has_judge:
+                needs_translate_check = (
+                    pass_name == "refactor_final" and translator == "auto"
+                )
+                if not violations and not has_judge and not needs_translate_check:
                     log(f"  Lowering pass: {pass_name} -> SKIP (already compliant)")
                     if pass_name == "refactor_final":
                         dsl_code = lowered_code
                         _write(outer_dir / "dsl_code.py", dsl_code)
                     continue
+
+            # When using deterministic translation, gate refactor_final on the
+            # translator: if translation fails, treat it as a refactor error so
+            # the model fixes the DSL until it lowers cleanly into STeP IR.
+            post_validator = None
+            if pass_name == "refactor_final" and translator == "auto":
+                post_validator = _make_translation_post_validator(
+                    kernel_name, dims, tensors, log,
+                )
 
             log(f"  Lowering pass: {pass_name}")
             pass_result = await _run_pass_loop(
@@ -951,6 +1035,7 @@ async def _run_outer_iteration(
                 tensors=tensors,
                 log=log,
                 judge_agent=judge_agents.get(pass_name),
+                post_validator=post_validator,
             )
             if pass_result["success"]:
                 lowered_code = pass_result["code"]
@@ -958,22 +1043,6 @@ async def _run_outer_iteration(
                 # Save refactor_final output as DSL code for translation guidance
                 if pass_name == "refactor_final":
                     dsl_code = lowered_code
-                    _write(outer_dir / "dsl_code_raw.py", dsl_code)
-                    # Post-process: fuse offchip_load + repeat_ref/expand_ref
-                    # into offchip_load_ref for STeP IR compatibility
-                    dsl_code, fusions = fuse_load_ref(dsl_code)
-                    if fusions:
-                        log(f"  Post-process: {len(fusions)} load_ref fusion(s)")
-                        for f in fusions:
-                            log(f"    {f}")
-                        # Verify the transform didn't break correctness
-                        verify = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
-                        if "match=True" in verify:
-                            lowered_code = dsl_code
-                        else:
-                            log(f"  Post-process BROKE correctness — reverting to raw code")
-                            log(f"    {verify.splitlines()[0]}")
-                            dsl_code = lowered_code
                     _write(outer_dir / "dsl_code.py", dsl_code)
             else:
                 log(f"  -> {pass_name} FAILED, stopping lowering pipeline")

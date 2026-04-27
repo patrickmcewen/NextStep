@@ -64,6 +64,22 @@ if not hasattr(_StepOps, 'shape'):
     )
 
 
+class _BranchRef(tuple):
+    # tuple subclass for the ``(node, idx)`` refs emitted by multi-output ops
+    # (Broadcast / Parallelize / FlatPartition). STeP IR `get_stream` accepts
+    # any (StepOps, int) tuple — including subclasses — so wrapping doesn't
+    # change downstream semantics. The added `.shape` lets DSL-style shape
+    # introspection (`xi.shape[0]`) keep working on per-branch refs.
+    def __new__(cls, node, idx):
+        return tuple.__new__(cls, (node, idx))
+
+    @property
+    def shape(self):
+        node, idx = self
+        s = node.stream_idx(idx)
+        return tuple(s.shape) + tuple(s.stream_dtype.shape)
+
+
 def _dsl2step_out_tile(x, mode, accum_rank):
     sd = x.stream.stream_dtype
     if mode == 'elem':
@@ -98,7 +114,9 @@ def translate(dsl_code: str) -> str:
     assert fn is not None, "translate: input must define def tiled_reference(...)"
 
     state = _State()
-    body = _denest_block(state, fn.body)
+    body = _strip_empty_shape_guards(fn.body)
+    body = _rewrite_dynamic_loads(body)
+    body = _denest_block(state, body)
     body = state.rewrite_block(body)
     body.insert(0, _stmt("graph = Graph()"))
 
@@ -142,6 +160,132 @@ def _arg(call: ast.Call, pos: int, name: str):
 def _arg_or_default(call, pos, name, default_src: str) -> str:
     node = _arg(call, pos, name)
     return _src(node) if node is not None else default_src
+
+
+# ---------------------------------------------------------------------------
+# Pre-pass: drop runtime-only `if x.shape[k] == 0: ... continue` empty-stream
+# guards. At graph-build time we always emit nodes for every branch — dynamic
+# emptiness is handled by the runtime engine, so the guard's body would only
+# be reachable in eager DSL execution. We strip the entire if-statement so
+# subsequent passes don't have to model `.shape[k] == 0` semantics on
+# symbolic dims (which raise on bool-conversion).
+# ---------------------------------------------------------------------------
+
+def _is_shape_subscript(node):
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "shape"
+    )
+
+
+def _is_zero_constant(node):
+    return isinstance(node, ast.Constant) and node.value == 0
+
+
+def _is_empty_shape_guard(stmt):
+    if not isinstance(stmt, ast.If):
+        return False
+    test = stmt.test
+    if not (isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1):
+        return False
+    left, right = test.left, test.comparators[0]
+    shape_vs_zero = (
+        (_is_shape_subscript(left) and _is_zero_constant(right))
+        or (_is_shape_subscript(right) and _is_zero_constant(left))
+    )
+    if not shape_vs_zero:
+        return False
+    # The guard must end in `continue` (loop short-circuit) for elision to be
+    # equivalent in graph mode. A guard without `continue` would change the
+    # control flow of the rest of the loop body, which we can't safely drop.
+    return any(isinstance(s, ast.Continue) for s in stmt.body)
+
+
+def _strip_empty_shape_guards(body):
+    out = []
+    for stmt in body:
+        if _is_empty_shape_guard(stmt):
+            continue
+        for attr in ("body", "orelse", "finalbody"):
+            if hasattr(stmt, attr):
+                setattr(stmt, attr, _strip_empty_shape_guards(getattr(stmt, attr)))
+        out.append(stmt)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pre-pass: rewrite the dynamic-broadcast load pattern
+#
+#   offchip_load(stride=(0,), out_shape_tiled=(<X>.shape[k],), ...)
+#
+# into the canonical ref-broadcast form
+#
+#   offchip_load_ref(ref=<X>, stride=(1,), out_shape_tiled=(1,), ...)
+#
+# `LinearOffChipLoad.out_shape_tiled` is statically typed as `Tuple[int, ...]`,
+# so a symbolic dim coming from `<X>.shape[k]` (a DynDim from FlatPartition or
+# similar) blows up at runtime. The ref form expresses the same semantics —
+# broadcast a single tile to match `<X>`'s stream — using STeP IR primitives.
+# This rewrite mirrors what the LLM translator would do by hand, so the
+# refactor pass can keep emitting the natural DSL-eager form.
+# ---------------------------------------------------------------------------
+
+def _matches_dynamic_broadcast_load(call: ast.Call):
+    """Return the ref Name node if `call` matches the dynamic-broadcast pattern,
+    else ``None``."""
+    if not (isinstance(call.func, ast.Name) and call.func.id == "offchip_load"):
+        return None
+    stride = _arg(call, 1, "stride")
+    out_shape = _arg(call, 2, "out_shape_tiled")
+    if not (isinstance(stride, ast.Tuple) and isinstance(out_shape, ast.Tuple)):
+        return None
+    if len(stride.elts) != 1 or len(out_shape.elts) != 1:
+        return None
+    s0 = stride.elts[0]
+    if not (isinstance(s0, ast.Constant) and s0.value == 0):
+        return None
+    sub = out_shape.elts[0]
+    if not (isinstance(sub, ast.Subscript)
+            and isinstance(sub.value, ast.Attribute)
+            and sub.value.attr == "shape"
+            and isinstance(sub.value.value, ast.Name)):
+        return None
+    return sub.value.value  # ast.Name
+
+
+def _rewrite_dynamic_loads(body):
+    one = lambda: ast.Tuple(elts=[ast.Constant(value=1)], ctx=ast.Load())
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+        if isinstance(node, ast.Call):
+            ref = _matches_dynamic_broadcast_load(node)
+            if ref is None:
+                return
+            # Pull positional args off so we can rebuild keyword-only.
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            for pos, name in enumerate(("underlying", "stride", "out_shape_tiled",
+                                        "tile_row", "tile_col", "transposed")):
+                if pos < len(node.args) and name not in keywords:
+                    keywords[name] = node.args[pos]
+            keywords["stride"] = one()
+            keywords["out_shape_tiled"] = one()
+            keywords["ref"] = ast.Name(id=ref.id, ctx=ast.Load())
+            order = ("ref", "underlying", "stride", "out_shape_tiled",
+                     "tile_row", "tile_col", "transposed")
+            node.func = ast.Name(id="offchip_load_ref", ctx=ast.Load())
+            node.args = []
+            node.keywords = [ast.keyword(arg=k, value=keywords[k])
+                             for k in order if k in keywords]
+
+    for stmt in body:
+        visit(stmt)
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -337,15 +481,18 @@ class _State:
         #   xs = parallelize(x, n)              -> Name target
         #   a, b = parallelize(x, 2)            -> Tuple target
         #   (a, b) = parallelize(x, 2)          -> same
+        # Each ref is a `_BranchRef(node, idx)` (tuple subclass) so STeP IR
+        # consumers see it as a plain (node, int) tuple while DSL code can
+        # still introspect its shape (e.g. for empty-stream guards).
         if isinstance(target, ast.Name):
             bind = (f"{target.id} = "
-                    f"[({node_var}, _i) for _i in range({n_src})]\n")
+                    f"[_BranchRef({node_var}, _i) for _i in range({n_src})]\n")
         elif isinstance(target, (ast.Tuple, ast.List)):
             assert all(isinstance(e, ast.Name) for e in target.elts), (
                 f"{fname}: multi-output unpack target must be plain names"
             )
             bind = "".join(
-                f"{e.id} = ({node_var}, {i})\n"
+                f"{e.id} = _BranchRef({node_var}, {i})\n"
                 for i, e in enumerate(target.elts)
             )
         else:
