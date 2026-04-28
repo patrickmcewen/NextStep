@@ -21,7 +21,9 @@ transformer_subparts:
   gemm: large_4k
   rope: qwen_b64
   rms_norm: qwen_scale
-  sdpa_core: qwen_scale
+  sdpa_core_max: long_ctx_512
   gated_mlp: qwen_16x
   moe_routed: large_d1k
+  basic_prefill_attention: small
+  prefill_transformer_simple: small
 

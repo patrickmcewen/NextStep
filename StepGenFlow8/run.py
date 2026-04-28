@@ -17,8 +17,8 @@ def main():
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
-    parser.add_argument("--max-outer", type=int, default=3, help="Max outer loop iterations")
-    parser.add_argument("--max-turns", type=int, default=11, help="Max tool-call rounds per inner loop")
+    parser.add_argument("--max-outer", type=int, default=10, help="Max outer loop iterations")
+    parser.add_argument("--max-turns", type=int, default=20, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory (default: checkpoints/<timestamp>)")
@@ -32,6 +32,13 @@ def main():
                         help="Resume from a checkpoint where refactor_final succeeded. "
                              "Accepts: path to dsl_code.py, outer_N dir, or checkpoint root dir. "
                              "Skips lowering and starts directly from translation.")
+    parser.add_argument("--few-shot", nargs="+", default=None, metavar="PATH",
+                        help="Optional paths to previously completed step program "
+                             "directories. Each contributes a PyTorch→DSL example pair "
+                             "to the refactor_final system prompt. Useful for "
+                             "kernel-family hints (e.g. RoPE/SDPA/MoE for transformers). "
+                             "Accepts: dsl_code.py file, outer_N dir, or checkpoint root dir. "
+                             "Off by default.")
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
@@ -48,6 +55,7 @@ def main():
         pipeline=args.pipeline,
         resume_from=args.resume,
         translator=args.translator,
+        few_shot_paths=args.few_shot,
     ))
 
     if result["success"]:
