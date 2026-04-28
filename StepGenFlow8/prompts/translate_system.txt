@@ -30,9 +30,11 @@ The table below lists the target class for each DSL call. Entries marked "+ `gra
 |---|---|---|
 | `offchip_load` | `LinearOffChipLoad` + `graph.add_node()` | — |
 | `offchip_load_ref` | `LinearOffChipLoadRef` (takes `graph` as first arg) | — |
+| `dyn_offchip_load` | `DynLinearOffChipLoad` + `graph.add_node()` (pass `input_tensor_name=<key>` and `dtype=tensors['<key>'].dtype`) | — |
 | `random_offchip_load` | `RandomOffChipLoad` | — |
 | `select_gen` | `SelectGen` + `graph.add_node()` | — |
 | `metadata_gen` | `MetadataGen` + `graph.add_node()` | — |
+| `expert_addr_gen` | `ExpertAddrGen` (takes `graph` as first arg) | — |
 | `cache_read_addr_gen` | `CacheReadAddrGen` | — |
 | `filter_last_tile` | `FilterLastTile` | — |
 | `binary_matmul` | `BinaryMap` | `map_fn.Matmul` |
@@ -40,6 +42,8 @@ The table below lists the target class for each DSL call. Entries marked "+ `gra
 | `binary_add` | `BinaryMap` | `map_fn.Add` |
 | `binary_div` | `BinaryMap` | `map_fn.Div` |
 | `binary_is_equal` | `BinaryMap` | `map_fn.IsEqual` |
+| `binary_cache_write_addr_gen` | `BinaryMap` | `map_fn.CacheWriteAddrGen(row_offset)` |
+| `binary_row_wise_append` | `BinaryMap` | `map_fn.RowWiseAppend` |
 | `unary_silu` | `UnaryMap` | `map_fn.Silu` |
 | `unary_square` | `UnaryMap` | `map_fn.Square` |
 | `unary_exp` | `UnaryMap` | `map_fn.Exp` |
@@ -49,11 +53,16 @@ The table below lists the target class for each DSL call. Entries marked "+ `gra
 | `unary_add_imm` | `UnaryMap` | `map_fn.AddImmediate` |
 | `unary_sub_imm` | `UnaryMap` | `map_fn.SubImmediate` |
 | `unary_rowwise_sum` | `UnaryMap` | `map_fn.RowWiseSum` |
+| `unary_mask_row` | `UnaryMap` | `map_fn.MaskRow(tile=<input>.stream.stream_dtype)` |
+| `unary_select_to_scalar` | `UnaryMap` | `map_fn.SelectToScalar` |
+| `unary_to_const_int` | `UnaryMap` | `map_fn.ToConstInt(constant)` |
 | `binary_map_accum` | `BinaryMapAccum` | `map_accum_fn.Matmul` (NOT `map_fn.Matmul`) |
 | `accum_add` | `Accum` | `accum_fn.Add` |
 | `accum_mul` | `Accum` | `accum_fn.Mul` |
+| `accum_max` | `Accum` | `accum_fn.Max` |
 | `accum_retile_row` | `Accum` | `accum_fn.RetileRow` |
 | `accum_retile_col` | `Accum` | `accum_fn.RetileCol` |
+| `accum_signal_req_all_read` | `Accum` (output dtype `Tile(Uint64(), (1,1))`, init `Empty(shape=(1,1), dtype=Uint64())`) | `accum_fn.SignalReqAllRead` |
 | `promote` | `Promote` | — |
 | `promote_outer` | `PromoteOuter` | — |
 | `flatten` | `Flatten` | — |
@@ -64,15 +73,20 @@ The table below lists the target class for each DSL call. Entries marked "+ `gra
 | `repeat_static` | `RepeatStatic` | — |
 | `retile_streamify` | `RetileStreamify` | — |
 | `streamify` | `Streamify` | — |
+| `bufferize` | `Bufferize` | — |
+| `dyn_streamify` | `DynStreamify` (pass `repeat_rank` and `bufferized_rank`) | — |
 | `broadcast` | `Broadcast` | — |
 | `parallelize` | `Parallelize` | — |
 | `static_reassemble` | `StaticReassemble` | — |
 | `flat_partition` | `FlatPartition` | `partition_rank=0` (DSL always flattens entire stream) |
 | `flat_reassemble` | `FlatReassemble` | `reassemble_rank=0` (matches partition_rank) |
+| `eager_merge` | `EagerMerge` (returns `(data, sel)` — multi-output) | — |
+| `flatmap_filter_row_streamify` | `FlatmapFilterRowStreamify` | — |
+| `flatmap_counter` | `FlatmapCounter` | — |
 | `offchip_store` | `OffChipStore` | — |
 | `random_offchip_store` | `RandomOffChipStore` | — |
 
-Multi-output nodes (`Broadcast`, `Parallelize`, `FlatPartition`): access outputs as tuple refs `(node, i)`, NOT `node[i]`.
+Multi-output nodes (`Broadcast`, `Parallelize`, `FlatPartition`, `EagerMerge`): access outputs as tuple refs `(node, i)`, NOT `node[i]`.
 
 `FlatPartition` and `FlatReassemble` each need their own `SelectGen` control node.
 

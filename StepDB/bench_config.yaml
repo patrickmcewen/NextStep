@@ -1943,3 +1943,31 @@ sdpa_core_max:
       tile_m: 64
       tile_n: 256
   origin: seed
+sdpa_kv_read:
+  problem: seed_kernels/attention/sdpa_kv_read/reference.py
+  step_impl: null
+  params:
+  - hidden_dim
+  - seq_len
+  - num_kv_heads
+  - num_heads
+  - head_dim
+  - batch_size
+  - batch_idx
+  presets:
+    tiny:
+      hidden_dim: 16
+      seq_len: 8
+      num_kv_heads: 2
+      num_heads: 2
+      head_dim: 8
+      batch_size: 4
+      batch_idx: 0
+    small:
+      hidden_dim: 32
+      seq_len: 16
+      num_kv_heads: 2
+      num_heads: 4
+      head_dim: 16
+      batch_size: 8
+      batch_idx: 3

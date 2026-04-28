@@ -392,13 +392,11 @@ def _precompute_moe_routed(dims):
     expert_weights_raw, _ = torch.topk(router_logits, n_active, dim=-1)
     expert_weights = torch.softmax(expert_weights_raw, dim=-1)
 
-    # Multihot for FlatPartition
     expert_multihot = torch.zeros(B, n_experts, dtype=torch.int64)
     for b in range(B):
         for k in range(n_active):
             expert_multihot[b, expert_indices[b, k]] = 1
 
-    # Onehot for weight partitioning
     expert_onehot = torch.zeros(B, n_active, n_experts, dtype=torch.int64)
     for b in range(B):
         for k in range(n_active):
@@ -812,3 +810,15 @@ def _precompute_basic_prefill_attention(dims):
         "sin": sin,
         "o_proj_weight": o_proj_weight,
     }
+
+@register("sdpa_kv_read")
+def _precompute_sdpa_kv_read(dims):
+    torch.manual_seed(SEED)
+    hidden_dim = dims["hidden_dim"]
+    seq_len = dims["seq_len"]
+    num_heads = dims["num_heads"]
+    head_dim = dims["head_dim"]
+    num_kv_heads = dims["num_kv_heads"]
+    batch_size = dims["batch_size"]
+    batch_idx = dims["batch_idx"]
+    return {"x": torch.randn(1, hidden_dim), "W_q": torch.randn(hidden_dim, num_heads * head_dim), "W_k": torch.randn(hidden_dim, num_kv_heads * head_dim), "W_v": torch.randn(hidden_dim, num_kv_heads * head_dim), "K_cache": torch.randn(batch_size, seq_len+1, num_kv_heads, head_dim), "V_cache": torch.randn(batch_size, seq_len+1, num_kv_heads, head_dim), "batch_idx": batch_idx, "seq_len": seq_len}

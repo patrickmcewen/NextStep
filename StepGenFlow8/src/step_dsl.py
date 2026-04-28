@@ -47,6 +47,19 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
     return result.unsqueeze(0)  # prepend leading 1
 
 
+def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col):
+    assert underlying.dtype in [torch.float32, torch.float16], (
+        f"dyn_offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    )
+    R, C = underlying.shape[-2], underlying.shape[-1]
+    assert R % tile_row == 0 and C % tile_col == 0, (
+        f"dyn_offchip_load: ({R},{C}) not divisible by tile ({tile_row},{tile_col})"
+    )
+    grid_r, grid_c = R // tile_row, C // tile_col
+    tiled = underlying.reshape(grid_r, tile_row, grid_c, tile_col).permute(0, 2, 1, 3)
+    return tiled.reshape(*tensor_shape_tiled, tile_row, tile_col).unsqueeze(0)
+
+
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float32 or float16, got {underlying.dtype}"
     loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed)
@@ -90,6 +103,17 @@ def cache_read_addr_gen(idx, seq_len, row_offset):
         assert n >= 0, f"cache_read_addr_gen: seq_len[{b}]={n} must be >= 0"
         out.append(torch.arange(base, base + n, dtype=torch.float32).reshape(1, n, 1, 1))
     return out
+
+
+def expert_addr_gen(x, expert_addr_base, num_tile_per_expert):
+    assert (x.sum(dim=-1) == 1).all(), (
+        "expert_addr_gen: input must be one-hot (exactly one expert selected per element)"
+    )
+    expert_indices = x.argmax(dim=-1)
+    base = expert_addr_base + expert_indices * num_tile_per_expert
+    offsets = torch.arange(num_tile_per_expert, dtype=base.dtype)
+    addrs = base.unsqueeze(-1) + offsets
+    return addrs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).float()
 
 
 def filter_last_tile(seq_len):
@@ -324,6 +348,21 @@ def unary_rowwise_sum(x):
     _assert_float(x, "unary_rowwise_sum")
     return x.sum(dim=-1, keepdim=True)
 
+
+def unary_mask_row(x):
+    _assert_float(x, "unary_mask_row")
+    return torch.ones_like(x[..., :1])
+
+
+def unary_select_to_scalar(x):
+    _assert_float(x, "unary_select_to_scalar")
+    return x
+
+
+def unary_to_const_int(x, constant):
+    _assert_float(x, "unary_to_const_int")
+    return torch.full_like(x, constant, dtype=torch.float32)
+
 def accum_add(x, rank=1):
     _assert_float(x, "accum_add")
     assert rank > 0, f"accum_add: rank must be > 0, got {rank}"
@@ -363,6 +402,31 @@ def accum_retile_col(x, rank=1):
         x = x.permute(perm).contiguous()
         x = x.reshape(*s[:-3], s[-2], s[-3] * s[-1])
     return x
+
+
+def accum_signal_req_all_read(x, rank=1):
+    _assert_float(x, "accum_signal_req_all_read")
+    assert rank > 0, f"accum_signal_req_all_read: rank must be > 0, got {rank}"
+    stream_shape = x.shape[:-2 - rank]
+    return torch.ones(*stream_shape, 1, 1)
+
+def eager_merge(inputs):
+    n = len(inputs)
+    assert n > 0, "eager_merge: must have at least one input"
+    tile_r, tile_c = inputs[0].shape[-2], inputs[0].shape[-1]
+    for i, p in enumerate(inputs):
+        assert p.shape[-2:] == (tile_r, tile_c), (
+            f"eager_merge: input {i} tile shape {tuple(p.shape[-2:])} != ({tile_r},{tile_c})"
+        )
+    data = torch.cat(list(inputs), dim=0)
+    counts = [p.shape[0] for p in inputs]
+    select = torch.zeros(sum(counts), n)
+    offset = 0
+    for i, c in enumerate(counts):
+        select[offset:offset + c, i] = 1.0
+        offset += c
+    return [data, select]
+
 
 def flat_partition(x, control, n):
     assert control.shape[-1] == n, (
@@ -409,6 +473,31 @@ def flat_reassemble(inputs, control):
         ctrl_stream_shape = (1,) + ctrl_stream_shape
     n_active = output.shape[1]
     return output.reshape(*ctrl_stream_shape, n_active, tile_r, tile_c)
+
+def flatmap_filter_row_streamify(x, mask):
+    tile_r, tile_c = x.shape[-2], x.shape[-1]
+    flat_data = x.reshape(-1, tile_r, tile_c)
+    flat_mask = mask.reshape(-1, tile_r, 1)
+    rows = []
+    for i in range(flat_data.shape[0]):
+        for r in range(tile_r):
+            if flat_mask[i, r, 0] > 0:
+                rows.append(flat_data[i, r:r + 1, :])
+    assert len(rows) > 0, "flatmap_filter_row_streamify: no rows passed the mask"
+    result = torch.cat(rows, dim=0)
+    outer = x.shape[:-2][:-1]
+    return result.reshape(*outer, len(rows), 1, tile_c)
+
+
+def flatmap_counter(x):
+    stream_shape = x.shape[:-2]
+    flat = x.reshape(-1)
+    assert flat.numel() == 1, (
+        "flatmap_counter: only single-scalar input supported"
+    )
+    n = int(flat[0].item())
+    return torch.arange(n, dtype=x.dtype).reshape(*stream_shape, n, 1, 1)
+
 
 def promote(x, rank=1):
     max_rank = x.ndim - 1
@@ -572,6 +661,17 @@ def streamify(x, repeat_factors, rank=0):
         offset += 1  # account for newly inserted dim
     return result
 
+
+def bufferize(x):
+    return x
+
+
+def dyn_streamify(x, ref, bufferized_rank):
+    ref_stream_shape = ref.shape[:-2]
+    buf_and_tile_dims = x.shape[-(2 + bufferized_rank):]
+    expand_shape = list(ref_stream_shape) + list(buf_and_tile_dims)
+    return x.expand(expand_shape).contiguous()
+
 def broadcast(x, n):
     return [x.clone() for _ in range(n)]
 
@@ -609,13 +709,9 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False):
         mapped = mapped.sum(dim=-3)
     return mapped
 
-def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col):
+def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0):
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_store: underlying dtype must be float32 or float16, got {underlying.dtype}"
-    )
-    assert underlying.ndim == 2, (
-        f"random_offchip_store: underlying must be 2D (flatten any batch dims first), "
-        f"got shape {tuple(underlying.shape)}"
     )
     assert waddr.shape[-2:] == (1, 1), (
         f"random_offchip_store: waddr tile shape must be (1,1), got {tuple(waddr.shape[-2:])}"
@@ -626,21 +722,41 @@ def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col):
     assert wdata.shape[:-2] == waddr.shape[:-2], (
         f"random_offchip_store: wdata stream {tuple(wdata.shape[:-2])} != waddr stream {tuple(waddr.shape[:-2])}"
     )
-    R, C = underlying.shape
+    R, C = underlying.shape[-2], underlying.shape[-1]
     assert R % tile_row == 0 and C % tile_col == 0, (
         f"random_offchip_store: ({R},{C}) not divisible by tile ({tile_row},{tile_col})"
     )
-    grid_c = C // tile_col
+    # Mirror random_offchip_load's flat tile walk: batch dims (row-major) -> grid_r -> grid_c.
+    # The Rust impl asserts 2D underlying, but the Python op layer (ops.py) builds tensor_shape_tiled
+    # with leading batch dims (e.g. KV cache [batch, maxN, num_kv_heads, head_dim]), so we follow
+    # the load-side semantics and accept N-D underlying.
+    assert underlying.is_contiguous(), (
+        "random_offchip_store: underlying must be contiguous so writes propagate through the view"
+    )
+    batch_shape = underlying.shape[:-2]
+    B = 1
+    for d in batch_shape:
+        B *= d
+    grid_r, grid_c = R // tile_row, C // tile_col
+    tiles_per_batch = grid_r * grid_c
+    flat_batch = underlying.view(B, R, C)
     addrs = waddr.reshape(-1).long().tolist()
     wflat = wdata.reshape(-1, tile_row, tile_col)
     for i, a in enumerate(addrs):
-        gr, gc = a // grid_c, a % grid_c
-        underlying[gr * tile_row:(gr + 1) * tile_row, gc * tile_col:(gc + 1) * tile_col] = wflat[i]
+        b = a // tiles_per_batch
+        within = a % tiles_per_batch
+        gr, gc = within // grid_c, within % grid_c
+        flat_batch[b, gr * tile_row:(gr + 1) * tile_row, gc * tile_col:(gc + 1) * tile_col] = wflat[i]
     stream_shape = waddr.shape[:-2]
     return torch.ones(*stream_shape, 1, 1, dtype=torch.float32)
 
 
 def offchip_store(x):
+    # Note: the Rust IR also has a DynOffChipStore whose runtime body is byte-for-byte
+    # identical to OffChipStore — they only differ at construction (DynOffChipStore reads
+    # tensor_shape_tiled from a JSON file at startup instead of taking it as a Vec<usize>).
+    # Since this DSL doesn't deal with on-disk shape files, dyn_offchip_store is omitted;
+    # offchip_store covers the value-level behavior of both.
     assert x.ndim >= 2, (
         f"offchip_store: input must be a tile stream (at least 2D for tile_r, tile_c), "
         f"got shape {tuple(x.shape)}."
@@ -672,7 +788,8 @@ def offchip_store(x):
 
 DSL_FUNCTIONS = {
     # Source
-    "offchip_load", "offchip_load_ref", "select_gen", "metadata_gen",
+    "offchip_load", "offchip_load_ref", "dyn_offchip_load",
+    "select_gen", "metadata_gen", "expert_addr_gen",
     "cache_read_addr_gen", "random_offchip_load", "filter_last_tile",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
@@ -682,16 +799,20 @@ DSL_FUNCTIONS = {
     # Unary compute
     "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
     "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
+    "unary_mask_row", "unary_select_to_scalar", "unary_to_const_int",
     # Accumulation
     "accum_add", "accum_mul", "accum_max", "accum_retile_row", "accum_retile_col",
+    "accum_signal_req_all_read",
     # Stream shape
     "promote", "promote_outer", "flatten", "reshape_stream", "reshape_pad_stream",
-    "expand_ref", "repeat_ref", "repeat_static", "streamify",
-    "retile_streamify",
+    "expand_ref", "repeat_ref", "repeat_static", "streamify", "dyn_streamify",
+    "bufferize", "retile_streamify",
     # Multi-output
     "broadcast", "parallelize", "static_reassemble",
     # Routing
-    "flat_partition", "flat_reassemble",
+    "eager_merge", "flat_partition", "flat_reassemble",
+    # Flatmap
+    "flatmap_filter_row_streamify", "flatmap_counter",
     # Sink
     "offchip_store", "random_offchip_store",
 }

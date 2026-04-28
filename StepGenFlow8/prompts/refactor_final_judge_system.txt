@@ -8,7 +8,8 @@ These are the ONLY functions allowed for tensor computation:
 
 DSL_FUNCTIONS = {
     # Source
-    "offchip_load", "offchip_load_ref", "select_gen", "metadata_gen",
+    "offchip_load", "offchip_load_ref", "dyn_offchip_load",
+    "select_gen", "metadata_gen", "expert_addr_gen",
     "cache_read_addr_gen", "random_offchip_load", "filter_last_tile",
     # Binary compute
     "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
@@ -18,16 +19,20 @@ DSL_FUNCTIONS = {
     # Unary compute
     "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
     "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
+    "unary_mask_row", "unary_select_to_scalar", "unary_to_const_int",
     # Accumulation
     "accum_add", "accum_mul", "accum_max", "accum_retile_row", "accum_retile_col",
+    "accum_signal_req_all_read",
     # Stream shape
     "promote", "promote_outer", "flatten", "reshape_stream", "reshape_pad_stream",
-    "expand_ref", "repeat_ref", "repeat_static", "streamify",
-    "retile_streamify",
+    "expand_ref", "repeat_ref", "repeat_static", "streamify", "dyn_streamify",
+    "bufferize", "retile_streamify",
     # Multi-output
     "broadcast", "parallelize", "static_reassemble",
     # Routing
-    "flat_partition", "flat_reassemble",
+    "eager_merge", "flat_partition", "flat_reassemble",
+    # Flatmap
+    "flatmap_filter_row_streamify", "flatmap_counter",
     # Sink
     "offchip_store", "random_offchip_store",
 }

@@ -24,17 +24,21 @@ _BINARY_MAP = {
     "binary_add":      "Add",
     "binary_div":      "Div",
     "binary_is_equal": "IsEqual",
+    "binary_row_wise_append": "RowWiseAppend",
+    "binary_set_offset": "SetOffset",
 }
 _UNARY_MAP = {
-    "unary_silu":        "Silu",
-    "unary_square":      "Square",
-    "unary_exp":         "Exp",
-    "unary_rsqrt":       "Rsqrt",
-    "unary_pow2":        "Pow2",
-    "unary_mul_imm":     "MulImmediate",
-    "unary_add_imm":     "AddImmediate",
-    "unary_sub_imm":     "SubImmediate",
-    "unary_rowwise_sum": "RowWiseSum",
+    "unary_silu":             "Silu",
+    "unary_square":            "Square",
+    "unary_exp":               "Exp",
+    "unary_rsqrt":             "Rsqrt",
+    "unary_pow2":              "Pow2",
+    "unary_mul_imm":           "MulImmediate",
+    "unary_add_imm":           "AddImmediate",
+    "unary_sub_imm":           "SubImmediate",
+    "unary_rowwise_sum":       "RowWiseSum",
+    "unary_select_to_scalar":  "SelectToScalar",
+    "unary_to_const_int":      "ToConstInt",
 }
 _ACCUM_MAP = {
     # accum_fn class name, output-tile mode
@@ -44,7 +48,7 @@ _ACCUM_MAP = {
     "accum_retile_row": ("RetileRow", "row"),
     "accum_retile_col": ("RetileCol", "col"),
 }
-_MULTI_OUTPUT = {"broadcast", "parallelize", "flat_partition"}
+_MULTI_OUTPUT = {"broadcast", "parallelize", "flat_partition", "eager_merge"}
 
 # All DSL function names that this translator knows how to rewrite.
 _DSL_NAMES: set = set()
@@ -101,6 +105,15 @@ def _dsl2step_out_tile(x, mode, accum_rank):
 
 def _dsl2step_init(x):
     return Empty(shape=(1, 1), dtype=x.stream.stream_dtype.tile_dtype)
+
+
+def _dsl2step_in_tile(x):
+    # Resolve the input stream's tile dtype, accepting either a StepOps node or
+    # a (node, idx) branch ref produced by multi-output ops.
+    if isinstance(x, tuple) and len(x) == 2:
+        node, idx = x
+        return node.stream_idx(idx).stream_dtype
+    return x.stream.stream_dtype
 """
 
 
@@ -450,33 +463,44 @@ class _State:
         return _DISPATCH[fname](self, target.id, stmt.value)
 
     def _rewrite_multi(self, target, call, fname):
-        n_node = _arg(call, 1 if fname != "flat_partition" else 2,
-                      "n" if fname != "flat_partition" else "n")
-        assert n_node is not None, f"{fname}: missing 'n' argument"
-        n_src = _src(n_node)
         node_var = self.fresh(fname)
 
-        if fname == "broadcast":
-            x = _src(_arg(call, 0, "x"))
-            ctor = (f"{node_var} = Broadcast(graph, {x}, num_consumers={n_src})\n")
-        elif fname == "parallelize":
-            x = _src(_arg(call, 0, "x"))
+        if fname == "eager_merge":
+            # eager_merge always produces 2 streams: (data, select).
+            inputs     = _src(_arg(call, 0, "inputs"))
+            input_rank = _arg_or_default(call, 1, "input_rank", "1")
+            n_src = "2"
             ctor = (
-                f"{node_var} = Parallelize(graph, {x}, "
-                f"parallelize_rank={x}.stream.rank, num_consumers={n_src})\n"
+                f"{node_var} = EagerMerge(graph, {inputs}, "
+                f"input_rank={input_rank})\n"
             )
-        else:  # flat_partition
-            x = _src(_arg(call, 0, "x"))
-            ctrl = _src(_arg(call, 1, "control"))
-            assert ctrl in self.select_gen_vars, (
-                f"flat_partition: control argument {ctrl!r} must be assigned "
-                f"from select_gen(...) earlier in the function"
-            )
-            ctor = (
-                f"{node_var} = FlatPartition(graph, {x}, control={ctrl}, "
-                f"partition_rank=0, switch_cycles=[1] * {n_src}, "
-                f"write_back_mu=False, num_consumers={n_src})\n"
-            )
+        else:
+            n_node = _arg(call, 1 if fname != "flat_partition" else 2,
+                          "n" if fname != "flat_partition" else "n")
+            assert n_node is not None, f"{fname}: missing 'n' argument"
+            n_src = _src(n_node)
+
+            if fname == "broadcast":
+                x = _src(_arg(call, 0, "x"))
+                ctor = (f"{node_var} = Broadcast(graph, {x}, num_consumers={n_src})\n")
+            elif fname == "parallelize":
+                x = _src(_arg(call, 0, "x"))
+                ctor = (
+                    f"{node_var} = Parallelize(graph, {x}, "
+                    f"parallelize_rank={x}.stream.rank, num_consumers={n_src})\n"
+                )
+            else:  # flat_partition
+                x = _src(_arg(call, 0, "x"))
+                ctrl = _src(_arg(call, 1, "control"))
+                assert ctrl in self.select_gen_vars, (
+                    f"flat_partition: control argument {ctrl!r} must be assigned "
+                    f"from select_gen(...) earlier in the function"
+                )
+                ctor = (
+                    f"{node_var} = FlatPartition(graph, {x}, control={ctrl}, "
+                    f"partition_rank=0, switch_cycles=[1] * {n_src}, "
+                    f"write_back_mu=False, num_consumers={n_src})\n"
+                )
 
         # Bind the multi-output to the user's target. Three forms:
         #   xs = parallelize(x, n)              -> Name target
@@ -561,15 +585,17 @@ def _h_offchip_load_ref(state, target, call):
 
 
 def _h_random_offchip_load(state, target, call):
-    underlying = _src(_arg(call, 0, "underlying"))
-    raddr      = _src(_arg(call, 1, "raddr"))
-    tile_row   = _src(_arg(call, 2, "tile_row"))
-    tile_col   = _src(_arg(call, 3, "tile_col"))
-    transposed = _arg(call, 4, "transposed")
+    underlying    = _src(_arg(call, 0, "underlying"))
+    raddr         = _src(_arg(call, 1, "raddr"))
+    tile_row      = _src(_arg(call, 2, "tile_row"))
+    tile_col      = _src(_arg(call, 3, "tile_col"))
+    base_addr_byte = _arg_or_default(call, 4, "base_addr_byte", "0")
+    transposed    = _arg(call, 5, "transposed")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     return _block(
         f"{target} = RandomOffChipLoad(graph, underlying={underlying}, "
-        f"raddr={raddr}, tile_row={tile_row}, tile_col={tile_col}{extra})\n"
+        f"raddr={raddr}, tile_row={tile_row}, tile_col={tile_col}, "
+        f"base_addr_byte={base_addr_byte}, par_dispatch=1{extra})\n"
     )
 
 
@@ -607,6 +633,112 @@ def _h_filter_last_tile(state, target, call):
     return _block(f"{target} = FilterLastTile(graph, {seq_len})\n")
 
 
+def _h_binary_cache_write_addr_gen(state, target, call):
+    idx        = _src(_arg(call, 0, "idx"))
+    seq_len    = _src(_arg(call, 1, "seq_len"))
+    row_offset = _src(_arg(call, 2, "row_offset"))
+    return _block(
+        f"{target} = BinaryMap(graph, {idx}, {seq_len}, "
+        f"fn=map_fn.CacheWriteAddrGen(row_offset={row_offset}), "
+        f"write_back_mu=False)\n"
+    )
+
+
+def _h_unary_mask_row(state, target, call):
+    # MaskRow needs the input tile as a constructor argument so it can derive
+    # the (row, 1) output shape; resolve it from the input stream at build time.
+    x = _src(_arg(call, 0, "x"))
+    return _block(
+        f"{target} = UnaryMap(graph, {x}, "
+        f"fn=map_fn.MaskRow(tile=_dsl2step_in_tile({x})), "
+        f"write_back_mu=False)\n"
+    )
+
+
+def _h_accum_signal_req_all_read(state, target, call):
+    x    = _src(_arg(call, 0, "x"))
+    rank = _arg_or_default(call, 1, "rank", "1")
+    # SignalReqAllRead's output is fixed: Tile(uint64, (1, 1)).
+    return _block(
+        f"{target} = Accum(graph, {x}, "
+        f"output_stream_dtype=Tile(tile_dtype=Uint64(), shape=(1, 1)), "
+        f"fn=accum_fn.SignalReqAllRead(), "
+        f"init_fn=Empty(shape=(1, 1), dtype=Uint64()), "
+        f"accum_rank={rank}, write_back_mu=False)\n"
+    )
+
+
+def _h_flatmap_filter_row_streamify(state, target, call):
+    x    = _src(_arg(call, 0, "x"))
+    mask = _src(_arg(call, 1, "mask"))
+    return _block(
+        f"{target} = FlatmapFilterRowStreamify(graph, input={x}, mask={mask})\n"
+    )
+
+
+def _h_flatmap_counter(state, target, call):
+    x = _src(_arg(call, 0, "x"))
+    return _block(f"{target} = FlatmapCounter(graph, input={x})\n")
+
+
+def _h_expert_addr_gen(state, target, call):
+    x                   = _src(_arg(call, 0, "x"))
+    expert_addr_base    = _src(_arg(call, 1, "expert_addr_base"))
+    num_tile_per_expert = _src(_arg(call, 2, "num_tile_per_expert"))
+    return _block(
+        f"{target} = ExpertAddrGen(graph, {x}, "
+        f"num_tile_per_expert={num_tile_per_expert}, "
+        f"expert_addr_base={expert_addr_base})\n"
+    )
+
+
+def _h_dyn_offchip_load(state, target, call):
+    underlying_node = _arg(call, 0, "underlying")
+    # ``underlying`` must be a ``tensors['<name>']`` subscript so we can lift
+    # the tensor name into ``input_tensor_name`` and read its dtype at build
+    # time.
+    assert (
+        isinstance(underlying_node, ast.Subscript)
+        and isinstance(underlying_node.value, ast.Name)
+        and underlying_node.value.id == "tensors"
+        and isinstance(underlying_node.slice, ast.Constant)
+        and isinstance(underlying_node.slice.value, str)
+    ), (
+        "dyn_offchip_load: underlying must be tensors['<name>'], got "
+        f"{ast.dump(underlying_node) if underlying_node is not None else 'None'}"
+    )
+    name_str = underlying_node.slice.value
+    underlying = _src(underlying_node)
+    tensor_shape_tiled = _src(_arg(call, 1, "tensor_shape_tiled"))
+    tile_row = _src(_arg(call, 2, "tile_row"))
+    tile_col = _src(_arg(call, 3, "tile_col"))
+    return _block(
+        f"{target} = DynLinearOffChipLoad("
+        f"input_tensor_name={name_str!r}, "
+        f"tensor_shape_tiled={tensor_shape_tiled}, "
+        f"dtype={underlying}.dtype, "
+        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch=1)\n"
+        f"graph.add_node({target})\n"
+    )
+
+
+def _h_bufferize(state, target, call):
+    x    = _src(_arg(call, 0, "x"))
+    rank = _arg_or_default(call, 1, "rank", "1")
+    return _block(f"{target} = Bufferize(graph, {x}, rank={rank})\n")
+
+
+def _h_dyn_streamify(state, target, call):
+    x               = _src(_arg(call, 0, "x"))
+    ref             = _src(_arg(call, 1, "ref"))
+    bufferized_rank = _src(_arg(call, 2, "bufferized_rank"))
+    repeat_rank     = _arg_or_default(call, 3, "repeat_rank", "1")
+    return _block(
+        f"{target} = DynStreamify(graph, input={x}, ref={ref}, "
+        f"repeat_rank={repeat_rank}, bufferized_rank={bufferized_rank})\n"
+    )
+
+
 def _make_binary_map(map_class):
     def handler(state, target, call):
         a = _src(_arg(call, 0, "a"))
@@ -627,7 +759,7 @@ def _make_binary_map(map_class):
 def _make_unary_map(map_class):
     def handler(state, target, call):
         x = _src(_arg(call, 0, "x"))
-        if map_class in ("MulImmediate", "AddImmediate", "SubImmediate"):
+        if map_class in ("MulImmediate", "AddImmediate", "SubImmediate", "ToConstInt"):
             c = _src(_arg(call, 1, "constant"))
             fn_str = f"map_fn.{map_class}({c})"
         else:
@@ -779,15 +911,16 @@ def _h_offchip_store(state, target, call):
 
 
 def _h_random_offchip_store(state, target, call):
-    underlying = _src(_arg(call, 0, "underlying"))
-    wdata      = _src(_arg(call, 1, "wdata"))
-    waddr      = _src(_arg(call, 2, "waddr"))
-    tile_row   = _src(_arg(call, 3, "tile_row"))
-    tile_col   = _src(_arg(call, 4, "tile_col"))
+    underlying     = _src(_arg(call, 0, "underlying"))
+    wdata          = _src(_arg(call, 1, "wdata"))
+    waddr          = _src(_arg(call, 2, "waddr"))
+    tile_row       = _src(_arg(call, 3, "tile_row"))
+    tile_col       = _src(_arg(call, 4, "tile_col"))
+    base_addr_byte = _arg_or_default(call, 5, "base_addr_byte", "0")
     return _block(
         f"{target} = RandomOffChipStore(graph, underlying={underlying}, "
         f"wdata={wdata}, waddr={waddr}, tile_row={tile_row}, "
-        f"tile_col={tile_col})\n"
+        f"tile_col={tile_col}, base_addr_byte={base_addr_byte}, par_dispatch=1)\n"
     )
 
 
@@ -798,10 +931,15 @@ def _h_random_offchip_store(state, target, call):
 _DISPATCH = {
     "offchip_load":         _h_offchip_load,
     "offchip_load_ref":     _h_offchip_load_ref,
+    "dyn_offchip_load":     _h_dyn_offchip_load,
     "random_offchip_load":  _h_random_offchip_load,
     "select_gen":           _h_select_gen,
     "metadata_gen":         _h_metadata_gen,
+    "expert_addr_gen":      _h_expert_addr_gen,
     "cache_read_addr_gen":  _h_cache_read_addr_gen,
+    "binary_cache_write_addr_gen": _h_binary_cache_write_addr_gen,
+    "unary_mask_row":       _h_unary_mask_row,
+    "accum_signal_req_all_read": _h_accum_signal_req_all_read,
     "filter_last_tile":     _h_filter_last_tile,
     "binary_map_accum":     _h_binary_map_accum,
     "promote":              _h_promote,
@@ -814,14 +952,19 @@ _DISPATCH = {
     "repeat_static":        _h_repeat_static,
     "streamify":            _h_streamify,
     "retile_streamify":     _h_retile_streamify,
+    "bufferize":            _h_bufferize,
+    "dyn_streamify":        _h_dyn_streamify,
     "static_reassemble":    _h_static_reassemble,
     "flat_reassemble":      _h_flat_reassemble,
+    "flatmap_filter_row_streamify": _h_flatmap_filter_row_streamify,
+    "flatmap_counter":      _h_flatmap_counter,
     "offchip_store":        _h_offchip_store,
     "random_offchip_store": _h_random_offchip_store,
-    # broadcast / parallelize / flat_partition: handled by _State._rewrite_multi
+    # broadcast / parallelize / flat_partition / eager_merge: handled by _State._rewrite_multi
     "broadcast":            None,
     "parallelize":          None,
     "flat_partition":       None,
+    "eager_merge":          None,
 }
 for _name, _cls in _BINARY_MAP.items():
     _DISPATCH[_name] = _make_binary_map(_cls)
