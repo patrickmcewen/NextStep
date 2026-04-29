@@ -35,6 +35,7 @@ import numpy as np
 SEED = 42
 
 from graph.graph import MultiDiGraph as Graph
+from graph.graph import MultiDiGraph
 from rewrite.broadcast import infer_broadcast
 from step_py.datatype import (
     Float32, Float16, Uint32, Uint64, Bool,

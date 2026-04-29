@@ -31,14 +31,6 @@ Similarly, use `reassemble_rank=0` for `FlatReassemble`.
 {map_code}
 ```
 
-## Section 3: STeP Functional Emulator (functional.py)
-
-This is how each STeP node actually executes. Use this to understand the semantics when translating.
-
-```python
-{functional_code}
-```
-
 ## Runtime environment
 
 Your `build_graph` runs after the following scaffold is prepended. These names — and ONLY these — are in scope. Do not add `import` lines of your own; any import fails the exec.

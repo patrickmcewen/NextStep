@@ -17,13 +17,13 @@ def main():
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
-    parser.add_argument("--max-outer", type=int, default=10, help="Max outer loop iterations")
-    parser.add_argument("--max-turns", type=int, default=20, help="Max tool-call rounds per inner loop")
+    parser.add_argument("--max-outer", type=int, default=5, help="Max outer loop iterations")
+    parser.add_argument("--max-turns", type=int, default=16, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory (default: checkpoints/<timestamp>)")
-    parser.add_argument("--pipeline", default="standard", choices=["standard", "direct"],
-                        help="Pipeline mode: 'standard' (lowering + translate) or 'direct' (PyTorch → STeP in one step)")
+    parser.add_argument("--pipeline", default="standard", choices=["standard", "direct", "direct_no_functional"],
+                        help="Pipeline mode: 'standard' (lowering + translate) or 'direct' (PyTorch → STeP in one step) or 'direct_no_functional' (PyTorch → STeP in one step without functional.py)")
     parser.add_argument("--translator", default="auto", choices=["llm", "auto"],
                         help="Translation backend: 'auto' (default; deterministic AST rewrite "
                              "from DSL to STeP) or 'llm' (LLM translate pass). "

@@ -212,7 +212,7 @@ _CORRECTNESS_CHECKERS = {
 
 # Cumulative pass orders — each pass inherits all prior bans within its group.
 _REFACTOR_ORDER = ["refactor_load", "refactor_compute", "refactor_shape", "refactor_final"]
-_TRANSLATION_ORDER = ["translate", "translate_full"]
+_TRANSLATION_ORDER = ["translate", "translate_full", "translate_full_no_functional"]
 
 # Allowed torch.XXX() calls in the OUTPUT of each pass.
 # None = unrestricted.  set() = nothing allowed.
@@ -225,6 +225,7 @@ _PASS_ALLOWED_TORCH = {
     # The build_graph body should only contain STeP graph construction.
     "translate": set(),  # no torch in build_graph body — all ops are STeP nodes
     "translate_full": set(),
+    "translate_full_no_functional": set(),
 }
 
 # Allowed F.XXX() calls per pass.
@@ -236,6 +237,7 @@ _PASS_ALLOWED_F = {
     "refactor_final": set(),
     "translate": set(),
     "translate_full": set(),
+    "translate_full_no_functional": set(),
 }
 
 # Extra string patterns banned at each stage.
@@ -310,6 +312,9 @@ _PASS_EXTRA_BANS = {
     "translate_full": [
         ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
     ],
+    "translate_full_no_functional": [
+        ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
+    ],
 }
 
 # Passes where the judge should also run on NONCOMPLIANT code (not just after
@@ -323,6 +328,7 @@ _PASS_REQUIRES = {
     "refactor_load":     ["offchip_load", "offchip_store"],
     "translate":         ["LinearOffChipLoad", "OffChipStore"],
     "translate_full":    ["LinearOffChipLoad", "OffChipStore"],
+    "translate_full_no_functional": ["LinearOffChipLoad", "OffChipStore"],
 }
 
 # Regex to find torch.XXX( and F.XXX( calls
@@ -857,7 +863,7 @@ async def run_kernel(
     """
     assert pipeline in PIPELINES, f"Unknown pipeline '{pipeline}'. Known: {sorted(PIPELINES.keys())}"
     assert translator in ("llm", "auto"), f"Unknown translator '{translator}'. Known: llm, auto"
-    assert not (translator == "auto" and pipeline == "direct"), (
+    assert not (translator == "auto" and (pipeline == "direct" or pipeline == "direct_no_functional")), (
         "translator='auto' requires pipeline='standard' (it consumes refactor_final's DSL output)"
     )
     pipeline_config = PIPELINES[pipeline]

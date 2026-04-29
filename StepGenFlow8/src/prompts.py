@@ -74,6 +74,11 @@ DIRECT_TRANSLATOR_PASSES = [
      "func_name": "build_graph", "executor": "graph"},
 ]
 
+DIRECT_TRANSLATOR_PASSES_NO_FUNCTIONAL = [
+    {"name": "translate_full_no_functional", "template": "translate_system_full_no_functional.txt",
+     "func_name": "build_graph", "executor": "graph"},
+]
+
 # Pipeline configurations
 PIPELINES = {
     "standard": {
@@ -83,6 +88,10 @@ PIPELINES = {
     "direct": {
         "lowering": [],
         "translation": DIRECT_TRANSLATOR_PASSES,
+    },
+    "direct_no_functional": {
+        "lowering": [],
+        "translation": DIRECT_TRANSLATOR_PASSES_NO_FUNCTIONAL,
     },
 }
 
@@ -213,7 +222,7 @@ def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
     ``pytorch_ref``, and ``dsl_code``. Templates without the
     ``{few_shot_examples}`` placeholder ignore this argument.
     """
-    all_passes = LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES
+    all_passes = LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES_NO_FUNCTIONAL
     pass_info = None
     for p in all_passes:
         if p["name"] == pass_name:
@@ -237,6 +246,22 @@ def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
         utility_ops_path = _STEP_TL_SRC / "step_py" / "utility_ops.py"
         assert utility_ops_path.exists(), f"utility_ops.py not found: {utility_ops_path}"
         replacements["utility_ops_code"] = utility_ops_path.read_text()#_strip_ops_boilerplate(utility_ops_path.read_text())
+    if "{accum_code}" in template:
+        accum_path = _STEP_TL_SRC / "step_py" / "functions" / "accum_fn.py"
+        assert accum_path.exists(), f"accum_fn.py not found: {accum_path}"
+        replacements["accum_code"] = accum_path.read_text()
+    if "{init_code}" in template:
+        init_path = _STEP_TL_SRC / "step_py" / "functions" / "init_fn.py"
+        assert init_path.exists(), f"init_fn.py not found: {init_path}"
+        replacements["init_code"] = init_path.read_text()
+    if "{map_accum_code}" in template:
+        map_accum_path = _STEP_TL_SRC / "step_py" / "functions" / "map_accum_fn.py"
+        assert map_accum_path.exists(), f"map_accum_fn.py not found: {map_accum_path}"
+        replacements["map_accum_code"] = map_accum_path.read_text()
+    if "{map_code}" in template:
+        map_path = _STEP_TL_SRC / "step_py" / "functions" / "map_fn.py"
+        assert map_path.exists(), f"map_fn.py not found: {map_path}"
+        replacements["map_code"] = map_path.read_text()
     for fn_name in ("init_fn", "map_fn", "accum_fn", "map_accum_fn"):
         placeholder = "{" + fn_name + "_code}"
         if placeholder in template:
@@ -265,6 +290,7 @@ _JUDGE_TEMPLATES = {
     "refactor_final": "refactor_final_judge_system.txt",
     "translate": "translate_judge_system.txt",
     "translate_full": "translate_judge_system.txt",
+    "translate_full_no_functional": "translate_judge_system.txt",
 }
 
 
@@ -418,7 +444,7 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
 
     # Determine which function name this pass expects
     pass_info = None
-    for p in LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES:
+    for p in LOWERING_PASSES + TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES + DIRECT_TRANSLATOR_PASSES_NO_FUNCTIONAL:
         if p["name"] == pass_name:
             pass_info = p
             break

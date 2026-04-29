@@ -52,7 +52,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--max-outer", type=int, default=None)
     p.add_argument("--max-turns", type=int, default=None)
-    p.add_argument("--pipeline", default=None, choices=[None, "standard", "direct"])
+    p.add_argument("--pipeline", default=None, choices=[None, "standard", "direct", "direct_no_functional"])
     p.add_argument("--translator", default=None, choices=[None, "auto", "llm"])
     return p.parse_args(argv)
 
