@@ -939,7 +939,22 @@ async def run_kernel(
             translator=translator,
         ))
 
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Normalize exceptions into the same failure-result shape so one outer's
+    # crash doesn't take down the rest of the run.
+    for i, r in enumerate(results):
+        if isinstance(r, BaseException):
+            err_msg = f"{type(r).__name__}: {r}"
+            print(f"[outer_{i}] CRASHED — {err_msg}")
+            results[i] = {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "cycle_count": None,
+                "final_diagnosis": err_msg,
+            }
 
     per_outer = [{"outer": i, "success": bool(r["success"])} for i, r in enumerate(results)]
 
