@@ -1,4 +1,0 @@
-{
-  "kernel": "sdpa_core",
-  "preset": "long_ctx_512"
-}

@@ -1,5 +1,0 @@
-{
-  "kernel": "gemm",
-  "preset": "small",
-  "cycles": null
-}
