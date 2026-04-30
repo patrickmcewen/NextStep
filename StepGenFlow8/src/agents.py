@@ -10,6 +10,7 @@ from openai.types.chat import ChatCompletion
 from openai.types.shared import Reasoning
 
 from src.prompts import (build_pass_system_prompt, build_judge_system_prompt,
+                         build_bundle_judge_system_prompt,
                           build_autotune_system_prompt)
 
 
@@ -141,6 +142,25 @@ def make_judge_agent(llm_config: dict, pass_name: str) -> Agent:
 
     return Agent(
         name=f"StepJudge_{pass_name}",
+        instructions=system_prompt,
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_bundle_judge_agent(llm_config: dict, compliance: dict) -> Agent:
+    """Bundle-mode judge: prompt is templated from the bundle's compliance config.
+
+    Use in place of make_judge_agent(refactor_final) when running with a bundle
+    so the judge checks against the abstraction's invented operator surface
+    rather than the hard-coded step_dsl vocabulary.
+    """
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    system_prompt = build_bundle_judge_system_prompt(compliance)
+
+    return Agent(
+        name="StepJudge_bundle",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),

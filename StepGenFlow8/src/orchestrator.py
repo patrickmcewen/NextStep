@@ -35,7 +35,8 @@ os.environ.setdefault("STEP_DSL_TRACE", "1")
 from src.dsl_to_step import translate as _dsl_to_step_translate
 from agents import Runner
 
-from src.agents import make_diagnostician_agent, make_judge_agent, make_pass_agent
+from src.agents import (make_diagnostician_agent, make_judge_agent,
+                        make_bundle_judge_agent, make_pass_agent)
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
                          DIRECT_TRANSLATOR_PASSES, PIPELINES,
                          build_pass_user_prompt,
@@ -66,9 +67,25 @@ from precompute import precompute_tensors  # noqa: E402  (StepDB/precompute.py)
 # ---------------------------------------------------------------------------
 
 def _extract_code(text: str) -> str:
-    """Extract the last python code block from LLM output."""
-    blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
-    return blocks[-1].strip() if blocks else ""
+    """Extract the last python code block from LLM output.
+
+    Accepts ```python ... ``` and bare ``` ... ``` fences. Falls back to the
+    whole response if it parses as valid Python — some bundle prompts instruct
+    the model to omit fences entirely, and we don't want that to trip
+    NO_CODE_EXTRACTED.
+    """
+    import ast
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return blocks[-1].strip()
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    try:
+        ast.parse(stripped)
+    except SyntaxError:
+        return ""
+    return stripped
 
 
 def _reasoning_text(run_result) -> str:
@@ -440,6 +457,56 @@ def _check_banned_ops(code: str, pass_name: str) -> list[str]:
     return list(dict.fromkeys(violations))
 
 
+def _check_bundle_compliance(code: str, compliance: dict) -> list[str]:
+    """Bundle-mode compliance checker driven by the bundle's manifest config.
+
+    Mirrors ``_check_banned_ops`` but pulls allowed/banned/required from the
+    bundle's compliance dict rather than the hard-coded step_dsl tables.
+    Empty allowlist = allowlist disabled.
+    """
+    code = _strip_annotations(code)
+    code = _extract_func_body(code)
+
+    allowed = compliance.get("allowed_ops") or []
+    banned = compliance.get("banned_patterns") or []
+    required = compliance.get("required_ops") or []
+
+    violations: list[str] = []
+
+    if allowed:
+        # Any torch.X(...) or F.X(...) call whose suffix isn't in `allowed`
+        # gets flagged. The allowlist names abstraction-level operators;
+        # raw-torch passthrough is what we're trying to catch here.
+        allowed_set = set(allowed)
+        for match in _TORCH_CALL_RE.finditer(code):
+            call_name = match.group(1)
+            if call_name not in allowed_set and f"torch.{call_name}" not in allowed_set:
+                violations.append(
+                    f"- `torch.{call_name}()` is not in this bundle's allowed_ops "
+                    "— replace with one of the abstraction's operators"
+                )
+        for match in _F_CALL_RE.finditer(code):
+            call_name = match.group(1)
+            if call_name not in allowed_set and f"F.{call_name}" not in allowed_set:
+                violations.append(
+                    f"- `F.{call_name}()` is not in this bundle's allowed_ops "
+                    "— replace with one of the abstraction's operators"
+                )
+
+    for entry in banned:
+        pattern = entry["pattern"]
+        if re.search(r'\b' + re.escape(pattern), code):
+            violations.append(f"- `{pattern}` still present — {entry['fix']}")
+
+    for name in required:
+        if name not in code:
+            violations.append(
+                f"- `{name}` missing — this bundle requires a call to {name}"
+            )
+
+    return list(dict.fromkeys(violations))
+
+
 # ---------------------------------------------------------------------------
 # Generic pass loop — works for both lowering and translator passes
 # ---------------------------------------------------------------------------
@@ -592,7 +659,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, prev_code=None,
                          executor="tiled", tensors=None, log=print,
                          judge_agent=None, dsl_code=None,
-                         post_validator=None):
+                         post_validator=None,
+                         compliance_override: dict | None = None):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -642,8 +710,10 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             log(f"      No code block found ({len(assistant_text)} chars). Retrying.")
             _write(turn_dir / "status.txt", "NO_CODE_EXTRACTED")
             conversation.append({"role": "user", "content":
-                "Your response did not contain a code block. "
-                "Please provide your implementation inside a ```python code fence."
+                "Your response did not contain extractable Python. Either wrap "
+                "the implementation in a ```python ... ``` fence, OR make the "
+                "entire response valid Python source with no surrounding prose "
+                "(comments are fine). Your previous response failed both checks."
             })
             continue
 
@@ -666,7 +736,14 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             _write(turn_dir / "correctness_result.txt", result)
 
             if "match=True" in result:
-                violations = _check_banned_ops(code, pass_name)
+                # Bundle mode (compliance_override set) drives the regex
+                # checker from the bundle's manifest so it speaks the
+                # abstraction's invented vocabulary; non-bundle mode falls
+                # back to the hard-coded step_dsl tables.
+                if compliance_override is not None:
+                    violations = _check_bundle_compliance(code, compliance_override)
+                else:
+                    violations = _check_banned_ops(code, pass_name)
                 if violations:
                     _write(turn_dir / "status.txt", "CORRECT_BUT_NONCOMPLIANT")
                     log(f"      -> CORRECT but {len(violations)} violation(s) remain")
@@ -897,21 +974,40 @@ async def run_kernel(
 
     # --- Step 1: bundle-dir path resolution ---
     bundle_path = None
+    bundle_compliance = None
     if bundle_dir is not None:
         bundle_path = Path(bundle_dir).resolve()
         assert bundle_path.exists(), f"bundle dir not found: {bundle_path}"
         if str(bundle_path) not in sys.path:
             sys.path.insert(0, str(bundle_path))
+        manifest = json.loads((bundle_path / "manifest.json").read_text())
+        assert "compliance" in manifest, (
+            f"bundle {bundle_path} manifest.json is missing the `compliance` block; "
+            "regenerate it with allowed_ops / banned_patterns / required_ops."
+        )
+        bundle_compliance = manifest["compliance"]
 
     # --- Step 2: resolve translate_fn and refactor_system_prompt ---
     if bundle_dir is not None:
         import importlib
+        import importlib.util
         # Force reimport in case a previous bundle in the same process polluted sys.modules.
         if "transpiler" in sys.modules:
             del sys.modules["transpiler"]
         transpiler_mod = importlib.import_module("transpiler")
         translate_fn = transpiler_mod.translate
         refactor_system_prompt = (bundle_path / "refactor_system.txt").read_text()
+
+        # Register the bundle's abstraction.py as `step_dsl` so exec'd kernel
+        # code can `import step_dsl` (the name the system prompt uses).
+        abstraction_path = bundle_path / "abstraction.py"
+        assert abstraction_path.exists(), f"bundle missing abstraction.py: {abstraction_path}"
+        if "step_dsl" in sys.modules:
+            del sys.modules["step_dsl"]
+        spec = importlib.util.spec_from_file_location("step_dsl", abstraction_path)
+        step_dsl_mod = importlib.util.module_from_spec(spec)
+        sys.modules["step_dsl"] = step_dsl_mod
+        spec.loader.exec_module(step_dsl_mod)
     else:
         translate_fn = _dsl_to_step_translate
         refactor_system_prompt = None
@@ -969,9 +1065,15 @@ async def run_kernel(
         for p in agent_passes
     }
 
-    # Create judge agents for passes that have one
-    from src.prompts import _JUDGE_TEMPLATES
-    judge_agents = {name: make_judge_agent(llm_config, name) for name in _JUDGE_TEMPLATES}
+    # Create judge agents for passes that have one. In bundle_dir mode the
+    # judge prompt is templated from the bundle's compliance config so it
+    # speaks the abstraction's invented operator surface; non-bundle mode
+    # uses the per-pass step_dsl-aware templates.
+    if bundle_dir is not None:
+        judge_agents = {"refactor_final": make_bundle_judge_agent(llm_config, bundle_compliance)}
+    else:
+        from src.prompts import _JUDGE_TEMPLATES
+        judge_agents = {name: make_judge_agent(llm_config, name) for name in _JUDGE_TEMPLATES}
 
     # Set up checkpoint directory
     if checkpoint_dir is None:
@@ -1006,6 +1108,7 @@ async def run_kernel(
             resume_dsl_code=resume_dsl_code,
             translator=translator,
             translate_fn=translate_fn,
+            compliance_override=bundle_compliance,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1046,6 +1149,7 @@ async def _run_outer_iteration(
     resume_dsl_code: str = None,
     translator: str = "llm",
     translate_fn=None,
+    compliance_override: dict | None = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -1109,7 +1213,10 @@ async def _run_outer_iteration(
             # deterministic translation already succeeds — otherwise the skip
             # would mask a translator-side failure that the loop is meant to fix.
             if pass_name in _REFACTOR_ORDER and lowered_code is not None:
-                violations = _check_banned_ops(lowered_code, pass_name)
+                if compliance_override is not None:
+                    violations = _check_bundle_compliance(lowered_code, compliance_override)
+                else:
+                    violations = _check_banned_ops(lowered_code, pass_name)
                 has_judge = pass_name in judge_agents
                 needs_translate_check = (
                     pass_name == "refactor_final" and translator == "auto"
@@ -1141,6 +1248,7 @@ async def _run_outer_iteration(
                 log=log,
                 judge_agent=judge_agents.get(pass_name),
                 post_validator=post_validator,
+                compliance_override=compliance_override,
             )
             outer_total_tokens += pass_result.get("total_tokens", 0)
             if pass_result["success"]:

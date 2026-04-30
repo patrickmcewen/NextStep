@@ -377,6 +377,50 @@ def build_judge_system_prompt(pass_name: str) -> str:
     return template_path.read_text()
 
 
+_BUNDLE_JUDGE_TEMPLATE = "bundle_refactor_judge_system.txt"
+
+
+def build_bundle_judge_system_prompt(compliance: dict) -> str:
+    """Build the bundle-mode judge system prompt from a compliance config.
+
+    `compliance` is the dict persisted in bundle manifest.json
+    (see ``flowv1/src/bundle._normalize_compliance`` for the schema).
+    The template carries placeholders {allowed_ops_block}, {banned_patterns_block},
+    {required_ops_block} that get filled with bullet-list renderings of the
+    config — keeps the judge wholly vocabulary-driven.
+    """
+    template_path = _PROMPTS_DIR / _BUNDLE_JUDGE_TEMPLATE
+    assert template_path.exists(), f"Bundle judge template not found: {template_path}"
+
+    allowed = compliance.get("allowed_ops") or []
+    banned = compliance.get("banned_patterns") or []
+    required = compliance.get("required_ops") or []
+
+    if allowed:
+        allowed_block = "\n".join(f"- `{name}`" for name in allowed)
+    else:
+        allowed_block = "(no allowlist — any callable name is permitted)"
+
+    if banned:
+        banned_block = "\n".join(
+            f"- `{e['pattern']}` — {e['fix']}" for e in banned
+        )
+    else:
+        banned_block = "(no extra banned patterns)"
+
+    if required:
+        required_block = "\n".join(f"- `{name}`" for name in required)
+    else:
+        required_block = "(no required operators)"
+
+    template = template_path.read_text()
+    return template.format(
+        allowed_ops_block=allowed_block,
+        banned_patterns_block=banned_block,
+        required_ops_block=required_block,
+    )
+
+
 def _get_precompute_source(kernel_name: str) -> str:
     """Extract the source of the precompute.py function registered for `kernel_name`.
 

@@ -54,8 +54,8 @@ def _exec_build_graph(code: str, dims: dict, tensors: dict = None):
     Otherwise falls back to build_graph(dims) for backward compat.
     """
     StepOps._counter = 0
-    stripped = _strip_imports(code)
-    full_code = IMPORT_SCAFFOLD + "\n" + stripped
+    #stripped = _strip_imports(code)
+    full_code = IMPORT_SCAFFOLD + "\n" + code
     scaffold_lines = IMPORT_SCAFFOLD.count("\n") + 1
     namespace = {}
     exec(full_code, namespace)
@@ -66,7 +66,7 @@ def _exec_build_graph(code: str, dims: dict, tensors: dict = None):
         else:
             graph, output_op = namespace["build_graph"](dims)
     except Exception as exc:
-        raise _enhance_error(exc, stripped, scaffold_lines) from exc
+        raise _enhance_error(exc, code, scaffold_lines) from exc
     return graph, output_op
 
 
