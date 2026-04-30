@@ -16,7 +16,7 @@ from src.regression_planning import Job
 
 _log = logging.getLogger(__name__)
 
-RunOne = Callable[[Job, Path], Awaitable[tuple[int, float, int, int]]]
+RunOne = Callable[[Job, Path], Awaitable[tuple[int, float, int, int, int]]]
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class JobResult:
     duration_s: float
     outer_passed: int
     outer_total: int
+    total_tokens: int = 0
 
 
 def build_run_py_command(
@@ -59,6 +60,14 @@ def build_run_py_command(
     if bundle_dir is not None:
         cmd += ["--bundle-dir", str(bundle_dir)]
     return cmd
+
+
+def read_total_tokens(checkpoint_dir: Path) -> int:
+    result_path = checkpoint_dir / "result.json"
+    if not result_path.exists():
+        return 0
+    data = json.loads(result_path.read_text())
+    return int(data.get("total_tokens", 0))
 
 
 def read_per_outer(checkpoint_dir: Path) -> tuple[int, int]:
@@ -122,7 +131,7 @@ async def run_jobs(
         log_path = jobs_dir / f"{job.kernel}__{job.preset}.log"
         async with sem:
             _log.info("START %s/%s", job.kernel, job.preset)
-            exit_code, duration, outer_passed, outer_total = await run_one(job, log_path)
+            exit_code, duration, outer_passed, outer_total, total_tokens = await run_one(job, log_path)
         status = "pass" if exit_code == 0 else "fail"
         completed += 1
         if status == "pass":
@@ -139,7 +148,7 @@ async def run_jobs(
         _log.info("[%d/%d done, %d passed]", completed, total, passed)
         return JobResult(
             job=job, status=status, exit_code=exit_code, duration_s=duration,
-            outer_passed=outer_passed, outer_total=outer_total,
+            outer_passed=outer_passed, outer_total=outer_total, total_tokens=total_tokens,
         )
 
     return await asyncio.gather(*(_run(j) for j in jobs))
@@ -208,6 +217,7 @@ def write_summary(
         },
         "benchmarks": benchmarks,
     }
+    payload["total_tokens"] = sum(r.total_tokens for r in results)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False))
 
 

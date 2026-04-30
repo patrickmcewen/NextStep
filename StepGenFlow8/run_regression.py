@@ -17,6 +17,7 @@ from src.regression_runner import (
     build_run_py_command,
     init_output_dir,
     read_per_outer,
+    read_total_tokens,
     run_jobs,
     run_subprocess,
     setup_logging,
@@ -142,7 +143,8 @@ async def _amain(args: argparse.Namespace) -> int:
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)
-        return exit_code, duration, outer_passed, outer_total
+        total_tokens = read_total_tokens(job_ckpt_dir)
+        return exit_code, duration, outer_passed, outer_total, total_tokens
 
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     t0 = asyncio.get_event_loop().time()

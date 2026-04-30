@@ -445,11 +445,18 @@ def _check_banned_ops(code: str, pass_name: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def _run_judge(judge_agent, code: str, turn_dir: Path,
-                     log=print, context: str = "") -> str | None:
-    """Run the LLM judge on code. Returns None if PASS, or violation feedback if REJECT."""
+                     log=print, context: str = "") -> tuple[str | None, int]:
+    """Run the LLM judge on code. Returns (verdict, tokens_used).
+
+    verdict is None if PASS, or a violation feedback string if REJECT.
+    tokens_used is the total_tokens from the SDK RunResult (0 if usage unavailable).
+    """
     judge_prompt = f"Review this code:\n\n{context}\n```python\n{code}\n```" if context else \
                    f"Review this code for compliance:\n\n```python\n{code}\n```"
     result = await Runner.run(judge_agent, [{"role": "user", "content": judge_prompt}])
+    tokens_used = 0
+    if result.context_wrapper.usage is not None:
+        tokens_used = result.context_wrapper.usage.total_tokens
     judge_text = result.final_output or ""
     _write(turn_dir / "judge_response.txt", judge_text)
     judge_reasoning = _reasoning_text(result)
@@ -457,7 +464,7 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
         _write(turn_dir / "judge_reasoning.txt", judge_reasoning)
 
     if "VERDICT: PASS" in judge_text:
-        return None
+        return None, tokens_used
 
     # Extract violations from judge response
     if "VERDICT: REJECT" in judge_text:
@@ -467,11 +474,11 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
             violations_text = judge_text[idx:]
         else:
             violations_text = judge_text[judge_text.find("VERDICT: REJECT"):]
-        return violations_text
+        return violations_text, tokens_used
 
     # Ambiguous response — treat as reject
     log(f"      Judge gave ambiguous verdict, treating as reject")
-    return judge_text
+    return judge_text, tokens_used
 
 
 def _make_translation_post_validator(kernel_name: str, dims: dict,
@@ -611,6 +618,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
     last_code = None
     success = False
+    total_tokens = 0
 
     for turn in range(max_turns):
         turn_dir = pass_dir / f"turn_{turn}"
@@ -620,6 +628,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         _write(turn_dir / "user_prompt.txt", last_user_msg)
 
         run_result = await Runner.run(agent, conversation)
+        if run_result.context_wrapper.usage is not None:
+            total_tokens += run_result.context_wrapper.usage.total_tokens
         assistant_text = run_result.final_output or ""
         conversation.append({"role": "assistant", "content": assistant_text})
         _write(turn_dir / "response.txt", assistant_text)
@@ -675,8 +685,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         judge_ctx = ""
                         if tensors is not None:
                             judge_ctx = "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
-                        judge_violations = await _run_judge(
+                        judge_violations, judge_tokens = await _run_judge(
                             judge_agent, code, turn_dir, log, context=judge_ctx)
+                        total_tokens += judge_tokens
                         if judge_violations is not None:
                             judge_feedback = "\n\n## Judge feedback (line-specific):\n\n" + judge_violations
 
@@ -706,8 +717,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         )
                         if tensors is not None:
                             judge_ctx += "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
-                        judge_violations = await _run_judge(
+                        judge_violations, judge_tokens = await _run_judge(
                             judge_agent, code, turn_dir, log, context=judge_ctx)
+                        total_tokens += judge_tokens
 
                     if judge_violations is not None:
                         _write(turn_dir / "status.txt", "CORRECT_BUT_JUDGE_REJECTED")
@@ -800,7 +812,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         )
         conversation.append({"role": "user", "content": feedback})
 
-    return {"success": success, "code": last_code}
+    return {"success": success, "code": last_code, "total_tokens": total_tokens}
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1021,7 @@ async def run_kernel(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
+                "total_tokens": 0,
                 "cycle_count": None,
                 "final_diagnosis": err_msg,
             }
@@ -1018,6 +1031,7 @@ async def run_kernel(
     # Return first success, or the last failure
     chosen = next((r for r in results if r["success"]), results[-1])
     chosen["per_outer"] = per_outer
+    chosen["total_tokens"] = sum(r.get("total_tokens", 0) for r in results)
     _write(ckpt_root / "result.json", json.dumps(chosen, indent=2, default=str))
     return chosen
 
@@ -1067,6 +1081,7 @@ async def _run_outer_iteration(
     lowered_code = None
     dsl_code = None  # output of refactor_final, used as translation guide
     pipeline_ok = True
+    outer_total_tokens = 0
 
     # ============================================================
     # Resume mode: skip lowering, use provided DSL code directly
@@ -1127,6 +1142,7 @@ async def _run_outer_iteration(
                 judge_agent=judge_agents.get(pass_name),
                 post_validator=post_validator,
             )
+            outer_total_tokens += pass_result.get("total_tokens", 0)
             if pass_result["success"]:
                 lowered_code = pass_result["code"]
                 log(f"  -> {pass_name} OK")
@@ -1149,6 +1165,7 @@ async def _run_outer_iteration(
                     "outer_iteration": i,
                     "outer_iterations": max_outer,
                     "total_tool_calls": 0,
+                    "total_tokens": outer_total_tokens,
                     "cycle_count": None,
                 }
 
@@ -1205,6 +1222,7 @@ async def _run_outer_iteration(
             judge_agent=judge_agents.get(pass_name),
             dsl_code=dsl_code,
         )
+        outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
             translated_code = pass_result["code"]
             log(f"  -> {pass_name} OK")
@@ -1227,6 +1245,7 @@ async def _run_outer_iteration(
                 result = _build_success_result(i, 0,
                                                {"code": final_code, "tool_outputs": []},
                                                [], lowered_code)
+                result["total_tokens"] = outer_total_tokens
                 return result
             else:
                 log(f"-> FAIL: {graph_result.splitlines()[0]}")
@@ -1246,6 +1265,7 @@ async def _run_outer_iteration(
         "outer_iteration": i,
         "outer_iterations": max_outer,
         "total_tool_calls": 0,
+        "total_tokens": outer_total_tokens,
         "cycle_count": None,
         "tiled_code": lowered_code,
     }
