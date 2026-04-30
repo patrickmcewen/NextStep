@@ -846,6 +846,7 @@ async def run_kernel(
     resume_from: str = None,
     translator: str = "llm",
     few_shot_paths=None,
+    bundle_dir: str | None = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 

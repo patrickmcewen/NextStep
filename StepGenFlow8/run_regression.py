@@ -54,6 +54,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--max-turns", type=int, default=None)
     p.add_argument("--pipeline", default=None, choices=[None, "standard", "direct", "direct_no_functional"])
     p.add_argument("--translator", default=None, choices=[None, "auto", "llm"])
+    p.add_argument("--bundle-dir", default=None, metavar="PATH",
+                   help="Bundle directory passed through to each per-job run.py invocation.")
     return p.parse_args(argv)
 
 
@@ -136,6 +138,7 @@ async def _amain(args: argparse.Namespace) -> int:
             pipeline=args.pipeline,
             translator=args.translator,
             checkpoint_dir=job_ckpt_dir,
+            bundle_dir=args.bundle_dir,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)

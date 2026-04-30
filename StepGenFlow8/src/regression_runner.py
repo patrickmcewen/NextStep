@@ -41,6 +41,7 @@ def build_run_py_command(
     pipeline: str | None,
     translator: str | None,
     checkpoint_dir: Path | None,
+    bundle_dir: Path | None = None,
 ) -> list[str]:
     cmd = [python_exe, str(run_py_path), job.kernel, job.preset, "--model", model]
     if config is not None:
@@ -55,6 +56,8 @@ def build_run_py_command(
         cmd += ["--translator", translator]
     if checkpoint_dir is not None:
         cmd += ["--checkpoint-dir", str(checkpoint_dir)]
+    if bundle_dir is not None:
+        cmd += ["--bundle-dir", str(bundle_dir)]
     return cmd
 
 

@@ -39,6 +39,12 @@ def main():
                              "kernel-family hints (e.g. RoPE/SDPA/MoE for transformers). "
                              "Accepts: dsl_code.py file, outer_N dir, or checkpoint root dir. "
                              "Off by default.")
+    parser.add_argument("--bundle-dir", default=None, metavar="PATH",
+                        help="Path to a bundle directory containing abstraction.py, "
+                             "transpiler.py, and refactor_system.txt. When set, the "
+                             "inner orchestrator loads these instead of the legacy "
+                             "src/step_dsl.py / src/dsl_to_step.py / prompt files. "
+                             "Required when invoked from the AbstractionOpt outer flow.")
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
@@ -56,6 +62,7 @@ def main():
         resume_from=args.resume,
         translator=args.translator,
         few_shot_paths=args.few_shot,
+        bundle_dir=args.bundle_dir,
     ))
 
     if result["success"]:
