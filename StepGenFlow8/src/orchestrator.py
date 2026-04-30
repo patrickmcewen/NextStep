@@ -203,6 +203,8 @@ _CORRECTNESS_CHECKERS = {
     "dsl": _run_dsl_correctness,
     "hybrid": _run_hybrid_correctness,
     "graph": _run_graph_correctness,
+    # bundle-dir mode: DSL correctness is skipped; only the post-validator runs
+    "passthrough": lambda code, kernel_name, dims, tensors=None: "match=True",
 }
 
 
@@ -473,7 +475,8 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
 
 
 def _make_translation_post_validator(kernel_name: str, dims: dict,
-                                     tensors: dict, log):
+                                     tensors: dict, log,
+                                     translate_fn=None):
     """Build a refactor_final post-validator that runs deterministic translation.
 
     The validator returns ``None`` when the DSL code translates cleanly into a
@@ -482,13 +485,19 @@ def _make_translation_post_validator(kernel_name: str, dims: dict,
     user prompt of the refactor loop, so translator-side constraints (e.g.
     ``select_gen`` must precede ``flat_partition``) get fixed by the refactor
     agent rather than failing later in a separate pass.
+
+    ``translate_fn`` defaults to ``_dsl_to_step_translate``; bundle-dir mode
+    passes the bundle's own ``transpiler.translate`` instead.
     """
+    if translate_fn is None:
+        translate_fn = _dsl_to_step_translate
+
     def validator(code: str, turn_dir: Path) -> str | None:
         check_dir = turn_dir / "translate_check"
 
         log(f"      [translate-check] running deterministic translator...")
         try:
-            step_code = _dsl_to_step_translate(code)
+            step_code = translate_fn(code)
         except Exception:
             err = traceback.format_exc()
             _write(check_dir / "error.txt", err)
@@ -541,18 +550,24 @@ def _make_translation_post_validator(kernel_name: str, dims: dict,
 
 def _run_deterministic_translate(dsl_code: str, kernel_name: str,
                                  dims: dict, tensors: dict,
-                                 outer_dir: Path, log) -> dict:
+                                 outer_dir: Path, log,
+                                 translate_fn=None) -> dict:
     """Translate DSL -> STeP build_graph deterministically (no LLM).
 
     Mirrors the on-disk layout of ``_run_pass_loop`` so checkpoints are
     interchangeable: ``<outer_dir>/translate/turn_0/{extracted_code.py,
     correctness_result.txt, status.txt}``.
+
+    ``translate_fn`` defaults to ``_dsl_to_step_translate``; bundle-dir mode
+    passes ``transpiler.translate`` from the bundle.
     """
+    if translate_fn is None:
+        translate_fn = _dsl_to_step_translate
     pass_dir = outer_dir / "translate"
     turn_dir = pass_dir / "turn_0"
     log(f"  Translation pass: translate (deterministic AST rewrite)")
 
-    step_code = _dsl_to_step_translate(dsl_code)
+    step_code = translate_fn(dsl_code)
     _write(turn_dir / "extracted_code.py", step_code)
     log(f"      Generated code: {len(step_code)} chars")
 
@@ -867,9 +882,39 @@ async def run_kernel(
     assert not (translator == "auto" and (pipeline == "direct" or pipeline == "direct_no_functional")), (
         "translator='auto' requires pipeline='standard' (it consumes refactor_final's DSL output)"
     )
-    pipeline_config = PIPELINES[pipeline]
-    lowering_passes = pipeline_config["lowering"]
-    translator_passes = pipeline_config["translation"]
+
+    # --- Step 1: bundle-dir path resolution ---
+    bundle_path = None
+    if bundle_dir is not None:
+        bundle_path = Path(bundle_dir).resolve()
+        assert bundle_path.exists(), f"bundle dir not found: {bundle_path}"
+        if str(bundle_path) not in sys.path:
+            sys.path.insert(0, str(bundle_path))
+
+    # --- Step 2: resolve translate_fn and refactor_system_prompt ---
+    if bundle_dir is not None:
+        import importlib
+        # Force reimport in case a previous bundle in the same process polluted sys.modules.
+        if "transpiler" in sys.modules:
+            del sys.modules["transpiler"]
+        transpiler_mod = importlib.import_module("transpiler")
+        translate_fn = transpiler_mod.translate
+        refactor_system_prompt = (bundle_path / "refactor_system.txt").read_text()
+    else:
+        translate_fn = _dsl_to_step_translate
+        refactor_system_prompt = None
+
+    # --- Step 5: bundle-dir mode uses only refactor_final + deterministic translate ---
+    if bundle_dir is not None:
+        # Single-pass: input abstraction DSL → refactor_final → translate_fn → graph check.
+        # DSL correctness is skipped (passthrough); the post-validator is the only gate.
+        lowering_passes = [{"name": "refactor_final", "executor": "passthrough"}]
+        translator_passes = []
+        translator = "auto"
+    else:
+        pipeline_config = PIPELINES[pipeline]
+        lowering_passes = pipeline_config["lowering"]
+        translator_passes = pipeline_config["translation"]
 
     config = _load_stepdb_config()
     assert kernel_name in config, f"Kernel '{kernel_name}' not found"
@@ -902,9 +947,13 @@ async def run_kernel(
             f"Few-shot examples: "
             f"{[ex['kernel_name'] for ex in few_shot_examples]}"
         )
+    # --- Step 3: wire refactor_system_prompt into refactor_final agent ---
     pass_agents = {
         p["name"]: make_pass_agent(
-            llm_config, p["name"], few_shot_examples=few_shot_examples)
+            llm_config, p["name"], few_shot_examples=few_shot_examples,
+            system_prompt_override=(
+                refactor_system_prompt if p["name"] == "refactor_final" else None
+            ))
         for p in agent_passes
     }
 
@@ -944,6 +993,7 @@ async def run_kernel(
             translator_passes=translator_passes,
             resume_dsl_code=resume_dsl_code,
             translator=translator,
+            translate_fn=translate_fn,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -981,6 +1031,7 @@ async def _run_outer_iteration(
     lowering_passes: list = None, translator_passes: list = None,
     resume_dsl_code: str = None,
     translator: str = "llm",
+    translate_fn=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -990,7 +1041,12 @@ async def _run_outer_iteration(
         resume_dsl_code: If set, skip all lowering passes and use this as the
             DSL code for translation. Used when resuming from a checkpoint where
             refactor_final succeeded but translate failed.
+        translate_fn: DSL→STeP translator callable. Defaults to
+            ``_dsl_to_step_translate``; bundle-dir mode passes
+            ``transpiler.translate`` from the bundle.
     """
+    if translate_fn is None:
+        translate_fn = _dsl_to_step_translate
     log_path = outer_dir / "log.txt"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(log_path, "w")
@@ -1057,6 +1113,7 @@ async def _run_outer_iteration(
             if pass_name == "refactor_final" and translator == "auto":
                 post_validator = _make_translation_post_validator(
                     kernel_name, dims, tensors, log,
+                    translate_fn=translate_fn,
                 )
 
             log(f"  Lowering pass: {pass_name}")
@@ -1116,6 +1173,7 @@ async def _run_outer_iteration(
         )
         det_result = _run_deterministic_translate(
             dsl_code, kernel_name, dims, tensors, outer_dir, log,
+            translate_fn=translate_fn,
         )
         if det_result["success"]:
             translated_code = det_result["code"]

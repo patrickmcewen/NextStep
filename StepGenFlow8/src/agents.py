@@ -76,17 +76,23 @@ def make_client(llm_config: dict) -> AsyncOpenAI:
 
 
 def make_pass_agent(llm_config: dict, pass_name: str,
-                    few_shot_examples=None) -> Agent:
+                    few_shot_examples=None,
+                    system_prompt_override: str | None = None) -> Agent:
     """Create an agent for any pass (lowering or translator).
 
     ``few_shot_examples`` is an optional list of resolved example dicts (see
     ``resolve_few_shot_examples``); only passes whose template contains
     ``{few_shot_examples}`` consume them.
+    ``system_prompt_override`` replaces the default system prompt entirely
+    when provided (used in bundle-dir mode to inject a user-supplied prompt).
     """
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    system_prompt = build_pass_system_prompt(
-        pass_name, few_shot_examples=few_shot_examples)
+    if system_prompt_override is not None:
+        system_prompt = system_prompt_override
+    else:
+        system_prompt = build_pass_system_prompt(
+            pass_name, few_shot_examples=few_shot_examples)
 
     return Agent(
         name=f"StepPass_{pass_name}",
