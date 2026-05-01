@@ -27,3 +27,6 @@ transformer_subparts:
   basic_prefill_attention: small
   prefill_transformer_simple: small
 
+toughies:
+  basic_prefill_attention: small
+  prefill_transformer_simple: small

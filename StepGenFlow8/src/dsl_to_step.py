@@ -724,18 +724,18 @@ def _h_dyn_offchip_load(state, target, call):
 
 def _h_bufferize(state, target, call):
     x    = _src(_arg(call, 0, "x"))
-    rank = _arg_or_default(call, 1, "rank", "1")
+    rank = _src(_arg(call, 1, "rank"))
     return _block(f"{target} = Bufferize(graph, {x}, rank={rank})\n")
 
 
 def _h_dyn_streamify(state, target, call):
-    x               = _src(_arg(call, 0, "x"))
-    ref             = _src(_arg(call, 1, "ref"))
-    bufferized_rank = _src(_arg(call, 2, "bufferized_rank"))
-    repeat_rank     = _arg_or_default(call, 3, "repeat_rank", "1")
+    x           = _src(_arg(call, 0, "x"))
+    ref         = _src(_arg(call, 1, "ref"))
+    repeat_rank = _arg_or_default(call, 2, "repeat_rank", "1")
+    # bufferized_rank is now derived inside DynStreamify from the input Buffer.
     return _block(
         f"{target} = DynStreamify(graph, input={x}, ref={ref}, "
-        f"repeat_rank={repeat_rank}, bufferized_rank={bufferized_rank})\n"
+        f"repeat_rank={repeat_rank})\n"
     )
 
 
@@ -864,12 +864,12 @@ def _h_repeat_static(state, target, call):
 
 
 def _h_streamify(state, target, call):
-    x       = _src(_arg(call, 0, "x"))
-    factors = _src(_arg(call, 1, "repeat_factors"))
-    rank    = _arg_or_default(call, 2, "rank", "0")
+    x               = _src(_arg(call, 0, "x"))
+    stride          = _src(_arg(call, 1, "stride"))
+    out_shape_tiled = _src(_arg(call, 2, "out_shape_tiled"))
     return _block(
-        f"{target} = Streamify(graph, {x}, repeat_factors=list({factors}), "
-        f"rank={rank})\n"
+        f"{target} = Streamify(graph, {x}, stride=tuple({stride}), "
+        f"out_shape_tiled=tuple({out_shape_tiled}))\n"
     )
 
 

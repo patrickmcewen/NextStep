@@ -9,10 +9,9 @@
         "pmu_buffer_bytes": 393216
     },
     "constraints": {
-        "max_compute_bw_per_op": 1024,
         "max_total_compute_bw": 4096,
         "max_par_dispatch": 16,
         "pmu_bw_bytes_per_cycle": 64
     },
-    "max_turns": 8
+    "max_turns": 12
 }

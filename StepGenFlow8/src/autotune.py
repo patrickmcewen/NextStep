@@ -142,15 +142,18 @@ def _node_label(n) -> str:
     return label
 
 
-def _build_verbose_report(graph, result) -> str:
-    """Verbose per-node timing report.
+def _build_verbose_report(graph, result, hw_config: dict) -> str:
+    """Verbose per-node timing + memory report.
 
     Sections:
-      1. Graph structure — predecessors/successors for each node.
-      2. Per-node block — incoming OTI/NIT, T_fire, OTPC, N_fire, derived
-         (OCI/OTI/ICI/ICD/st/fto/end), and an OCI max-breakdown labeled by
-         the predecessor each candidate term comes from.
-      3. Critical path — latency chain (st argmax) and throughput origin
+      1. Memory totals — summed on-chip requirement and off-chip traffic
+         across the whole graph (with PMU-cap utilization if known).
+      2. Graph structure — predecessors/successors for each node.
+      3. Per-node block — timing (T_fire/OTPC/N_fire/OCI/OTI/ICI/ICD/st/
+         fto/end), per-node on-chip / off-chip memory, an OCI
+         max-breakdown labeled by the predecessor each candidate term
+         comes from.
+      4. Critical path — latency chain (st argmax) and throughput origin
          (OCI argmax) from the last-finishing leaf.
     """
     info = result["per_node"]
@@ -161,8 +164,43 @@ def _build_verbose_report(graph, result) -> str:
             return expr.xreplace(sym_subs)
         return expr
 
+    # ------------------------------------------------------------------
+    # Per-node memory metrics. Cached so the totals section and the
+    # per-node section read identical values.
+    # ------------------------------------------------------------------
+    on_chip_bytes: dict[int, int] = {}
+    off_chip_bytes: dict[int, int] = {}
+    for nid, i in info.items():
+        n = i["node"]
+        on_chip_bytes[nid] = _sym_to_int(_sub(n.on_chip_requirement(count_fifos=False)))
+        off_chip_bytes[nid] = _sym_to_int(_sub(n.off_chip_traffic()))
+    total_on_chip = sum(on_chip_bytes.values())
+    total_off_chip = sum(off_chip_bytes.values())
+    pmu_cap = hw_config.get("pmu_buffer_bytes")
+
     total = _sym_to_int(result["total_cycles"])
     lines = [f"total_cycles={total}", ""]
+
+    # ------------------------------------------------------------------
+    # 1. Memory totals
+    # ------------------------------------------------------------------
+    lines.append("=" * 72)
+    lines.append("MEMORY USAGE  (bytes)")
+    lines.append("=" * 72)
+    if pmu_cap:
+        pct = 100.0 * total_on_chip / pmu_cap
+        lines.append(
+            f"  on-chip  (sum of on_chip_requirement, count_fifos=False): "
+            f"{total_on_chip}  ({pct:.1f}% of pmu_buffer_bytes={pmu_cap})"
+        )
+    else:
+        lines.append(
+            f"  on-chip  (sum of on_chip_requirement, count_fifos=False): {total_on_chip}"
+        )
+    lines.append(
+        f"  off-chip (sum of off_chip_traffic over kernel run):        {total_off_chip}"
+    )
+    lines.append("")
 
     # ------------------------------------------------------------------
     # 1. Graph structure
@@ -212,6 +250,9 @@ def _build_verbose_report(graph, result) -> str:
         lines.append(f"  params:   T_fire={t_fire}  OTPC={otpc}  N_fire={n_fire}")
         lines.append(f"  times:    st={st}  ICD={icd}  fto={fto}  end={end}")
         lines.append(f"  rates:    OCI={oci}  OTI={oti_f:.2f}  ICI={ici}")
+        lines.append(
+            f"  memory:   on_chip={on_chip_bytes[nid]} B  off_chip={off_chip_bytes[nid]} B"
+        )
 
         if preds:
             lines.append(f"  inputs:")
@@ -407,16 +448,78 @@ def _build_verbose_report(graph, result) -> str:
     return "\n".join(lines)
 
 
+def _normalize_compute_bw(graph, max_total_compute_bw: int) -> list[tuple[int, str, int, int]]:
+    """Rescale every compute op's `compute_bw` so their sum equals `max_total_compute_bw`.
+
+    The autotuner uses this to enforce the global compute-bandwidth budget
+    instead of trusting the model to do per-op arithmetic. The model picks
+    relative shares; we apply the uniform scale that turns the total
+    allocation into the budget. Each `compute_bw` is floored at 1 (which
+    is also the operator-level minimum in ops.py), so the resulting sum
+    may exceed `max_total_compute_bw` slightly when many tiny shares hit
+    the floor — acceptable for a budget enforcement pass.
+
+    Returns a list of (instance_id, op_label, old_bw, new_bw) for the
+    rescaled nodes (graph traversal order) so callers can show the
+    rescaling in the timing report.
+    """
+    assert max_total_compute_bw >= 1, (
+        f"max_total_compute_bw must be >= 1, got {max_total_compute_bw}"
+    )
+    compute_nodes = [n for n in graph.nodes if hasattr(n, "compute_bw")]
+    if not compute_nodes:
+        return []
+    total = sum(n.compute_bw for n in compute_nodes)
+    assert total >= 1, "Sum of compute_bw across compute ops is zero — invalid graph"
+    scale = max_total_compute_bw / total
+    rescaling = []
+    for n in compute_nodes:
+        old = n.compute_bw
+        new = max(1, int(round(old * scale)))
+        n.compute_bw = new
+        rescaling.append((n.instance_id, _node_label(n), old, new))
+    return rescaling
+
+
+def _format_rescaling(rescaling, max_total_compute_bw: int) -> str:
+    """Pretty-print the compute_bw rescaling table prepended to the timing report."""
+    if not rescaling:
+        return ""
+    lines = [
+        "=" * 72,
+        f"COMPUTE_BW RESCALING  (sum normalized to max_total_compute_bw={max_total_compute_bw})",
+        "=" * 72,
+    ]
+    old_total = sum(old for _, _, old, _ in rescaling)
+    new_total = sum(new for _, _, _, new in rescaling)
+    lines.append(f"  before: sum(compute_bw) = {old_total}")
+    lines.append(f"  after:  sum(compute_bw) = {new_total}")
+    for _, label, old, new in rescaling:
+        lines.append(f"    {label:<40}  compute_bw: {old:>6} -> {new:>6}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _measure(code: str, kernel_name: str, dims: dict, tensors: dict,
-             hw_config: dict) -> tuple[int, str]:
+             hw_config: dict, max_total_compute_bw: int) -> tuple[int, str]:
     """Run the analytical timing model on `code`. Returns (total_cycles, report).
+
+    Before timing, every compute op's `compute_bw` is rescaled so the sum
+    equals `max_total_compute_bw` (see `_normalize_compute_bw`). The
+    timing report begins with a summary of that rescaling so the agent
+    sees the post-scaled values.
 
     Callers are expected to have already verified correctness of `code`.
     """
     graph, _out = _exec_build_graph(code, dims, tensors)
+    rescaling = _normalize_compute_bw(graph, max_total_compute_bw)
     result = analyze_timing(graph, hw_config=hw_config)
     total = _sym_to_int(result["total_cycles"])
-    return total, _build_verbose_report(graph, result)
+    report = ""#_build_verbose_report(graph, result, hw_config)
+    prefix = _format_rescaling(rescaling, max_total_compute_bw)
+    if prefix:
+        report = prefix + report
+    return total, report
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +549,7 @@ async def run_autotune(
     """
     hw_config = autotune_config["hw_config"]
     constraints = autotune_config["constraints"]
+    max_total_compute_bw = constraints["max_total_compute_bw"]
     if max_turns is None:
         max_turns = autotune_config.get("max_turns", 8)
 
@@ -471,7 +575,7 @@ async def run_autotune(
 
     # Measure baseline
     baseline_cycles, baseline_report = _measure(
-        baseline_code, kernel_name, dims, tensors, hw_config)
+        baseline_code, kernel_name, dims, tensors, hw_config, max_total_compute_bw)
     print(f"Baseline total_cycles = {baseline_cycles}")
 
     # Merge hw_config + constraints for the system prompt's {hw_constraints} block
@@ -557,7 +661,7 @@ async def run_autotune(
         # Correctness OK — measure
         try:
             new_cycles, new_report = _measure(
-                proposal, kernel_name, dims, tensors, hw_config)
+                proposal, kernel_name, dims, tensors, hw_config, max_total_compute_bw)
         except Exception:
             err = traceback.format_exc()
             _write(turn_dir / "status.txt", "TIMING_ERROR")

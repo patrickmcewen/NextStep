@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--resume", required=True, metavar="PATH",
                         help="Path to a successful checkpoint — a .py file, a turn dir, "
                              "an outer_N dir, a kernel dir, or a checkpoint root.")
-    parser.add_argument("--model", default="gpt-oss120b",
+    parser.add_argument("--model", default="gpt-oss-120b",
                         help="Profile name under configs/ (loads configs/<name>.json). "
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
