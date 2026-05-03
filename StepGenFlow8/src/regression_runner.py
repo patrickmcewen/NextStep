@@ -41,6 +41,10 @@ def build_run_py_command(
     pipeline: str | None,
     translator: str | None,
     checkpoint_dir: Path | None,
+    autotune: bool,
+    autotune_config: str | None,
+    autotune_max_turns: int | None,
+    autotune_agent: str | None,
 ) -> list[str]:
     cmd = [python_exe, str(run_py_path), job.kernel, job.preset, "--model", model]
     if config is not None:
@@ -55,6 +59,14 @@ def build_run_py_command(
         cmd += ["--translator", translator]
     if checkpoint_dir is not None:
         cmd += ["--checkpoint-dir", str(checkpoint_dir)]
+    if autotune:
+        cmd += ["--autotune"]
+        if autotune_config is not None:
+            cmd += ["--autotune-config", autotune_config]
+        if autotune_max_turns is not None:
+            cmd += ["--autotune-max-turns", str(autotune_max_turns)]
+        if autotune_agent is not None:
+            cmd += ["--autotune-agent", autotune_agent]
     return cmd
 
 
