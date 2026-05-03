@@ -18,6 +18,17 @@ These functions are pre-imported and available at runtime. Here are their exact 
 {dsl_code}
 ```
 
+## NOTE ABOUT LOADS
+
+## Stride Convention
+
+`stride` and `out_shape_tiled` define how tile indices map to positions in the underlying tensor's tile grid.
+
+- **Advancing dim**: `stride[i] = grid_cols_per_step` — tiles advance through the grid
+- **Broadcast dim**: `stride[i] = 0` — same tile replicated along this dimension
+
+## HINT: Arbitrary permutation of tensor can be expressed through a Bufferize + Streamify pair with proper strides.
+
 ## Function Signature
 
 ```python

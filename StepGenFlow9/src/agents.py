@@ -1,18 +1,8 @@
-"""Agent factories for StepGenFlow.
+"""Agent definitions for StepGenFlow4.
 
-Builds the LLM agents the orchestrator and autotuner consume:
-
-  - ``make_pass_agent``         — refactor / translate pass agent (system prompt
-                                  selected by pass name, with optional bundle
-                                  prompt override and few-shot examples)
-  - ``make_judge_agent``        — per-pass compliance judge
-  - ``make_bundle_judge_agent`` — judge templated from a bundle's compliance
-                                  config (bundle mode only)
-  - ``make_autotune_agent``     — autotuner agent (general / parallel variant)
-
-All factories use ``ReasoningAwareModel`` so OpenRouter reasoning models
-surface chain-of-thought as structured ``ReasoningItem``s rather than
-contaminating the response content.
+Creates agents for lowering passes, translator passes, the Writer, and the Analyst.
+Uses plain OpenAI chat completions (no native tool calling) since the vLLM
+deployment doesn't have --enable-auto-tool-choice.
 """
 
 from agents import Agent, AsyncOpenAI, ModelSettings, OpenAIChatCompletionsModel
@@ -172,6 +162,72 @@ def make_bundle_judge_agent(llm_config: dict, compliance: dict) -> Agent:
     return Agent(
         name="StepJudge_bundle",
         instructions=system_prompt,
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+_DIAGNOSTICIAN_SYSTEM_PROMPT = """\
+You diagnose failed runs of a STeP DSL code-generation pipeline.
+
+A run consists of a sequence of refactoring passes (refactor_load, \
+refactor_compute, refactor_shape, refactor_final, ...). Each pass is an \
+LLM-driven loop of up to ~11 turns; each turn proposes code, runs a \
+correctness check, and gets feedback. You will receive a structured \
+summary of every turn that ran in this outer iteration: pass name, turn \
+index, status, a tail of the model's chain-of-thought reasoning (when \
+present), the head of the correctness/error output, and the tail of the \
+per-op shape trace (when present).
+
+Produce a thorough diagnosis. Use the reasoning excerpts to distinguish \
+*conceptual* mistakes (the model held a wrong mental model) from \
+*mechanical* mistakes (it knew the right approach but miscoded the args), \
+and to spot cases where the model recognized the problem but pushed forward \
+anyway. Cite specific evidence (turn numbers, op names, shapes, quoted \
+phrases from reasoning).
+
+Cover at least these four points, in this order:
+
+1. **Blocking pass.** Which pass was the first to never reach PASS, and \
+   how many turns did it spend stuck.
+2. **Dominant error pattern.** Across the failing turns of that pass, \
+   what error class recurs (stream-shape mismatch in op X, flatten/reshape \
+   rank out of bounds, repeat_ref / expand_ref shape constraint violation, \
+   a torch.stack divergence cascading from earlier shape corruption, etc.). \
+   Be specific about which op and which shapes.
+3. **Root-cause classification.** Pick one or more: (a) conceptual gap — \
+   the model misunderstands a DSL invariant; cite which one. (b) feedback \
+   blind spot — the model received feedback but didn't act on its \
+   downstream implications. (c) cascade — an earlier op produced a wrong \
+   shape and every later op inherits the corruption. (d) regression — the \
+   model fixed one thing but broke another. Use the reasoning excerpts to \
+   support the classification.
+4. **Next-attempt recommendation.** One concrete change in approach for \
+   the next outer iteration: a different decomposition, a new prompt hint, \
+   a different sequence of ops, etc. Not vague advice.
+
+Stream-shape invariants you should cite when relevant: every binary op \
+(binary_mul, binary_add, binary_matmul, ...) requires *identical* stream \
+shapes on both operands. flatten/reshape_stream rank arguments are bounded \
+by stream-dim count. repeat_ref/expand_ref require x.stream == ref.stream \
+modulo their documented relation. offchip_load's stride and out_shape_tiled \
+together determine the output stream shape and must respect divisibility.
+
+Length: as long as needed to be specific and useful — typically 3–6 short \
+paragraphs (~300–800 words). Use the four numbered headings above. Plain \
+markdown is fine. Do not restate the prompt. Do not hedge. If the trace \
+and reasoning are empty (run died before any pass produced output), say \
+so plainly in one sentence.
+"""
+
+
+def make_diagnostician_agent(llm_config: dict) -> Agent:
+    """Create an agent that diagnoses a failed outer iteration."""
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepDiagnostician",
+        instructions=_DIAGNOSTICIAN_SYSTEM_PROMPT,
         model=model,
         model_settings=_build_model_settings(llm_config),
     )
