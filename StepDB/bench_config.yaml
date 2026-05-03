@@ -1971,3 +1971,57 @@ sdpa_kv_read:
       head_dim: 16
       batch_size: 8
       batch_idx: 3
+streamify_identity_2d:
+  problem: seed_kernels/language_primitives/streamify_identity_2d/reference.py
+  step_impl: seed_kernels/language_primitives/streamify_identity_2d/step_impl.py
+  params:
+  - M
+  - K
+  - tile_m
+  - tile_k
+  presets:
+    small:
+      M: 32
+      K: 48
+      tile_m: 16
+      tile_k: 16
+    square:
+      M: 64
+      K: 64
+      tile_m: 16
+      tile_k: 16
+    large:
+      M: 128
+      K: 128
+      tile_m: 32
+      tile_k: 32
+  origin: seed
+streamify_repeat_outer:
+  problem: seed_kernels/language_primitives/streamify_repeat_outer/reference.py
+  step_impl: seed_kernels/language_primitives/streamify_repeat_outer/step_impl.py
+  params:
+  - M
+  - K
+  - R
+  - tile_m
+  - tile_k
+  presets:
+    small:
+      M: 32
+      K: 48
+      R: 3
+      tile_m: 16
+      tile_k: 16
+    square:
+      M: 64
+      K: 64
+      R: 4
+      tile_m: 16
+      tile_k: 16
+    large:
+      M: 128
+      K: 128
+      R: 5
+      tile_m: 32
+      tile_k: 32
+  origin: seed
