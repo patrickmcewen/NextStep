@@ -910,7 +910,7 @@ async def run_kernel(
     resume_from: str = None,
     translator: str = "llm",
     few_shot_paths=None,
-    autotune_options: dict | None = None,
+    autotune_options: dict = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1044,11 +1044,11 @@ async def _run_outer_iteration(
     pass_agents: dict, judge_agents: dict,
     max_turns: int,
     ckpt_root: Path, preset: str, experience_dir: str,
+    llm_config: dict,
     lowering_passes: list = None, translator_passes: list = None,
     resume_dsl_code: str = None,
     translator: str = "llm",
-    llm_config: dict = None,
-    autotune_options: dict | None = None,
+    autotune_options: dict = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
