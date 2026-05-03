@@ -265,3 +265,64 @@ def test_read_per_outer_missing_file(tmp_path: Path):
 def test_read_per_outer_missing_per_outer_key(tmp_path: Path):
     (tmp_path / "result.json").write_text(json.dumps({"success": False}))
     assert read_per_outer(tmp_path) == (0, 0)
+
+
+from src.regression_runner import read_autotune
+
+
+def _write_result_json(tmp_path: Path, per_outer: list[dict], **extra) -> None:
+    payload = {"success": True, "per_outer": per_outer, **extra}
+    (tmp_path / "result.json").write_text(json.dumps(payload))
+
+
+def test_read_autotune_returns_none_when_no_result_json(tmp_path: Path):
+    assert read_autotune(tmp_path) is None
+
+
+def test_read_autotune_returns_none_when_no_per_outer(tmp_path: Path):
+    (tmp_path / "result.json").write_text(json.dumps({"success": False}))
+    assert read_autotune(tmp_path) is None
+
+
+def test_read_autotune_returns_none_when_no_outer_has_autotune(tmp_path: Path):
+    _write_result_json(tmp_path, [
+        {"outer": 0, "success": True, "autotune": None},
+        {"outer": 1, "success": False, "autotune": None},
+    ])
+    assert read_autotune(tmp_path) is None
+
+
+def test_read_autotune_returns_none_when_only_errors(tmp_path: Path):
+    _write_result_json(tmp_path, [
+        {"outer": 0, "success": True, "autotune": {
+            "status": "error", "error": "boom",
+            "baseline_cycles": 1000, "best_cycles": 950, "speedup": 1000/950,
+            "checkpoint_dir": "x",
+        }},
+    ])
+    assert read_autotune(tmp_path) is None
+
+
+def test_read_autotune_picks_best_outer_with_lowest_best_cycles(tmp_path: Path):
+    _write_result_json(tmp_path, [
+        {"outer": 0, "success": True, "autotune": {
+            "status": "ok", "baseline_cycles": 1000, "best_cycles": 900,
+            "speedup": 1000/900, "checkpoint_dir": "x"}},
+        {"outer": 1, "success": True, "autotune": {
+            "status": "ok", "baseline_cycles": 1000, "best_cycles": 850,
+            "speedup": 1000/850, "checkpoint_dir": "y"}},
+        {"outer": 2, "success": True, "autotune": {
+            "status": "error", "error": "z",
+            "baseline_cycles": 1000, "best_cycles": 920,
+            "speedup": 1000/920, "checkpoint_dir": "z"}},
+        {"outer": 3, "success": False, "autotune": None},
+    ])
+    out = read_autotune(tmp_path)
+    assert out is not None
+    assert out["best_outer"] == 1
+    assert out["baseline_cycles"] == 1000
+    assert out["best_cycles"] == 850
+    assert out["speedup"] == pytest.approx(1000 / 850)
+    assert len(out["per_outer"]) == 4
+    statuses = [e["status"] for e in out["per_outer"]]
+    assert statuses == ["ok", "ok", "error", "missing"]

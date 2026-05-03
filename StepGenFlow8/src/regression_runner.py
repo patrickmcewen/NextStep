@@ -88,6 +88,64 @@ def read_per_outer(checkpoint_dir: Path) -> tuple[int, int]:
     return passed, len(per_outer)
 
 
+def read_autotune(checkpoint_dir: Path) -> dict | None:
+    """Return best-across-outers autotune summary, or None if no data.
+
+    Reads <checkpoint_dir>/result.json's per_outer entries, picks the entry
+    with status=='ok' that has the lowest best_cycles, and returns:
+      {
+        "best_outer": int,
+        "baseline_cycles": int,
+        "best_cycles": int,
+        "speedup": float,
+        "per_outer": [{outer, status, baseline_cycles, best_cycles, speedup}, ...],
+      }
+    Returns None when no outer has status=='ok' (autotune disabled, no outer
+    succeeded, or every outer's autotune crashed).
+    """
+    result_path = checkpoint_dir / "result.json"
+    if not result_path.exists():
+        return None
+    data = json.loads(result_path.read_text())
+    per_outer = data.get("per_outer")
+    if not per_outer:
+        return None
+
+    summarized = []
+    for entry in per_outer:
+        at = entry.get("autotune")
+        if at is None:
+            summarized.append({
+                "outer": entry.get("outer"),
+                "status": "missing",
+                "baseline_cycles": None,
+                "best_cycles": None,
+                "speedup": None,
+            })
+        else:
+            summarized.append({
+                "outer": entry.get("outer"),
+                "status": at.get("status"),
+                "baseline_cycles": at.get("baseline_cycles"),
+                "best_cycles": at.get("best_cycles"),
+                "speedup": at.get("speedup"),
+            })
+
+    ok_entries = [e for e in summarized
+                  if e["status"] == "ok" and e["best_cycles"] is not None]
+    if not ok_entries:
+        return None
+
+    best = min(ok_entries, key=lambda e: e["best_cycles"])
+    return {
+        "best_outer": best["outer"],
+        "baseline_cycles": best["baseline_cycles"],
+        "best_cycles": best["best_cycles"],
+        "speedup": best["speedup"],
+        "per_outer": summarized,
+    }
+
+
 async def run_subprocess(cmd: list[str], log_path: Path, cwd: Path) -> tuple[int, float]:
     """Run `cmd` as a subprocess; merge stdout+stderr into `log_path`.
 
