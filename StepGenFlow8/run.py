@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import sys
 
 from src.config_loader import load_llm_config
@@ -12,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description="StepGenFlow — generate STeP programs from PyTorch references")
     parser.add_argument("kernel", help="Kernel name from StepDB (e.g., element_wise_add)")
     parser.add_argument("preset", help="Preset name (e.g., small)")
-    parser.add_argument("--model", default="gpt-oss120b",
+    parser.add_argument("--model", default="gpt-oss-120b",
                         help="Profile name under configs/ (loads configs/<name>.json). "
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
@@ -39,9 +40,28 @@ def main():
                              "kernel-family hints (e.g. RoPE/SDPA/MoE for transformers). "
                              "Accepts: dsl_code.py file, outer_N dir, or checkpoint root dir. "
                              "Off by default.")
+    parser.add_argument("--autotune", action="store_true",
+                        help="Run the autotuner on each outer's verified build_graph.")
+    parser.add_argument("--autotune-config", default="autotune_config.json",
+                        help="Path to autotune_config JSON (hw_config, constraints, max_turns).")
+    parser.add_argument("--autotune-max-turns", type=int, default=None,
+                        help="Override max_turns from autotune_config.")
+    parser.add_argument("--autotune-agent", default="general",
+                        choices=["general", "parallel"],
+                        help="Which autotuner agent to run.")
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
+
+    autotune_options = None
+    if args.autotune:
+        with open(args.autotune_config) as f:
+            autotune_cfg = json.load(f)
+        autotune_options = {
+            "config": autotune_cfg,
+            "max_turns": args.autotune_max_turns,
+            "agent_variant": args.autotune_agent,
+        }
 
     result = asyncio.run(run_kernel(
         kernel_name=args.kernel,
@@ -56,6 +76,7 @@ def main():
         resume_from=args.resume,
         translator=args.translator,
         few_shot_paths=args.few_shot,
+        autotune_options=autotune_options,
     ))
 
     if result["success"]:
