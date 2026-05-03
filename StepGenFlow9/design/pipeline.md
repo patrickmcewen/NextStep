@@ -23,6 +23,10 @@ arguments:
 | `--few-shot` | example program paths shown to the refactor agent |
 | `--bundle-dir` | bundle directory; activates bundle mode |
 | `--checkpoint-dir` | override the default timestamped checkpoint root |
+| `--autotune` | run the autotuner on each outer's verified `build_graph` (off by default) |
+| `--autotune-config` | path to `autotune_config.json` (loaded only when `--autotune` is set) |
+| `--autotune-max-turns` | override `max_turns` from the autotune config |
+| `--autotune-agent` | autotune agent variant (`general` or `parallel`) |
 
 LLM configuration (provider URL, API key, model id, optional reasoning
 effort) is loaded from JSON profiles under a repo-root `configs/` directory
@@ -87,6 +91,14 @@ are normalized into failure-result records), and the call returns the
 Outer attempts share precomputed gold tensors (memoized per `(kernel, dims)`
 to avoid re-allocating multi-GiB references) but otherwise have no shared
 state.
+
+Under `--autotune`, each outer that produces a verified `build_graph`
+runs the autotuner inline before its coroutine returns. Because each
+outer is its own task, an outer's autotune runs concurrently with
+whatever the other outers are still doing on the functional pipeline.
+The autotuner writes under `outer_<i>/autotune/`, and an autotune
+crash is trapped at the boundary so the outer's functional success is
+preserved. See [autotuner.md](autotuner.md) for the per-outer schema.
 
 ## Resume
 

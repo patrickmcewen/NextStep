@@ -1,18 +1,21 @@
-"""Tool wrappers for step_py functional simulation and timing model.
+"""Execution helpers for the orchestrator.
 
-Exposes helpers for executing build_graph, tiled_reference, and hybrid_reference
-code, plus @function_tool wrappers for the LLM agent.
+Two executors backed by ``exec`` of the LLM-emitted code:
+    - ``_exec_dsl_ref``     runs ``tiled_reference(dims, tensors)`` against the
+                            mounted DSL surface (standalone or bundle abstraction)
+                            and returns the output tensor.
+    - ``_exec_build_graph`` runs ``build_graph(dims, tensors)`` and returns the
+                            ``(graph, output_op)`` pair; correctness then dispatches
+                            it through the STeP simulator.
+
+Both share the IMPORT_SCAFFOLD and the user-code line-mapping enhancement
+machinery so that errors point back into the LLM's source.
 """
 import importlib.util
-import json
 import sys
-import traceback
 from pathlib import Path
 
-import networkx
-import sympy
 import torch
-from agents import function_tool
 
 # ---------------------------------------------------------------------------
 # Path setup — make step_py and validate_functional importable
@@ -36,35 +39,24 @@ _validate_functional_mod = importlib.util.module_from_spec(_vf_spec)
 _vf_spec.loader.exec_module(_validate_functional_mod)
 
 IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
-_strip_imports = _validate_functional_mod._strip_imports
 
 from step_py.ops import StepOps
-from timing_and_emulator.functional import execute, execute_values
-from timing_and_emulator.timing import analyze_timing
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _exec_build_graph(code: str, dims: dict, tensors: dict = None):
-    """Execute user code that defines build_graph() and return (graph, output_op).
-
-    If tensors is provided, calls build_graph(dims, tensors).
-    Otherwise falls back to build_graph(dims) for backward compat.
-    """
+def _exec_build_graph(code: str, dims: dict, tensors: dict):
+    """Execute user code that defines build_graph() and return (graph, output_op)."""
     StepOps._counter = 0
-    #stripped = _strip_imports(code)
     full_code = IMPORT_SCAFFOLD + "\n" + code
     scaffold_lines = IMPORT_SCAFFOLD.count("\n") + 1
     namespace = {}
     exec(full_code, namespace)
-    assert "build_graph" in namespace, "Code must define a build_graph(dims) function"
+    assert "build_graph" in namespace, "Code must define a build_graph(dims, tensors) function"
     try:
-        if tensors is not None:
-            graph, output_op = namespace["build_graph"](dims, tensors)
-        else:
-            graph, output_op = namespace["build_graph"](dims)
+        graph, output_op = namespace["build_graph"](dims, tensors)
     except Exception as exc:
         raise _enhance_error(exc, code, scaffold_lines) from exc
     return graph, output_op
@@ -229,137 +221,45 @@ def enhance_emulator_error(exc: Exception, user_code: str) -> str:
     return "\n".join(parts)
 
 
-TILED_SCAFFOLD = "import torch\nimport torch.nn.functional as F\nimport math\n"
-
-# DSL scaffold: basic imports + all step_dsl functions injected into namespace
+# DSL scaffold: torch + step_dsl source injected into the exec'd namespace so
+# the LLM-emitted tiled_reference can call DSL ops without writing imports.
 _DSL_PY = Path(__file__).resolve().parent / "step_dsl.py"
-DSL_SCAFFOLD = TILED_SCAFFOLD + "\n" + _DSL_PY.read_text() + "\n"
-
-# Hybrid scaffold: all STeP imports + execute_values for inline emulator calls
-HYBRID_SCAFFOLD = IMPORT_SCAFFOLD + "\nfrom timing_and_emulator.functional import execute_values\nimport torch.nn.functional as F\n"
-
-
-def _exec_tiled_ref(code: str, dims: dict, tensors: dict = None) -> torch.Tensor:
-    """Execute user code that defines tiled_reference() and return the output tensor."""
-    scaffold_lines = TILED_SCAFFOLD.count("\n") + 1
-    namespace = {}
-    exec(TILED_SCAFFOLD + "\n" + code, namespace)
-    assert "tiled_reference" in namespace, "Code must define a tiled_reference function"
-    try:
-        if tensors is not None:
-            result = namespace["tiled_reference"](dims, tensors)
-        else:
-            result = namespace["tiled_reference"](dims)
-    except Exception as exc:
-        raise _enhance_hybrid_error(exc, code, scaffold_lines) from exc
-    assert isinstance(result, torch.Tensor), f"tiled_reference must return a torch.Tensor, got {type(result)}"
-    return result
+DSL_SCAFFOLD = (
+    "import torch\nimport torch.nn.functional as F\nimport math\n\n"
+    + _DSL_PY.read_text() + "\n"
+)
 
 
-def _exec_dsl_ref(code: str, dims: dict, tensors: dict = None) -> torch.Tensor:
-    """Execute user code with DSL functions available. Returns output tensor.
+def _exec_dsl_ref(code: str, dims: dict, tensors: dict) -> torch.Tensor:
+    """Execute user code with DSL functions available. Returns the output tensor.
 
     The DSL scaffold injects all step_dsl functions (offchip_load, binary_matmul,
     etc.) into the execution namespace so the refactored code can call them directly.
+    In bundle mode the bundle's abstraction is mounted as ``step_dsl`` before this
+    runs; the same scaffold imports torch/F and prepends the abstraction's source.
     """
     scaffold_lines = DSL_SCAFFOLD.count("\n") + 1
     namespace = {}
     exec(DSL_SCAFFOLD + "\n" + code, namespace)
     assert "tiled_reference" in namespace, "Code must define a tiled_reference function"
     try:
-        if tensors is not None:
-            result = namespace["tiled_reference"](dims, tensors)
-        else:
-            result = namespace["tiled_reference"](dims)
+        result = namespace["tiled_reference"](dims, tensors)
     except Exception as exc:
-        raise _enhance_hybrid_error(exc, code, scaffold_lines) from exc
+        raise _enhance_user_code_error(exc, code, scaffold_lines) from exc
     assert isinstance(result, torch.Tensor), f"tiled_reference must return a torch.Tensor, got {type(result)}"
     return result
 
-def _strip_all_imports(code: str) -> str:
-    """Aggressively strip ALL import/from lines — the scaffold provides everything."""
-    lines = code.split("\n")
-    result = []
-    in_multiline = False
-    for line in lines:
-        s = line.strip()
-        if in_multiline:
-            if ")" in s:
-                in_multiline = False
-            continue
-        if s.startswith(("import ", "from ")):
-            if "(" in s and ")" not in s:
-                in_multiline = True
-            continue
-        result.append(line)
-    return "\n".join(result)
 
+def _enhance_user_code_error(exc: Exception, user_code: str, scaffold_lines: int) -> Exception:
+    """Enhance an error raised by exec'd user code with line context and tensor shapes.
 
-def _exec_hybrid_ref(code: str, dims: dict, tensors: dict = None) -> torch.Tensor:
-    """Execute hybrid_reference or build_graph from user code, return output tensor.
-
-    Accepts either function name. If build_graph is found, runs it through the
-    emulator to get the output tensor. If hybrid_reference is found, calls it directly.
-    """
-    StepOps._counter = 0
-    stripped = _strip_all_imports(code)
-    full_code = HYBRID_SCAFFOLD + "\n" + stripped
-    scaffold_lines = HYBRID_SCAFFOLD.count("\n") + 1
-    namespace = {}
-    exec(full_code, namespace)
-
-    # build_graph is the primary function name; hybrid_reference accepted for compat
-    if "build_graph" in namespace:
-        try:
-            if tensors is not None:
-                graph, output_op = namespace["build_graph"](dims, tensors)
-            else:
-                graph, output_op = namespace["build_graph"](dims)
-            from timing_and_emulator.functional import execute as _execute
-            result = _execute(graph, output_op)
-        except Exception as exc:
-            raise _enhance_hybrid_error(exc, stripped, scaffold_lines) from exc
-        assert isinstance(result, torch.Tensor), f"build_graph emulator output must be a torch.Tensor, got {type(result)}"
-        return result
-
-    if "hybrid_reference" in namespace:
-        # Legacy compat
-        try:
-            if tensors is not None:
-                result = namespace["hybrid_reference"](dims, tensors)
-            else:
-                result = namespace["hybrid_reference"](dims)
-        except Exception as exc:
-            raise _enhance_hybrid_error(exc, stripped, scaffold_lines) from exc
-        assert isinstance(result, torch.Tensor)
-        return result
-
-    assert False, "Code must define a build_graph(dims, tensors) function"
-
-
-def _enhance_hybrid_error(exc: Exception, user_code: str, scaffold_lines: int) -> Exception:
-    """Enhance errors from hybrid/tiled code with line context and tensor shapes.
-
-    If the error originated inside the emulator (functional.py), uses
-    enhance_emulator_error to identify the failing node and its inputs.
-    Otherwise shows the failing user code line with tensor shapes.
+    Maps ``<string>`` traceback frames back to the user's code, quotes the failing
+    line plus a few lines of context, and lists tensor-shape locals at that frame.
+    Used by ``_exec_dsl_ref`` (the DSL executor); the build_graph executor uses
+    ``_enhance_error`` which additionally inspects ops.py / datatype.py frames.
     """
     import traceback as tb
 
-    # Check if the error went through the emulator (functional.py)
-    cursor = exc.__traceback__
-    in_emulator = False
-    while cursor is not None:
-        if "functional.py" in cursor.tb_frame.f_code.co_filename:
-            in_emulator = True
-            break
-        cursor = cursor.tb_next
-
-    if in_emulator:
-        enhanced = enhance_emulator_error(exc, user_code)
-        return type(exc)(enhanced)
-
-    # Error in user code itself — show line context and tensor shapes
     user_code_lines = user_code.split("\n")
     parts = [f"{type(exc).__name__}: {exc}"]
 
@@ -384,7 +284,6 @@ def _enhance_hybrid_error(exc: Exception, user_code: str, scaffold_lines: int) -
             marker = ">>>" if j == user_line - 1 else "   "
             parts.append(f"  {marker} {user_code_lines[j]}")
 
-        # Show shapes of tensor locals at the failing frame
         if i < len(raw_frames):
             frame_obj = raw_frames[i][0]
             tensor_shapes = {}
@@ -399,104 +298,3 @@ def _enhance_hybrid_error(exc: Exception, user_code: str, scaffold_lines: int) -
                     parts.append(f"    {name} = {shape_str}")
 
     return type(exc)("\n".join(parts))
-
-# ---------------------------------------------------------------------------
-# @function_tool wrappers
-# ---------------------------------------------------------------------------
-
-
-@function_tool
-def check_correctness(code: str, kernel_name: str, dims_json: str) -> str:
-    """Check if a build_graph() produces output matching the PyTorch reference."""
-    try:
-        dims = json.loads(dims_json)
-        graph, output_op = _exec_build_graph(code, dims)
-        sim = execute(graph, output_op)
-
-        config = _validate_functional_mod.load_config()
-        gold = _validate_functional_mod.run_reference(kernel_name, dims, config)
-
-        if gold.shape != sim.shape:
-            return (
-                f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs sim {tuple(sim.shape)}\n"
-                f"match=False"
-            )
-
-        max_err = (gold - sim).abs().max().item()
-        rel_err = max_err / (gold.abs().max().item() + 1e-12)
-        match = rel_err < 1e-5
-
-        result = (
-            f"match={match}\n"
-            f"max_abs_err={max_err:.2e}\n"
-            f"rel_err={rel_err:.2e}\n"
-            f"output_shape={tuple(sim.shape)}"
-        )
-
-        if not match:
-            diff = (gold - sim).abs()
-            worst_idx = diff.argmax().item()
-            worst_multi = torch.unravel_index(diff.argmax(), diff.shape)
-            result += (
-                f"\nworst_error_index={tuple(i.item() for i in worst_multi)}"
-                f"\ngold_value={gold.flatten()[worst_idx].item():.6e}"
-                f"\nsim_value={sim.flatten()[worst_idx].item():.6e}"
-            )
-
-        return result
-    except Exception:
-        return traceback.format_exc()
-
-
-@function_tool
-def analyze_performance(code: str, dims_json: str) -> str:
-    """Run the analytical timing model on a build_graph() function."""
-    try:
-        dims = json.loads(dims_json)
-        graph, _output_op = _exec_build_graph(code, dims)
-        result = analyze_timing(graph)
-
-        total = result["total_cycles"]
-        sym_subs = result.get("sym_subs")
-
-        # Handle symbolic expressions
-        if hasattr(total, 'free_symbols') and total.free_symbols:
-            subs = sym_subs if sym_subs else {s: 1 for s in total.free_symbols}
-            total = total.xreplace(subs)
-
-        total_val = int(sympy.N(total))
-
-        lines = [f"total_cycles={total_val}"]
-        lines.append("")
-        lines.append("per_node breakdown:")
-
-        bottleneck_id = None
-        bottleneck_end = -1
-
-        for nid, info in result["per_node"].items():
-            node = info["node"]
-            op_type = node.__class__.__name__
-
-            st_val = int(sympy.N(info["st"]))
-            end_val = int(sympy.N(info["end"]))
-            oci_val = int(sympy.N(info["OCI"]))
-            oti_val = float(sympy.N(info["OTI"]))
-
-            lines.append(
-                f"  [{nid}] {op_type}: st={st_val} end={end_val} OCI={oci_val} OTI={oti_val:.1f}"
-            )
-
-            if end_val > bottleneck_end:
-                bottleneck_end = end_val
-                bottleneck_id = nid
-
-        assert bottleneck_id is not None, "Graph has no nodes"
-        bn_node = result["per_node"][bottleneck_id]["node"]
-        lines.append("")
-        lines.append(
-            f"bottleneck: [{bottleneck_id}] {bn_node.__class__.__name__} (end={bottleneck_end})"
-        )
-
-        return "\n".join(lines)
-    except Exception:
-        return traceback.format_exc()

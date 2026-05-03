@@ -1,16 +1,24 @@
-"""Orchestrator for StepGenFlow5 — progressive translation pipeline.
+"""Orchestrator for StepGenFlow — per-kernel two-phase pipeline.
 
-Two-phase pipeline:
-  Phase 1 (lowering): tiler -> router -> retiler -> canonicalize
-    Each pass outputs tiled_reference(dims) -> torch.Tensor, validated against gold.
-    Canonicalize enforces single-assignment form with only canonical ops.
-  Phase 2 (translation): single translate pass (DSL -> STeP graph)
-    Takes DSL-refactored code and translates all DSL calls 1:1 into STeP graph nodes, outputs
-    build_graph(dims) -> (graph, output_op), validated via emulator against gold.
+Phase 1 (lowering): a single ``refactor_final`` LLM pass rewrites the PyTorch
+reference into DSL form. Each turn is gated by the ``dsl`` executor against
+gold, and (under ``--translator=auto``) also by a post-validator that runs the
+deterministic translator and the resulting STeP graph against gold.
+
+Phase 2 (translation): either the deterministic AST translator
+(``--translator=auto``) or an LLM ``translate`` pass (``--translator=llm``) emits
+``build_graph(dims, tensors)``; the result is gated by the ``graph`` executor.
+
+The ``direct`` and ``direct_no_functional`` pipelines skip phase 1 and produce
+``build_graph`` directly from PyTorch via a single LLM pass.
+
+Bundle mode replaces the standalone DSL surface with a bundle's abstraction
+(mounted as ``step_dsl``) and the deterministic translator with the bundle's
+own ``transpiler.translate``; the pipeline collapses to a single
+``refactor_final`` pass plus one deterministic translate.
 
 Checkpoint structure:
   checkpoints/<timestamp>/<kernel>/outer_<N>/<pass_name>/turn_<M>/...
-  checkpoints/<timestamp>/<kernel>/outer_<N>/analyst/...
   checkpoints/<timestamp>/<kernel>/result.json
 """
 
@@ -35,15 +43,13 @@ os.environ.setdefault("STEP_DSL_TRACE", "1")
 from src.dsl_to_step import translate as _dsl_to_step_translate
 from agents import Runner
 
-from src.agents import (make_diagnostician_agent, make_judge_agent,
-                        make_bundle_judge_agent, make_pass_agent)
-from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES,
-                         DIRECT_TRANSLATOR_PASSES, PIPELINES,
+from src.agents import (make_judge_agent, make_bundle_judge_agent,
+                        make_pass_agent)
+from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES, PIPELINES,
                          build_pass_user_prompt,
                          _format_tensors_description,
                          resolve_few_shot_examples)
-from src.tools import (_exec_build_graph, _exec_tiled_ref, _exec_hybrid_ref,
-                       _exec_dsl_ref,
+from src.tools import (_exec_build_graph, _exec_dsl_ref,
                        _validate_functional_mod, enhance_emulator_error)
 
 # ---------------------------------------------------------------------------
@@ -250,22 +256,25 @@ def _compare_against_gold(result, kernel_name, dims, label="result"):
     return out
 
 
-def _run_tiled_correctness(code, kernel_name, dims, tensors=None):
-    result = _exec_tiled_ref(code, dims, tensors)
-    return _compare_against_gold(result, kernel_name, dims, "tiled")
+def _run_dsl_correctness(code, kernel_name, dims, tensors):
+    """Run a refactor-pass candidate against gold via the DSL executor.
 
-
-def _run_hybrid_correctness(code, kernel_name, dims, tensors=None):
-    result = _exec_hybrid_ref(code, dims, tensors)
-    return _compare_against_gold(result, kernel_name, dims, "hybrid")
-
-
-def _run_dsl_correctness(code, kernel_name, dims, tensors=None):
+    The DSL surface is directly runnable (the standalone ``step_dsl`` module
+    or the bundle's mounted abstraction), so we exec the candidate as
+    ``tiled_reference(dims, tensors)`` and compare its output to gold.
+    """
     result = _exec_dsl_ref(code, dims, tensors)
     return _compare_against_gold(result, kernel_name, dims, "dsl")
 
 
-def _run_graph_correctness(code, kernel_name, dims, tensors=None):
+def _run_graph_correctness(code, kernel_name, dims, tensors):
+    """Run a translate-pass candidate against gold via the simulator.
+
+    The candidate is exec'd as ``build_graph(dims, tensors)`` and the
+    resulting graph is dispatched through the STeP simulator. Simulator
+    failures are re-raised with node + user-code context so the LLM gets
+    actionable feedback.
+    """
     from timing_and_emulator.functional import execute
     graph, output_op = _exec_build_graph(code, dims, tensors)
     try:
@@ -278,141 +287,112 @@ def _run_graph_correctness(code, kernel_name, dims, tensors=None):
     return _compare_against_gold(sim, kernel_name, dims, "sim")
 
 
-# Map executor type to correctness checker
+# Map executor type to correctness checker. ``dsl`` gates phase-1 refactor
+# passes; ``graph`` gates phase-2 translate passes.
 _CORRECTNESS_CHECKERS = {
-    "tiled": _run_tiled_correctness,
-    "dsl": _run_dsl_correctness,
-    "hybrid": _run_hybrid_correctness,
+    "dsl":   _run_dsl_correctness,
     "graph": _run_graph_correctness,
-    # bundle-dir mode: DSL correctness is skipped; only the post-validator runs
-    "passthrough": lambda code, kernel_name, dims, tensors=None: "match=True",
 }
 
 
 # ---------------------------------------------------------------------------
-# Compliance checking — each pass progressively constrains allowed operations
+# Compliance checking — per-pass regex rules over the function body
 # ---------------------------------------------------------------------------
 
-# Cumulative pass orders — each pass inherits all prior bans within its group.
-_REFACTOR_ORDER = ["refactor_load", "refactor_compute", "refactor_shape", "refactor_final"]
-_TRANSLATION_ORDER = ["translate", "translate_full", "translate_full_no_functional"]
-
-# Allowed torch.XXX() calls in the OUTPUT of each pass.
-# None = unrestricted.  set() = nothing allowed.
-# Within a cumulative group: effective allowlist = last non-None up to that point.
-# Standalone passes (canonicalize, tiler, etc.): checked independently.
-_PASS_ALLOWED_TORCH = {
-    "refactor_final": set(),  # everything must be DSL — no torch at all
-    # --- Translation passes (cumulative) ---
-    # Input is DSL code (no torch at all), so torch is banned from the start.
-    # The build_graph body should only contain STeP graph construction.
-    "translate": set(),  # no torch in build_graph body — all ops are STeP nodes
-    "translate_full": set(),
-    "translate_full_no_functional": set(),
+# Per-pass compliance rules. Each pass is independent (no cumulative
+# inheritance): the only refactor pass is ``refactor_final``, and the
+# translate variants run as alternatives keyed by ``--pipeline``. Each entry
+# carries the four standalone fields documented in design/pass_loop.md:
+#   - allowed_torch:    set of allowed ``torch.X`` callables (empty = none)
+#   - allowed_F:        set of allowed ``F.X`` callables (empty = none)
+#   - banned_patterns:  list of (substring, fix-hint) pairs, each surfaced as a
+#                       violation line that quotes the fix back to the model
+#   - required_ops:     names that must appear textually in the function body
+_PASS_RULES: dict[str, dict] = {
+    # Phase 1: PyTorch -> DSL form. Output must be pure DSL.
+    "refactor_final": {
+        "allowed_torch": set(),
+        "allowed_F": set(),
+        "banned_patterns": [
+            (".unsqueeze(", "use promote(x, rank) or promote_outer(x)"),
+            (".squeeze(",   "use flatten(x, rank, rank) or accum_retile_row/col"),
+            (".expand(",    "use expand_ref(x, ref) or repeat_static(x, factor)"),
+            (".sum(",       "use accum_add(x, rank=1) or unary_rowwise_sum(x)"),
+            (".prod(",      "use accum_mul(x, rank=1)"),
+            ("torch.matmul", "use binary_matmul(a, b)"),
+            ("torch.exp",    "use unary_exp(x)"),
+            ("torch.rsqrt",  "use unary_rsqrt(x)"),
+            ("F.silu",       "use unary_silu(x)"),
+            ("out_shape_tiled=(1,)",
+             "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
+        ],
+        "required_ops": ["offchip_load", "offchip_store"],
+    },
+    # Phase 2 standard: DSL -> STeP graph. All DSL calls become STeP nodes.
+    "translate": {
+        "allowed_torch": set(),
+        "allowed_F": set(),
+        "banned_patterns": [
+            ("offchip_load(",    "replace with LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, transposed)"),
+            ("offchip_store(",   "replace with OffChipStore(graph, input, par_dispatch=4)"),
+            ("select_gen(",      "replace with SelectGen(is_multihot=..., tensor=..., n=...) - args match the DSL call"),
+            ("metadata_gen(",    "replace with MetadataGen(tensor=tensor)"),
+            ("binary_matmul(",   "replace with BinaryMap(graph, a, b, map_fn.Matmul(), False, 1024)"),
+            ("binary_mul(",      "replace with BinaryMap(graph, a, b, map_fn.Mul(), False, 1024)"),
+            ("binary_add(",      "replace with BinaryMap(graph, a, b, map_fn.Add(), False, 1024)"),
+            ("binary_div(",      "replace with BinaryMap(graph, a, b, map_fn.Div(), False, 1024)"),
+            ("binary_is_equal(", "replace with BinaryMap(graph, a, b, map_fn.IsEqual(), False, 1024)"),
+            ("binary_map_accum(","replace with BinaryMapAccum(graph, a, b, map_accum_fn.Matmul(), init_fn.Zero(...), rank, False, 1024)"),
+            ("unary_silu(",      "replace with UnaryMap(graph, x, map_fn.Silu(), False, 1024)"),
+            ("unary_square(",    "replace with UnaryMap(graph, x, map_fn.Square(), False, 1024)"),
+            ("unary_exp(",       "replace with UnaryMap(graph, x, map_fn.Exp(), False, 1024)"),
+            ("unary_rsqrt(",     "replace with UnaryMap(graph, x, map_fn.Rsqrt(), False, 1024)"),
+            ("unary_pow2(",      "replace with UnaryMap(graph, x, map_fn.Pow2(), False, 1024)"),
+            ("unary_mul_imm(",   "replace with UnaryMap(graph, x, map_fn.MulImmediate(c), False, 1024)"),
+            ("unary_add_imm(",   "replace with UnaryMap(graph, x, map_fn.AddImmediate(c), False, 1024)"),
+            ("unary_sub_imm(",   "replace with UnaryMap(graph, x, map_fn.SubImmediate(c), False, 1024)"),
+            ("unary_rowwise_sum(","replace with UnaryMap(graph, x, map_fn.RowWiseSum(), False, 1024)"),
+            ("accum_add(",       "replace with Accum(graph, x, ..., accum_fn.Add(), ..., accum_rank=rank)"),
+            ("accum_mul(",       "replace with Accum(graph, x, ..., accum_fn.Mul(), ..., accum_rank=rank)"),
+            ("accum_retile_row(","replace with Accum(graph, x, ..., accum_fn.RetileRow(), ...)"),
+            ("accum_retile_col(","replace with Accum(graph, x, ..., accum_fn.RetileCol(), ...)"),
+            ("promote(",         "replace with Promote(graph, input, promote_rank=rank)"),
+            ("promote_outer(",   "replace with PromoteOuter(graph, input)"),
+            ("expand_ref(",      "replace with ExpandRef(graph, input, ref, expand_rank=...)"),
+            ("repeat_ref(",      "replace with RepeatRef(graph, input, ref)"),
+            ("repeat_static(",   "replace with RepeatStatic(graph, input, repeat_factor)"),
+            ("flatten(",         "replace with Flatten(graph, input, min_rank, max_rank)"),
+            ("reshape_stream(",  "replace with Reshape(graph, input, chunk_size, reshape_rank, write_back_mu=False)"),
+            ("retile_streamify(","replace with RetileStreamify(graph, input, split_row, chunk=chunk)"),
+            ("broadcast(",       "replace with Broadcast(graph, input, num_consumers=n)"),
+            ("parallelize(",     "replace with Parallelize(graph, input, num_consumers=n)"),
+            ("static_reassemble(","replace with StaticReassemble(graph, inputs, stream=shape)"),
+            ("flat_partition(",  "replace with FlatPartition(graph, input, control, ...)"),
+            ("flat_reassemble(", "replace with FlatReassemble(graph, inputs, control, ...)"),
+            ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
+        ],
+        "required_ops": ["LinearOffChipLoad", "OffChipStore"],
+    },
+    # Phase 2 direct: PyTorch -> STeP graph in one LLM pass; no DSL intermediate.
+    "translate_full": {
+        "allowed_torch": set(),
+        "allowed_F": set(),
+        "banned_patterns": [
+            ("execute_values", "remove mid-function execution; return (graph, output_op)"),
+        ],
+        "required_ops": ["LinearOffChipLoad", "OffChipStore"],
+    },
+    "translate_full_no_functional": {
+        "allowed_torch": set(),
+        "allowed_F": set(),
+        "banned_patterns": [
+            ("execute_values", "remove mid-function execution; return (graph, output_op)"),
+        ],
+        "required_ops": ["LinearOffChipLoad", "OffChipStore"],
+    },
 }
 
-# Allowed F.XXX() calls per pass.
-_PASS_ALLOWED_F = {
-    "canonicalize": {"F.silu", "F.pad"},
-    "refactor_load": {"F.silu", "F.pad"},  # compute still PyTorch
-    "refactor_compute": {"F.pad"},           # F.silu replaced by unary_silu; F.pad kept for routing stream padding
-    "refactor_shape": {"F.pad"},            # shape ops are DSL; F.pad kept for routing
-    "refactor_final": set(),
-    "translate": set(),
-    "translate_full": set(),
-    "translate_full_no_functional": set(),
-}
-
-# Extra string patterns banned at each stage.
-# For cumulative groups (refactor, translation), bans accumulate across passes.
-_PASS_EXTRA_BANS = {
-    "tiler": [
-        ("torch.einsum",   "use torch.matmul for matrix multiplication"),
-        ("torch.bmm",      "use torch.matmul for matrix multiplication"),
-        ("F.softmax",      "decompose into exp, row-wise sum, div"),
-        ("F.layer_norm",   "decompose into mean-subtract, variance, rsqrt, scale"),
-        ("F.gelu",         "decompose into primitives or use F.silu"),
-    ],
-    "refactor_load": [
-        ("out_shape_tiled=(1,)", "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
-    ],
-    "refactor_compute": [
-        ("torch.matmul",   "use binary_matmul(a, b)"),
-        ("torch.exp",      "use unary_exp(x)"),
-        ("torch.rsqrt",    "use unary_rsqrt(x)"),
-        ("F.silu",         "use unary_silu(x)"),
-    ],
-    "refactor_shape": [
-        (".unsqueeze(",    "use promote(x, rank) or promote_outer(x)"),
-        (".squeeze(",      "use flatten(x, rank, rank) or accum_retile_row/col"),
-        (".expand(",       "use expand_ref(x, ref) or repeat_static(x, factor)"),
-    ],
-    "refactor_final": [
-        (".sum(",          "use accum_add(x, rank=1) or unary_rowwise_sum(x)"),
-        (".prod(",         "use accum_mul(x, rank=1)"),
-    ],
-    # Translation: all DSL calls must become STeP nodes in a single pass.
-    "translate": [
-        ("offchip_load(",    "replace with LinearOffChipLoad(underlying, stride, out_shape_tiled, tile_row, tile_col, par_dispatch, transposed)"),
-        ("offchip_store(",   "replace with OffChipStore(graph, input, par_dispatch=4)"),
-        ("select_gen(",      "replace with SelectGen(is_multihot=..., tensor=..., n=...) - args match the DSL call"),
-        ("metadata_gen(",    "replace with MetadataGen(tensor=tensor)"),
-        ("binary_matmul(",   "replace with BinaryMap(graph, a, b, map_fn.Matmul(), False, 1024)"),
-        ("binary_mul(",      "replace with BinaryMap(graph, a, b, map_fn.Mul(), False, 1024)"),
-        ("binary_add(",      "replace with BinaryMap(graph, a, b, map_fn.Add(), False, 1024)"),
-        ("binary_div(",      "replace with BinaryMap(graph, a, b, map_fn.Div(), False, 1024)"),
-        ("binary_is_equal(", "replace with BinaryMap(graph, a, b, map_fn.IsEqual(), False, 1024)"),
-        ("binary_map_accum(","replace with BinaryMapAccum(graph, a, b, map_accum_fn.Matmul(), init_fn.Zero(...), rank, False, 1024)"),
-        ("unary_silu(",      "replace with UnaryMap(graph, x, map_fn.Silu(), False, 1024)"),
-        ("unary_square(",    "replace with UnaryMap(graph, x, map_fn.Square(), False, 1024)"),
-        ("unary_exp(",       "replace with UnaryMap(graph, x, map_fn.Exp(), False, 1024)"),
-        ("unary_rsqrt(",     "replace with UnaryMap(graph, x, map_fn.Rsqrt(), False, 1024)"),
-        ("unary_pow2(",      "replace with UnaryMap(graph, x, map_fn.Pow2(), False, 1024)"),
-        ("unary_mul_imm(",   "replace with UnaryMap(graph, x, map_fn.MulImmediate(c), False, 1024)"),
-        ("unary_add_imm(",   "replace with UnaryMap(graph, x, map_fn.AddImmediate(c), False, 1024)"),
-        ("unary_sub_imm(",   "replace with UnaryMap(graph, x, map_fn.SubImmediate(c), False, 1024)"),
-        ("unary_rowwise_sum(","replace with UnaryMap(graph, x, map_fn.RowWiseSum(), False, 1024)"),
-        ("accum_add(",       "replace with Accum(graph, x, ..., accum_fn.Add(), ..., accum_rank=rank)"),
-        ("accum_mul(",       "replace with Accum(graph, x, ..., accum_fn.Mul(), ..., accum_rank=rank)"),
-        ("accum_retile_row(","replace with Accum(graph, x, ..., accum_fn.RetileRow(), ...)"),
-        ("accum_retile_col(","replace with Accum(graph, x, ..., accum_fn.RetileCol(), ...)"),
-        ("promote(",         "replace with Promote(graph, input, promote_rank=rank)"),
-        ("promote_outer(",   "replace with PromoteOuter(graph, input)"),
-        ("expand_ref(",      "replace with ExpandRef(graph, input, ref, expand_rank=...)"),
-        ("repeat_ref(",      "replace with RepeatRef(graph, input, ref)"),
-        ("repeat_static(",   "replace with RepeatStatic(graph, input, repeat_factor)"),
-        ("flatten(",         "replace with Flatten(graph, input, min_rank, max_rank)"),
-        ("reshape_stream(",  "replace with Reshape(graph, input, chunk_size, reshape_rank, write_back_mu=False)"),
-        ("retile_streamify(","replace with RetileStreamify(graph, input, split_row, chunk=chunk)"),
-        ("broadcast(",       "replace with Broadcast(graph, input, num_consumers=n)"),
-        ("parallelize(",     "replace with Parallelize(graph, input, num_consumers=n)"),
-        ("static_reassemble(","replace with StaticReassemble(graph, inputs, stream=shape)"),
-        ("flat_partition(",  "replace with FlatPartition(graph, input, control, ...)"),
-        ("flat_reassemble(", "replace with FlatReassemble(graph, inputs, control, ...)"),
-        ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
-    ],
-    # Direct pipeline: same bans as translate (no DSL, no PyTorch, only STeP nodes)
-    "translate_full": [
-        ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
-    ],
-    "translate_full_no_functional": [
-        ("execute_values",   "remove mid-function execution; return (graph, output_op)"),
-    ],
-}
-
-# Passes where the judge should also run on NONCOMPLIANT code (not just after
-# regex passes). Gives the LLM richer line-specific feedback for shape/routing
-# conversions where the regex message alone ("`.unsqueeze(` still present") is
-# not enough to guide the fix.
-_JUDGE_ON_NONCOMPLIANT = {"refactor_shape", "refactor_final"}
-
-# Ops that MUST appear in code after this pass.
-_PASS_REQUIRES = {
-    "refactor_load":     ["offchip_load", "offchip_store"],
-    "translate":         ["LinearOffChipLoad", "OffChipStore"],
-    "translate_full":    ["LinearOffChipLoad", "OffChipStore"],
-    "translate_full_no_functional": ["LinearOffChipLoad", "OffChipStore"],
-}
+_TRANSLATION_PASSES = {"translate", "translate_full", "translate_full_no_functional"}
 
 # Regex to find torch.XXX( and F.XXX( calls
 _TORCH_CALL_RE = re.compile(r'\btorch\.(\w+)\s*\(')
@@ -442,82 +422,48 @@ def _extract_func_body(code: str) -> str:
 
 
 def _check_banned_ops(code: str, pass_name: str) -> list[str]:
-    """Check if code complies with this pass's output constraints.
+    """Check whether ``code`` complies with this pass's output constraints.
 
-    Returns list of violation messages. Empty = compliant.
-
-    Refactor and translation passes use cumulative rules within their group.
-    Standalone passes (canonicalize, tiler) are checked independently.
-
-    For translation passes, only the build_graph body is checked — scaffold
-    code (DSL functions, functional.py) may legitimately use torch.* internally.
+    Returns a list of violation messages; empty means compliant. Each pass's
+    rules are independent — there is no cumulative inheritance. For translation
+    passes, only the ``build_graph`` body is checked so scaffold code (DSL
+    functions, functional.py) may use torch.* internally without false
+    positives.
     """
-    # Strip annotation comments before checking — they contain STeP node names
-    # that would falsely satisfy _PASS_REQUIRES checks.
-    code = _strip_annotations(code)
-
-    # For translation passes, scope checking to the function body only
-    if pass_name in _TRANSLATION_ORDER:
-        code = _extract_func_body(code)
-
-    has_rules = (pass_name in _PASS_ALLOWED_TORCH or pass_name in _PASS_ALLOWED_F
-                 or pass_name in _PASS_EXTRA_BANS or pass_name in _PASS_REQUIRES)
-    if not has_rules:
+    rules = _PASS_RULES.get(pass_name)
+    if rules is None:
         return []
 
-    # Determine which passes to check cumulatively
-    if pass_name in _REFACTOR_ORDER:
-        idx = _REFACTOR_ORDER.index(pass_name)
-        check_passes = _REFACTOR_ORDER[:idx + 1]
-    elif pass_name in _TRANSLATION_ORDER:
-        idx = _TRANSLATION_ORDER.index(pass_name)
-        check_passes = _TRANSLATION_ORDER[:idx + 1]
-    else:
-        check_passes = [pass_name]
+    # Strip annotation comments before checking — they contain STeP node names
+    # that would falsely satisfy required-op checks.
+    code = _strip_annotations(code)
+    if pass_name in _TRANSLATION_PASSES:
+        code = _extract_func_body(code)
 
-    violations = []
+    violations: list[str] = []
 
-    # 1. Effective torch allowlist (last non-None among checked passes)
-    allowed_torch = None
-    for p in check_passes:
-        stage = _PASS_ALLOWED_TORCH.get(p)
-        if stage is not None:
-            allowed_torch = stage
+    allowed_torch = rules["allowed_torch"]
+    for match in _TORCH_CALL_RE.finditer(code):
+        call = f"torch.{match.group(1)}"
+        if call not in allowed_torch:
+            violations.append(f"- `{call}()` is not allowed — replace with a canonical pattern")
 
-    if allowed_torch is not None:
-        for match in _TORCH_CALL_RE.finditer(code):
-            call = f"torch.{match.group(1)}"
-            if call not in allowed_torch:
-                violations.append(f"- `{call}()` is not allowed — replace with a canonical pattern")
+    allowed_f = rules["allowed_F"]
+    for match in _F_CALL_RE.finditer(code):
+        call = f"F.{match.group(1)}"
+        if call not in allowed_f:
+            violations.append(f"- `{call}()` is not allowed — decompose into primitives")
 
-    # 2. Effective F allowlist (last non-None among checked passes)
-    allowed_f = None
-    for p in check_passes:
-        stage = _PASS_ALLOWED_F.get(p)
-        if stage is not None:
-            allowed_f = stage
+    # Word-boundary anchor avoids false positives like "broadcast(" matching "infer_broadcast(".
+    for pattern, fix in rules["banned_patterns"]:
+        if re.search(r'\b' + re.escape(pattern), code):
+            violations.append(f"- `{pattern}` still present — {fix}")
 
-    if allowed_f is not None:
-        for match in _F_CALL_RE.finditer(code):
-            call = f"F.{match.group(1)}"
-            if call not in allowed_f:
-                violations.append(f"- `{call}()` is not allowed — decompose into primitives")
+    for required in rules["required_ops"]:
+        if required not in code:
+            violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
 
-    # 3. Extra banned patterns (cumulative across checked passes)
-    # Use word-boundary regex to avoid false positives like "broadcast(" matching "infer_broadcast("
-    for p in check_passes:
-        for pattern, fix in _PASS_EXTRA_BANS.get(p, []):
-            regex = r'\b' + re.escape(pattern)
-            if re.search(regex, code):
-                violations.append(f"- `{pattern}` still present — {fix}")
-
-    # 4. Required ops (cumulative across checked passes)
-    for p in check_passes:
-        for required in _PASS_REQUIRES.get(p, []):
-            if required not in code:
-                violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
-
-    # Deduplicate
+    # Deduplicate while preserving order
     return list(dict.fromkeys(violations))
 
 
@@ -720,8 +666,8 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
 
 
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
-                         ckpt_dir: Path, prev_code=None,
-                         executor="tiled", tensors=None, log=print,
+                         ckpt_dir: Path, *, executor: str, tensors: dict,
+                         prev_code=None, log=print,
                          judge_agent=None, dsl_code=None,
                          post_validator=None,
                          compliance_override: dict | None = None):
@@ -811,17 +757,17 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 if violations:
                     _write(turn_dir / "status.txt", "CORRECT_BUT_NONCOMPLIANT")
                     log(f"      -> CORRECT but {len(violations)} violation(s) remain")
-                    if pass_name in _TRANSLATION_ORDER:
+                    if pass_name in _TRANSLATION_PASSES:
                         fix_hint = "Replace these with the corresponding STeP operations."
-                    elif pass_name in _REFACTOR_ORDER:
-                        fix_hint = "Replace these with the corresponding DSL function calls listed in the instructions."
                     else:
-                        fix_hint = "Refactor these into the canonical primitives listed in the instructions."
+                        fix_hint = "Replace these with the corresponding DSL function calls listed in the instructions."
 
-                    # For some passes, also run the judge on noncompliant code
-                    # to give richer line-specific guidance alongside regex violations.
+                    # On the refactor pass, also run the judge on noncompliant
+                    # code so the LLM gets richer line-specific guidance
+                    # alongside the regex violations (the regex message alone
+                    # isn't enough for shape/routing rewrites).
                     judge_feedback = ""
-                    if judge_agent is not None and pass_name in _JUDGE_ON_NONCOMPLIANT:
+                    if judge_agent is not None and pass_name == "refactor_final":
                         log(f"      Also running judge for richer feedback...")
                         judge_ctx = ""
                         if tensors is not None:
@@ -1079,9 +1025,11 @@ async def run_kernel(
 
     # --- Step 5: bundle-dir mode uses only refactor_final + deterministic translate ---
     if bundle_dir is not None:
-        # Single-pass: input abstraction DSL → refactor_final → translate_fn → graph check.
-        # DSL correctness is skipped (passthrough); the post-validator is the only gate.
-        lowering_passes = [{"name": "refactor_final", "executor": "passthrough"}]
+        # Single-pass: PyTorch -> abstraction (refactor_final) -> transpiler.translate -> graph check.
+        # The bundle's abstraction is required to be directly runnable, so the
+        # ``dsl`` executor catches abstraction-level bugs; the post-validator
+        # (transpiler + simulator) catches transpiler/IR-level bugs separately.
+        lowering_passes = [{"name": "refactor_final", "executor": "dsl"}]
         translator_passes = []
         translator = "auto"
     else:
@@ -1258,113 +1206,77 @@ async def _run_outer_iteration(
     if translator_passes is None:
         translator_passes = TRANSLATOR_PASSES
 
-    lowered_code = None
     dsl_code = None  # output of refactor_final, used as translation guide
-    pipeline_ok = True
     outer_total_tokens = 0
 
     # ============================================================
-    # Resume mode: skip lowering, use provided DSL code directly
+    # Phase 1: Lowering pass (refactor_final). Skipped on resume and on
+    # direct pipelines (which have lowering_passes == []).
     # ============================================================
     if resume_dsl_code is not None:
         dsl_code = resume_dsl_code
         _write(outer_dir / "dsl_code.py", dsl_code)
         log(f"  Resumed from checkpoint — using saved dsl_code ({len(dsl_code)} chars)")
         print(f"{tag} Resumed — skipping lowering")
+    elif lowering_passes:
+        assert len(lowering_passes) == 1 and lowering_passes[0]["name"] == "refactor_final", (
+            f"phase 1 expects exactly one refactor_final pass, got {[p['name'] for p in lowering_passes]}"
+        )
+        pass_info = lowering_passes[0]
+        pass_name = pass_info["name"]
+        executor = pass_info["executor"]
 
-    # ============================================================
-    # Phase 1: Lowering passes (skipped when resuming)
-    #   tiler -> router -> retiler -> canonicalize ->
-    #   refactor_load -> refactor_compute -> refactor_final
-    # The refactor passes progressively rewrite canonical PyTorch into
-    # DSL function calls that map 1:1 to STeP graph nodes.
-    # ============================================================
-    else:
-        for pass_info in lowering_passes:
-            pass_name = pass_info["name"]
-            executor = pass_info.get("executor", "tiled")
-
-            # Skip refactor passes if code already complies AND no judge needs to
-            # verify. For refactor_final under translator='auto', also require that
-            # deterministic translation already succeeds — otherwise the skip
-            # would mask a translator-side failure that the loop is meant to fix.
-            if pass_name in _REFACTOR_ORDER and lowered_code is not None:
-                if compliance_override is not None:
-                    violations = _check_bundle_compliance(lowered_code, compliance_override)
-                else:
-                    violations = _check_banned_ops(lowered_code, pass_name)
-                has_judge = pass_name in judge_agents
-                needs_translate_check = (
-                    pass_name == "refactor_final" and translator == "auto"
-                )
-                if not violations and not has_judge and not needs_translate_check:
-                    log(f"  Lowering pass: {pass_name} -> SKIP (already compliant)")
-                    if pass_name == "refactor_final":
-                        dsl_code = lowered_code
-                        _write(outer_dir / "dsl_code.py", dsl_code)
-                    continue
-
-            # When using deterministic translation, gate refactor_final on the
-            # translator: if translation fails, treat it as a refactor error so
-            # the model fixes the DSL until it lowers cleanly into STeP IR.
-            post_validator = None
-            if pass_name == "refactor_final" and translator == "auto":
-                post_validator = _make_translation_post_validator(
-                    kernel_name, dims, tensors, log,
-                    translate_fn=translate_fn,
-                )
-
-            log(f"  Lowering pass: {pass_name}")
-            pass_result = await _run_pass_loop(
-                pass_agents[pass_name], pass_name, kernel_name, dims, max_turns,
-                ckpt_dir=outer_dir,
-                prev_code=lowered_code,
-                executor=executor,
-                tensors=tensors,
-                log=log,
-                judge_agent=judge_agents.get(pass_name),
-                post_validator=post_validator,
-                compliance_override=compliance_override,
+        # When using deterministic translation, gate refactor_final on the
+        # translator: if translation fails, treat it as a refactor error so
+        # the model fixes the DSL until it lowers cleanly into STeP IR.
+        post_validator = None
+        if translator == "auto":
+            post_validator = _make_translation_post_validator(
+                kernel_name, dims, tensors, log,
+                translate_fn=translate_fn,
             )
-            outer_total_tokens += pass_result.get("total_tokens", 0)
-            if pass_result["success"]:
-                lowered_code = pass_result["code"]
-                log(f"  -> {pass_name} OK")
-                # Save refactor_final output as DSL code for translation guidance
-                if pass_name == "refactor_final":
-                    dsl_code = lowered_code
-                    _write(outer_dir / "dsl_code.py", dsl_code)
-            else:
-                log(f"  -> {pass_name} FAILED, stopping lowering pipeline")
-                pipeline_ok = False
-                break
 
-        if lowering_passes:
-            if not pipeline_ok or lowered_code is None:
-                log(f"Lowering pipeline failed")
-                print(f"{tag} Lowering FAILED")
-                log_file.close()
-                return {
-                    "success": False,
-                    "outer_iteration": i,
-                    "outer_iterations": max_outer,
-                    "total_tool_calls": 0,
-                    "total_tokens": outer_total_tokens,
-                    "cycle_count": None,
-                }
-
+        log(f"  Lowering pass: {pass_name}")
+        pass_result = await _run_pass_loop(
+            pass_agents[pass_name], pass_name, kernel_name, dims, max_turns,
+            ckpt_dir=outer_dir,
+            executor=executor,
+            tensors=tensors,
+            log=log,
+            judge_agent=judge_agents.get(pass_name),
+            post_validator=post_validator,
+            compliance_override=compliance_override,
+        )
+        outer_total_tokens += pass_result.get("total_tokens", 0)
+        if pass_result["success"]:
+            dsl_code = pass_result["code"]
+            _write(outer_dir / "dsl_code.py", dsl_code)
+            log(f"  -> {pass_name} OK")
             log(f"Lowering pipeline succeeded")
             print(f"{tag} Lowering OK")
         else:
-            log(f"No lowering passes (direct pipeline)")
-            print(f"{tag} Direct pipeline — skipping lowering")
+            log(f"  -> {pass_name} FAILED")
+            log(f"Lowering pipeline failed")
+            print(f"{tag} Lowering FAILED")
+            log_file.close()
+            return {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "total_tokens": outer_total_tokens,
+                "cycle_count": None,
+            }
+    else:
+        log(f"No lowering passes (direct pipeline)")
+        print(f"{tag} Direct pipeline — skipping lowering")
 
     # ============================================================
     # Phase 2: STeP translation passes
     # The DSL code from the refactor pass is passed as a translation guide.
     # Each DSL call maps 1:1 to a STeP node, making translation mechanical.
     # ============================================================
-    translated_code = dsl_code if dsl_code is not None else lowered_code
+    translated_code = dsl_code
     translation_ok = True
 
     if translator == "auto":
@@ -1387,13 +1299,6 @@ async def _run_outer_iteration(
     for pass_info in translator_passes:
         pass_name = pass_info["name"]
         executor = pass_info["executor"]
-
-        # Skip if input already complies with this pass's requirements
-        if translated_code is not None:
-            violations = _check_banned_ops(translated_code, pass_name)
-            if not violations:
-                log(f"  Translation pass: {pass_name} -> SKIP (already compliant)")
-                continue
 
         log(f"  Translation pass: {pass_name} (executor={executor})")
         pass_result = await _run_pass_loop(
@@ -1463,23 +1368,5 @@ async def _run_outer_iteration(
         "total_tool_calls": 0,
         "total_tokens": outer_total_tokens,
         "cycle_count": None,
-        "tiled_code": lowered_code,
+        "tiled_code": dsl_code,
     }
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _build_success_result(iteration, total_tool_calls, inner, all_inner_results, tiled_code):
-    return {
-        "success": True,
-        "outer_iterations": iteration + 1,
-        "total_tool_calls": total_tool_calls,
-        "cycle_count": inner.get("cycle_count"),
-        "final_diagnosis": None,
-        "tiled_code": tiled_code,
-        "traces": [{"code": r.get("code"), "tool_outputs": r.get("tool_outputs", [])} for r in all_inner_results],
-    }
-
-

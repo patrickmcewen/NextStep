@@ -1,9 +1,13 @@
-"""Prompt construction for StepGenFlow7 — progressive translation pipeline.
+"""Prompt construction for StepGenFlow.
 
-Phase 1: PyTorch lowering passes (tiler, refactor_final)
-Phase 2: STeP translation (single pass — DSL calls map 1:1 to STeP graph nodes)
+Phase 1: PyTorch -> DSL form via the ``refactor_final`` pass (gated by the
+``dsl`` executor; under ``--translator=auto`` also gated by deterministic
+translation as a post-validator).
 
-Each phase produces verifiable intermediate code that matches gold.
+Phase 2: DSL -> STeP graph. Either the deterministic AST translator
+(``--translator=auto``, no LLM call) or an LLM ``translate`` pass
+(``--translator=llm``). The ``direct`` pipelines collapse phases 1+2 into a
+single ``translate_full`` LLM pass.
 """
 import ast
 import importlib.util

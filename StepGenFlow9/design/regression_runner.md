@@ -43,8 +43,13 @@ rather than in-process tasks?
   in bundle mode is unnecessary at the suite level.
 
 Pass-through arguments to each subprocess: model / config, max-outer,
-max-turns, pipeline, translator, bundle dir. The runner does not
-mediate these; it just forwards them.
+max-turns, pipeline, translator, bundle dir, and the autotune knobs
+(`--autotune`, `--autotune-config`, `--autotune-max-turns`,
+`--autotune-agent`). The runner does not mediate these; it just
+forwards them. Per-outer autotune integration is therefore a
+suite-level toggle: enabling `--autotune` on `run_regression.py`
+turns it on for every job's per-outer hook, with no
+regression-specific autotune knobs of its own.
 
 The runner does **not** raise on a non-zero exit. A failing kernel is a
 real outcome the caller (the outer flow's scoring step, or a human)
@@ -103,6 +108,11 @@ SuiteSummary:
     passed:    int          # sum over jobs of per-outer passed counts
     total:     int          # sum over jobs of per-outer totals
   total_tokens:  int        # sum over jobs of LLM token usage
+  autotune_overall:                # only when --autotune was set
+    jobs_with_data:   int          # jobs whose autotune block had status=="ok"
+    geomean_speedup:  float | null # geomean across those jobs
+    min_speedup:      float | null
+    max_speedup:      float | null
   benchmarks:
     <kernel>:
       passed:    int
@@ -115,6 +125,17 @@ SuiteSummary:
           exit_code:     int
           outer_passed:  int
           outer_total:   int
+          autotune:                # null when no outer reached the autotune hook
+            best_outer:       int       # outer with the lowest best_cycles
+            baseline_cycles:  int
+            best_cycles:      int
+            speedup:          float
+            per_outer:
+              - outer:            int
+                status:           "ok" | "error" | "missing"
+                baseline_cycles:  int | null
+                best_cycles:      int | null
+                speedup:          float | null
 ```
 
 The outer flow scores a suite by reading `pass_rate = overall.fraction`
@@ -125,6 +146,20 @@ Per-job `outer_passed` / `outer_total` are recovered by reading each
 job's `result.json` (which records the pass/fail of each parallel outer
 attempt). When a job's result file is missing — typical on a hard crash
 — the runner falls back to `(0, 0)` rather than crashing the summary.
+
+Per-job `autotune` is recovered the same way: the runner reads the
+job's `result.json` `per_outer` entries, picks the outer with the
+lowest `best_cycles` among those with `status=="ok"`, and surfaces it
+as the headline. The per-outer breakdown distinguishes three states:
+`ok` (autotune ran cleanly), `error` (autotune crashed, possibly with
+a partial best from `progress.json`), and `missing` (the outer's
+functional pipeline never reached the autotune hook). When no outer
+has `status=="ok"`, the headline `autotune` block is null and that
+job contributes only to `autotune_overall.jobs_with_data` if other
+jobs did. The "best across outers" framing is intentional: the
+chosen outer is selected by *correctness* (first success), and the
+performance number you want is the best the run achieved, not
+necessarily the chosen one's.
 
 ## Logging
 

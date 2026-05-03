@@ -44,9 +44,14 @@ comparison, AST-level translation, regex compliance, the timing model).
 ```
 
 `max_outer` independent attempts at the implementer pipeline run in parallel
-per kernel; the first to succeed wins. A separate batch driver
+per kernel; the first to succeed wins. The autotuner is opt-in via
+`run.py --autotune` and runs per-outer (immediately after each outer
+produces a verified `build_graph`, in that outer's own coroutine);
+it can also be invoked standalone via `run_autotune.py` against a
+finished implementer checkpoint. A separate batch driver
 (`run_regression.py`) fans out across many `(kernel, preset)` jobs as
-subprocesses with a parallelism cap.
+subprocesses with a parallelism cap and forwards the autotune toggle
+unchanged.
 
 ## Two operating modes
 

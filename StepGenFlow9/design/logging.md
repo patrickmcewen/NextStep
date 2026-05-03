@@ -21,6 +21,14 @@ directory is the durable record of the run.
     └── outer_<i>/                  # one per parallel outer attempt
         ├── log.txt                 # this attempt's lifecycle log (per-pass progress, gate verdicts)
         ├── dsl_code.py             # phase-1 verified DSL output (when refactor_final succeeded)
+        ├── autotune/               # only present when --autotune was set and this outer succeeded
+        │   └── <kernel>/           # the autotune subsystem's own checkpoint tree
+        │       ├── config.json
+        │       ├── baseline.py / baseline_timing.txt
+        │       ├── progress.json   # crash-safe best-so-far (see autotuner.md)
+        │       ├── turn_<n>/...
+        │       ├── best.py / best_timing.txt
+        │       └── result.json     # only present on a clean autotune completion
         └── <pass>/                 # one per LLM pass that ran
             ├── system_prompt.txt   # the rendered system prompt this pass actually used
             └── turn_<m>/
@@ -39,6 +47,12 @@ directory is the durable record of the run.
                     ├── graph_error.txt            # simulator exception, when graph failed to execute
                     └── graph_correctness.txt      # gold comparison of the lowered graph
 ```
+
+The `autotune/<kernel>/` nesting under each outer is the per-outer
+autotune subsystem's own checkpoint tree (see
+[autotuner.md](autotuner.md)). It only appears when `--autotune` was
+set on the invocation *and* that particular outer's functional
+pipeline reached the verified-graph step.
 
 `status.txt` is the most useful single file for triage — its values
 are a fixed vocabulary:
@@ -72,13 +86,17 @@ PerKernelResult:
   per_outer:
     - outer:    int
       success:  bool
+      autotune: dict | null                # per-outer autotune block (see autotuner.md);
+                                           # absent when --autotune was off or the outer
+                                           # never reached the verified-graph step
+  autotune:          dict | null           # the chosen outer's autotune block (when present)
   total_tokens:      int                   # summed across every outer attempt's LLM calls
   traces:            list                  # writer-style code/tool-output captures (legacy)
 ```
 
 `per_outer` is the field the regression runner reads to derive
-`outer_passed` / `outer_total` for its summary. `total_tokens` is what
-the outer flow reads to score the bundle.
+`outer_passed` / `outer_total` and per-job autotune for its summary.
+`total_tokens` is what the outer flow reads to score the bundle.
 
 ## Run config
 
@@ -123,16 +141,20 @@ regression_results/<YYYYmmdd-HHMMSS>/
 
 ## Autotune checkpoint tree
 
-An autotune invocation owns a separate tree:
+Standalone autotune (`run_autotune.py`) owns its own top-level tree.
+Per-outer autotune (`run.py --autotune`) writes the same shape under
+each outer's `autotune/<kernel>/` subdirectory; the only structural
+difference is location.
 
 ```
 checkpoints_autotune/<YYYY-MM-DD-HHMMSS>/<kernel>/
 ├── config.json                # kernel, preset, dims, autotune config, resume path
 ├── baseline.py                # the verified build_graph the run started from
 ├── baseline_timing.txt        # the baseline timing report
+├── progress.json              # crash-safe best-so-far snapshot (see autotuner.md)
 ├── best.py                    # the lowest-cycles verified build_graph found
 ├── best_timing.txt            # the best's timing report
-├── result.json                # baseline_cycles, best_cycles, speedup, turns, resume path
+├── result.json                # only present on a clean completion of the loop
 └── turn_<n>/
     ├── user_prompt.txt
     ├── response.txt
@@ -159,4 +181,5 @@ two real gates (correctness + timing model).
 | Judge kept rejecting | `turn_<m>/judge_response.txt` |
 | Deterministic translator kept failing | `turn_<m>/translate_check/error.txt` or `graph_error.txt` |
 | Regression-suite kernel never started | `regression_results/<stamp>/jobs/<kernel>__<preset>.log` |
-| Autotuner regressed correctness | `checkpoints_autotune/.../turn_<n>/correctness_result.txt` (the loop ignores it; baseline is preserved as `baseline.py`) |
+| Autotuner regressed correctness | `<...>/turn_<n>/correctness_result.txt` (the loop ignores it; baseline is preserved as `baseline.py`) |
+| Per-outer autotune crashed | `<checkpoint-dir>/<kernel>/outer_<i>/autotune/<kernel>/progress.json` for last-known best; outer's `result.json` `autotune.status` will be `error` with the exception message |

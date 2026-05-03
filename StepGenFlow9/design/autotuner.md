@@ -8,9 +8,20 @@ correctness against gold and then scored by the analytical timing model
 on STeP IR. The autotuner never produces incorrect graphs by
 construction.
 
-The autotuner runs after the implementer pipeline; it is not part of the
-per-kernel pipeline that produces a graph in the first place. It has its
-own CLI entry point and its own checkpoint tree.
+There are two ways to run the autotuner:
+
+- **Standalone** (`run_autotune.py`): run after the fact against any
+  finished implementer checkpoint. This is the original entry point and
+  is what gets used when iterating on the autotuner itself.
+- **Per-outer integration** (`run.py --autotune ...`): the implementer
+  pipeline calls the autotuner inline at the end of each outer attempt
+  that produced a verified `build_graph`. This is the path the
+  AbstractionOpt outer flow uses to score a bundle on both correctness
+  *and* performance in a single pass.
+
+Either way, the autotuner is not part of the per-kernel pipeline that
+produces a graph in the first place — it is a strictly downstream
+performance pass with its own checkpoint tree.
 
 ## Inputs
 
@@ -35,6 +46,14 @@ are loaded from a JSON config file (default `autotune_config.json`).
 They are used both to drive the timing model and to render the
 constraints into the agent's system prompt so the LLM's proposals stay
 within the target hardware envelope.
+
+When invoked per-outer from `run.py --autotune`, the resume path is
+implicit (the just-finished outer's directory) and the LLM config is
+reused from the implementer pipeline; the only autotune-specific
+arguments accepted at the `run.py` boundary are `--autotune-config`,
+`--autotune-max-turns`, and `--autotune-agent`. The functional pipeline
+and the autotuner share an LLM by design — running them under the same
+profile is what the integration is for.
 
 ## Baseline measurement
 
@@ -143,8 +162,67 @@ Plus the run-level files:
 - `config.json` — kernel, preset, dims, autotune config, resume path
 - `baseline.py` / `baseline_timing.txt`
 - `best.py` / `best_timing.txt`
+- `progress.json` — running snapshot of `baseline_cycles`,
+  `best_cycles`, last-completed `turn`, and `last_status`. Written
+  immediately after baseline measurement and re-written at the end of
+  every turn iteration. This is the file external code reads to
+  recover best-so-far when the autotune loop did not get a chance to
+  emit `result.json` (process killed, OOM, time-cap, etc.).
 - `result.json` — `baseline_cycles`, `best_cycles`, `speedup`, turns,
-  resume path
+  resume path. Only written on a clean completion of the loop.
+
+`progress.json` and `result.json` are deliberately separate: the
+former is the crash-safe checkpoint, the latter is the
+clean-completion record. Code that summarizes a run should prefer
+`result.json` when present and fall back to `progress.json`
+otherwise.
+
+## Per-outer integration
+
+Under `run.py --autotune`, autotune runs inside the implementer's
+outer-iteration coroutine immediately after a verified `build_graph`
+is produced for that outer. Each outer's autotune therefore runs
+concurrently with whatever the other outers are still doing, since
+the outer iterations themselves run under `asyncio.gather`.
+
+The autotuner's checkpoint root for that outer is
+`outer_<i>/autotune/`. Aside from the directory placement and the
+implicit resume from the just-finished outer, the loop is identical
+to the standalone path — same baseline measurement, same turn
+structure, same artifacts.
+
+**Failure trap.** If the autotune loop raises (model timeout, bad
+config, etc.) the exception is caught at the
+implementer↔autotuner boundary. The outer's functional success is
+preserved, and the outer's result dict gains an `autotune` block
+with `status="error"`, the exception message, and whatever
+baseline / best cycle counts were recoverable from `progress.json`.
+This is the *only* try/except in the integration path: the principle
+is that an autotune failure is a perf-side outcome, not a
+correctness-side outcome, and should not invalidate work the
+functional pipeline already finished.
+
+**Outer-result schema.** When `--autotune` is enabled, each outer's
+result dict (and the surviving entry in `per_outer`) gains an
+`autotune` field:
+
+```json
+{
+  "status":           "ok" | "error",
+  "baseline_cycles":  int | null,
+  "best_cycles":      int | null,
+  "speedup":          float | null,
+  "checkpoint_dir":   str,
+  "error":            str   // present only when status == "error"
+}
+```
+
+When `--autotune` is disabled the field is absent. When an outer's
+functional pipeline failed, the field is absent for that outer
+(autotune never ran). The regression runner's per-job summary picks
+the lowest-`best_cycles` outer with `status=="ok"` and surfaces it as
+the job's headline autotune number — see
+[regression_runner.md](regression_runner.md).
 
 ## Why correctness is re-checked every turn
 
