@@ -160,7 +160,7 @@ async def _run_outer_autotune(*, outer_dir: Path, kernel_name: str, preset: str,
         progress = _load_autotune_progress(autotune_ckpt / kernel_name)
         baseline = progress.get("baseline_cycles")
         best = progress.get("best_cycles")
-        speedup = (baseline / best) if (baseline and best) else None
+        speedup = (baseline / best) if (baseline is not None and best is not None) else None
         return {
             "status": "error",
             "error": f"{type(e).__name__}: {e}",
