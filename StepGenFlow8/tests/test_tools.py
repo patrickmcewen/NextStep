@@ -39,7 +39,7 @@ DIMS = {"M": 32, "K": 48, "tile_m": 16, "tile_k": 16}
 
 def test_exec_build_graph_and_inspect():
     from src.tools import _exec_build_graph, _format_node_values
-    from step_py.functional import execute_values
+    from timing_and_emulator.functional import execute_values
 
     graph, output_op = _exec_build_graph(ELEMENT_WISE_ADD_CODE, DIMS)
     values = execute_values(graph)
@@ -64,7 +64,7 @@ def build_graph(dims):
 
 def test_check_correctness_good_code():
     from src.tools import _exec_build_graph, _validate_functional_mod
-    from step_py.functional import execute
+    from timing_and_emulator.functional import execute
     from step_py.ops import StepOps
 
     StepOps._counter = 0
@@ -82,7 +82,7 @@ def test_check_correctness_good_code():
 
 def test_check_correctness_wrong_output():
     from src.tools import _exec_build_graph, _validate_functional_mod
-    from step_py.functional import execute
+    from timing_and_emulator.functional import execute
     from step_py.ops import StepOps
 
     wrong_code = ELEMENT_WISE_ADD_CODE.replace("fn=Add()", "fn=Mul()")
@@ -102,7 +102,7 @@ def test_check_correctness_wrong_output():
 
 def test_analyze_performance():
     from src.tools import _exec_build_graph
-    from step_py.timing import analyze_timing
+    from timing_and_emulator.timing import analyze_timing
 
     graph, output_op = _exec_build_graph(ELEMENT_WISE_ADD_CODE, DIMS)
     result = analyze_timing(graph)

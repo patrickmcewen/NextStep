@@ -202,7 +202,7 @@ def _run_dsl_correctness(code, kernel_name, dims, tensors=None):
 
 
 def _run_graph_correctness(code, kernel_name, dims, tensors=None):
-    from step_py.functional import execute
+    from timing_and_emulator.functional import execute
     graph, output_op = _exec_build_graph(code, dims, tensors)
     try:
         sim = execute(graph, output_op)

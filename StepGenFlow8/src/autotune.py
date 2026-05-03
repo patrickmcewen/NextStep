@@ -42,7 +42,7 @@ for p in (_STEPDB_DIR, _STEP_TL_SRC, _STEP_TL_PROTO):
 
 from precompute import precompute_tensors  # noqa: E402  (StepDB/precompute.py)
 
-from step_py.timing import analyze_timing  # noqa: E402
+from timing_and_emulator.timing import analyze_timing  # noqa: E402
 
 # Reuse the orchestrator's correctness checker so we verify identically to
 # the implementer pipeline.

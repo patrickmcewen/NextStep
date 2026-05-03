@@ -39,8 +39,8 @@ IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 _strip_imports = _validate_functional_mod._strip_imports
 
 from step_py.ops import StepOps
-from step_py.functional import execute, execute_values
-from step_py.timing import analyze_timing
+from timing_and_emulator.functional import execute, execute_values
+from timing_and_emulator.timing import analyze_timing
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +236,7 @@ _DSL_PY = Path(__file__).resolve().parent / "step_dsl.py"
 DSL_SCAFFOLD = TILED_SCAFFOLD + "\n" + _DSL_PY.read_text() + "\n"
 
 # Hybrid scaffold: all STeP imports + execute_values for inline emulator calls
-HYBRID_SCAFFOLD = IMPORT_SCAFFOLD + "\nfrom step_py.functional import execute_values\nimport torch.nn.functional as F\n"
+HYBRID_SCAFFOLD = IMPORT_SCAFFOLD + "\nfrom timing_and_emulator.functional import execute_values\nimport torch.nn.functional as F\n"
 
 
 def _exec_tiled_ref(code: str, dims: dict, tensors: dict = None) -> torch.Tensor:
@@ -315,7 +315,7 @@ def _exec_hybrid_ref(code: str, dims: dict, tensors: dict = None) -> torch.Tenso
                 graph, output_op = namespace["build_graph"](dims, tensors)
             else:
                 graph, output_op = namespace["build_graph"](dims)
-            from step_py.functional import execute as _execute
+            from timing_and_emulator.functional import execute as _execute
             result = _execute(graph, output_op)
         except Exception as exc:
             raise _enhance_hybrid_error(exc, stripped, scaffold_lines) from exc

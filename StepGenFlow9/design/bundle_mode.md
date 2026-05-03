@@ -23,8 +23,9 @@ asserted up front. Bundle mode forces:
 - the translator selection collapses to `auto` (the bundle's own
   transpiler is the only translator that knows the abstraction's
   vocabulary);
-- the refactor pass uses the `passthrough` correctness executor — see
-  below for why;
+- the refactor pass uses the `dsl` correctness executor against the
+  bundle's abstraction (which the bundle is required to make directly
+  runnable; see below);
 - the standard step-DSL judge agent is replaced with a bundle-templated
   one.
 
@@ -66,6 +67,12 @@ This eviction discipline matters because the outer flow can run multiple
 bundles back-to-back inside a single Python process — a stale module
 would silently smuggle the previous bundle's vocabulary into the next.
 
+The mounted abstraction must be **directly runnable**: the `dsl`
+executor calls `tiled_reference(dims, tensors)` against it on every turn
+to get a real correctness signal independent of the bundle's transpiler.
+A bundle whose abstraction is only a vocabulary stub is not supported by
+this flow.
+
 ## Pipeline collapse
 
 Bundle mode runs exactly one LLM pass (`refactor_final`) followed by one
@@ -74,26 +81,17 @@ deterministic translate. Several things collapse:
 - **No phase ordering.** There is no separate translate pass; the
   bundle's `transpiler.translate` is invoked directly after the refactor
   pass succeeds.
-- **The post-validator is the gate.** Because the executor for the
-  refactor pass is `passthrough` (it always reports `match=True`), the
-  *only* gate that proves the candidate is correct is the post-validator
-  — which runs the bundle's transpiler, runs the resulting graph on the
-  simulator, and compares against gold. Why passthrough rather than
-  `dsl`? The DSL surface is the bundle's invention; the orchestrator
-  cannot know how to call into it from outside the bundle's prompt
-  contract, so it does not try. The bundle author owns DSL-level
-  semantics; the orchestrator owns IR-level ground truth.
+- **Two real gates, in the standard places.** The `dsl` executor runs
+  the bundle's abstraction directly and compares against gold — this
+  catches abstraction-level bugs independent of the transpiler. The
+  post-validator runs the bundle's `transpiler.translate`, dispatches
+  the resulting graph on the simulator, and compares against gold — this
+  catches transpiler bugs separately. Splitting these two responsibilities
+  cleanly is what makes the bundle author's surface (the abstraction) and
+  the orchestrator's ground truth (IR semantics) testable in isolation.
 - **No cumulative-table compliance.** Compliance is one allowlist plus
   one banned-pattern list plus one required-ops list, exactly as the
   manifest declares.
-
-> Note. In a future iteration this could be split into two real gates —
-> a DSL-level executor that runs the abstraction directly to get a
-> correctness signal independent of the transpiler, and an IR-level
-> executor that catches transpiler bugs separately. The flowv2
-> outer-flow design documents this as the v1→v2 difference; the inner
-> flow currently exposes only the IR-level gate. Bundles whose
-> abstractions are directly runnable would benefit from the split.
 
 ## Compliance config
 
@@ -136,16 +134,14 @@ post-validator, shape trace, enhanced tracebacks) all behave the same
 as in standalone mode, with the substitutions listed above. In
 particular:
 
-- the correctness block always reports PASS for the refactor pass
-  (passthrough), so it does not contribute information;
+- the correctness block reports a real PASS / FAIL from running the
+  bundle's abstraction against gold, so a refactor that breaks the
+  algorithm fails fast at the abstraction layer rather than waiting for
+  the transpiler;
 - the post-validator's translator-failure / graph-execution-failure /
-  graph-mismatch branches are the only place an actual semantic
-  failure can be signaled;
+  graph-mismatch branches signal failures that survived the abstraction
+  gate — i.e., bugs in the bundle's transpiler or in the LLM's use of
+  vocabulary that the abstraction tolerates but the IR rejects;
 - the shape trace only appears if the bundle's abstraction emits the
   expected trace prints (the standalone DSL does; a bundle's
-  abstraction need not).
-
-Bundle authors who want richer correctness-side feedback should make
-their abstraction directly runnable and have the orchestrator invoke it
-via a non-passthrough executor. That extension is straightforward but
-not currently wired.
+  abstraction need not, but is encouraged to).

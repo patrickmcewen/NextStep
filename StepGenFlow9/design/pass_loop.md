@@ -58,30 +58,36 @@ context.
 
 ## Executors
 
-Correctness is run by one of five executor functions, selected per pass.
+Correctness is run by one of two executor functions, selected per pass.
 Each takes the extracted code and returns either a "match=True" string
 or a structured failure description:
 
 | executor | role |
 |---|---|
-| `tiled` | exec'd as `tiled_reference(dims, tensors)` with only `torch` + `F` in scope. Validates a pre-DSL refactor stage. |
-| `dsl` | exec'd as `tiled_reference(dims, tensors)` with the full step-DSL surface injected into the namespace. Validates a DSL-form refactor. |
-| `hybrid` | exec'd as `build_graph(dims, tensors)` and run through the simulator, but with `torch` / `F` / `execute_values` also in scope. Used when intermediate stages may mix DSL and graph. |
-| `graph` | exec'd as `build_graph(dims, tensors)`, run through the simulator. Validates a translate-pass output. |
-| `passthrough` | always reports `match=True`. Used in bundle mode where DSL-level correctness is unverifiable from outside the bundle and the post-validator is the real gate. |
+| `dsl` | exec'd as `tiled_reference(dims, tensors)` with the DSL surface injected into the namespace. Validates a refactor pass — the DSL is directly runnable, so a refactor-pass output gets a real correctness signal before the translator ever runs. |
+| `graph` | exec'd as `build_graph(dims, tensors)`, run through the STeP simulator. Validates a translate pass — the lowered IR graph is dispatched and its output compared to gold. |
 
-Every non-passthrough executor compares the result tensor's shape against
-gold, then computes max-absolute and relative error and accepts on
-`rel_err < 1e-5`. On mismatch, the worst-error index is reported alongside
-the gold and candidate values at that index. Gold is memoized per
-`(kernel, dims)` for the process lifetime.
+Each executor compares the result tensor's shape against gold, then
+computes max-absolute and relative error and accepts on `rel_err < 1e-5`.
+On mismatch, the worst-error index is reported alongside the gold and
+candidate values at that index. Gold is memoized per `(kernel, dims)` for
+the process lifetime.
 
-The non-graph executors prepend a small import scaffold to the user code
+The `dsl` executor prepends a small import scaffold to the user code
 (`torch`, `torch.nn.functional`, the DSL module, etc.) so the model never
 needs to write `import` statements; the system prompts forbid imports
-explicitly. The graph executor uses an analogous scaffold sourced from
+explicitly. The `graph` executor uses an analogous scaffold sourced from
 StepDB so the same imports are in scope across the implementer flow,
 StepDB validation, and the autotuner.
+
+Because the DSL is directly runnable, the executor split lines up exactly
+with the phase split: phase 1 (refactor) is gated by `dsl`, phase 2
+(translate) is gated by `graph`. There is no executor mode that mixes
+the two scopes or skips correctness; every LLM-emitted candidate is
+exec'd against gold before the next gate runs. In bundle mode the
+abstraction takes the place of the standalone DSL surface (see
+[bundle_mode.md](bundle_mode.md)), and the same `dsl` executor runs
+against it.
 
 ## Compliance check
 

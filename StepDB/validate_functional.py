@@ -149,7 +149,7 @@ def run_reference(kernel_name, dims, config):
 
 def run_functional_sim(graph, output_op):
     """Run the functional simulation and return the output tensor."""
-    from step_py.functional import execute
+    from timing_and_emulator.functional import execute
     return execute(graph, output_op)
 
 

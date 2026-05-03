@@ -1,9 +1,13 @@
-"""Prompt construction for StepGenFlow7 — progressive translation pipeline.
+"""Prompt construction for StepGenFlow.
 
-Phase 1: PyTorch lowering passes (tiler, refactor_final)
-Phase 2: STeP translation (single pass — DSL calls map 1:1 to STeP graph nodes)
+Phase 1: PyTorch -> DSL form via the ``refactor_final`` pass (gated by the
+``dsl`` executor; under ``--translator=auto`` also gated by deterministic
+translation as a post-validator).
 
-Each phase produces verifiable intermediate code that matches gold.
+Phase 2: DSL -> STeP graph. Either the deterministic AST translator
+(``--translator=auto``, no LLM call) or an LLM ``translate`` pass
+(``--translator=llm``). The ``direct`` pipelines collapse phases 1+2 into a
+single ``translate_full`` LLM pass.
 """
 import ast
 import importlib.util
@@ -23,8 +27,8 @@ _DEIO_ROOT = _PROJECT_ROOT.parent  # DEIOpt/
 _STEPDB_DIR = _DEIO_ROOT / "StepDB"
 _STEP_TL_SRC = _DEIO_ROOT / "step_tl" / "src"
 _STEP_TL_PROTO = _STEP_TL_SRC / "proto"
-_FUNCTIONAL_PY = _STEP_TL_SRC / "step_py" / "functional.py"
-_TIMING_PY = _STEP_TL_SRC / "step_py" / "timing.py"
+_FUNCTIONAL_PY = _STEP_TL_SRC / "timing_and_emulator" / "functional.py"
+_TIMING_PY = _STEP_TL_SRC / "timing_and_emulator" / "timing.py"
 
 for p in (_STEP_TL_SRC, _STEP_TL_PROTO):
     sp = str(p)
@@ -212,7 +216,7 @@ def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
 
     Templates contain {placeholder} tokens that are filled from source files:
       {ops_code}           — step_tl/src/step_py/ops.py
-      {functional_code}    — step_tl/src/step_py/functional.py
+      {functional_code}    — step_tl/src/timing_and_emulator/functional.py
       {dsl_code}           — StepGenFlow8/src/step_dsl.py
       {few_shot_examples}  — optional PyTorch→DSL example pairs (refactor_final)
     This keeps the prompts in sync with the actual source code automatically.
@@ -298,7 +302,7 @@ def build_autotune_system_prompt(hw_constraints: dict,
                                   template_name: str = "autotune_system.txt") -> str:
     """Build the autotuner agent's system prompt.
 
-    Injects the full source of step_py/timing.py at {timing_code} so the LLM
+    Injects the full source of timing_and_emulator/timing.py at {timing_code} so the LLM
     knows exactly how each knob maps to total_cycles, and the caller-supplied
     `hw_constraints` dict (rendered as JSON) at {hw_constraints}.
 

@@ -129,7 +129,7 @@ def run_analytical_model(graph, hw_config=None, sym_subs=None):
             If None and expression has free symbols, assumes uniform
             distribution (each symbolic dim gets value 1).
     """
-    from step_py.timing import analyze_timing
+    from timing_and_emulator.timing import analyze_timing
     result = analyze_timing(graph, hw_config)
     total = result["total_cycles"]
 

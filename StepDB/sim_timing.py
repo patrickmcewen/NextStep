@@ -193,7 +193,7 @@ def run_analytical_model(graph) -> tuple[int, dict]:
     Any remaining symbolic dimensions (from FlatPartition dynamic routing)
     are substituted with 1 (expected uniform value).
     """
-    from step_py.timing import analyze_timing
+    from timing_and_emulator.timing import analyze_timing
 
     result = analyze_timing(graph)
     total = result["total_cycles"]
@@ -233,7 +233,7 @@ def build_analytical_tiles(graph, ana_per_node: dict) -> pd.DataFrame:
 
     We generate one row per tile to match the simulator's tile event format.
     """
-    from step_py.timing import topological_sort
+    from timing_and_emulator.timing import topological_sort
 
     rows = []
     for n in topological_sort(graph):
@@ -283,7 +283,7 @@ def build_analytical_tiles(graph, ana_per_node: dict) -> pd.DataFrame:
 
 def build_comparison(graph, sim_node_df: pd.DataFrame, ana_per_node: dict) -> pd.DataFrame:
     """Merge simulator and analytical per-node timing into one DataFrame."""
-    from step_py.timing import topological_sort
+    from timing_and_emulator.timing import topological_sort
 
     analytical_rows = []
     for n in topological_sort(graph):
