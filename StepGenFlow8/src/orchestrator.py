@@ -124,6 +124,70 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _load_autotune_progress(autotune_kernel_dir: Path) -> dict:
+    """Read `progress.json` written by run_autotune, or return {} if absent.
+
+    `autotune_kernel_dir` is the inner kernel-named directory created by
+    run_autotune (i.e. <outer_dir>/autotune/<kernel_name>). When run_autotune
+    raises before writing baseline progress, the file may not exist.
+    """
+    path = autotune_kernel_dir / "progress.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+# Deferred to avoid circular import (src.autotune imports from src.orchestrator).
+# Populated lazily on first call to _run_outer_autotune; monkeypatch can
+# replace this module-level name before the helper is invoked.
+run_autotune = None
+
+
+async def _run_outer_autotune(*, outer_dir: Path, kernel_name: str, preset: str,
+                              llm_config: dict, autotune_options: dict,
+                              log, tag: str) -> dict:
+    """Run the autotuner against an outer's verified build_graph.
+
+    Trapping is deliberate: a midway autotune crash must not undo the
+    functional pipeline's success on this outer. On exception we recover
+    best-so-far from progress.json (written incrementally by run_autotune).
+    """
+    global run_autotune
+    if run_autotune is None:
+        from src.autotune import run_autotune as _ra
+        run_autotune = _ra
+
+    autotune_ckpt = outer_dir / "autotune"
+    try:
+        result = await run_autotune(
+            kernel_name=kernel_name,
+            preset=preset,
+            llm_config=llm_config,
+            autotune_config=autotune_options["config"],
+            resume_from=str(outer_dir),
+            max_turns=autotune_options["max_turns"],
+            checkpoint_dir=str(autotune_ckpt),
+            agent_variant=autotune_options["agent_variant"],
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        msg = f"{tag} autotune FAILED: {type(e).__name__}: {e}"
+        log(msg)
+        print(msg)
+        progress = _load_autotune_progress(autotune_ckpt / kernel_name)
+        baseline = progress.get("baseline_cycles")
+        best = progress.get("best_cycles")
+        speedup = (baseline / best) if (baseline is not None and best is not None) else None
+        return {
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "checkpoint_dir": str(autotune_ckpt),
+            "baseline_cycles": baseline,
+            "best_cycles": best,
+            "speedup": speedup,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -951,6 +1015,7 @@ async def run_kernel(
     translator: str = "llm",
     few_shot_paths=None,
     bundle_dir: str | None = None,
+    autotune_options: dict = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1109,6 +1174,8 @@ async def run_kernel(
             translator=translator,
             translate_fn=translate_fn,
             compliance_override=bundle_compliance,
+            llm_config=llm_config,
+            autotune_options=autotune_options,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1129,7 +1196,14 @@ async def run_kernel(
                 "final_diagnosis": err_msg,
             }
 
-    per_outer = [{"outer": i, "success": bool(r["success"])} for i, r in enumerate(results)]
+    per_outer = [
+        {
+            "outer": i,
+            "success": bool(r["success"]),
+            "autotune": r.get("autotune"),
+        }
+        for i, r in enumerate(results)
+    ]
 
     # Return first success, or the last failure
     chosen = next((r for r in results if r["success"]), results[-1])
@@ -1145,11 +1219,13 @@ async def _run_outer_iteration(
     pass_agents: dict, judge_agents: dict,
     max_turns: int,
     ckpt_root: Path, preset: str, experience_dir: str,
+    llm_config: dict,
     lowering_passes: list = None, translator_passes: list = None,
     resume_dsl_code: str = None,
     translator: str = "llm",
     translate_fn=None,
     compliance_override: dict | None = None,
+    autotune_options: dict = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -1349,11 +1425,23 @@ async def _run_outer_iteration(
             if "match=True" in graph_result:
                 log(f"-> PASS (graph verified)")
                 print(f"{tag} SUCCESS")
-                log_file.close()
                 result = _build_success_result(i, 0,
                                                {"code": final_code, "tool_outputs": []},
                                                [], lowered_code)
                 result["total_tokens"] = outer_total_tokens
+                if autotune_options is not None:
+                    log(f"{tag} starting autotune...")
+                    print(f"{tag} starting autotune...")
+                    result["autotune"] = await _run_outer_autotune(
+                        outer_dir=outer_dir,
+                        kernel_name=kernel_name,
+                        preset=preset,
+                        llm_config=llm_config,
+                        autotune_options=autotune_options,
+                        log=log,
+                        tag=tag,
+                    )
+                log_file.close()
                 return result
             else:
                 log(f"-> FAIL: {graph_result.splitlines()[0]}")

@@ -4,7 +4,7 @@ You will be given a `build_graph(dims, tensors)` function that is already
 verified correct (its emulator output matches the PyTorch reference). Your
 job is to rewrite it so it runs faster on the target hardware, while keeping
 its output numerically identical. You can change the tiling scheme, add parallel computations,
-reallocate compute resources, and/or make larger scale changes to the graph.
+reallocate compute resources, reduce memory traffic, and/or make larger scale changes to the graph.
 
 ## STeP API reference (ops.py)
 ```python
@@ -32,10 +32,16 @@ respect them:
 {hw_constraints}
 
 Budget rules:
-- The sum of `compute_bw` across all compute ops that overlap in time
-  should not exceed `max_total_compute_bw`. The timing model does not
-  enforce this — you must.
-- No single op may have `compute_bw > max_compute_bw_per_op`.
+- After you emit the graph, the autotuner runs a post-scaling pass that
+  rescales every compute op's `compute_bw` by a uniform factor so the
+  sum of `compute_bw` across all compute ops in the graph equals
+  `max_total_compute_bw` exactly (with each value floored at 1). As a
+  consequence, only the *ratios* between per-op `compute_bw` values
+  matter — the absolute numbers you write are scaled away. Use
+  `compute_bw` to express the relative compute share you want each op
+  to receive. The timing report you receive reflects post-scaled
+  values, and includes a summary of the rescaling so you can see what
+  each op ended up with.
 - No off-chip op may have `par_dispatch > max_par_dispatch`.
 
 ## Performance model

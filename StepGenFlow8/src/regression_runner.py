@@ -16,7 +16,7 @@ from src.regression_planning import Job
 
 _log = logging.getLogger(__name__)
 
-RunOne = Callable[[Job, Path], Awaitable[tuple[int, float, int, int, int]]]
+RunOne = Callable[[Job, Path], Awaitable[tuple[int, float, int, int, int, dict | None]]]
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,7 @@ class JobResult:
     outer_passed: int
     outer_total: int
     total_tokens: int = 0
+    autotune: dict | None = None
 
 
 def build_run_py_command(
@@ -43,6 +44,10 @@ def build_run_py_command(
     translator: str | None,
     checkpoint_dir: Path | None,
     bundle_dir: Path | None = None,
+    autotune: bool = False,
+    autotune_config: str | None = None,
+    autotune_max_turns: int | None = None,
+    autotune_agent: str | None = None,
 ) -> list[str]:
     cmd = [python_exe, str(run_py_path), job.kernel, job.preset, "--model", model]
     if config is not None:
@@ -59,6 +64,14 @@ def build_run_py_command(
         cmd += ["--checkpoint-dir", str(checkpoint_dir)]
     if bundle_dir is not None:
         cmd += ["--bundle-dir", str(bundle_dir)]
+    if autotune:
+        cmd += ["--autotune"]
+        if autotune_config is not None:
+            cmd += ["--autotune-config", autotune_config]
+        if autotune_max_turns is not None:
+            cmd += ["--autotune-max-turns", str(autotune_max_turns)]
+        if autotune_agent is not None:
+            cmd += ["--autotune-agent", autotune_agent]
     return cmd
 
 
@@ -86,6 +99,64 @@ def read_per_outer(checkpoint_dir: Path) -> tuple[int, int]:
         return 0, 0
     passed = sum(1 for entry in per_outer if entry.get("success"))
     return passed, len(per_outer)
+
+
+def read_autotune(checkpoint_dir: Path) -> dict | None:
+    """Return best-across-outers autotune summary, or None if no data.
+
+    Reads <checkpoint_dir>/result.json's per_outer entries, picks the entry
+    with status=='ok' that has the lowest best_cycles, and returns:
+      {
+        "best_outer": int,
+        "baseline_cycles": int,
+        "best_cycles": int,
+        "speedup": float,
+        "per_outer": [{outer, status, baseline_cycles, best_cycles, speedup}, ...],
+      }
+    Returns None when no outer has status=='ok' (autotune disabled, no outer
+    succeeded, or every outer's autotune crashed).
+    """
+    result_path = checkpoint_dir / "result.json"
+    if not result_path.exists():
+        return None
+    data = json.loads(result_path.read_text())
+    per_outer = data.get("per_outer")
+    if not per_outer:
+        return None
+
+    summarized = []
+    for entry in per_outer:
+        at = entry.get("autotune")
+        if at is None:
+            summarized.append({
+                "outer": entry.get("outer"),
+                "status": "missing",
+                "baseline_cycles": None,
+                "best_cycles": None,
+                "speedup": None,
+            })
+        else:
+            summarized.append({
+                "outer": entry.get("outer"),
+                "status": at.get("status"),
+                "baseline_cycles": at.get("baseline_cycles"),
+                "best_cycles": at.get("best_cycles"),
+                "speedup": at.get("speedup"),
+            })
+
+    ok_entries = [e for e in summarized
+                  if e["status"] == "ok" and e["best_cycles"] is not None]
+    if not ok_entries:
+        return None
+
+    best = min(ok_entries, key=lambda e: e["best_cycles"])
+    return {
+        "best_outer": best["outer"],
+        "baseline_cycles": best["baseline_cycles"],
+        "best_cycles": best["best_cycles"],
+        "speedup": best["speedup"],
+        "per_outer": summarized,
+    }
 
 
 async def run_subprocess(cmd: list[str], log_path: Path, cwd: Path) -> tuple[int, float]:
@@ -131,7 +202,8 @@ async def run_jobs(
         log_path = jobs_dir / f"{job.kernel}__{job.preset}.log"
         async with sem:
             _log.info("START %s/%s", job.kernel, job.preset)
-            exit_code, duration, outer_passed, outer_total, total_tokens = await run_one(job, log_path)
+            exit_code, duration, outer_passed, outer_total, total_tokens, autotune = \
+                await run_one(job, log_path)
         status = "pass" if exit_code == 0 else "fail"
         completed += 1
         if status == "pass":
@@ -148,7 +220,8 @@ async def run_jobs(
         _log.info("[%d/%d done, %d passed]", completed, total, passed)
         return JobResult(
             job=job, status=status, exit_code=exit_code, duration_s=duration,
-            outer_passed=outer_passed, outer_total=outer_total, total_tokens=total_tokens,
+            outer_passed=outer_passed, outer_total=outer_total,
+            total_tokens=total_tokens, autotune=autotune,
         )
 
     return await asyncio.gather(*(_run(j) for j in jobs))
@@ -192,6 +265,7 @@ def write_summary(
                     "exit_code": r.exit_code,
                     "outer_passed": r.outer_passed,
                     "outer_total": r.outer_total,
+                    "autotune": r.autotune,
                 }
                 for r in sorted(group, key=lambda r: r.job.preset)
             },
@@ -199,6 +273,24 @@ def write_summary(
 
     overall_passed = sum(1 for r in results if r.status == "pass")
     overall_total = len(results)
+
+    autotune_speedups = [r.autotune["speedup"] for r in results
+                         if r.autotune is not None and r.autotune.get("speedup") is not None]
+    if autotune_speedups:
+        from math import prod
+        geomean = prod(autotune_speedups) ** (1.0 / len(autotune_speedups))
+        autotune_overall = {
+            "jobs_with_data": len(autotune_speedups),
+            "min_speedup": min(autotune_speedups),
+            "max_speedup": max(autotune_speedups),
+            "geomean_speedup": geomean,
+        }
+    else:
+        autotune_overall = {
+            "jobs_with_data": 0,
+            "min_speedup": None, "max_speedup": None, "geomean_speedup": None,
+        }
+
     payload = {
         "started_at": started_at,
         "finished_at": finished_at,
@@ -215,6 +307,7 @@ def write_summary(
             "passed": sum(r.outer_passed for r in results),
             "total": sum(r.outer_total for r in results),
         },
+        "autotune_overall": autotune_overall,
         "benchmarks": benchmarks,
     }
     payload["total_tokens"] = sum(r.total_tokens for r in results)

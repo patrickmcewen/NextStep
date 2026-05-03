@@ -16,6 +16,7 @@ from src.regression_planning import load_bench_config, plan_jobs
 from src.regression_runner import (
     build_run_py_command,
     init_output_dir,
+    read_autotune,
     read_per_outer,
     read_total_tokens,
     run_jobs,
@@ -57,6 +58,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--translator", default=None, choices=[None, "auto", "llm"])
     p.add_argument("--bundle-dir", default=None, metavar="PATH",
                    help="Bundle directory passed through to each per-job run.py invocation.")
+
+    # Autotune pass-through to run.py
+    p.add_argument("--autotune", action="store_true",
+                   help="Enable per-outer autotune in each run.py invocation.")
+    p.add_argument("--autotune-config", default=None,
+                   help="Pass-through path to autotune_config JSON.")
+    p.add_argument("--autotune-max-turns", type=int, default=None,
+                   help="Pass-through override for autotune max_turns.")
+    p.add_argument("--autotune-agent", default=None, choices=[None, "general", "parallel"],
+                   help="Pass-through autotune agent variant.")
     return p.parse_args(argv)
 
 
@@ -120,6 +131,10 @@ async def _amain(args: argparse.Namespace) -> int:
         "max_turns": args.max_turns,
         "pipeline": args.pipeline,
         "translator": args.translator,
+        "autotune": args.autotune,
+        "autotune_config": args.autotune_config,
+        "autotune_max_turns": args.autotune_max_turns,
+        "autotune_agent": args.autotune_agent,
         "bench_config": str(args.bench_config),
         "run_py": str(args.run_py),
         "subset_file": str(args.subset_file),
@@ -140,11 +155,16 @@ async def _amain(args: argparse.Namespace) -> int:
             translator=args.translator,
             checkpoint_dir=job_ckpt_dir,
             bundle_dir=args.bundle_dir,
+            autotune=args.autotune,
+            autotune_config=args.autotune_config,
+            autotune_max_turns=args.autotune_max_turns,
+            autotune_agent=args.autotune_agent,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)
         total_tokens = read_total_tokens(job_ckpt_dir)
-        return exit_code, duration, outer_passed, outer_total, total_tokens
+        autotune = read_autotune(job_ckpt_dir)
+        return exit_code, duration, outer_passed, outer_total, total_tokens, autotune
 
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     t0 = asyncio.get_event_loop().time()

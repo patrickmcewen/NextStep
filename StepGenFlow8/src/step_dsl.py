@@ -2,8 +2,40 @@
 STeP DSL
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
+
+
+class Buffered:
+    """Torch tensor with the buffer-rank promise made by bufferize().
+
+    Layout: tensor.shape == (*in_stream, *buffer_grid, tile_r, tile_c)
+    where len(buffer_grid) == buffer_rank.  Mirrors the IR's Bufferize ->
+    Stream(stream_dtype=Buffer) state.
+    """
+
+    __slots__ = ("tensor", "buffer_rank")
+
+    def __init__(self, tensor, buffer_rank):
+        assert isinstance(tensor, torch.Tensor), \
+            f"Buffered: tensor must be torch.Tensor, got {type(tensor).__name__}"
+        assert isinstance(buffer_rank, int) and buffer_rank >= 1, \
+            f"Buffered: buffer_rank must be int >= 1, got {buffer_rank!r}"
+        assert tensor.ndim >= 2 + buffer_rank, (
+            f"Buffered: tensor.ndim={tensor.ndim} too small for buffer_rank={buffer_rank}"
+        )
+        self.tensor = tensor
+        self.buffer_rank = buffer_rank
+
+    @property
+    def buffer_shape(self):
+        return tuple(self.tensor.shape[-2 - self.buffer_rank : -2])
+
+    @property
+    def in_stream_shape(self):
+        return tuple(self.tensor.shape[: -2 - self.buffer_rank])
 
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
@@ -650,27 +682,45 @@ def repeat_ref(x, ref):
     expand_shape = ref_stream + tile_dims
     return result.expand(expand_shape).contiguous()
 
-def streamify(x, repeat_factors, rank=0):
-    result = x
-    offset = 2 + rank  # skip buffer dims + tile_r + tile_c
-    for rf in repeat_factors:
-        result = result.unsqueeze(-offset)
-        shape = list(result.shape)
-        shape[-offset] = rf
-        result = result.expand(shape).contiguous()
-        offset += 1  # account for newly inserted dim
-    return result
+def streamify(x, stride, out_shape_tiled):
+    assert isinstance(x, Buffered), \
+        f"streamify expects a Buffered (output of bufferize()), got {type(x).__name__}"
+    assert len(stride) == len(out_shape_tiled), (
+        f"streamify: stride {tuple(stride)} and out_shape_tiled {tuple(out_shape_tiled)} "
+        f"must have same length"
+    )
+
+    buffer_shape = x.buffer_shape
+    n_tiles = math.prod(buffer_shape)
+    max_idx = sum((s - 1) * st for s, st in zip(out_shape_tiled, stride))
+    assert max_idx < n_tiles, (
+        f"streamify: stride {tuple(stride)} x out_shape_tiled {tuple(out_shape_tiled)} "
+        f"exceeds buffer grid {buffer_shape} (max_idx={max_idx}, n_tiles={n_tiles})"
+    )
+
+    t = x.tensor
+    in_stream_rank = t.ndim - 2 - x.buffer_rank
+    tile_r, tile_c = t.shape[-2], t.shape[-1]
+    flat = t.reshape(*t.shape[:in_stream_rank], -1, tile_r, tile_c)
+
+    ranges = [torch.arange(s) for s in out_shape_tiled]
+    grids = torch.meshgrid(*ranges, indexing="ij")
+    linear_idx = sum(g.long() * int(s) for g, s in zip(grids, stride))
+    return flat[..., linear_idx.long(), :, :]
 
 
-def bufferize(x):
-    return x
+def bufferize(x, rank):
+    return Buffered(x, buffer_rank=rank)
 
 
-def dyn_streamify(x, ref, bufferized_rank):
+def dyn_streamify(x, ref):
+    assert isinstance(x, Buffered), \
+        f"dyn_streamify expects a Buffered (output of bufferize()), got {type(x).__name__}"
+    bufferized_rank = x.buffer_rank
     ref_stream_shape = ref.shape[:-2]
-    buf_and_tile_dims = x.shape[-(2 + bufferized_rank):]
+    buf_and_tile_dims = x.tensor.shape[-(2 + bufferized_rank):]
     expand_shape = list(ref_stream_shape) + list(buf_and_tile_dims)
-    return x.expand(expand_shape).contiguous()
+    return x.tensor.expand(expand_shape).contiguous()
 
 def broadcast(x, n):
     return [x.clone() for _ in range(n)]
