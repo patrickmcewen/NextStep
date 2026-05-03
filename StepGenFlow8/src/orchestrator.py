@@ -1029,7 +1029,14 @@ async def run_kernel(
                 "final_diagnosis": err_msg,
             }
 
-    per_outer = [{"outer": i, "success": bool(r["success"])} for i, r in enumerate(results)]
+    per_outer = [
+        {
+            "outer": i,
+            "success": bool(r["success"]),
+            "autotune": r.get("autotune"),
+        }
+        for i, r in enumerate(results)
+    ]
 
     # Return first success, or the last failure
     chosen = next((r for r in results if r["success"]), results[-1])
