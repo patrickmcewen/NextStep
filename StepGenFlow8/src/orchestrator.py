@@ -1233,10 +1233,22 @@ async def _run_outer_iteration(
             if "match=True" in graph_result:
                 log(f"-> PASS (graph verified)")
                 print(f"{tag} SUCCESS")
-                log_file.close()
                 result = _build_success_result(i, 0,
                                                {"code": final_code, "tool_outputs": []},
                                                [], lowered_code)
+                if autotune_options is not None:
+                    log(f"{tag} starting autotune...")
+                    print(f"{tag} starting autotune...")
+                    result["autotune"] = await _run_outer_autotune(
+                        outer_dir=outer_dir,
+                        kernel_name=kernel_name,
+                        preset=preset,
+                        llm_config=llm_config,
+                        autotune_options=autotune_options,
+                        log=log,
+                        tag=tag,
+                    )
+                log_file.close()
                 return result
             else:
                 log(f"-> FAIL: {graph_result.splitlines()[0]}")
