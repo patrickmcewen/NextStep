@@ -107,6 +107,19 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _load_autotune_progress(autotune_kernel_dir: Path) -> dict:
+    """Read `progress.json` written by run_autotune, or return {} if absent.
+
+    `autotune_kernel_dir` is the inner kernel-named directory created by
+    run_autotune (i.e. <outer_dir>/autotune/<kernel_name>). When run_autotune
+    raises before writing baseline progress, the file may not exist.
+    """
+    path = autotune_kernel_dir / "progress.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
