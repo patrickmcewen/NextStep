@@ -141,7 +141,7 @@ def test_run_jobs_caps_concurrency(tmp_path: Path):
         peak = 0
         lock = asyncio.Lock()
 
-        async def stub(job: Job, log_path: Path) -> tuple[int, float, int, int]:
+        async def stub(job: Job, log_path: Path) -> tuple[int, float, int, int, dict | None]:
             nonlocal inflight, peak
             async with lock:
                 inflight += 1
@@ -149,7 +149,7 @@ def test_run_jobs_caps_concurrency(tmp_path: Path):
             await asyncio.sleep(0.05)
             async with lock:
                 inflight -= 1
-            return 0, 0.05, 1, 1
+            return 0, 0.05, 1, 1, None
 
         results = await run_jobs(jobs, max_parallel=3, jobs_dir=tmp_path, run_one=stub)
         return results, peak
@@ -166,10 +166,10 @@ def test_run_jobs_caps_concurrency(tmp_path: Path):
 def test_run_jobs_records_failures(tmp_path: Path):
     jobs = [Job("a", "p"), Job("b", "p")]
 
-    async def stub(job: Job, log_path: Path) -> tuple[int, float, int, int]:
+    async def stub(job: Job, log_path: Path) -> tuple[int, float, int, int, dict | None]:
         if job.kernel == "a":
-            return 0, 0.01, 1, 1
-        return 1, 0.01, 0, 3
+            return 0, 0.01, 1, 1, None
+        return 1, 0.01, 0, 3, None
 
     results = asyncio.run(
         run_jobs(jobs, max_parallel=2, jobs_dir=tmp_path, run_one=stub)

@@ -16,7 +16,7 @@ from src.regression_planning import Job
 
 _log = logging.getLogger(__name__)
 
-RunOne = Callable[[Job, Path], Awaitable[tuple[int, float, int, int]]]
+RunOne = Callable[[Job, Path], Awaitable[tuple[int, float, int, int, dict | None]]]
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class JobResult:
     duration_s: float
     outer_passed: int
     outer_total: int
+    autotune: dict | None = None
 
 
 def build_run_py_command(
@@ -189,7 +190,8 @@ async def run_jobs(
         log_path = jobs_dir / f"{job.kernel}__{job.preset}.log"
         async with sem:
             _log.info("START %s/%s", job.kernel, job.preset)
-            exit_code, duration, outer_passed, outer_total = await run_one(job, log_path)
+            exit_code, duration, outer_passed, outer_total, autotune = \
+                await run_one(job, log_path)
         status = "pass" if exit_code == 0 else "fail"
         completed += 1
         if status == "pass":
@@ -206,7 +208,7 @@ async def run_jobs(
         _log.info("[%d/%d done, %d passed]", completed, total, passed)
         return JobResult(
             job=job, status=status, exit_code=exit_code, duration_s=duration,
-            outer_passed=outer_passed, outer_total=outer_total,
+            outer_passed=outer_passed, outer_total=outer_total, autotune=autotune,
         )
 
     return await asyncio.gather(*(_run(j) for j in jobs))
