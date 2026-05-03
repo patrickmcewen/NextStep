@@ -120,6 +120,57 @@ def _load_autotune_progress(autotune_kernel_dir: Path) -> dict:
     return json.loads(path.read_text())
 
 
+# Deferred to avoid circular import (src.autotune imports from src.orchestrator).
+# Populated lazily on first call to _run_outer_autotune; monkeypatch can
+# replace this module-level name before the helper is invoked.
+run_autotune = None
+
+
+async def _run_outer_autotune(*, outer_dir: Path, kernel_name: str, preset: str,
+                              llm_config: dict, autotune_options: dict,
+                              log, tag: str) -> dict:
+    """Run the autotuner against an outer's verified build_graph.
+
+    Trapping is deliberate: a midway autotune crash must not undo the
+    functional pipeline's success on this outer. On exception we recover
+    best-so-far from progress.json (written incrementally by run_autotune).
+    """
+    global run_autotune
+    if run_autotune is None:
+        from src.autotune import run_autotune as _ra
+        run_autotune = _ra
+
+    autotune_ckpt = outer_dir / "autotune"
+    try:
+        result = await run_autotune(
+            kernel_name=kernel_name,
+            preset=preset,
+            llm_config=llm_config,
+            autotune_config=autotune_options["config"],
+            resume_from=str(outer_dir),
+            max_turns=autotune_options["max_turns"],
+            checkpoint_dir=str(autotune_ckpt),
+            agent_variant=autotune_options["agent_variant"],
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        msg = f"{tag} autotune FAILED: {type(e).__name__}: {e}"
+        log(msg)
+        print(msg)
+        progress = _load_autotune_progress(autotune_ckpt / kernel_name)
+        baseline = progress.get("baseline_cycles")
+        best = progress.get("best_cycles")
+        speedup = (baseline / best) if (baseline and best) else None
+        return {
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "checkpoint_dir": str(autotune_ckpt),
+            "baseline_cycles": baseline,
+            "best_cycles": best,
+            "speedup": speedup,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
