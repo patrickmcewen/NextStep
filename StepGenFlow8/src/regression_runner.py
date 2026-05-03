@@ -252,6 +252,7 @@ def write_summary(
                     "exit_code": r.exit_code,
                     "outer_passed": r.outer_passed,
                     "outer_total": r.outer_total,
+                    "autotune": r.autotune,
                 }
                 for r in sorted(group, key=lambda r: r.job.preset)
             },
@@ -259,6 +260,24 @@ def write_summary(
 
     overall_passed = sum(1 for r in results if r.status == "pass")
     overall_total = len(results)
+
+    autotune_speedups = [r.autotune["speedup"] for r in results
+                         if r.autotune is not None and r.autotune.get("speedup") is not None]
+    if autotune_speedups:
+        from math import prod
+        geomean = prod(autotune_speedups) ** (1.0 / len(autotune_speedups))
+        autotune_overall = {
+            "jobs_with_data": len(autotune_speedups),
+            "min_speedup": min(autotune_speedups),
+            "max_speedup": max(autotune_speedups),
+            "geomean_speedup": geomean,
+        }
+    else:
+        autotune_overall = {
+            "jobs_with_data": 0,
+            "min_speedup": None, "max_speedup": None, "geomean_speedup": None,
+        }
+
     payload = {
         "started_at": started_at,
         "finished_at": finished_at,
@@ -275,6 +294,7 @@ def write_summary(
             "passed": sum(r.outer_passed for r in results),
             "total": sum(r.outer_total for r in results),
         },
+        "autotune_overall": autotune_overall,
         "benchmarks": benchmarks,
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=False))

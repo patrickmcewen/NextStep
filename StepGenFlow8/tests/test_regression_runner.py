@@ -326,3 +326,75 @@ def test_read_autotune_picks_best_outer_with_lowest_best_cycles(tmp_path: Path):
     assert len(out["per_outer"]) == 4
     statuses = [e["status"] for e in out["per_outer"]]
     assert statuses == ["ok", "ok", "error", "missing"]
+
+
+def test_write_summary_includes_per_preset_autotune(tmp_path: Path):
+    autotune_a = {
+        "best_outer": 1, "baseline_cycles": 1000, "best_cycles": 800,
+        "speedup": 1.25, "per_outer": [],
+    }
+    autotune_b = {
+        "best_outer": 0, "baseline_cycles": 2000, "best_cycles": 1000,
+        "speedup": 2.0, "per_outer": [],
+    }
+    results = [
+        JobResult(Job("gemm", "small"), status="pass", exit_code=0,
+                  duration_s=1.0, outer_passed=3, outer_total=3, autotune=autotune_a),
+        JobResult(Job("silu", "small"), status="pass", exit_code=0,
+                  duration_s=0.5, outer_passed=2, outer_total=2, autotune=autotune_b),
+        JobResult(Job("relu", "small"), status="fail", exit_code=1,
+                  duration_s=0.3, outer_passed=0, outer_total=2, autotune=None),
+    ]
+    summary_path = tmp_path / "summary.json"
+    write_summary(summary_path, results=results,
+                  started_at="2026-05-03T14:00:00Z", finished_at="2026-05-03T14:05:00Z",
+                  wall_seconds=300.0, max_parallel=2, model="gpt-oss-120b",
+                  preset_mode="all_presets")
+    data = json.loads(summary_path.read_text())
+    assert data["benchmarks"]["gemm"]["presets"]["small"]["autotune"]["best_cycles"] == 800
+    assert data["benchmarks"]["silu"]["presets"]["small"]["autotune"]["speedup"] == 2.0
+    assert data["benchmarks"]["relu"]["presets"]["small"]["autotune"] is None
+
+
+def test_write_summary_autotune_overall_aggregates(tmp_path: Path):
+    autotune_a = {"best_outer": 0, "baseline_cycles": 1000, "best_cycles": 800,
+                  "speedup": 1.25, "per_outer": []}
+    autotune_b = {"best_outer": 0, "baseline_cycles": 2000, "best_cycles": 1000,
+                  "speedup": 2.0, "per_outer": []}
+    results = [
+        JobResult(Job("gemm", "small"), status="pass", exit_code=0,
+                  duration_s=1.0, outer_passed=1, outer_total=1, autotune=autotune_a),
+        JobResult(Job("silu", "small"), status="pass", exit_code=0,
+                  duration_s=0.5, outer_passed=1, outer_total=1, autotune=autotune_b),
+        JobResult(Job("relu", "small"), status="fail", exit_code=1,
+                  duration_s=0.3, outer_passed=0, outer_total=1, autotune=None),
+    ]
+    summary_path = tmp_path / "summary.json"
+    write_summary(summary_path, results=results,
+                  started_at="2026-05-03T14:00:00Z", finished_at="2026-05-03T14:05:00Z",
+                  wall_seconds=300.0, max_parallel=2, model="gpt-oss-120b",
+                  preset_mode="all_presets")
+    data = json.loads(summary_path.read_text())
+    overall = data["autotune_overall"]
+    assert overall["jobs_with_data"] == 2
+    assert overall["min_speedup"] == pytest.approx(1.25)
+    assert overall["max_speedup"] == pytest.approx(2.0)
+    # geomean of 1.25 and 2.0 = sqrt(2.5) ≈ 1.5811
+    assert overall["geomean_speedup"] == pytest.approx((1.25 * 2.0) ** 0.5)
+
+
+def test_write_summary_autotune_overall_omitted_without_data(tmp_path: Path):
+    results = [
+        JobResult(Job("gemm", "small"), status="pass", exit_code=0,
+                  duration_s=1.0, outer_passed=1, outer_total=1, autotune=None),
+    ]
+    summary_path = tmp_path / "summary.json"
+    write_summary(summary_path, results=results,
+                  started_at="2026-05-03T14:00:00Z", finished_at="2026-05-03T14:05:00Z",
+                  wall_seconds=300.0, max_parallel=2, model="gpt-oss-120b",
+                  preset_mode="all_presets")
+    data = json.loads(summary_path.read_text())
+    assert data["autotune_overall"] == {
+        "jobs_with_data": 0,
+        "min_speedup": None, "max_speedup": None, "geomean_speedup": None,
+    }
