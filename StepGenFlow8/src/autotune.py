@@ -522,6 +522,21 @@ def _measure(code: str, kernel_name: str, dims: dict, tensors: dict,
     return total, report
 
 
+def _write_progress(ckpt_root: Path, *, baseline_cycles: int, best_cycles: int,
+                    turn: int, last_status: str) -> None:
+    """Write running progress so external code can recover best-so-far on crash.
+
+    Called once after baseline measurement (turn=-1, last_status='BASELINE')
+    and again at the end of every turn-loop iteration. Overwrites prior writes.
+    """
+    _write(ckpt_root / "progress.json", json.dumps({
+        "baseline_cycles": baseline_cycles,
+        "best_cycles": best_cycles,
+        "turn": turn,
+        "last_status": last_status,
+    }, indent=2))
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -605,11 +620,12 @@ async def run_autotune(
     _write(ckpt_root / "baseline.py", baseline_code)
     _write(ckpt_root / "baseline_timing.txt", baseline_report)
 
-    # ---- Agent loop ----
     best_code = baseline_code
     best_cycles = baseline_cycles
     current_code = baseline_code
     current_report = baseline_report
+    _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                    best_cycles=best_cycles, turn=-1, last_status="BASELINE")
 
     user_prompt = build_autotune_user_prompt(
         kernel_name, dims, current_code, current_report,
@@ -637,6 +653,8 @@ async def run_autotune(
             conversation.append({"role": "user", "content":
                 "Your response did not contain a ```python code block. "
                 "Please emit the full updated build_graph(dims, tensors)."})
+            _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                            best_cycles=best_cycles, turn=turn, last_status="NO_CODE")
             continue
         _write(turn_dir / "extracted_code.py", proposal)
 
@@ -656,6 +674,8 @@ async def run_autotune(
                 f"```\n{correctness}\n```\n\n"
                 f"### Last correct build_graph (use this as the base)\n\n"
                 f"```python\n{current_code}\n```"})
+            _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                            best_cycles=best_cycles, turn=turn, last_status="CORRECTNESS_FAIL")
             continue
 
         # Correctness OK — measure
@@ -669,6 +689,8 @@ async def run_autotune(
                 f"## Timing model error\n\n```\n{err}\n```\n\n"
                 "Correctness passed but analyze_timing raised. This usually "
                 "means a knob is out of range."})
+            _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                            best_cycles=best_cycles, turn=turn, last_status="TIMING_ERROR")
             continue
 
         _write(turn_dir / "timing.txt", new_report)
@@ -689,6 +711,8 @@ async def run_autotune(
         conversation.append({"role": "user", "content": build_autotune_user_prompt(
             kernel_name, dims, current_code, current_report,
             baseline_cycles=baseline_cycles, best_cycles=best_cycles)})
+        _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                        best_cycles=best_cycles, turn=turn, last_status=tag)
 
     result = {
         "success": True,
