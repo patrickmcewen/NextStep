@@ -910,6 +910,7 @@ async def run_kernel(
     resume_from: str = None,
     translator: str = "llm",
     few_shot_paths=None,
+    autotune_options: dict | None = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1007,6 +1008,8 @@ async def run_kernel(
             translator_passes=translator_passes,
             resume_dsl_code=resume_dsl_code,
             translator=translator,
+            llm_config=llm_config,
+            autotune_options=autotune_options,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1044,6 +1047,8 @@ async def _run_outer_iteration(
     lowering_passes: list = None, translator_passes: list = None,
     resume_dsl_code: str = None,
     translator: str = "llm",
+    llm_config: dict = None,
+    autotune_options: dict | None = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
