@@ -126,3 +126,26 @@ def test_timing_error_short_circuits_at_step_4(stub_gates):
     assert out["status"] == "TIMING_ERROR"
     assert "timing boom" in out["timing_error_text"]
     assert out["new_cycles"] is None
+
+
+def test_run_autotune_reads_dsl_code_from_outer_dir(tmp_path):
+    """The autotune entry point's resume path resolves to outer_<N>/dsl_code.py."""
+    outer_dir = tmp_path / "outer_0"
+    outer_dir.mkdir()
+    (outer_dir / "dsl_code.py").write_text("# placeholder dsl source\n")
+
+    code, src = autotune_mod._resolve_resume_dsl_with_source(
+        str(outer_dir), kernel_name="dummy",
+    )
+    assert code == "# placeholder dsl source\n"
+    assert src == outer_dir / "dsl_code.py"
+
+
+def test_run_autotune_rejects_path_with_no_dsl_code(tmp_path):
+    """Pointing at a directory with no dsl_code.py fails loudly."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    with pytest.raises((AssertionError, FileNotFoundError)):
+        autotune_mod._resolve_resume_dsl_with_source(
+            str(empty_dir), kernel_name="dummy",
+        )

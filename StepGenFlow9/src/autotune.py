@@ -1,14 +1,16 @@
 """Autotuner orchestration.
 
-Takes a correctness-verified `build_graph(dims, tensors)` produced by the
-StepGenFlow pipeline (or loaded from a past successful checkpoint) and runs
-an agent loop that iteratively proposes performance-oriented rewrites.
-Each proposal is checked for correctness against the reference, then fed
-through the analytical timing model; the report is sent back to the agent.
+Takes a correctness-verified DSL ``tiled_reference(dims, tensors)`` (the
+output of the implementer's refactor pass, persisted as ``dsl_code.py``)
+and runs an agent loop that iteratively proposes performance-oriented
+rewrites of the DSL. Each proposal is run through the triple-gate chain
+(DSL exec -> translate -> IR sim) against the reference, then fed through
+the analytical timing model on the translated build_graph; the report is
+sent back to the agent.
 
 The autotuner never mutates the algorithm — it only changes knobs like
 tile_row / tile_col, par_dispatch, compute_bw, write_back_mu, and the
-choice of buffering / broadcast / retile ops.
+choice of buffering / broadcast / retile DSL ops.
 """
 
 import json
@@ -58,54 +60,41 @@ from src.dsl_to_step import translate  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint resume — locate a passing build_graph from a previous run
+# Checkpoint resume — locate a DSL source from a previous run
 # ---------------------------------------------------------------------------
 
-def _find_passing_extract(search_root: Path) -> Path:
-    """Find the newest `extracted_code.py` whose sibling `status.txt` says PASS.
+def _resolve_resume_dsl_with_source(resume_from: str, kernel_name: str) -> tuple[str, Path]:
+    """Resolve `resume_from` to (dsl_code, source_path).
 
-    Used to locate the final build_graph produced by a successful translate
-    pass under a given checkpoint sub-tree.
-    """
-    candidates = []
-    for status_file in search_root.rglob("status.txt"):
-        if status_file.read_text().strip().startswith("PASS"):
-            code_file = status_file.parent / "extracted_code.py"
-            if code_file.is_file():
-                candidates.append(code_file)
-    assert candidates, (
-        f"No turn with status.txt=='PASS' + extracted_code.py found under {search_root}. "
-        f"Autotuning requires a successful translate pass as its starting point."
-    )
-    # Prefer the latest-modified match (deepest outer/turn iteration usually wins).
-    candidates.sort(key=lambda p: p.stat().st_mtime)
-    return candidates[-1]
-
-
-def _resolve_resume_build_graph(resume_from: str, kernel_name: str) -> tuple[str, Path]:
-    """Resolve `resume_from` to (build_graph_code, source_path).
-
-    Accepts:
-      - Path to a .py file directly.
-      - Path to a turn directory containing extracted_code.py + PASSing status.txt.
-      - Path to an outer_N, translate/, or kernel directory — searches recursively
-        for the last passing extracted_code.py.
-      - Path to a checkpoint root (the timestamped dir above the kernel name).
+    Same path semantics as ``orchestrator._resolve_resume_dsl`` but returns
+    the resolved file's Path so the autotune config.json can record where
+    the baseline came from.
     """
     p = Path(resume_from)
     assert p.exists(), f"resume_from path does not exist: {p}"
 
-    if p.is_file():
-        assert p.suffix == ".py", f"resume_from file must be .py: {p}"
+    if p.suffix == ".py" and p.is_file():
         return p.read_text(), p
 
-    # Directory case. Prefer a kernel-scoped subtree if present so we don't
-    # accidentally pick up a passing turn from a different kernel.
-    kernel_dir = p / kernel_name
-    search_root = kernel_dir if kernel_dir.is_dir() else p
-    chosen = _find_passing_extract(search_root)
-    print(f"  Resolved resume path: {chosen}")
-    return chosen.read_text(), chosen
+    if p.is_dir() and (p / "dsl_code.py").is_file():
+        chosen = p / "dsl_code.py"
+        return chosen.read_text(), chosen
+
+    if p.is_dir():
+        candidates = sorted((p / kernel_name).glob("outer_*/dsl_code.py"))
+        assert candidates, (
+            f"No dsl_code.py found under {p / kernel_name}/outer_*/. "
+            f"Ensure refactor_final succeeded in the checkpoint you're resuming from."
+        )
+        chosen = candidates[0]
+        print(f"  Resolved resume path: {chosen}")
+        return chosen.read_text(), chosen
+
+    raise FileNotFoundError(
+        f"Cannot resolve resume_from='{resume_from}'. "
+        f"Expected a .py file, a directory with dsl_code.py, "
+        f"or a checkpoint root directory."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -631,16 +620,16 @@ async def run_autotune(
     checkpoint_dir: str = None,
     agent_variant: str = "general",
 ) -> dict:
-    """Autotune a verified build_graph() starting from a past checkpoint.
+    """Autotune a verified DSL ``tiled_reference`` starting from a past checkpoint.
 
     Args:
-        autotune_config: dict with keys `hw_config`, `constraints`, `max_turns`
-            (see autotune_config.json).
+        autotune_config: dict with keys ``hw_config``, ``constraints``,
+            ``max_turns`` (see autotune_config.json).
         resume_from: path to the successful implementer checkpoint — a file,
-            turn dir, outer dir, or checkpoint root. See _resolve_resume_build_graph.
-        max_turns: overrides autotune_config["max_turns"] if provided.
-        agent_variant: which autotuner agent to run — "general" (default) or
-            "parallel" (Parallelize/StaticReassemble specialist).
+            outer dir, or checkpoint root. See ``_resolve_resume_dsl_with_source``.
+        max_turns: overrides ``autotune_config["max_turns"]`` if provided.
+        agent_variant: which autotuner agent to run — ``"general"`` (default)
+            or ``"parallel"`` (Parallelize/StaticReassemble specialist).
     """
     hw_config = autotune_config["hw_config"]
     constraints = autotune_config["constraints"]
@@ -654,32 +643,38 @@ async def run_autotune(
     assert preset in config[kernel_name]["presets"], f"Preset '{preset}' not found"
     dims = config[kernel_name]["presets"][preset]
 
-    # Load the baseline build_graph from the resume checkpoint
-    baseline_code, baseline_src = _resolve_resume_build_graph(resume_from, kernel_name)
-    print(f"Loaded baseline build_graph ({len(baseline_code)} chars) from {baseline_src}")
+    # Load the baseline DSL from the resume checkpoint.
+    baseline_dsl_code, baseline_src = _resolve_resume_dsl_with_source(
+        resume_from, kernel_name)
+    print(f"Loaded baseline DSL ({len(baseline_dsl_code)} chars) from {baseline_src}")
 
-    # Precompute tensors (same call used by the implementer pipeline)
+    # Precompute tensors (same call used by the implementer pipeline).
     tensors = precompute_tensors(kernel_name, dims)
     print(f"Pre-computed tensors: {sorted(tensors.keys())}")
 
-    # Verify baseline correctness up front — required invariant
-    baseline_check = _run_graph_correctness(baseline_code, kernel_name, dims, tensors)
-    assert "match=True" in baseline_check, (
-        f"Baseline code from {baseline_src} failed correctness:\n{baseline_check}"
+    # Verify baseline through every gate up front — required invariant.
+    eval_baseline = _evaluate_dsl_turn(
+        baseline_dsl_code, kernel_name, dims, tensors, hw_config, max_total_compute_bw)
+    assert eval_baseline["status"] == "PASS", (
+        f"Baseline DSL from {baseline_src} did not pass all gates: "
+        f"status={eval_baseline['status']}\n\n"
+        f"DSL correctness:\n{eval_baseline['dsl_correctness_text']}\n\n"
+        f"Translate error:\n{eval_baseline['translate_error_text']}\n\n"
+        f"Graph correctness:\n{eval_baseline['graph_correctness_text']}\n\n"
+        f"Timing error:\n{eval_baseline['timing_error_text']}"
     )
-
-    # Measure baseline
-    baseline_cycles, baseline_report = _measure(
-        baseline_code, kernel_name, dims, tensors, hw_config, max_total_compute_bw)
+    baseline_translated = eval_baseline["translated_code"]
+    baseline_cycles = eval_baseline["new_cycles"]
+    baseline_report = eval_baseline["new_report"]
     print(f"Baseline total_cycles = {baseline_cycles}")
 
-    # Merge hw_config + constraints for the system prompt's {hw_constraints} block
+    # Merge hw_config + constraints for the system prompt's {hw_constraints} block.
     prompt_constraints = {**hw_config, **constraints}
 
-    # Create the autotuner agent
+    # Create the autotuner agent.
     agent = make_autotune_agent(llm_config, prompt_constraints, variant=agent_variant)
 
-    # Checkpoint setup
+    # Checkpoint setup.
     if checkpoint_dir is None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         checkpoint_dir = str(Path("checkpoints_autotune") / ts)
@@ -697,18 +692,20 @@ async def run_autotune(
         "max_turns": max_turns,
         "agent_variant": agent_variant,
     }, indent=2))
-    _write(ckpt_root / "baseline.py", baseline_code)
+    _write(ckpt_root / "baseline_dsl.py", baseline_dsl_code)
+    _write(ckpt_root / "baseline_translated.py", baseline_translated)
     _write(ckpt_root / "baseline_timing.txt", baseline_report)
 
-    best_code = baseline_code
+    best_dsl = baseline_dsl_code
+    best_translated = baseline_translated
     best_cycles = baseline_cycles
-    current_code = baseline_code
+    current_dsl = baseline_dsl_code
     current_report = baseline_report
     _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
                     best_cycles=best_cycles, turn=-1, last_status="BASELINE")
 
     user_prompt = build_autotune_user_prompt(
-        kernel_name, dims, current_code, current_report,
+        kernel_name, dims, current_dsl, current_report,
         baseline_cycles=baseline_cycles, best_cycles=best_cycles)
     conversation = [{"role": "user", "content": user_prompt}]
 
@@ -732,64 +729,106 @@ async def run_autotune(
             _write(turn_dir / "status.txt", "NO_CODE")
             conversation.append({"role": "user", "content":
                 "Your response did not contain a ```python code block. "
-                "Please emit the full updated build_graph(dims, tensors)."})
+                "Please emit the full updated tiled_reference(dims, tensors)."})
             _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
                             best_cycles=best_cycles, turn=turn, last_status="NO_CODE")
             continue
         _write(turn_dir / "extracted_code.py", proposal)
 
-        # Correctness first
-        try:
-            correctness = _run_graph_correctness(proposal, kernel_name, dims, tensors)
-        except Exception:
-            correctness = "ERROR:\n" + traceback.format_exc()
-        _write(turn_dir / "correctness_result.txt", correctness)
+        result = _evaluate_dsl_turn(
+            proposal, kernel_name, dims, tensors, hw_config, max_total_compute_bw)
 
-        if "match=True" not in correctness:
-            print(f"  correctness FAILED: {correctness.splitlines()[0]}")
-            _write(turn_dir / "status.txt", "CORRECTNESS_FAIL")
+        # Persist artifacts for whichever gates ran. Each artifact is
+        # written iff its corresponding text was populated.
+        if result["dsl_correctness_text"] is not None:
+            _write(turn_dir / "dsl_correctness_result.txt", result["dsl_correctness_text"])
+        if result["translated_code"] is not None:
+            _write(turn_dir / "translated_code.py", result["translated_code"])
+        if result["translate_error_text"] is not None:
+            _write(turn_dir / "translate_error.txt", result["translate_error_text"])
+        if result["graph_correctness_text"] is not None:
+            _write(turn_dir / "graph_correctness_result.txt", result["graph_correctness_text"])
+        if result["timing_error_text"] is not None:
+            _write(turn_dir / "timing_error.txt", result["timing_error_text"])
+
+        status = result["status"]
+
+        if status == "DSL_FAIL":
+            print(f"  DSL_FAIL: {result['dsl_correctness_text'].splitlines()[0]}")
+            _write(turn_dir / "status.txt", "DSL_FAIL")
             conversation.append({"role": "user", "content":
-                "## Correctness: FAIL\n\n"
-                "Your proposal no longer matches the reference. \n\n"
-                f"```\n{correctness}\n```\n\n"
-                f"### Last correct build_graph (use this as the base)\n\n"
-                f"```python\n{current_code}\n```"})
+                "## Correctness gate 1 (DSL exec): FAIL\n\n"
+                "Your proposal's DSL eager exec disagreed with gold.\n\n"
+                f"```\n{result['dsl_correctness_text']}\n```\n\n"
+                f"### Last correct tiled_reference (use this as the base)\n\n"
+                f"```python\n{current_dsl}\n```"})
             _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
-                            best_cycles=best_cycles, turn=turn, last_status="CORRECTNESS_FAIL")
+                            best_cycles=best_cycles, turn=turn, last_status="DSL_FAIL")
             continue
 
-        # Correctness OK — measure
-        try:
-            new_cycles, new_report = _measure(
-                proposal, kernel_name, dims, tensors, hw_config, max_total_compute_bw)
-        except Exception:
-            err = traceback.format_exc()
+        if status == "TRANSLATE_ERROR":
+            print(f"  TRANSLATE_ERROR: {result['translate_error_text'].splitlines()[-2]}")
+            _write(turn_dir / "status.txt", "TRANSLATE_ERROR")
+            conversation.append({"role": "user", "content":
+                "## Correctness gate 2 (translate): RAISED\n\n"
+                "Your DSL exec passed but the deterministic translator could not "
+                "lower it. This is usually a malformed DSL pattern (unsupported "
+                "assignment shape, unknown DSL function, etc.).\n\n"
+                f"```\n{result['translate_error_text']}\n```\n\n"
+                f"### Last correct tiled_reference (use this as the base)\n\n"
+                f"```python\n{current_dsl}\n```"})
+            _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                            best_cycles=best_cycles, turn=turn, last_status="TRANSLATE_ERROR")
+            continue
+
+        if status == "IR_FAIL":
+            print(f"  IR_FAIL: {result['graph_correctness_text'].splitlines()[0]}")
+            _write(turn_dir / "status.txt", "IR_FAIL")
+            conversation.append({"role": "user", "content":
+                "## Correctness gate 3 (IR sim): FAIL\n\n"
+                "DSL exec passed and translation succeeded, but the lowered "
+                "graph's simulator output disagreed with gold. This generally "
+                "indicates a translator/lowering issue surfaced by your edit.\n\n"
+                f"```\n{result['graph_correctness_text']}\n```\n\n"
+                f"### Last correct tiled_reference (use this as the base)\n\n"
+                f"```python\n{current_dsl}\n```"})
+            _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
+                            best_cycles=best_cycles, turn=turn, last_status="IR_FAIL")
+            continue
+
+        if status == "TIMING_ERROR":
+            print(f"  TIMING_ERROR: {result['timing_error_text'].splitlines()[-2]}")
             _write(turn_dir / "status.txt", "TIMING_ERROR")
             conversation.append({"role": "user", "content":
-                f"## Timing model error\n\n```\n{err}\n```\n\n"
+                "## Timing model error\n\n"
+                f"```\n{result['timing_error_text']}\n```\n\n"
                 "Correctness passed but analyze_timing raised. This usually "
                 "means a knob is out of range."})
             _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
                             best_cycles=best_cycles, turn=turn, last_status="TIMING_ERROR")
             continue
 
+        # PASS path.
+        new_cycles = result["new_cycles"]
+        new_report = result["new_report"]
         _write(turn_dir / "timing.txt", new_report)
         delta = new_cycles - best_cycles
         tag = "NEW_BEST" if new_cycles < best_cycles else ("SAME" if new_cycles == best_cycles else "REGRESSION")
         _write(turn_dir / "status.txt", f"PASS {tag} cycles={new_cycles} delta={delta:+d}")
         print(f"  correctness=PASS cycles={new_cycles} ({tag}, Δ={delta:+d})")
 
-        current_code = proposal
+        current_dsl = proposal
         current_report = new_report
         if new_cycles < best_cycles:
             best_cycles = new_cycles
-            best_code = proposal
-            _write(ckpt_root / "best.py", best_code)
+            best_dsl = proposal
+            best_translated = result["translated_code"]
+            _write(ckpt_root / "best.py", best_dsl)
+            _write(ckpt_root / "best_translated.py", best_translated)
             _write(ckpt_root / "best_timing.txt", new_report)
 
-        # Feed the next prompt
         conversation.append({"role": "user", "content": build_autotune_user_prompt(
-            kernel_name, dims, current_code, current_report,
+            kernel_name, dims, current_dsl, current_report,
             baseline_cycles=baseline_cycles, best_cycles=best_cycles)})
         _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
                         best_cycles=best_cycles, turn=turn, last_status=tag)
@@ -806,8 +845,9 @@ async def run_autotune(
         "checkpoint_dir": str(ckpt_root),
     }
     _write(ckpt_root / "result.json", json.dumps(result, indent=2))
-    if best_code is not baseline_code:
-        _write(ckpt_root / "best.py", best_code)
+    if best_dsl is not baseline_dsl_code:
+        _write(ckpt_root / "best.py", best_dsl)
+        _write(ckpt_root / "best_translated.py", best_translated)
     print(f"\n[autotune] done — baseline={baseline_cycles} best={best_cycles} "
           f"speedup={result['speedup']:.2f}x" if result["speedup"] else "")
     return result
