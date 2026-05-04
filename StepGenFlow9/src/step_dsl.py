@@ -1,5 +1,16 @@
-"""
-STeP DSL
+"""STeP DSL.
+
+Each DSL function whose lowered STeP node carries a perf knob accepts that
+knob as a keyword-only argument with default 1:
+
+  - compute DSL calls (binary_*, unary_*, accum_*, binary_map_accum) accept
+    ``compute_bw=N``.
+  - off-chip DSL calls (offchip_load*, dyn_offchip_load, random_offchip_*,
+    offchip_store) accept ``par_dispatch=N``.
+
+The kwarg is asserted (>= 1) but otherwise inert at eager exec time —
+the deterministic translator (dsl_to_step.py) reads it back from the AST
+and forwards it to the STeP node constructor.
 """
 
 import math
@@ -37,7 +48,8 @@ class Buffered:
     def in_stream_shape(self):
         return tuple(self.tensor.shape[: -2 - self.buffer_rank])
 
-def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
+def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, par_dispatch=1):
+    assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
     R, C = underlying.shape[-2], underlying.shape[-1]
 
@@ -79,7 +91,8 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
     return result.unsqueeze(0)  # prepend leading 1
 
 
-def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col):
+def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, par_dispatch=1):
+    assert par_dispatch >= 1, f"dyn_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"dyn_offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
     )
@@ -92,7 +105,8 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col):
     return tiled.reshape(*tensor_shape_tiled, tile_row, tile_col).unsqueeze(0)
 
 
-def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False):
+def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, par_dispatch=1):
+    assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float32 or float16, got {underlying.dtype}"
     loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed)
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
@@ -167,7 +181,8 @@ def filter_last_tile(seq_len):
     return out.reshape(*stream_shape, max_seq, 2)
 
 
-def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False):
+def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False, par_dispatch=1):
+    assert par_dispatch >= 1, f"random_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
     )
@@ -217,7 +232,8 @@ def _assert_int(x, op_name):
     )
 
 
-def binary_matmul(a, b, weight_transposed=False):
+def binary_matmul(a, b, weight_transposed=False, compute_bw=1):
+    assert compute_bw >= 1, f"binary_matmul: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_matmul")
     _assert_float(b, "binary_matmul")
     _assert_stream_match(a, b, "binary_matmul")
@@ -226,28 +242,32 @@ def binary_matmul(a, b, weight_transposed=False):
     return torch.matmul(a, b)
 
 
-def binary_mul(a, b):
+def binary_mul(a, b, compute_bw=1):
+    assert compute_bw >= 1, f"binary_mul: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_mul")
     _assert_float(b, "binary_mul")
     _assert_stream_match(a, b, "binary_mul")
     return a * b
 
 
-def binary_add(a, b):
+def binary_add(a, b, compute_bw=1):
+    assert compute_bw >= 1, f"binary_add: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_add")
     _assert_float(b, "binary_add")
     _assert_stream_match(a, b, "binary_add")
     return a + b
 
 
-def binary_div(a, b):
+def binary_div(a, b, compute_bw=1):
+    assert compute_bw >= 1, f"binary_div: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_div")
     _assert_float(b, "binary_div")
     _assert_stream_match(a, b, "binary_div")
     return a / b
 
 
-def binary_is_equal(a, b):
+def binary_is_equal(a, b, compute_bw=1):
+    assert compute_bw >= 1, f"binary_is_equal: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_is_equal")
     _assert_float(b, "binary_is_equal")
     _assert_stream_match(a, b, "binary_is_equal")
@@ -273,7 +293,8 @@ class _OffsetTile:
         return self.data.dtype
 
 
-def binary_set_offset(a, b):
+def binary_set_offset(a, b, compute_bw=1):
+    assert compute_bw >= 1, f"binary_set_offset: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_set_offset")
     _assert_float(b, "binary_set_offset")
     _assert_stream_match(a, b, "binary_set_offset")
@@ -284,7 +305,8 @@ def binary_set_offset(a, b):
     return _OffsetTile(a, offsets)
 
 
-def binary_row_wise_append(a, b):
+def binary_row_wise_append(a, b, compute_bw=1):
+    assert compute_bw >= 1, f"binary_row_wise_append: compute_bw must be >= 1, got {compute_bw}"
     if isinstance(a, _OffsetTile):
         data = a.data
         offsets = a.offsets
@@ -311,12 +333,13 @@ def binary_row_wise_append(a, b):
     return result
 
 
-def binary_cache_write_addr_gen(idx, seq_len, row_offset):
+def binary_cache_write_addr_gen(idx, seq_len, row_offset, compute_bw=1):
     """Compute KV-cache write address: ``idx * row_offset + seq_len``.
 
     Mirrors step-perf/map_fn::cache_write_addr_gen. ``idx`` and ``seq_len`` are
     (*stream, 1, 1) scalar tiles; ``row_offset`` is a Python int.
     """
+    assert compute_bw >= 1, f"binary_cache_write_addr_gen: compute_bw must be >= 1, got {compute_bw}"
     assert idx.shape[-2:] == (1, 1), (
         f"binary_cache_write_addr_gen: idx tile shape must be (1,1), got {tuple(idx.shape[-2:])}"
     )
@@ -335,95 +358,112 @@ def binary_cache_write_addr_gen(idx, seq_len, row_offset):
 # Mirrors: _apply_unary (L443) from functional.py
 # ---------------------------------------------------------------------------
 
-def unary_silu(x):
+def unary_silu(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_silu: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_silu")
     return F.silu(x)
 
 
-def unary_square(x):
+def unary_square(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_square: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_square")
     return x ** 2
 
 
-def unary_exp(x):
+def unary_exp(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_exp: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_exp")
     return torch.exp(x)
 
 
-def unary_rsqrt(x):
+def unary_rsqrt(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_rsqrt: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_rsqrt")
     return torch.rsqrt(x)
 
 
-def unary_pow2(x):
+def unary_pow2(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_pow2: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_pow2")
     return torch.pow(2.0, x)
 
 
-def unary_mul_imm(x, constant):
+def unary_mul_imm(x, constant, compute_bw=1):
+    assert compute_bw >= 1, f"unary_mul_imm: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_mul_imm")
     assert constant != 0.0, "unary_mul_imm: constant must be nonzero."
     return x * constant
 
 
-def unary_add_imm(x, constant):
+def unary_add_imm(x, constant, compute_bw=1):
+    assert compute_bw >= 1, f"unary_add_imm: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_add_imm")
     return x + constant
 
 
-def unary_sub_imm(x, constant):
+def unary_sub_imm(x, constant, compute_bw=1):
+    assert compute_bw >= 1, f"unary_sub_imm: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_sub_imm")
     return x - constant
 
 
-def unary_rowwise_sum(x):
+def unary_rowwise_sum(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_rowwise_sum: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_rowwise_sum")
     return x.sum(dim=-1, keepdim=True)
 
 
-def unary_mask_row(x):
+def unary_mask_row(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_mask_row: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_mask_row")
     return torch.ones_like(x[..., :1])
 
 
-def unary_select_to_scalar(x):
+def unary_select_to_scalar(x, compute_bw=1):
+    assert compute_bw >= 1, f"unary_select_to_scalar: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_select_to_scalar")
     return x
 
 
-def unary_to_const_int(x, constant):
+def unary_to_const_int(x, constant, compute_bw=1):
+    assert compute_bw >= 1, f"unary_to_const_int: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "unary_to_const_int")
     return torch.full_like(x, constant, dtype=torch.float32)
 
-def accum_add(x, rank=1):
+def accum_add(x, rank=1, compute_bw=1):
+    assert compute_bw >= 1, f"accum_add: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "accum_add")
     assert rank > 0, f"accum_add: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.sum(dim=-3)
     return x
 
-def accum_mul(x, rank=1):
+def accum_mul(x, rank=1, compute_bw=1):
+    assert compute_bw >= 1, f"accum_mul: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "accum_mul")
     assert rank > 0, f"accum_mul: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.prod(dim=-3)
     return x
 
-def accum_max(x, rank=1):
+def accum_max(x, rank=1, compute_bw=1):
+    assert compute_bw >= 1, f"accum_max: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "accum_max")
     assert rank > 0, f"accum_max: rank must be > 0, got {rank}"
     for _ in range(rank):
         x = x.amax(dim=-3)
     return x
 
-def accum_retile_row(x, rank=1):
+def accum_retile_row(x, rank=1, compute_bw=1):
+    assert compute_bw >= 1, f"accum_retile_row: compute_bw must be >= 1, got {compute_bw}"
     assert rank > 0, f"accum_retile_row: rank must be > 0, got {rank}"
     for _ in range(rank):
         s = x.shape
         x = x.reshape(*s[:-3], s[-3] * s[-2], s[-1])
     return x
 
-def accum_retile_col(x, rank=1):
+def accum_retile_col(x, rank=1, compute_bw=1):
+    assert compute_bw >= 1, f"accum_retile_col: compute_bw must be >= 1, got {compute_bw}"
     assert rank > 0, f"accum_retile_col: rank must be > 0, got {rank}"
     for _ in range(rank):
         s = x.shape
@@ -436,7 +476,8 @@ def accum_retile_col(x, rank=1):
     return x
 
 
-def accum_signal_req_all_read(x, rank=1):
+def accum_signal_req_all_read(x, rank=1, compute_bw=1):
+    assert compute_bw >= 1, f"accum_signal_req_all_read: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(x, "accum_signal_req_all_read")
     assert rank > 0, f"accum_signal_req_all_read: rank must be > 0, got {rank}"
     stream_shape = x.shape[:-2 - rank]
@@ -746,7 +787,8 @@ def static_reassemble(inputs, target_stream_shape=None):
             result = result.reshape(target)
     return result
 
-def binary_map_accum(a, b, rank=1, weight_transposed=False):
+def binary_map_accum(a, b, rank=1, weight_transposed=False, compute_bw=1):
+    assert compute_bw >= 1, f"binary_map_accum: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_map_accum")
     _assert_float(b, "binary_map_accum")
     assert rank > 0, f"binary_map_accum: rank must be > 0, got {rank}"
@@ -759,7 +801,8 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False):
         mapped = mapped.sum(dim=-3)
     return mapped
 
-def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0):
+def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0, par_dispatch=1):
+    assert par_dispatch >= 1, f"random_offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_store: underlying dtype must be float32 or float16, got {underlying.dtype}"
     )
@@ -801,7 +844,8 @@ def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr
     return torch.ones(*stream_shape, 1, 1, dtype=torch.float32)
 
 
-def offchip_store(x):
+def offchip_store(x, par_dispatch=1):
+    assert par_dispatch >= 1, f"offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
     # Note: the Rust IR also has a DynOffChipStore whose runtime body is byte-for-byte
     # identical to OffChipStore — they only differ at construction (DynOffChipStore reads
     # tensor_shape_tiled from a JSON file at startup instead of taking it as a Vec<usize>).
