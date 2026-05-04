@@ -130,6 +130,18 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _build_success_result(iteration, total_tool_calls, inner, all_inner_results, tiled_code):
+    return {
+        "success": True,
+        "outer_iterations": iteration + 1,
+        "total_tool_calls": total_tool_calls,
+        "cycle_count": inner.get("cycle_count"),
+        "final_diagnosis": None,
+        "tiled_code": tiled_code,
+        "traces": [{"code": r.get("code"), "tool_outputs": r.get("tool_outputs", [])} for r in all_inner_results],
+    }
+
+
 def _load_autotune_progress(autotune_kernel_dir: Path) -> dict:
     """Read `progress.json` written by run_autotune, or return {} if absent.
 
@@ -1322,38 +1334,44 @@ async def _run_outer_iteration(
             break
 
     if translation_ok:
-        # Verify the final code actually works as a build_graph
+        # Verify the final code actually works as a build_graph. The
+        # try/except is scoped tightly around _run_graph_correctness — that
+        # call can legitimately raise on user code, but everything past it
+        # is harness logic; surfacing harness bugs loud is worth more than
+        # smoothing them into a kernel "fail".
         final_code = translated_code
         log(f"Translation pipeline completed — verifying final graph...")
         try:
             graph_result = _run_graph_correctness(final_code, kernel_name, dims, tensors)
-            if "match=True" in graph_result:
-                log(f"-> PASS (graph verified)")
-                print(f"{tag} SUCCESS")
-                result = _build_success_result(i, 0,
-                                               {"code": final_code, "tool_outputs": []},
-                                               [], lowered_code)
-                result["total_tokens"] = outer_total_tokens
-                if autotune_options is not None:
-                    log(f"{tag} starting autotune...")
-                    print(f"{tag} starting autotune...")
-                    result["autotune"] = await _run_outer_autotune(
-                        outer_dir=outer_dir,
-                        kernel_name=kernel_name,
-                        preset=preset,
-                        llm_config=llm_config,
-                        autotune_options=autotune_options,
-                        log=log,
-                        tag=tag,
-                    )
-                log_file.close()
-                return result
-            else:
-                log(f"-> FAIL: {graph_result.splitlines()[0]}")
-                translation_ok = False
         except Exception:
             err_msg = traceback.format_exc().splitlines()[-1]
             log(f"-> ERROR: {err_msg}")
+            translation_ok = False
+            graph_result = None
+
+        if graph_result is not None and "match=True" in graph_result:
+            log(f"-> PASS (graph verified)")
+            print(f"{tag} SUCCESS")
+            result = _build_success_result(i, 0,
+                                           {"code": final_code, "tool_outputs": []},
+                                           [], dsl_code)
+            result["total_tokens"] = outer_total_tokens
+            if autotune_options is not None:
+                log(f"{tag} starting autotune...")
+                print(f"{tag} starting autotune...")
+                result["autotune"] = await _run_outer_autotune(
+                    outer_dir=outer_dir,
+                    kernel_name=kernel_name,
+                    preset=preset,
+                    llm_config=llm_config,
+                    autotune_options=autotune_options,
+                    log=log,
+                    tag=tag,
+                )
+            log_file.close()
+            return result
+        elif graph_result is not None:
+            log(f"-> FAIL: {graph_result.splitlines()[0]}")
             translation_ok = False
 
     if not translation_ok:

@@ -223,24 +223,39 @@ def enhance_emulator_error(exc: Exception, user_code: str) -> str:
 
 # DSL scaffold: torch + step_dsl source injected into the exec'd namespace so
 # the LLM-emitted tiled_reference can call DSL ops without writing imports.
+# In bundle mode the orchestrator registers the bundle's abstraction.py as
+# ``sys.modules["step_dsl"]`` before this runs; we resolve the source from
+# whichever module is currently bound to that name so the bundle's vocabulary
+# (gated_mlp, linear, …) actually lands in the exec namespace, instead of the
+# standalone ops (offchip_load, binary_matmul, …) the system prompt doesn't
+# describe.
 _DSL_PY = Path(__file__).resolve().parent / "step_dsl.py"
-DSL_SCAFFOLD = (
-    "import torch\nimport torch.nn.functional as F\nimport math\n\n"
-    + _DSL_PY.read_text() + "\n"
-)
+_DSL_IMPORTS = "import torch\nimport torch.nn.functional as F\nimport math\n\n"
+
+
+def _build_dsl_scaffold() -> str:
+    step_dsl_mod = sys.modules.get("step_dsl")
+    src_path = (
+        Path(step_dsl_mod.__file__)
+        if step_dsl_mod is not None and getattr(step_dsl_mod, "__file__", None)
+        else _DSL_PY
+    )
+    return _DSL_IMPORTS + src_path.read_text() + "\n"
 
 
 def _exec_dsl_ref(code: str, dims: dict, tensors: dict) -> torch.Tensor:
     """Execute user code with DSL functions available. Returns the output tensor.
 
-    The DSL scaffold injects all step_dsl functions (offchip_load, binary_matmul,
-    etc.) into the execution namespace so the refactored code can call them directly.
-    In bundle mode the bundle's abstraction is mounted as ``step_dsl`` before this
-    runs; the same scaffold imports torch/F and prepends the abstraction's source.
+    The DSL scaffold injects the active step_dsl source — the standalone
+    ``src/step_dsl.py`` in normal runs, or the bundle's ``abstraction.py``
+    when bundle mode has registered it as ``sys.modules["step_dsl"]`` —
+    into the execution namespace so the refactored code can call DSL ops
+    directly without writing imports.
     """
-    scaffold_lines = DSL_SCAFFOLD.count("\n") + 1
+    scaffold = _build_dsl_scaffold()
+    scaffold_lines = scaffold.count("\n") + 1
     namespace = {}
-    exec(DSL_SCAFFOLD + "\n" + code, namespace)
+    exec(scaffold + "\n" + code, namespace)
     assert "tiled_reference" in namespace, "Code must define a tiled_reference function"
     try:
         result = namespace["tiled_reference"](dims, tensors)
