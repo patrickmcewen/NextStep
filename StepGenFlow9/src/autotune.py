@@ -46,7 +46,15 @@ from timing_and_emulator.timing import analyze_timing  # noqa: E402
 
 # Reuse the orchestrator's correctness checker so we verify identically to
 # the implementer pipeline.
-from src.orchestrator import _run_graph_correctness, _write, _extract_code, _reasoning_text  # noqa: E402
+from src.orchestrator import (  # noqa: E402
+    _run_dsl_correctness,
+    _run_graph_correctness,
+    _write,
+    _extract_code,
+    _reasoning_text,
+    _resolve_resume_dsl,
+)
+from src.dsl_to_step import translate  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +506,78 @@ def _format_rescaling(rescaling, max_total_compute_bw: int) -> str:
         lines.append(f"    {label:<40}  compute_bw: {old:>6} -> {new:>6}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _evaluate_dsl_turn(
+    dsl_code: str,
+    kernel_name: str,
+    dims: dict,
+    tensors: dict,
+    hw_config: dict,
+    max_total_compute_bw: int,
+) -> dict:
+    """Run the triple-gate (DSL -> translate -> IR) chain plus the timing model.
+
+    Each gate is independent; we short-circuit at the first failure so later
+    artifacts are absent in that case (which the caller relies on to choose
+    feedback for the next turn). Exceptions raised by the gate functions are
+    captured into the corresponding text field so the LLM gets a full
+    traceback rather than a bare status.
+    """
+    out = {
+        "status": None,
+        "dsl_correctness_text": None,
+        "translated_code": None,
+        "translate_error_text": None,
+        "graph_correctness_text": None,
+        "timing_error_text": None,
+        "new_cycles": None,
+        "new_report": None,
+    }
+
+    # Gate 1: DSL exec vs gold.
+    try:
+        dsl_text = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
+    except Exception:
+        dsl_text = "ERROR:\n" + traceback.format_exc()
+    out["dsl_correctness_text"] = dsl_text
+    if "match=True" not in dsl_text:
+        out["status"] = "DSL_FAIL"
+        return out
+
+    # Gate 2: deterministic translate.
+    try:
+        translated = translate(dsl_code)
+    except Exception:
+        out["translate_error_text"] = traceback.format_exc()
+        out["status"] = "TRANSLATE_ERROR"
+        return out
+    out["translated_code"] = translated
+
+    # Gate 3: IR sim vs gold.
+    try:
+        graph_text = _run_graph_correctness(translated, kernel_name, dims, tensors)
+    except Exception:
+        graph_text = "ERROR:\n" + traceback.format_exc()
+    out["graph_correctness_text"] = graph_text
+    if "match=True" not in graph_text:
+        out["status"] = "IR_FAIL"
+        return out
+
+    # Step 4: timing model on the translated graph.
+    try:
+        new_cycles, new_report = _measure(
+            translated, kernel_name, dims, tensors, hw_config, max_total_compute_bw,
+        )
+    except Exception:
+        out["timing_error_text"] = traceback.format_exc()
+        out["status"] = "TIMING_ERROR"
+        return out
+
+    out["new_cycles"] = new_cycles
+    out["new_report"] = new_report
+    out["status"] = "PASS"
+    return out
 
 
 def _measure(code: str, kernel_name: str, dims: dict, tensors: dict,
