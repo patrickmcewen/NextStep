@@ -78,7 +78,3 @@ targeting and which knob(s) / DSL call(s) you are changing, then a single
 ```python fenced block containing the full updated
 `tiled_reference(dims, tensors)` function. Do NOT include import statements
 — they are injected.
-
-If you believe the current DSL is already optimal given the constraints,
-say so and output the unchanged `tiled_reference` anyway so the loop can
-terminate.
