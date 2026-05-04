@@ -1,7 +1,12 @@
 """Deterministic translator: DSL-refactored ``tiled_reference`` -> STeP ``build_graph``.
 
 Replaces the LLM ``translate`` pass. Each DSL call in
-``StepGenFlow8/src/step_dsl.py`` maps to one STeP IR node construction.
+``StepGenFlow9/src/step_dsl.py`` maps to one STeP IR node construction.
+
+Perf-knob kwargs on the DSL surface (``compute_bw=N`` on compute calls,
+``par_dispatch=N`` on off-chip memory calls) are read off the AST and forwarded
+to the STeP node constructor. Missing kwargs default to 1, preserving
+byte-for-byte translator output for any DSL source that does not pass them.
 
 Public API:
     translate(dsl_code: str) -> str
@@ -529,15 +534,16 @@ class _State:
 
     def _rewrite_return(self, stmt):
         # Two supported forms at the end of tiled_reference:
-        #   return offchip_store(x)
-        #   return out                      (out was assigned earlier)
+        #   return offchip_store(x)               (with optional par_dispatch=N kwarg)
+        #   return out                            (out was assigned earlier)
         if (isinstance(stmt.value, ast.Call)
                 and isinstance(stmt.value.func, ast.Name)
                 and stmt.value.func.id == "offchip_store"):
             x = _src(stmt.value.args[0])
+            par_dispatch = _arg_or_default(stmt.value, 1, "par_dispatch", "1")
             store_var = self.fresh("store")
             return _block(
-                f"{store_var} = OffChipStore(graph, {x}, par_dispatch=1)\n"
+                f"{store_var} = OffChipStore(graph, {x}, par_dispatch={par_dispatch})\n"
                 f"graph = infer_broadcast(graph)\n"
                 f"return graph, {store_var}\n"
             )
@@ -559,11 +565,12 @@ def _h_offchip_load(state, target, call):
     tile_row   = _src(_arg(call, 3, "tile_row"))
     tile_col   = _src(_arg(call, 4, "tile_col"))
     transposed = _arg(call, 5, "transposed")
+    par_dispatch = _arg_or_default(call, 6, "par_dispatch", "1")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     return _block(
         f"{target} = LinearOffChipLoad({underlying}, stride={stride}, "
         f"out_shape_tiled={out_shape}, tile_row={tile_row}, tile_col={tile_col}, "
-        f"par_dispatch=1{extra})\n"
+        f"par_dispatch={par_dispatch}{extra})\n"
         f"graph.add_node({target})\n"
     )
 
@@ -576,26 +583,28 @@ def _h_offchip_load_ref(state, target, call):
     tile_row   = _src(_arg(call, 4, "tile_row"))
     tile_col   = _src(_arg(call, 5, "tile_col"))
     transposed = _arg(call, 6, "transposed")
+    par_dispatch = _arg_or_default(call, 7, "par_dispatch", "1")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     return _block(
         f"{target} = LinearOffChipLoadRef(graph, ref={ref}, "
         f"underlying={underlying}, stride={stride}, out_shape_tiled={out_shape}, "
-        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch=1{extra})\n"
+        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch={par_dispatch}{extra})\n"
     )
 
 
 def _h_random_offchip_load(state, target, call):
-    underlying    = _src(_arg(call, 0, "underlying"))
-    raddr         = _src(_arg(call, 1, "raddr"))
-    tile_row      = _src(_arg(call, 2, "tile_row"))
-    tile_col      = _src(_arg(call, 3, "tile_col"))
+    underlying     = _src(_arg(call, 0, "underlying"))
+    raddr          = _src(_arg(call, 1, "raddr"))
+    tile_row       = _src(_arg(call, 2, "tile_row"))
+    tile_col       = _src(_arg(call, 3, "tile_col"))
     base_addr_byte = _arg_or_default(call, 4, "base_addr_byte", "0")
-    transposed    = _arg(call, 5, "transposed")
+    transposed     = _arg(call, 5, "transposed")
+    par_dispatch   = _arg_or_default(call, 6, "par_dispatch", "1")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     return _block(
         f"{target} = RandomOffChipLoad(graph, underlying={underlying}, "
         f"raddr={raddr}, tile_row={tile_row}, tile_col={tile_col}, "
-        f"base_addr_byte={base_addr_byte}, par_dispatch=1{extra})\n"
+        f"base_addr_byte={base_addr_byte}, par_dispatch={par_dispatch}{extra})\n"
     )
 
 
@@ -637,10 +646,11 @@ def _h_binary_cache_write_addr_gen(state, target, call):
     idx        = _src(_arg(call, 0, "idx"))
     seq_len    = _src(_arg(call, 1, "seq_len"))
     row_offset = _src(_arg(call, 2, "row_offset"))
+    compute_bw = _arg_or_default(call, 3, "compute_bw", "1")
     return _block(
         f"{target} = BinaryMap(graph, {idx}, {seq_len}, "
         f"fn=map_fn.CacheWriteAddrGen(row_offset={row_offset}), "
-        f"write_back_mu=False)\n"
+        f"write_back_mu=False, compute_bw={compute_bw})\n"
     )
 
 
@@ -648,23 +658,25 @@ def _h_unary_mask_row(state, target, call):
     # MaskRow needs the input tile as a constructor argument so it can derive
     # the (row, 1) output shape; resolve it from the input stream at build time.
     x = _src(_arg(call, 0, "x"))
+    compute_bw = _arg_or_default(call, 1, "compute_bw", "1")
     return _block(
         f"{target} = UnaryMap(graph, {x}, "
         f"fn=map_fn.MaskRow(tile=_dsl2step_in_tile({x})), "
-        f"write_back_mu=False)\n"
+        f"write_back_mu=False, compute_bw={compute_bw})\n"
     )
 
 
 def _h_accum_signal_req_all_read(state, target, call):
     x    = _src(_arg(call, 0, "x"))
     rank = _arg_or_default(call, 1, "rank", "1")
+    compute_bw = _arg_or_default(call, 2, "compute_bw", "1")
     # SignalReqAllRead's output is fixed: Tile(uint64, (1, 1)).
     return _block(
         f"{target} = Accum(graph, {x}, "
         f"output_stream_dtype=Tile(tile_dtype=Uint64(), shape=(1, 1)), "
         f"fn=accum_fn.SignalReqAllRead(), "
         f"init_fn=Empty(shape=(1, 1), dtype=Uint64()), "
-        f"accum_rank={rank}, write_back_mu=False)\n"
+        f"accum_rank={rank}, write_back_mu=False, compute_bw={compute_bw})\n"
     )
 
 
@@ -712,12 +724,13 @@ def _h_dyn_offchip_load(state, target, call):
     tensor_shape_tiled = _src(_arg(call, 1, "tensor_shape_tiled"))
     tile_row = _src(_arg(call, 2, "tile_row"))
     tile_col = _src(_arg(call, 3, "tile_col"))
+    par_dispatch = _arg_or_default(call, 4, "par_dispatch", "1")
     return _block(
         f"{target} = DynLinearOffChipLoad("
         f"input_tensor_name={name_str!r}, "
         f"tensor_shape_tiled={tensor_shape_tiled}, "
         f"dtype={underlying}.dtype, "
-        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch=1)\n"
+        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch={par_dispatch})\n"
         f"graph.add_node({target})\n"
     )
 
@@ -747,11 +760,13 @@ def _make_binary_map(map_class):
             wt = _arg(call, 2, "weight_transposed")
             wt_s = f"weight_transposed={_src(wt)}" if wt is not None else ""
             fn_str = f"map_fn.Matmul({wt_s})"
+            compute_bw = _arg_or_default(call, 3, "compute_bw", "1")
         else:
             fn_str = f"map_fn.{map_class}()"
+            compute_bw = _arg_or_default(call, 2, "compute_bw", "1")
         return _block(
             f"{target} = BinaryMap(graph, {a}, {b}, fn={fn_str}, "
-            f"write_back_mu=False)\n"
+            f"write_back_mu=False, compute_bw={compute_bw})\n"
         )
     return handler
 
@@ -762,11 +777,13 @@ def _make_unary_map(map_class):
         if map_class in ("MulImmediate", "AddImmediate", "SubImmediate", "ToConstInt"):
             c = _src(_arg(call, 1, "constant"))
             fn_str = f"map_fn.{map_class}({c})"
+            compute_bw = _arg_or_default(call, 2, "compute_bw", "1")
         else:
             fn_str = f"map_fn.{map_class}()"
+            compute_bw = _arg_or_default(call, 1, "compute_bw", "1")
         return _block(
             f"{target} = UnaryMap(graph, {x}, fn={fn_str}, "
-            f"write_back_mu=False)\n"
+            f"write_back_mu=False, compute_bw={compute_bw})\n"
         )
     return handler
 
@@ -775,11 +792,12 @@ def _make_accum(accum_class, mode):
     def handler(state, target, call):
         x = _src(_arg(call, 0, "x"))
         rank = _arg_or_default(call, 1, "rank", "1")
+        compute_bw = _arg_or_default(call, 2, "compute_bw", "1")
         return _block(
             f"{target} = Accum(graph, {x}, "
             f"output_stream_dtype=_dsl2step_out_tile({x}, {mode!r}, {rank}), "
             f"fn=accum_fn.{accum_class}(), init_fn=_dsl2step_init({x}), "
-            f"accum_rank={rank}, write_back_mu=False)\n"
+            f"accum_rank={rank}, write_back_mu=False, compute_bw={compute_bw})\n"
         )
     return handler
 
@@ -790,10 +808,11 @@ def _h_binary_map_accum(state, target, call):
     rank = _arg_or_default(call, 2, "rank", "1")
     wt = _arg(call, 3, "weight_transposed")
     wt_s = f"weight_transposed={_src(wt)}" if wt is not None else ""
+    compute_bw = _arg_or_default(call, 4, "compute_bw", "1")
     return _block(
         f"{target} = BinaryMapAccum(graph, {a}, {b}, "
         f"fn=map_accum_fn.Matmul({wt_s}), init_fn=_dsl2step_init({a}), "
-        f"rank={rank}, write_back_mu=False)\n"
+        f"rank={rank}, write_back_mu=False, compute_bw={compute_bw})\n"
     )
 
 
@@ -907,7 +926,8 @@ def _h_flat_reassemble(state, target, call):
 
 def _h_offchip_store(state, target, call):
     x = _src(_arg(call, 0, "x"))
-    return _block(f"{target} = OffChipStore(graph, {x}, par_dispatch=1)\n")
+    par_dispatch = _arg_or_default(call, 1, "par_dispatch", "1")
+    return _block(f"{target} = OffChipStore(graph, {x}, par_dispatch={par_dispatch})\n")
 
 
 def _h_random_offchip_store(state, target, call):
@@ -917,10 +937,11 @@ def _h_random_offchip_store(state, target, call):
     tile_row       = _src(_arg(call, 3, "tile_row"))
     tile_col       = _src(_arg(call, 4, "tile_col"))
     base_addr_byte = _arg_or_default(call, 5, "base_addr_byte", "0")
+    par_dispatch   = _arg_or_default(call, 6, "par_dispatch", "1")
     return _block(
         f"{target} = RandomOffChipStore(graph, underlying={underlying}, "
         f"wdata={wdata}, waddr={waddr}, tile_row={tile_row}, "
-        f"tile_col={tile_col}, base_addr_byte={base_addr_byte}, par_dispatch=1)\n"
+        f"tile_col={tile_col}, base_addr_byte={base_addr_byte}, par_dispatch={par_dispatch})\n"
     )
 
 
