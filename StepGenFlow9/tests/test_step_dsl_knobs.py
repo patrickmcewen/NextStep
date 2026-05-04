@@ -68,3 +68,12 @@ def test_offchip_load_par_dispatch_zero_raises():
             tile_col=8,
             par_dispatch=0,
         )
+
+
+def test_binary_matmul_compute_bw_must_be_keyword():
+    a = torch.randn(2, 4, 4)
+    b = torch.randn(2, 4, 4)
+    with pytest.raises(TypeError):
+        # Passing 4 positional args (a, b, weight_transposed, compute_bw) should fail
+        # because compute_bw is keyword-only.
+        binary_matmul(a, b, False, 8)
