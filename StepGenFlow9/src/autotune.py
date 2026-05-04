@@ -54,7 +54,6 @@ from src.orchestrator import (  # noqa: E402
     _write,
     _extract_code,
     _reasoning_text,
-    _resolve_resume_dsl,
 )
 from src.dsl_to_step import translate  # noqa: E402
 
