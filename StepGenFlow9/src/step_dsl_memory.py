@@ -91,6 +91,61 @@ def tracker(mock_bf16: bool | None = None) -> _TrackerScope:
 
 
 # ---------------------------------------------------------------------------
+# Helpers — n_byte and shape extraction
+# ---------------------------------------------------------------------------
+
+
+_DTYPE_TO_NAME = {
+    torch.float32: "Float32",
+    torch.float16: "Float16",
+}
+
+
+def _n_byte_for_name(name: str, mock_bf16: bool) -> int:
+    """ops.py-style n_byte by IR datatype class name. Authoritative table."""
+    if name == "Float16":
+        return 2
+    if name == "Float32":
+        return 2 if mock_bf16 else 4
+    if name == "Uint64":
+        return 8
+    raise AssertionError(f"_n_byte_for_name: unsupported dtype name {name!r}")
+
+
+def _n_byte(torch_dtype, mock_bf16: bool) -> int:
+    name = _DTYPE_TO_NAME.get(torch_dtype)
+    assert name is not None, (
+        f"_n_byte: unsupported torch dtype {torch_dtype}; "
+        "DSL only allows float32/float16 inputs"
+    )
+    return _n_byte_for_name(name, mock_bf16)
+
+
+def _tile_shape(t) -> tuple:
+    assert t.ndim >= 2, f"_tile_shape: tensor must have >= 2 dims, got {tuple(t.shape)}"
+    return (int(t.shape[-2]), int(t.shape[-1]))
+
+
+def _tile_bytes(t, mock_bf16: bool) -> int:
+    tr, tc = _tile_shape(t)
+    return tr * tc * _n_byte(t.dtype, mock_bf16)
+
+
+def _stream_total_elements(t) -> int:
+    """prod(tensor.shape[:-2]); equals 1 for a bare tile."""
+    assert t.ndim >= 2
+    n = 1
+    for d in t.shape[:-2]:
+        n *= int(d)
+    return n
+
+
+def _stream_dtype_size_bytes(t, mock_bf16: bool) -> int:
+    """Mirror ops.py: stream.stream_dtype.size_in_bytes() for a Tile dtype."""
+    return _tile_bytes(t, mock_bf16)
+
+
+# ---------------------------------------------------------------------------
 # Per-op metric registry
 # ---------------------------------------------------------------------------
 #
