@@ -178,3 +178,52 @@ def test_harness_imports_cleanly():
     assert callable(_assert_parity)
     # step_py.ops should be importable thanks to the sys.path edit.
     import step_py.ops  # noqa: F401
+
+
+def test_parity_offchip_load_then_store():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    return offchip_store(a)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)  # 2 tiles of 4x4
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_dyn_offchip_load_then_store():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = dyn_offchip_load(tensors["A"], tensor_shape_tiled=(2,),
+                         tile_row=4, tile_col=4)
+    return offchip_store(a)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_offchip_load_ref():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=1, tile_col=4)
+    b = offchip_load_ref(a, tensors["B"], stride=(0,), out_shape_tiled=(1,),
+                         tile_row=4, tile_col=4)
+    return offchip_store(b)
+'''
+    A = torch.randn(2, 4, dtype=torch.float32)
+    B = torch.randn(4, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A, "B": B})
+
+
+def test_parity_random_offchip_load():
+    src = '''
+def tiled_reference(dims, tensors):
+    addr = offchip_load(tensors["addr"], stride=(1,), out_shape_tiled=(2,),
+                        tile_row=1, tile_col=1)
+    a = random_offchip_load(tensors["A"], addr, tile_row=4, tile_col=4)
+    return offchip_store(a)
+'''
+    addr = torch.zeros(2, 1, dtype=torch.float32)
+    A = torch.randn(8, 8, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"addr": addr, "A": A})

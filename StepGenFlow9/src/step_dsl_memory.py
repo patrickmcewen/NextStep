@@ -212,6 +212,41 @@ def _safe_output_shape(out: Any) -> tuple:
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — off-chip load/store family
+# ---------------------------------------------------------------------------
+
+
+def _metrics_offchip_load_like(args, kwargs, output, mock_bf16):
+    """LinearOffChipLoad / LinearOffChipLoadRef / DynLinearOffChipLoad /
+    RandomOffChipLoad share one formula:
+
+      off_chip = stream.total_elements * tile_r * tile_c * n_byte
+      on_chip  = tile_r * tile_c * n_byte   (both count_fifos modes)
+    """
+    tile_bytes = _tile_bytes(output, mock_bf16)
+    n_stream = _stream_total_elements(output)
+    extra = {"tile_shape": _tile_shape(output)}
+    return n_stream * tile_bytes, tile_bytes, tile_bytes, extra
+
+
+def _metrics_offchip_store(args, kwargs, output, mock_bf16):
+    """OffChipStore: same formula as load, computed from the *input* stream
+    (the data being written), not the flattened 2D output."""
+    inp = args[0]
+    tile_bytes = _tile_bytes(inp, mock_bf16)
+    n_stream = _stream_total_elements(inp)
+    extra = {"tile_shape": _tile_shape(inp)}
+    return n_stream * tile_bytes, tile_bytes, tile_bytes, extra
+
+
+METRIC_FNS["offchip_load"]        = _metrics_offchip_load_like
+METRIC_FNS["offchip_load_ref"]    = _metrics_offchip_load_like
+METRIC_FNS["dyn_offchip_load"]    = _metrics_offchip_load_like
+METRIC_FNS["random_offchip_load"] = _metrics_offchip_load_like
+METRIC_FNS["offchip_store"]       = _metrics_offchip_store
+
+
 for _name in step_dsl.DSL_FUNCTIONS:
     assert hasattr(step_dsl, _name), f"step_dsl missing function listed in DSL_FUNCTIONS: {_name}"
     globals()[_name] = _make_wrapper(_name, getattr(step_dsl, _name))
