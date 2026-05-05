@@ -109,3 +109,72 @@ def test_stream_dtype_size_bytes_uses_output_tile():
     a = torch.randn(1, 8, 16, dtype=torch.float16)
     # tile = (8, 16); n_byte = 2
     assert sdm._stream_dtype_size_bytes(a, mock_bf16=True) == 8 * 16 * 2
+
+
+# ---------------------------------------------------------------------------
+# IR-parity validation harness (Task 3)
+# ---------------------------------------------------------------------------
+import sys
+from pathlib import Path
+
+import pytest
+
+# Add step_tl to sys.path so step_py.* imports work in the test process.
+# (src/tools.py also does this at import time, but be explicit here so the
+# harness is self-contained when run standalone.)
+_DEIO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_DEIO_ROOT / "step_tl" / "src"))
+
+from src import step_dsl  # noqa: E402  (after sys.path edit)
+from src.dsl_to_step import translate  # noqa: E402
+from src.tools import _exec_build_graph  # noqa: E402
+
+
+def _ir_totals(dsl_src: str, dims: dict, tensors: dict) -> tuple[int, int, int]:
+    """Translate dsl_src to IR, build the graph, sum per-node memory metrics."""
+    translated = translate(dsl_src)
+    graph, _output_op = _exec_build_graph(translated, dims, tensors)
+    off = 0
+    on = 0
+    on_fifo = 0
+    for node in graph.nodes():
+        off += int(node.off_chip_traffic())
+        on += int(node.on_chip_requirement(count_fifos=False))
+        on_fifo += int(node.on_chip_requirement(count_fifos=True))
+    return off, on, on_fifo
+
+
+def _shim_totals(dsl_src: str, dims: dict, tensors: dict) -> tuple[int, int, int]:
+    """Run dsl_src against step_dsl_memory under a fresh tracker; return totals.
+
+    Uses mock_bf16=False so the shim agrees with the IR side, which always
+    constructs ops without mock_bf16 (translator does not forward the kwarg).
+    """
+    namespace: dict = {}
+    exec("import torch\nimport torch.nn.functional as F\nimport math\n", namespace)
+    namespace.update({n: getattr(sdm, n) for n in step_dsl.DSL_FUNCTIONS})
+    namespace["Buffered"] = sdm.Buffered
+    exec(dsl_src, namespace)
+    fn = namespace["tiled_reference"]
+    with sdm.tracker(mock_bf16=False) as t:
+        fn(dims, tensors)
+    return t.total_off_chip, t.total_on_chip, t.total_on_chip_fifo
+
+
+def _assert_parity(dsl_src: str, dims: dict, tensors: dict):
+    ir = _ir_totals(dsl_src, dims, tensors)
+    shim = _shim_totals(dsl_src, dims, tensors)
+    assert shim == ir, (
+        f"shim totals != IR totals\n"
+        f"  shim (off, on, on_fifo) = {shim}\n"
+        f"  ir   (off, on, on_fifo) = {ir}"
+    )
+
+
+def test_harness_imports_cleanly():
+    """Smoke test: harness loads, helper functions are wired, sys.path edit works."""
+    assert callable(_ir_totals)
+    assert callable(_shim_totals)
+    assert callable(_assert_parity)
+    # step_py.ops should be importable thanks to the sys.path edit.
+    import step_py.ops  # noqa: F401
