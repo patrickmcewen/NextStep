@@ -92,3 +92,7 @@ dependencies:
       - typing-inspection==0.4.2
       - urllib3==2.6.3
       - uvicorn==0.44.0
+      - matplotlib==3.10.9
+      - pandas==3.0.2
+      - pymongo==4.17.0
+      - pygraphviz==1.14
