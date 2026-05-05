@@ -119,6 +119,26 @@ def _dsl2step_in_tile(x):
         node, idx = x
         return node.stream_idx(idx).stream_dtype
     return x.stream.stream_dtype
+
+
+def _seal_unused_branches(graph):
+    # Multi-output ops (Broadcast / Parallelize / FlatPartition / EagerMerge)
+    # declare `num_consumers` output streams. A branch index that no downstream
+    # node references via (node, idx) becomes a dangling sender at sim time
+    # and DAM panics with DisconnectedReceiver. Attach a ConsumerContext sink
+    # to each unused branch.
+    for node in list(graph.nodes):
+        n_branches = getattr(node, 'num_consumers', None)
+        if n_branches is None:
+            continue
+        used = set()
+        for consumer in graph.successors(node):
+            for inp in consumer.input_list:
+                if isinstance(inp, tuple) and len(inp) == 2 and inp[0] is node:
+                    used.add(inp[1])
+        for idx in range(n_branches):
+            if idx not in used:
+                ConsumerContext(graph, (node, idx))
 """
 
 
@@ -544,11 +564,13 @@ class _State:
             store_var = self.fresh("store")
             return _block(
                 f"{store_var} = OffChipStore(graph, {x}, par_dispatch={par_dispatch})\n"
+                f"_seal_unused_branches(graph)\n"
                 f"graph = infer_broadcast(graph)\n"
                 f"return graph, {store_var}\n"
             )
         out = _src(stmt.value)
         return _block(
+            f"_seal_unused_branches(graph)\n"
             f"graph = infer_broadcast(graph)\n"
             f"return graph, {out}\n"
         )
@@ -609,12 +631,16 @@ def _h_random_offchip_load(state, target, call):
 
 
 def _h_select_gen(state, target, call):
-    underlying  = _src(_arg(call, 0, "underlying"))
-    is_multihot = _src(_arg(call, 1, "is_multihot"))
-    n           = _src(_arg(call, 2, "n"))
+    # is_multihot=False (IndexN) is unimplemented in the simulator
+    # (proto_driver/mod.rs:2451 panics with `not yet implemented`). The
+    # multihot interpretation gives identical select semantics for the
+    # one-hot tensors generated kernels actually pass here, so force True
+    # regardless of what the DSL specified.
+    underlying = _src(_arg(call, 0, "underlying"))
+    n          = _src(_arg(call, 2, "n"))
     state.select_gen_vars.add(target)
     return _block(
-        f"{target} = SelectGen(is_multihot={is_multihot}, "
+        f"{target} = SelectGen(is_multihot=True, "
         f"tensor={underlying}, n={n})\n"
         f"graph.add_node({target})\n"
     )

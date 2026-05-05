@@ -369,6 +369,7 @@ def _precompute_moe_expert_single(dims):
 # MoE routed — routing metadata computed here
 # ---------------------------------------------------------------------------
 
+@register("generated_moe")
 @register("moe_routed")
 def _precompute_moe_routed(dims):
     B = dims["B"]

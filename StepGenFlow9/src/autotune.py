@@ -13,6 +13,8 @@ tile_row / tile_col, par_dispatch, compute_bw, write_back_mu, and the
 choice of buffering / broadcast / retile DSL ops.
 """
 
+import contextlib
+import io
 import json
 import re
 import sys
@@ -496,6 +498,37 @@ def _format_rescaling(rescaling, max_total_compute_bw: int) -> str:
     return "\n".join(lines)
 
 
+# Mirror src/orchestrator.py's MAX_LINES tail cap so long shape traces don't
+# blow out the context window when surfaced to the LLM after a DSL failure.
+_SHAPE_TRACE_MAX_LINES = 200
+
+
+def _format_shape_trace_block(trace: str) -> str:
+    """Return a ```-fenced shape-trace section for the LLM, or '' if no trace.
+
+    Tail-trims to the last `_SHAPE_TRACE_MAX_LINES` lines: when the run
+    errored, the lines just before the failing op are the most informative.
+    """
+    if not trace:
+        return ""
+    lines = trace.splitlines()
+    if len(lines) > _SHAPE_TRACE_MAX_LINES:
+        body = (f"... ({len(lines) - _SHAPE_TRACE_MAX_LINES} earlier lines elided) ...\n"
+                + "\n".join(lines[-_SHAPE_TRACE_MAX_LINES:]))
+    else:
+        body = "\n".join(lines)
+    return (
+        "\n\n## STeP DSL shape trace\n"
+        "Each line shows the input or output shape(s) of a step_dsl op call, "
+        "in execution order. `stream(...)×tile(R,C)` means the tensor's "
+        "stream shape is `(...)` and its tile shape is `(R,C)`. Use this to "
+        "verify shape invariants (binary ops require identical stream "
+        "shapes); when the run errored, the trace ends just before the "
+        "failing op.\n"
+        "```\n" + body + "\n```"
+    )
+
+
 def _evaluate_dsl_turn(
     dsl_code: str,
     kernel_name: str,
@@ -515,20 +548,28 @@ def _evaluate_dsl_turn(
     out = {
         "status": None,
         "dsl_correctness_text": None,
+        "dsl_shape_trace": "",
         "translated_code": None,
         "translate_error_text": None,
         "graph_correctness_text": None,
         "timing_error_text": None,
         "new_cycles": None,
         "new_report": None,
+        "new_verbose_report": None,
     }
 
-    # Gate 1: DSL exec vs gold.
+    # Gate 1: DSL exec vs gold. step_dsl ops print per-op shapes when
+    # STEP_DSL_TRACE=1 (set by the orchestrator on import); capture them
+    # so the trace can be surfaced to the LLM on failure instead of
+    # leaking to the autotuner's stdout.
+    _trace_buf = io.StringIO()
     try:
-        dsl_text = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
+        with contextlib.redirect_stdout(_trace_buf):
+            dsl_text = _run_dsl_correctness(dsl_code, kernel_name, dims, tensors)
     except Exception:
         dsl_text = "ERROR:\n" + traceback.format_exc()
     out["dsl_correctness_text"] = dsl_text
+    out["dsl_shape_trace"] = _trace_buf.getvalue()
     if "match=True" not in dsl_text:
         out["status"] = "DSL_FAIL"
         return out
@@ -554,7 +595,7 @@ def _evaluate_dsl_turn(
 
     # Step 4: timing model on the translated graph.
     try:
-        new_cycles, new_report = _measure(
+        new_cycles, new_report, new_verbose_report = _measure(
             translated, kernel_name, dims, tensors, hw_config, max_total_compute_bw,
         )
     except Exception:
@@ -564,30 +605,33 @@ def _evaluate_dsl_turn(
 
     out["new_cycles"] = new_cycles
     out["new_report"] = new_report
+    out["new_verbose_report"] = new_verbose_report
     out["status"] = "PASS"
     return out
 
 
 def _measure(code: str, kernel_name: str, dims: dict, tensors: dict,
-             hw_config: dict, max_total_compute_bw: int) -> tuple[int, str]:
-    """Run the analytical timing model on `code`. Returns (total_cycles, report).
+             hw_config: dict, max_total_compute_bw: int) -> tuple[int, str, str]:
+    """Run the analytical timing model on `code`.
 
-    Before timing, every compute op's `compute_bw` is rescaled so the sum
-    equals `max_total_compute_bw` (see `_normalize_compute_bw`). The
-    timing report begins with a summary of that rescaling so the agent
-    sees the post-scaled values.
+    Returns ``(total_cycles, llm_report, verbose_report)``:
+      * ``llm_report`` is the short text fed back to the model — currently
+        just the compute_bw rescaling summary.
+      * ``verbose_report`` is the full per-node timing/memory/critical-path
+        breakdown, for offline inspection only. Callers write it to a
+        ``verbose_timing.txt`` artifact and never put it in the prompt.
 
-    Callers are expected to have already verified correctness of `code`.
+    Before timing, every compute op's ``compute_bw`` is rescaled so the
+    sum equals ``max_total_compute_bw`` (see ``_normalize_compute_bw``).
+    Callers are expected to have already verified correctness of ``code``.
     """
     graph, _out = _exec_build_graph(code, dims, tensors)
     rescaling = _normalize_compute_bw(graph, max_total_compute_bw)
     result = analyze_timing(graph, hw_config=hw_config)
     total = _sym_to_int(result["total_cycles"])
-    report = ""#_build_verbose_report(graph, result, hw_config)
-    prefix = _format_rescaling(rescaling, max_total_compute_bw)
-    if prefix:
-        report = prefix + report
-    return total, report
+    verbose_report = _build_verbose_report(graph, result, hw_config)
+    llm_report = _format_rescaling(rescaling, max_total_compute_bw)
+    return total, llm_report, verbose_report
 
 
 def _write_progress(ckpt_root: Path, *, baseline_cycles: int, best_cycles: int,
@@ -658,6 +702,7 @@ async def run_autotune(
         f"Baseline DSL from {baseline_src} did not pass all gates: "
         f"status={eval_baseline['status']}\n\n"
         f"DSL correctness:\n{eval_baseline['dsl_correctness_text']}\n\n"
+        f"DSL shape trace:\n{eval_baseline['dsl_shape_trace']}\n\n"
         f"Translate error:\n{eval_baseline['translate_error_text']}\n\n"
         f"Graph correctness:\n{eval_baseline['graph_correctness_text']}\n\n"
         f"Timing error:\n{eval_baseline['timing_error_text']}"
@@ -665,6 +710,7 @@ async def run_autotune(
     baseline_translated = eval_baseline["translated_code"]
     baseline_cycles = eval_baseline["new_cycles"]
     baseline_report = eval_baseline["new_report"]
+    baseline_verbose_report = eval_baseline["new_verbose_report"]
     print(f"Baseline total_cycles = {baseline_cycles}")
 
     # Merge hw_config + constraints for the system prompt's {hw_constraints} block.
@@ -694,6 +740,7 @@ async def run_autotune(
     _write(ckpt_root / "baseline_dsl.py", baseline_dsl_code)
     _write(ckpt_root / "baseline_translated.py", baseline_translated)
     _write(ckpt_root / "baseline_timing.txt", baseline_report)
+    _write(ckpt_root / "baseline_verbose_timing.txt", baseline_verbose_report)
 
     best_dsl = baseline_dsl_code
     best_translated = baseline_translated
@@ -741,6 +788,8 @@ async def run_autotune(
         # written iff its corresponding text was populated.
         if result["dsl_correctness_text"] is not None:
             _write(turn_dir / "dsl_correctness_result.txt", result["dsl_correctness_text"])
+        if result["dsl_shape_trace"]:
+            _write(turn_dir / "shape_trace.txt", result["dsl_shape_trace"])
         if result["translated_code"] is not None:
             _write(turn_dir / "translated_code.py", result["translated_code"])
         if result["translate_error_text"] is not None:
@@ -758,8 +807,9 @@ async def run_autotune(
             conversation.append({"role": "user", "content":
                 "## Correctness gate 1 (DSL exec): FAIL\n\n"
                 "Your proposal's DSL eager exec disagreed with gold.\n\n"
-                f"```\n{result['dsl_correctness_text']}\n```\n\n"
-                f"### Last correct tiled_reference (use this as the base)\n\n"
+                f"```\n{result['dsl_correctness_text']}\n```"
+                + _format_shape_trace_block(result["dsl_shape_trace"])
+                + f"\n\n### Last correct tiled_reference (use this as the base)\n\n"
                 f"```python\n{current_dsl}\n```"})
             _write_progress(ckpt_root, baseline_cycles=baseline_cycles,
                             best_cycles=best_cycles, turn=turn, last_status="DSL_FAIL")
@@ -810,7 +860,9 @@ async def run_autotune(
         # PASS path.
         new_cycles = result["new_cycles"]
         new_report = result["new_report"]
+        new_verbose_report = result["new_verbose_report"]
         _write(turn_dir / "timing.txt", new_report)
+        _write(turn_dir / "verbose_timing.txt", new_verbose_report)
         delta = new_cycles - best_cycles
         tag = "NEW_BEST" if new_cycles < best_cycles else ("SAME" if new_cycles == best_cycles else "REGRESSION")
         _write(turn_dir / "status.txt", f"PASS {tag} cycles={new_cycles} delta={delta:+d}")
@@ -825,6 +877,7 @@ async def run_autotune(
             _write(ckpt_root / "best.py", best_dsl)
             _write(ckpt_root / "best_translated.py", best_translated)
             _write(ckpt_root / "best_timing.txt", new_report)
+            _write(ckpt_root / "best_verbose_timing.txt", new_verbose_report)
 
         conversation.append({"role": "user", "content": build_autotune_user_prompt(
             kernel_name, dims, current_dsl, current_report,

@@ -10,6 +10,7 @@ Usage:
     python evaluate.py --list                      # list available kernels + presets
 """
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -21,6 +22,7 @@ import numpy as np
 import torch
 
 from loader import load_config, get_dims, list_kernels, list_presets, load_problem, load_step_impl
+from precompute import precompute_tensors
 
 
 STEP_TL_SRC = str(Path(__file__).resolve().parent.parent / "step_tl" / "src")
@@ -159,7 +161,11 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     from sim import serialize, SimConfig, HBMConfig
     from utils.gold_checking import reconstruct_numpy
 
-    graph, output_op = build_graph(dims)
+    if "tensors" in inspect.signature(build_graph).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        graph, output_op = build_graph(dims, tensors)
+    else:
+        graph, output_op = build_graph(dims)
 
     os.chdir(work_dir)
     pb_path = os.path.join(os.getcwd(), "graph.pb")

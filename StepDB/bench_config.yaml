@@ -841,6 +841,27 @@ moe_routed:
       tile_n: 32
       tile_f: 256
   origin: seed
+generated_moe:
+  problem: seed_kernels/mlp/generated_moe/reference.py
+  step_impl: seed_kernels/mlp/generated_moe/step_impl.py
+  params:
+  - B
+  - D
+  - F
+  - n_experts
+  - n_active
+  - tile_n
+  - tile_f
+  presets:
+    large_d1k:
+        B: 64
+        D: 1024
+        F: 2048
+        n_experts: 8
+        n_active: 2
+        tile_n: 1
+        tile_f: 256
+  origin: seed
 vector_reduce_sum:
   problem: seed_kernels/reductions/vector_reduce_sum/reference.py
   step_impl: seed_kernels/reductions/vector_reduce_sum/step_impl.py
@@ -2024,4 +2045,33 @@ streamify_repeat_outer:
       R: 5
       tile_m: 32
       tile_k: 32
+  origin: seed
+parallelize_observe:
+  problem: seed_kernels/language_primitives/parallelize_observe/reference.py
+  step_impl: seed_kernels/language_primitives/parallelize_observe/step_impl.py
+  params:
+  - B
+  - K
+  - tile_m
+  - tile_k
+  - par_factor
+  presets:
+    tiny:
+      B: 8
+      K: 2
+      tile_m: 4
+      tile_k: 4
+      par_factor: 2
+    small:
+      B: 16
+      K: 4
+      tile_m: 8
+      tile_k: 8
+      par_factor: 4
+    mixtral_like:
+      B: 64
+      K: 8
+      tile_m: 16
+      tile_k: 16
+      par_factor: 4
   origin: seed

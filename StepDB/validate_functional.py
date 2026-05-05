@@ -7,6 +7,7 @@ Usage:
     python validate_functional.py --all               # all seed kernels, every preset
 """
 import argparse
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,9 @@ STEP_TL_PROTO = str(Path(__file__).resolve().parent.parent / "step_tl" / "src" /
 
 sys.path.insert(0, STEP_TL_SRC)
 sys.path.insert(0, STEP_TL_PROTO)
+sys.path.insert(0, STEPDB_DIR)
+
+from precompute import precompute_tensors
 
 # Imports prepended to step_impl code (mirrors validate_timing.py)
 IMPORT_SCAFFOLD = """\
@@ -131,7 +135,12 @@ def build_graph_from_impl(kernel_name, dims, config):
     namespace = {}
     exec(full_code, namespace)
     assert "build_graph" in namespace, f"build_graph not found in {impl_path}"
-    graph, output_op = namespace["build_graph"](dims)
+    build_graph_fn = namespace["build_graph"]
+    if "tensors" in inspect.signature(build_graph_fn).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        graph, output_op = build_graph_fn(dims, tensors)
+    else:
+        graph, output_op = build_graph_fn(dims)
     return graph, output_op
 
 

@@ -55,14 +55,9 @@ Budget rules:
 ## Performance model
 
 You will receive, after each proposal, a breakdown from the analytical
-timing model below. Read it. It tells you `total_cycles`, per-node start
+timing model below. It tells you `total_cycles`, per-node start
 and end times, OCI (output cycle interval — cycles between produced
-tiles), and OTI (per-element rate). The node with the highest `end` is
-the current bottleneck. Focus your next change on relieving that
-bottleneck; do not globally rewrite. Per-node names in the report
-correspond to STeP IR node classes (e.g. BinaryMap, UnaryMap, Accum,
-LinearOffChipLoad) — map them back to your DSL calls via the function
-names listed in step_dsl.py.
+tiles), and OTI (per-element rate).
 
 For reference, this is the full source of the timing model — study it to
 understand exactly how each knob affects total_cycles:

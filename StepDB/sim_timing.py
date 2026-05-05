@@ -13,6 +13,7 @@ Usage:
     python sim_timing.py --all                    # everything
 """
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -31,6 +32,7 @@ import sympy
 
 from loader import load_config, get_dims, list_kernels, list_presets, load_problem, load_step_impl
 from evaluate import IMPORT_SCAFFOLD, _strip_imports, STEP_TL_SRC, STEP_TL_PROTO, SIM_TIMEOUT_SECONDS
+from precompute import precompute_tensors
 
 
 MONGO_URI = "mongodb://127.0.0.1:27017"
@@ -58,9 +60,14 @@ def build_graph(kernel_name: str, preset: str):
     full_code = IMPORT_SCAFFOLD + step_code#_strip_imports(step_code)
     namespace = {}
     exec(full_code, namespace)
-    assert namespace.get("build_graph") is not None, "step_impl.py does not define build_graph"
+    build_graph_fn = namespace.get("build_graph")
+    assert build_graph_fn is not None, "step_impl.py does not define build_graph"
 
-    graph, output_op = namespace["build_graph"](dims)
+    if "tensors" in inspect.signature(build_graph_fn).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        graph, output_op = build_graph_fn(dims, tensors)
+    else:
+        graph, output_op = build_graph_fn(dims)
     return graph, output_op, dims
 
 

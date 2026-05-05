@@ -1,3 +1,6 @@
 [submodule "step_tl"]
 	path = step_tl
 	url = https://github.com/stanford-ppl/step_tl.git
+[submodule "elasticy"]
+	path = elasticy
+	url = https://github.com/const-antin/elasticy.git

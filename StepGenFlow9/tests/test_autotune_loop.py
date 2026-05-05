@@ -28,7 +28,7 @@ def stub_gates(monkeypatch):
         "translate_raises": False,
         "graph_correctness": "match=True",
         "measure_raises": False,
-        "measure_result": (1234, "TIMING REPORT"),
+        "measure_result": (1234, "TIMING REPORT", "VERBOSE TIMING REPORT"),
     }
 
     def fake_dsl(code, kernel_name, dims, tensors):
@@ -73,12 +73,67 @@ def test_clean_pass_status_and_artifacts(stub_gates):
     out = _evaluate()
     assert out["status"] == "PASS"
     assert out["dsl_correctness_text"] == "match=True"
+    assert out["dsl_shape_trace"] == ""
     assert out["translated_code"].startswith("TRANSLATED:")
     assert out["graph_correctness_text"] == "match=True"
     assert out["new_cycles"] == 1234
     assert out["new_report"] == "TIMING REPORT"
+    assert out["new_verbose_report"] == "VERBOSE TIMING REPORT"
     assert out["translate_error_text"] is None
     assert out["timing_error_text"] is None
+
+
+def test_gate1_stdout_is_captured_into_shape_trace(stub_gates, monkeypatch, capsys):
+    """Anything gate 1 prints (e.g. step_dsl shape lines under STEP_DSL_TRACE=1)
+    must end up in `dsl_shape_trace` and NOT leak to the autotuner's stdout."""
+    def noisy_dsl(code, kernel_name, dims, tensors):
+        print("[step_dsl] binary_matmul input shape(s): a=stream(64,)×tile(1,1024)")
+        print("[step_dsl] binary_matmul output shape(s): stream(64,)×tile(1,1024)")
+        return "match=True"
+
+    monkeypatch.setattr(autotune_mod, "_run_dsl_correctness", noisy_dsl)
+
+    out = _evaluate()
+    assert out["status"] == "PASS"
+    assert "[step_dsl] binary_matmul input shape(s)" in out["dsl_shape_trace"]
+    assert "[step_dsl] binary_matmul output shape(s)" in out["dsl_shape_trace"]
+    captured = capsys.readouterr()
+    assert "[step_dsl]" not in captured.out
+
+
+def test_dsl_fail_captures_shape_trace_for_llm_feedback(stub_gates, monkeypatch):
+    """On gate 1 failure, the captured trace must be present in the result so
+    the controller can surface it to the LLM alongside the mismatch."""
+    def noisy_failing_dsl(code, kernel_name, dims, tensors):
+        print("[step_dsl] binary_matmul input shape(s): a=stream(64,)×tile(1,1024)")
+        return "match=False mismatch=...sample..."
+
+    monkeypatch.setattr(autotune_mod, "_run_dsl_correctness", noisy_failing_dsl)
+
+    out = _evaluate()
+    assert out["status"] == "DSL_FAIL"
+    assert out["dsl_shape_trace"].startswith("[step_dsl] binary_matmul")
+
+
+def test_format_shape_trace_block_empty_returns_empty_string():
+    assert autotune_mod._format_shape_trace_block("") == ""
+
+
+def test_format_shape_trace_block_tail_trims_long_traces():
+    """Traces longer than _SHAPE_TRACE_MAX_LINES keep the *tail* (lines just
+    before the failing op are most informative)."""
+    cap = autotune_mod._SHAPE_TRACE_MAX_LINES
+    over = cap + 50
+    lines = [f"line_{i}" for i in range(over)]
+    block = autotune_mod._format_shape_trace_block("\n".join(lines))
+
+    assert "earlier lines elided" in block
+    assert "50 earlier lines elided" in block
+    # First kept line is line_50 (over - cap = 50 lines were elided).
+    assert "line_50" in block
+    assert f"line_{over - 1}" in block
+    # Lines from before the cut should be gone.
+    assert "line_0\n" not in block
 
 
 def test_dsl_fail_short_circuits_at_gate_1(stub_gates):
