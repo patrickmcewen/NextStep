@@ -240,11 +240,29 @@ def _metrics_offchip_store(args, kwargs, output, mock_bf16):
     return n_stream * tile_bytes, tile_bytes, tile_bytes, extra
 
 
+def _metrics_random_offchip_store(args, kwargs, output, mock_bf16):
+    """RandomOffChipStore: traffic over the ack stream * tile bytes.
+
+    Tile bytes use the *underlying* tensor's dtype (positional arg 0), not
+    the float32 'ones' ack tile that the DSL returns. Default buffer_depth
+    is 1 in the DSL, so on-chip terms collapse to tile_bytes.
+    """
+    underlying = args[0]
+    tile_row = args[3] if len(args) > 3 else kwargs["tile_row"]
+    tile_col = args[4] if len(args) > 4 else kwargs["tile_col"]
+    n_byte = _n_byte(underlying.dtype, mock_bf16)
+    tile_bytes = int(tile_row) * int(tile_col) * n_byte
+    n_stream = _stream_total_elements(output)  # ack stream
+    extra = {"tile_shape": (int(tile_row), int(tile_col))}
+    return n_stream * tile_bytes, tile_bytes, tile_bytes, extra
+
+
 METRIC_FNS["offchip_load"]        = _metrics_offchip_load_like
 METRIC_FNS["offchip_load_ref"]    = _metrics_offchip_load_like
 METRIC_FNS["dyn_offchip_load"]    = _metrics_offchip_load_like
 METRIC_FNS["random_offchip_load"] = _metrics_offchip_load_like
 METRIC_FNS["offchip_store"]       = _metrics_offchip_store
+METRIC_FNS["random_offchip_store"] = _metrics_random_offchip_store
 
 
 for _name in step_dsl.DSL_FUNCTIONS:

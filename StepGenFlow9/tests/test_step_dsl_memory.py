@@ -227,3 +227,19 @@ def tiled_reference(dims, tensors):
     addr = torch.zeros(2, 1, dtype=torch.float32)
     A = torch.randn(8, 8, dtype=torch.float32)
     _assert_parity(src, dims={}, tensors={"addr": addr, "A": A})
+
+
+def test_parity_random_offchip_store():
+    src = '''
+def tiled_reference(dims, tensors):
+    addr = offchip_load(tensors["addr"], stride=(1,), out_shape_tiled=(2,),
+                        tile_row=1, tile_col=1)
+    data = offchip_load(tensors["data"], stride=(1,), out_shape_tiled=(2,),
+                        tile_row=4, tile_col=4)
+    return random_offchip_store(tensors["A"], data, addr,
+                                 tile_row=4, tile_col=4)
+'''
+    addr = torch.zeros(2, 1, dtype=torch.float32)
+    data = torch.randn(8, 4, dtype=torch.float32)
+    A = torch.zeros(8, 8, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"addr": addr, "data": data, "A": A})
