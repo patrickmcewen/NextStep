@@ -5,8 +5,7 @@ per-op ``off_chip_traffic`` and ``on_chip_requirement`` (both ``count_fifos``
 modes) — matching what ``step_tl/src/step_py/ops.py`` would compute on the
 lowered IR. State lives on a ``Tracker`` that is created with
 ``step_dsl_memory.tracker()`` (a context manager) and read out via
-``Tracker.records``, ``Tracker.total_off_chip``, ``Tracker.total_on_chip``,
-and ``Tracker.report()``.
+``Tracker.records``, ``Tracker.total_off_chip``, and ``Tracker.total_on_chip``.
 
 When no tracker is active, the shim is a transparent forwarder.
 """
@@ -14,9 +13,10 @@ When no tracker is active, the shim is a transparent forwarder.
 from __future__ import annotations
 
 import functools
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+import torch
 
 from src import step_dsl
 
@@ -65,15 +65,29 @@ class Tracker:
 _ACTIVE: Tracker | None = None
 
 
-@contextmanager
-def tracker(mock_bf16: bool | None = None):
-    global _ACTIVE
-    prev = _ACTIVE
-    _ACTIVE = Tracker(mock_bf16=MOCK_BF16 if mock_bf16 is None else mock_bf16)
-    try:
-        yield _ACTIVE
-    finally:
-        _ACTIVE = prev
+class _TrackerScope:
+    """Context manager body for ``tracker()``. Saves and restores ``_ACTIVE``
+    so nested ``with`` blocks correctly stack and unwind, without using
+    ``try/finally`` (the @contextmanager generator equivalent would).
+    """
+
+    def __init__(self, mock_bf16):
+        self._tracker = Tracker(mock_bf16=mock_bf16)
+        self._prev: Tracker | None = None
+
+    def __enter__(self) -> "Tracker":
+        global _ACTIVE
+        self._prev = _ACTIVE
+        _ACTIVE = self._tracker
+        return self._tracker
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        global _ACTIVE
+        _ACTIVE = self._prev
+
+
+def tracker(mock_bf16: bool | None = None) -> _TrackerScope:
+    return _TrackerScope(mock_bf16=MOCK_BF16 if mock_bf16 is None else mock_bf16)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +96,8 @@ def tracker(mock_bf16: bool | None = None):
 #
 # Each entry maps a DSL function name to a callable
 #     (args, kwargs, output, mock_bf16) -> (off_chip, on_chip, on_chip_fifo, extra)
-# All four byte values are concrete ``int``. ``extra`` is a dict of op-specific
+# Three byte values and an ``extra`` dict are returned (concrete ``int`` for
+# each byte field; ``dict`` for ``extra``). ``extra`` carries op-specific
 # facts useful for grouped reporting (tile shape, dtype, n_byte, …).
 #
 # Ops not yet present in this dict are forwarded transparently and do not
@@ -120,20 +135,26 @@ def _make_wrapper(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _safe_output_shape(out: Any) -> tuple:
-    """Return a (best-effort) shape tuple for whatever a DSL op returned.
+    """Return the shape tuple for whatever a DSL op returned.
 
     DSL ops return torch.Tensor, list[Tensor], Buffered, or _OffsetTile.
+    Raises AssertionError for any other type so unexpected outputs surface
+    immediately rather than silently producing an empty shape.
     """
-    import torch
     if isinstance(out, torch.Tensor):
         return tuple(out.shape)
-    if isinstance(out, list) and out and all(isinstance(x, torch.Tensor) for x in out):
+    if isinstance(out, list):
+        assert out and all(isinstance(x, torch.Tensor) for x in out), (
+            f"_safe_output_shape: list output must be non-empty list of tensors, got {out!r}"
+        )
         return tuple(out[0].shape)
-    if hasattr(out, "tensor"):  # Buffered
+    if isinstance(out, step_dsl.Buffered):
         return tuple(out.tensor.shape)
-    if hasattr(out, "data"):    # _OffsetTile
+    if isinstance(out, step_dsl._OffsetTile):
         return tuple(out.data.shape)
-    return ()
+    raise AssertionError(
+        f"_safe_output_shape: unexpected output type {type(out).__name__}"
+    )
 
 
 for _name in step_dsl.DSL_FUNCTIONS:
