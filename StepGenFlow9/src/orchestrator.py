@@ -1056,7 +1056,10 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             turn_status = f"FAIL: {_error_summary(err)}"
 
         _write(turn_dir / "status.txt", turn_status)
-        log(f"      -> {turn_status}")
+        if turn_status == "PASS" and judge_agent is not None:
+            log(f"      -> PASS (judge approved)")
+        else:
+            log(f"      -> {turn_status}")
 
         if success_this_turn:
             success = True
@@ -1086,31 +1089,33 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 "```\n" + trace_body + "\n```"
             )
 
-        # Import-hint augmentation predicates (preserved verbatim).
-        if "ModuleNotFoundError" in feedback or "ImportError" in feedback:
-            feedback += (
-                "\n\n**IMPORTANT: Do NOT include any import statements in your code.** "
-                "All imports are injected automatically. Remove ALL import/from lines."
-            )
-        if "missing 1 required positional argument" in feedback:
-            feedback += (
-                "\n\n**IMPORTANT: Most STeP ops require `graph` as the FIRST positional arg.** "
-                "Source ops (LinearOffChipLoad, SelectGen, MetadataGen) do NOT take graph. "
-                "ALL other ops take `graph` as their first argument: "
-                "`Promote(graph, input, promote_rank=2)` not `Promote(input, promote_rank=2)`."
-            )
-        if "FlatPartition" in feedback and ("not subscriptable" in feedback or "not iterable" in feedback):
-            feedback += (
-                "\n\n**IMPORTANT: FlatPartition returns a single node, NOT a list.** "
-                "To access per-branch streams, pass a TUPLE `(partitioned, i)` as the input "
-                "to downstream ops. Example:\n"
-                "```python\n"
-                "partitioned = FlatPartition(graph, input_node, select_gen, ...)\n"
-                "# Access branch i:\n"
-                "branch_op = BinaryMap(graph, (partitioned, i), weight_load, ...)\n"
-                "```\n"
-                "Do NOT index `partitioned[i]` or iterate `for x in partitioned`."
-            )
+        # Import-hint augmentation predicates (only on correctness exceptions —
+        # the predicate strings can appear in LLM prose otherwise).
+        if feedback.startswith("## Error running code"):
+            if "ModuleNotFoundError" in feedback or "ImportError" in feedback:
+                feedback += (
+                    "\n\n**IMPORTANT: Do NOT include any import statements in your code.** "
+                    "All imports are injected automatically. Remove ALL import/from lines."
+                )
+            if "missing 1 required positional argument" in feedback:
+                feedback += (
+                    "\n\n**IMPORTANT: Most STeP ops require `graph` as the FIRST positional arg.** "
+                    "Source ops (LinearOffChipLoad, SelectGen, MetadataGen) do NOT take graph. "
+                    "ALL other ops take `graph` as their first argument: "
+                    "`Promote(graph, input, promote_rank=2)` not `Promote(input, promote_rank=2)`."
+                )
+            if "FlatPartition" in feedback and ("not subscriptable" in feedback or "not iterable" in feedback):
+                feedback += (
+                    "\n\n**IMPORTANT: FlatPartition returns a single node, NOT a list.** "
+                    "To access per-branch streams, pass a TUPLE `(partitioned, i)` as the input "
+                    "to downstream ops. Example:\n"
+                    "```python\n"
+                    "partitioned = FlatPartition(graph, input_node, select_gen, ...)\n"
+                    "# Access branch i:\n"
+                    "branch_op = BinaryMap(graph, (partitioned, i), weight_load, ...)\n"
+                    "```\n"
+                    "Do NOT index `partitioned[i]` or iterate `for x in partitioned`."
+                )
 
         feedback += (
             "\n\n**Fix the specific error above by making targeted changes to your "
