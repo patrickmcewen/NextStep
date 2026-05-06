@@ -321,6 +321,50 @@ for _uname in [
 del _uname
 
 
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — accum family
+# ---------------------------------------------------------------------------
+
+
+def _metrics_accum_unary(args, kwargs, output, mock_bf16):
+    """Single-input Accum family: on_chip(False) = out_size; on_chip(True) = out_size + in_size.
+
+    Mirrors Accum.on_chip_requirement in ops.py:
+      count_fifos=False -> accumulator_size
+      count_fifos=True  -> accumulator_size + input_size
+    """
+    inp = _tensor_of(args[0])
+    out = _tensor_of(output)
+    out_b = _stream_dtype_size_bytes(out, mock_bf16)
+    in_b = _stream_dtype_size_bytes(inp, mock_bf16)
+    return 0, out_b, out_b + in_b, {"in_bytes": in_b, "out_bytes": out_b}
+
+
+def _metrics_binary_map_accum(args, kwargs, output, mock_bf16):
+    """BinaryMapAccum: on_chip(False) = out_size; on_chip(True) = in1_size * (n_inputs + 1).
+
+    Mirrors BinaryMapAccum.on_chip_requirement in ops.py:
+      count_fifos=False -> out stream_dtype size
+      count_fifos=True  -> in_tile_size * (len(input_list) + 1) = in1_size * 3
+    """
+    in1 = _tensor_of(args[0])
+    out = _tensor_of(output)
+    out_b = _stream_dtype_size_bytes(out, mock_bf16)
+    in1_b = _stream_dtype_size_bytes(in1, mock_bf16)
+    return 0, out_b, 3 * in1_b, {"in_bytes": in1_b, "out_bytes": out_b}
+
+
+for _aname in [
+    "accum_add", "accum_mul", "accum_max",
+    "accum_retile_row", "accum_retile_col",
+    "accum_signal_req_all_read",
+]:
+    METRIC_FNS[_aname] = _metrics_accum_unary
+del _aname
+
+METRIC_FNS["binary_map_accum"] = _metrics_binary_map_accum
+
+
 for _name in step_dsl.DSL_FUNCTIONS:
     assert hasattr(step_dsl, _name), f"step_dsl missing function listed in DSL_FUNCTIONS: {_name}"
     globals()[_name] = _make_wrapper(_name, getattr(step_dsl, _name))

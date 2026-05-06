@@ -333,3 +333,30 @@ def tiled_reference(dims, tensors):
 '''
     A = torch.randn(8, 4, dtype=torch.float32)
     _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_accum_add():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2, 4),
+                     tile_row=4, tile_col=4)
+    b = accum_add(a, rank=1)
+    return offchip_store(b)
+'''
+    A = torch.randn(8, 16, dtype=torch.float32)  # 2x4 tiles of 4x4
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_binary_map_accum():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2, 4),
+                     tile_row=4, tile_col=4)
+    b = offchip_load(tensors["B"], stride=(1,), out_shape_tiled=(2, 4),
+                     tile_row=4, tile_col=4)
+    c = binary_map_accum(a, b, rank=1)
+    return offchip_store(c)
+'''
+    A = torch.randn(8, 16, dtype=torch.float32)
+    B = torch.randn(8, 16, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A, "B": B})
