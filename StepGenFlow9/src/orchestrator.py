@@ -1186,6 +1186,7 @@ async def run_kernel(
     few_shot_paths=None,
     bundle_dir: str | None = None,
     autotune_options: dict = None,
+    check_order: str = "correctness-first",
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1206,6 +1207,8 @@ async def run_kernel(
     assert not (translator == "auto" and (pipeline == "direct" or pipeline == "direct_no_functional")), (
         "translator='auto' requires pipeline='standard' (it consumes refactor_final's DSL output)"
     )
+    assert check_order in {"correctness-first", "compliance-first"}, \
+        f"Unknown check_order={check_order!r}. Known: correctness-first, compliance-first"
 
     # --- Step 1: bundle-dir path resolution ---
     bundle_path = None
@@ -1470,6 +1473,7 @@ async def _run_outer_iteration(
             judge_agent=judge_agents.get(pass_name),
             post_validator=post_validator,
             compliance_override=compliance_override,
+            check_order=check_order,
         )
         outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
@@ -1534,6 +1538,7 @@ async def _run_outer_iteration(
             log=log,
             judge_agent=judge_agents.get(pass_name),
             dsl_code=dsl_code,
+            check_order=check_order,
         )
         outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
