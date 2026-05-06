@@ -5,7 +5,8 @@ per-op ``off_chip_traffic`` and ``on_chip_requirement`` (both ``count_fifos``
 modes) — matching what ``step_tl/src/step_py/ops.py`` would compute on the
 lowered IR. State lives on a ``Tracker`` that is created with
 ``step_dsl_memory.tracker()`` (a context manager) and read out via
-``Tracker.records``, ``Tracker.total_off_chip``, and ``Tracker.total_on_chip``.
+``Tracker.records``, ``Tracker.total_off_chip``, ``Tracker.total_on_chip``,
+and ``Tracker.report()``.
 
 When no tracker is active, the shim is a transparent forwarder.
 """
@@ -60,6 +61,46 @@ class Tracker:
     @property
     def total_on_chip_fifo(self) -> int:
         return sum(r.on_chip_bytes_fifo for r in self.records)
+
+    def report(self, top_n: int = 10) -> str:
+        """Human-readable summary of recorded ops with totals and top-N breakdowns."""
+        lines = []
+        lines.append(
+            f"off-chip total: {self.total_off_chip} bytes  "
+            f"({sum(1 for r in self.records if r.off_chip_bytes)} ops)"
+        )
+        lines.append(
+            f"on-chip  total: {self.total_on_chip} bytes  "
+            f"(count_fifos=False, {len(self.records)} ops)"
+        )
+        lines.append(
+            f"on-chip  total: {self.total_on_chip_fifo} bytes  "
+            f"(count_fifos=True)"
+        )
+
+        off_sorted = sorted(self.records, key=lambda r: r.off_chip_bytes, reverse=True)
+        if any(r.off_chip_bytes for r in off_sorted):
+            lines.append("")
+            lines.append(f"top {top_n} off-chip:")
+            for r in off_sorted[:top_n]:
+                if r.off_chip_bytes == 0:
+                    break
+                lines.append(
+                    f"  {r.op_name:<28} stream={r.output_shape} bytes={r.off_chip_bytes}"
+                )
+
+        on_sorted = sorted(self.records, key=lambda r: r.on_chip_bytes, reverse=True)
+        if any(r.on_chip_bytes for r in on_sorted):
+            lines.append("")
+            lines.append(f"top {top_n} on-chip (count_fifos=False):")
+            for r in on_sorted[:top_n]:
+                if r.on_chip_bytes == 0:
+                    break
+                lines.append(
+                    f"  {r.op_name:<28} stream={r.output_shape} bytes={r.on_chip_bytes}"
+                )
+
+        return "\n".join(lines)
 
 
 _ACTIVE: Tracker | None = None

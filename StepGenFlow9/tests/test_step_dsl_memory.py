@@ -526,3 +526,24 @@ def tiled_reference(dims, tensors):
     n = torch.tensor([3], dtype=torch.float32)
     A = torch.randn(8, 4, dtype=torch.float32)
     _assert_parity(src, dims={}, tensors={"n": n, "A": A})
+
+
+def test_report_includes_totals_and_top_offenders():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(4,),
+                     tile_row=4, tile_col=4)
+    return offchip_store(a)
+'''
+    A = torch.randn(16, 4, dtype=torch.float32)
+    namespace = {}
+    exec("import torch\n", namespace)
+    namespace.update({n: getattr(sdm, n) for n in step_dsl.DSL_FUNCTIONS})
+    exec(src, namespace)
+    with sdm.tracker(mock_bf16=False) as t:
+        namespace["tiled_reference"]({}, {"A": A})
+    rep = t.report()
+    assert "off-chip" in rep.lower()
+    assert "on-chip" in rep.lower()
+    assert "offchip_load" in rep
+    assert str(t.total_off_chip) in rep
