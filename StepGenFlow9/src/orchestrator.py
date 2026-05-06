@@ -949,7 +949,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          judge_agent=None, dsl_code=None,
                          post_validator=None,
                          compliance_override: dict | None = None,
-                         check_order: str = "correctness-first"):
+                         check_order: str):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
