@@ -547,3 +547,48 @@ def tiled_reference(dims, tensors):
     assert "on-chip" in rep.lower()
     assert "offchip_load" in rep
     assert str(t.total_off_chip) in rep
+
+
+def test_e2e_moe_routed_parity():
+    """Run the moe_routed DSL example end-to-end and assert IR/shim parity.
+
+    This is the contract behind 'matches ops.py exactly' from the spec.
+    """
+    src_path = (
+        Path(__file__).resolve().parent.parent
+        / "checkpoints" / "2026-05-05-030928" / "moe_routed" / "outer_0"
+        / "dsl_code.py"
+    )
+    src = src_path.read_text()
+
+    B, D, F_dim = 4, 8, 16
+    n_experts, n_active = 3, 2
+    dims = {
+        "B": B, "D": D, "F": F_dim,
+        "n_experts": n_experts, "n_active": n_active,
+    }
+    tensors = {
+        "x": torch.randn(B, D, dtype=torch.float32),
+        "expert_multihot": torch.zeros(B, n_experts, dtype=torch.int32),
+        "expert_onehot": torch.zeros(B, n_active, n_experts, dtype=torch.int32),
+        "expert_weights": torch.randn(B, n_active, dtype=torch.float32),
+        "gate_weights":   torch.randn(n_experts, D, F_dim, dtype=torch.float32),
+        "up_weights":     torch.randn(n_experts, D, F_dim, dtype=torch.float32),
+        "down_weights":   torch.randn(n_experts, F_dim, D, dtype=torch.float32),
+    }
+    # Make multihot/onehot well-formed so flat_partition's invariants hold:
+    # for each token, pick n_active distinct experts and set both masks.
+    for b in range(B):
+        chosen = sorted({(b * 7 + k) % n_experts for k in range(n_active)})
+        # Pad up to n_active distinct values if the set has duplicates.
+        while len(chosen) < n_active:
+            for cand in range(n_experts):
+                if cand not in chosen:
+                    chosen.append(cand)
+                    break
+            chosen = sorted(set(chosen))
+        for k, e in enumerate(chosen[:n_active]):
+            tensors["expert_multihot"][b, e] = 1.0
+            tensors["expert_onehot"][b, k, e] = 1.0
+
+    _assert_parity(src, dims, tensors)
