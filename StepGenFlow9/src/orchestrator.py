@@ -32,6 +32,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -514,6 +515,19 @@ def _extract_func_body(code: str) -> str:
         if idx != -1:
             return code[idx:]
     return code  # fallback: check everything
+
+
+class _GateResult(NamedTuple):
+    """Per-turn gate result.
+
+    feedback: None means the gate passed; a string means the gate failed and
+        this string is the user-prompt feedback for the next turn.
+    status: status.txt content if this gate determines the turn outcome.
+    tokens: judge-call tokens (0 for non-LLM gates).
+    """
+    feedback: str | None
+    status: str
+    tokens: int = 0
 
 
 def _check_banned_ops(code: str, pass_name: str) -> list[str]:
