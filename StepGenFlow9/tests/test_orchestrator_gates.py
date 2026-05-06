@@ -250,3 +250,28 @@ def test_gate_judge_fail_correctness_verified_false(tmp_path, monkeypatch):
     assert res.feedback.startswith("## Judge rejected\n\nYour code does not follow canonical form:\n\n")
     assert "VIOLATIONS:\n- bad shape" in res.feedback
     assert res.feedback.endswith("Fix these structural issues.")
+
+
+def test_gate_post_validator_none(tmp_path):
+    """No post_validator => pass."""
+    log, _ = _make_log_capture()
+    res = orch_mod._gate_post_validator(None, "code", tmp_path, log)
+    assert res == orch_mod._GateResult(None, "PASS", 0)
+
+
+def test_gate_post_validator_pass(tmp_path):
+    log, _ = _make_log_capture()
+    def pv(code, td):
+        return None
+    res = orch_mod._gate_post_validator(pv, "code", tmp_path, log)
+    assert res == orch_mod._GateResult(None, "PASS", 0)
+
+
+def test_gate_post_validator_fail(tmp_path):
+    log, _ = _make_log_capture()
+    def pv(code, td):
+        return "## Translation failed\n..."
+    res = orch_mod._gate_post_validator(pv, "code", tmp_path, log)
+    assert res.feedback == "## Translation failed\n..."
+    assert res.status == "CORRECT_BUT_POST_VALIDATOR_REJECTED"
+    assert res.tokens == 0

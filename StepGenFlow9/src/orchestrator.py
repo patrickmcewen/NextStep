@@ -928,6 +928,21 @@ async def _gate_judge(judge_agent, code, tensors, turn_dir: Path, log,
     return _GateResult(feedback, status, judge_tokens)
 
 
+def _gate_post_validator(post_validator, code, turn_dir: Path, log) -> _GateResult:
+    """Deterministic translate-check (DSL -> STeP IR; runs graph against gold).
+
+    Always runs after correctness has passed in both orderings, so the
+    `CORRECT_BUT_*` status prefix is accurate regardless of `--check-order`.
+    """
+    if post_validator is None:
+        return _GateResult(None, "PASS", 0)
+    log(f"      Running post-validator...")
+    feedback = post_validator(code, turn_dir)
+    if feedback is None:
+        return _GateResult(None, "PASS", 0)
+    return _GateResult(feedback, "CORRECT_BUT_POST_VALIDATOR_REJECTED", 0)
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, *, executor: str, tensors: dict,
                          prev_code=None, log=print,
