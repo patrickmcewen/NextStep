@@ -774,6 +774,52 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
     return {"success": success, "code": step_code}
 
 
+async def _gate_correctness(code, kernel_name, dims, tensors, executor,
+                            turn_dir: Path, log) -> tuple[_GateResult, str]:
+    """Run check_correctness with stdout captured for shape trace.
+
+    Returns (gate_result, shape_trace). The shape trace is captured even on
+    failure so the caller can append it to feedback for the LLM.
+    """
+    check_correctness = _CORRECTNESS_CHECKERS[executor]
+    log(f"      Running correctness check ({executor})...")
+    _trace_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_trace_buf):
+            result = check_correctness(code, kernel_name, dims, tensors)
+        shape_trace = _trace_buf.getvalue()
+        if shape_trace:
+            _write(turn_dir / "shape_trace.txt", shape_trace)
+        _write(turn_dir / "correctness_result.txt", result)
+
+        if "match=True" in result:
+            return _GateResult(None, "PASS", 0), shape_trace
+
+        first_line = result.splitlines()[0] if result else "(empty)"
+        return (
+            _GateResult(
+                feedback=f"## Correctness check result\n{result}",
+                status=f"FAIL: {first_line}",
+                tokens=0,
+            ),
+            shape_trace,
+        )
+    except Exception:
+        shape_trace = _trace_buf.getvalue()
+        if shape_trace:
+            _write(turn_dir / "shape_trace.txt", shape_trace)
+        err = traceback.format_exc()
+        _write(turn_dir / "correctness_result.txt", f"ERROR:\n{err}")
+        return (
+            _GateResult(
+                feedback=f"## Error running code\n{err}",
+                status=f"FAIL: {_error_summary(err)}",
+                tokens=0,
+            ),
+            shape_trace,
+        )
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, *, executor: str, tensors: dict,
                          prev_code=None, log=print,
