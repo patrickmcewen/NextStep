@@ -553,33 +553,21 @@ class _State:
         return _block(ctor + bind)
 
     def _rewrite_return(self, stmt):
-        # Supported forms at the end of tiled_reference:
+        # Two supported forms at the end of tiled_reference:
         #   return offchip_store(x)               (with optional par_dispatch=N kwarg)
-        #   return dsl_call(...)                  (any other dispatched DSL op)
         #   return out                            (out was assigned earlier)
         if (isinstance(stmt.value, ast.Call)
-                and isinstance(stmt.value.func, ast.Name)):
-            fname = stmt.value.func.id
-            if fname == "offchip_store":
-                x = _src(stmt.value.args[0])
-                par_dispatch = _arg_or_default(stmt.value, 1, "par_dispatch", "1")
-                store_var = self.fresh("store")
-                return _block(
-                    f"{store_var} = OffChipStore(graph, {x}, par_dispatch={par_dispatch})\n"
-                    f"_seal_unused_branches(graph)\n"
-                    f"graph = infer_broadcast(graph)\n"
-                    f"return graph, {store_var}\n"
-                )
-            if fname in _DISPATCH and _DISPATCH[fname] is not None:
-                # DSL op in return position: emit the IR assignment via its handler,
-                # then return the resulting variable as the output op.
-                out_var = self.fresh(fname)
-                handler_stmts = _DISPATCH[fname](self, out_var, stmt.value)
-                return handler_stmts + _block(
-                    f"_seal_unused_branches(graph)\n"
-                    f"graph = infer_broadcast(graph)\n"
-                    f"return graph, {out_var}\n"
-                )
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == "offchip_store"):
+            x = _src(stmt.value.args[0])
+            par_dispatch = _arg_or_default(stmt.value, 1, "par_dispatch", "1")
+            store_var = self.fresh("store")
+            return _block(
+                f"{store_var} = OffChipStore(graph, {x}, par_dispatch={par_dispatch})\n"
+                f"_seal_unused_branches(graph)\n"
+                f"graph = infer_broadcast(graph)\n"
+                f"return graph, {store_var}\n"
+            )
         out = _src(stmt.value)
         return _block(
             f"_seal_unused_branches(graph)\n"

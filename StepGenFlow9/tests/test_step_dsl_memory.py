@@ -230,6 +230,44 @@ def tiled_reference(dims, tensors):
 
 
 def test_parity_random_offchip_store():
+    """Parity test for random_offchip_store.
+
+    The translator cannot be used here because OffChipStore (IR) rejects the
+    Bool ack stream that RandomOffChipStore emits.  We build the IR graph
+    directly and compare its per-node totals against the shim.
+    """
+    import step_py.ops as ir_ops
+    from graph.graph import MultiDiGraph as Graph
+    from rewrite.broadcast import infer_broadcast
+
+    addr = torch.zeros(2, 1, dtype=torch.float32)
+    data = torch.randn(8, 4, dtype=torch.float32)
+    A = torch.zeros(8, 8, dtype=torch.float32)
+
+    # --- IR side: build graph directly, no translator ---
+    ir_ops.StepOps._counter = 0
+    g = Graph()
+    addr_load = ir_ops.LinearOffChipLoad(
+        underlying=addr, stride=(1,), out_shape_tiled=(2,),
+        tile_row=1, tile_col=1, par_dispatch=1,
+    )
+    g.add_node(addr_load)
+    data_load = ir_ops.LinearOffChipLoad(
+        underlying=data, stride=(1,), out_shape_tiled=(2,),
+        tile_row=4, tile_col=4, par_dispatch=1,
+    )
+    g.add_node(data_load)
+    ros = ir_ops.RandomOffChipStore(
+        graph=g, underlying=A,
+        wdata=data_load, waddr=addr_load,
+        tile_row=4, tile_col=4, base_addr_byte=0, par_dispatch=1,
+    )
+    g = infer_broadcast(g)
+    ir_off = sum(int(n.off_chip_traffic()) for n in g.nodes())
+    ir_on = sum(int(n.on_chip_requirement(count_fifos=False)) for n in g.nodes())
+    ir_on_fifo = sum(int(n.on_chip_requirement(count_fifos=True)) for n in g.nodes())
+
+    # --- shim side ---
     src = '''
 def tiled_reference(dims, tensors):
     addr = offchip_load(tensors["addr"], stride=(1,), out_shape_tiled=(2,),
@@ -237,9 +275,12 @@ def tiled_reference(dims, tensors):
     data = offchip_load(tensors["data"], stride=(1,), out_shape_tiled=(2,),
                         tile_row=4, tile_col=4)
     return random_offchip_store(tensors["A"], data, addr,
-                                 tile_row=4, tile_col=4)
+                                tile_row=4, tile_col=4)
 '''
-    addr = torch.zeros(2, 1, dtype=torch.float32)
-    data = torch.randn(8, 4, dtype=torch.float32)
-    A = torch.zeros(8, 8, dtype=torch.float32)
-    _assert_parity(src, dims={}, tensors={"addr": addr, "data": data, "A": A})
+    shim = _shim_totals(src, dims={}, tensors={"addr": addr, "data": data, "A": A})
+    ir = (ir_off, ir_on, ir_on_fifo)
+    assert shim == ir, (
+        f"shim totals != IR totals\n"
+        f"  shim (off, on, on_fifo) = {shim}\n"
+        f"  ir   (off, on, on_fifo) = {ir}"
+    )
