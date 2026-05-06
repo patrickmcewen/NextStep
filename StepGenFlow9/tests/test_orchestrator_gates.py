@@ -76,3 +76,110 @@ def test_gate_correctness_exception(tmp_path, monkeypatch):
     assert res.status.startswith("FAIL:")
     written = (tmp_path / "correctness_result.txt").read_text()
     assert written.startswith("ERROR:\n")
+
+
+_BANNED_REFACTOR_FINAL_CODE = "def f():\n    import torch\n    return torch.matmul(a, b)\n"
+_CLEAN_CODE = "def f():\n    return 0\n"
+
+
+def _stub_check_banned_ops(monkeypatch, violations):
+    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn: list(violations))
+
+
+def test_gate_compliance_pass(tmp_path, monkeypatch):
+    _stub_check_banned_ops(monkeypatch, [])
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_compliance(
+        code=_CLEAN_CODE, pass_name="refactor_final",
+        compliance_override=None, judge_agent=None, tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert res.feedback is None
+    assert res.status == "PASS"
+    assert res.tokens == 0
+
+
+def test_gate_compliance_fail_correctness_verified_true(tmp_path, monkeypatch):
+    """Existing behavior: status CORRECT_BUT_NONCOMPLIANT, preamble references PASS."""
+    _stub_check_banned_ops(monkeypatch, ["torch.matmul: line 3"])
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_compliance(
+        code=_BANNED_REFACTOR_FINAL_CODE, pass_name="refactor_final",
+        compliance_override=None, judge_agent=None, tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert res.status == "CORRECT_BUT_NONCOMPLIANT"
+    assert res.feedback.startswith("## Correctness: PASS\n\nYour code produces the correct output, but still contains disallowed operations:\n\n")
+    assert "torch.matmul: line 3" in res.feedback
+    assert "Replace these with the corresponding DSL function calls" in res.feedback
+
+
+def test_gate_compliance_fail_correctness_verified_false(tmp_path, monkeypatch):
+    """New behavior under compliance-first: status NONCOMPLIANT, preamble does not claim correctness."""
+    _stub_check_banned_ops(monkeypatch, ["torch.matmul: line 3"])
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_compliance(
+        code=_BANNED_REFACTOR_FINAL_CODE, pass_name="refactor_final",
+        compliance_override=None, judge_agent=None, tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=False,
+    ))
+    assert res.status == "NONCOMPLIANT"
+    assert res.feedback.startswith("## Compliance check FAILED\n\nYour code uses disallowed operations:\n\n")
+    assert "torch.matmul: line 3" in res.feedback
+
+
+def test_gate_compliance_translation_pass_uses_step_hint(tmp_path, monkeypatch):
+    _stub_check_banned_ops(monkeypatch, ["foo"])
+    monkeypatch.setattr(orch_mod, "_TRANSLATION_PASSES", {"translate"})
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_compliance(
+        code="x", pass_name="translate",
+        compliance_override=None, judge_agent=None, tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert "Replace these with the corresponding STeP operations." in res.feedback
+
+
+def test_gate_compliance_refactor_final_carveout_runs_judge(tmp_path, monkeypatch):
+    _stub_check_banned_ops(monkeypatch, ["torch.matmul: line 3"])
+
+    captured_ctx = {}
+    async def fake_run_judge(judge_agent, code, turn_dir, log, *, context):
+        captured_ctx["ctx"] = context
+        return ("Issue: foo at line 5", 42)
+
+    monkeypatch.setattr(orch_mod, "_run_judge", fake_run_judge)
+    judge_agent = object()
+    log, _ = _make_log_capture()
+
+    res = _run(orch_mod._gate_compliance(
+        code=_BANNED_REFACTOR_FINAL_CODE, pass_name="refactor_final",
+        compliance_override=None, judge_agent=judge_agent, tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+
+    assert res.status == "CORRECT_BUT_NONCOMPLIANT"
+    assert res.tokens == 42
+    assert "## Judge feedback (line-specific):" in res.feedback
+    assert "Issue: foo at line 5" in res.feedback
+    assert "## Correctness status\nThis code has ALREADY been executed" in captured_ctx["ctx"]
+
+
+def test_gate_compliance_translation_pass_skips_carveout(tmp_path, monkeypatch):
+    """The carve-out is refactor_final-only — translation passes don't trigger it."""
+    _stub_check_banned_ops(monkeypatch, ["foo"])
+    monkeypatch.setattr(orch_mod, "_TRANSLATION_PASSES", {"translate"})
+
+    async def boom(*a, **kw):
+        raise AssertionError("judge should not run on translate")
+    monkeypatch.setattr(orch_mod, "_run_judge", boom)
+
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_compliance(
+        code="x", pass_name="translate",
+        compliance_override=None, judge_agent=object(), tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert res.status == "CORRECT_BUT_NONCOMPLIANT"
+    assert res.tokens == 0
+    assert "## Judge feedback" not in res.feedback

@@ -820,6 +820,79 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
         )
 
 
+def _build_judge_context(tensors, *, correctness_verified: bool) -> str:
+    """Compose the judge prompt context (correctness-status preamble + tensors)."""
+    if correctness_verified:
+        ctx = (
+            "## Correctness status\n"
+            "This code has ALREADY been executed and its output matches the reference "
+            "to within floating-point tolerance. Numerical correctness is verified. "
+            "Only evaluate the three structural checks.\n\n"
+        )
+    else:
+        ctx = (
+            "## Correctness status\n"
+            "This code has NOT yet been executed against the reference. Numerical "
+            "correctness is not yet verified. Evaluate only the structural checks; "
+            "correctness will be checked separately.\n\n"
+        )
+    if tensors is not None:
+        ctx += "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
+    return ctx
+
+
+async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
+                           tensors, turn_dir: Path, log,
+                           *, correctness_verified: bool) -> _GateResult:
+    """Regex compliance check.
+
+    On failure, on `pass_name == "refactor_final"` with a non-None judge_agent,
+    also runs the LLM judge for richer line-specific feedback (parity with the
+    pre-refactor inline carve-out).
+    """
+    if compliance_override is not None:
+        violations = _check_bundle_compliance(code, compliance_override)
+    else:
+        violations = _check_banned_ops(code, pass_name)
+
+    if not violations:
+        return _GateResult(None, "PASS", 0)
+
+    log(f"      -> {len(violations)} compliance violation(s)")
+
+    if pass_name in _TRANSLATION_PASSES:
+        fix_hint = "Replace these with the corresponding STeP operations."
+    else:
+        fix_hint = "Replace these with the corresponding DSL function calls listed in the instructions."
+
+    judge_feedback = ""
+    judge_tokens = 0
+    if judge_agent is not None and pass_name == "refactor_final":
+        log(f"      Also running judge for richer feedback...")
+        judge_ctx = _build_judge_context(tensors, correctness_verified=correctness_verified)
+        judge_violations, judge_tokens = await _run_judge(
+            judge_agent, code, turn_dir, log, context=judge_ctx)
+        if judge_violations is not None:
+            judge_feedback = "\n\n## Judge feedback (line-specific):\n\n" + judge_violations
+
+    if correctness_verified:
+        preamble = (
+            "## Correctness: PASS\n\n"
+            "Your code produces the correct output, but still contains "
+            "disallowed operations:\n\n"
+        )
+        status = "CORRECT_BUT_NONCOMPLIANT"
+    else:
+        preamble = (
+            "## Compliance check FAILED\n\n"
+            "Your code uses disallowed operations:\n\n"
+        )
+        status = "NONCOMPLIANT"
+
+    feedback = preamble + "\n".join(violations) + f"\n\n{fix_hint}" + judge_feedback
+    return _GateResult(feedback, status, judge_tokens)
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, *, executor: str, tensors: dict,
                          prev_code=None, log=print,
