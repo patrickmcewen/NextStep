@@ -365,6 +365,136 @@ del _aname
 METRIC_FNS["binary_map_accum"] = _metrics_binary_map_accum
 
 
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — stream-shape family
+# ---------------------------------------------------------------------------
+#
+# Group A: on_chip(False)=0, on_chip(True)=2*stream_dtype_size
+#   IR classes: Promote, Flatten, Reshape (reshape_stream), ReshapePadStream
+#
+# Group B: on_chip(False)=stream_dtype_size, on_chip(True)=2*stream_dtype_size
+#   IR classes: PromoteOuter, ExpandRef, RepeatRef, RepeatStatic
+#
+# Group C: on_chip(False)=0, on_chip(True)=0
+#   IR class: RetileStreamify
+#
+# Group D: on_chip(False)=buffer_size+tile_size, on_chip(True)=buffer_size+tile_size
+#   IR classes: Bufferize, Streamify, DynStreamify
+#   (count_fifos has no effect; same formula for both modes)
+#
+# All have off_chip_traffic=0 (assuming off_chip=False, the default).
+
+
+def _metrics_stream_shape_zero_no_fifo(args, kwargs, output, mock_bf16):
+    """Group A: Promote, Flatten, Reshape, ReshapePadStream.
+
+    on_chip(False) = 0
+    on_chip(True)  = 2 * stream_dtype_size_bytes(output)
+    """
+    out = _tensor_of(output)
+    out_b = _stream_dtype_size_bytes(out, mock_bf16)
+    return 0, 0, 2 * out_b, {"out_bytes": out_b}
+
+
+def _metrics_stream_shape_one_no_fifo(args, kwargs, output, mock_bf16):
+    """Group B: PromoteOuter, ExpandRef, RepeatRef, RepeatStatic.
+
+    on_chip(False) = stream_dtype_size_bytes(output)
+    on_chip(True)  = 2 * stream_dtype_size_bytes(output)
+    """
+    out = _tensor_of(output)
+    out_b = _stream_dtype_size_bytes(out, mock_bf16)
+    return 0, out_b, 2 * out_b, {"out_bytes": out_b}
+
+
+def _metrics_retile_streamify(args, kwargs, output, mock_bf16):
+    """RetileStreamify: on_chip_requirement always returns 0 (both modes)."""
+    return 0, 0, 0, {}
+
+
+def _metrics_bufferize(args, kwargs, output, mock_bf16):
+    """Bufferize: on_chip = buffer_size + tile_size (identical for both count_fifos modes).
+
+    IR formula:
+      tile_size   = in_stream.stream_dtype.size_in_bytes()  (input tile bytes)
+      buffer_size = output_buffer.stream_dtype.size_in_bytes()
+                  = prod(buffer_grid) * tile_bytes
+
+    DSL: bufferize(x, rank) returns Buffered(x, buffer_rank=rank).
+      input tensor x has shape (*stream_dims, tile_r, tile_c)
+      buffer_grid = x.shape[-2-rank : -2]  (the rank dims before the tile dims)
+    """
+    x = _tensor_of(args[0])          # input tensor
+    buf_out = output                  # Buffered
+    assert isinstance(buf_out, step_dsl.Buffered)
+    tile_b = _tile_bytes(x, mock_bf16)
+    buffer_grid = buf_out.buffer_shape  # e.g. (2,) for rank=1
+    n_buffer_tiles = 1
+    for d in buffer_grid:
+        n_buffer_tiles *= int(d)
+    buffer_b = n_buffer_tiles * tile_b
+    total = buffer_b + tile_b
+    return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
+
+
+def _metrics_streamify(args, kwargs, output, mock_bf16):
+    """Streamify: on_chip = buffer_size + tile_size (same for both modes).
+
+    IR: input is Buffer, output stream_dtype is Tile.
+      tile_size   = output.stream_dtype.size_in_bytes()  (same tile as buffer's buff_dtype)
+      buffer_size = in_buffer.size_in_bytes()
+                  = prod(buffer.shape) * tile_bytes
+
+    DSL: streamify(buf, stride, out_shape_tiled) where buf is Buffered.
+    """
+    buf = args[0]                     # Buffered
+    assert isinstance(buf, step_dsl.Buffered)
+    tile_b = _tile_bytes(buf.tensor, mock_bf16)
+    buffer_grid = buf.buffer_shape
+    n_buffer_tiles = 1
+    for d in buffer_grid:
+        n_buffer_tiles *= int(d)
+    buffer_b = n_buffer_tiles * tile_b
+    total = buffer_b + tile_b
+    return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
+
+
+def _metrics_dyn_streamify(args, kwargs, output, mock_bf16):
+    """DynStreamify: on_chip = buffer_size + tile_size (same for both modes).
+
+    Same structure as Streamify: input is Buffered, output expands the ref stream.
+    """
+    buf = args[0]                     # Buffered
+    assert isinstance(buf, step_dsl.Buffered)
+    tile_b = _tile_bytes(buf.tensor, mock_bf16)
+    buffer_grid = buf.buffer_shape
+    n_buffer_tiles = 1
+    for d in buffer_grid:
+        n_buffer_tiles *= int(d)
+    buffer_b = n_buffer_tiles * tile_b
+    total = buffer_b + tile_b
+    return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
+
+
+# Group A
+for _sname in ["promote", "flatten", "reshape_stream", "reshape_pad_stream"]:
+    METRIC_FNS[_sname] = _metrics_stream_shape_zero_no_fifo
+del _sname
+
+# Group B
+for _sname in ["promote_outer", "expand_ref", "repeat_ref", "repeat_static"]:
+    METRIC_FNS[_sname] = _metrics_stream_shape_one_no_fifo
+del _sname
+
+# Group C
+METRIC_FNS["retile_streamify"] = _metrics_retile_streamify
+
+# Group D
+METRIC_FNS["bufferize"]    = _metrics_bufferize
+METRIC_FNS["streamify"]    = _metrics_streamify
+METRIC_FNS["dyn_streamify"] = _metrics_dyn_streamify
+
+
 for _name in step_dsl.DSL_FUNCTIONS:
     assert hasattr(step_dsl, _name), f"step_dsl missing function listed in DSL_FUNCTIONS: {_name}"
     globals()[_name] = _make_wrapper(_name, getattr(step_dsl, _name))

@@ -360,3 +360,52 @@ def tiled_reference(dims, tensors):
     A = torch.randn(8, 16, dtype=torch.float32)
     B = torch.randn(8, 16, dtype=torch.float32)
     _assert_parity(src, dims={}, tensors={"A": A, "B": B})
+
+
+def test_parity_promote_outer():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = promote_outer(a)
+    return offchip_store(b)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_flatten():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1, 1), out_shape_tiled=(2, 2),
+                     tile_row=4, tile_col=4)
+    b = flatten(a, min_rank=0, max_rank=1)
+    return offchip_store(b)
+'''
+    A = torch.randn(8, 8, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_repeat_static():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = repeat_static(a, factor=3)
+    return offchip_store(b)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_bufferize_streamify():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    buf = bufferize(a, rank=1)
+    out = streamify(buf, stride=(1,), out_shape_tiled=(2,))
+    return offchip_store(out)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
