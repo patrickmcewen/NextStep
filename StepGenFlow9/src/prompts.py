@@ -30,6 +30,7 @@ _STEP_TL_PROTO = _STEP_TL_SRC / "proto"
 _FUNCTIONAL_PY = _STEP_TL_SRC / "timing_and_emulator" / "functional.py"
 _TIMING_PY = _STEP_TL_SRC / "timing_and_emulator" / "timing.py"
 _STEP_DSL_PY = _PROJECT_ROOT / "src" / "step_dsl.py"
+_STEP_DSL_MEM_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
 
 for p in (_STEP_TL_SRC, _STEP_TL_PROTO):
     sp = str(p)
@@ -323,6 +324,8 @@ def build_autotune_system_prompt(hw_constraints: dict,
     replacements = {}
     if "{step_dsl_code}" in template:
         replacements["step_dsl_code"] = _STEP_DSL_PY.read_text()
+    if "{step_dsl_memory_code}" in template:
+        replacements["step_dsl_memory_code"] = _STEP_DSL_MEM_PY.read_text()
     if "{timing_code}" in template:
         replacements["timing_code"] = _TIMING_PY.read_text()
     if "{hw_constraints}" in template:
@@ -332,7 +335,8 @@ def build_autotune_system_prompt(hw_constraints: dict,
 
 def build_autotune_user_prompt(kernel_name: str, dims: dict, build_graph_code: str,
                                 timing_report: str, baseline_cycles: int,
-                                best_cycles: int) -> str:
+                                best_cycles: int,
+                                feasibility: dict | None = None) -> str:
     """Build the autotuner user prompt for a single turn.
 
     `build_graph_code` parameter name is kept for back-compat at the call site,
@@ -340,8 +344,10 @@ def build_autotune_user_prompt(kernel_name: str, dims: dict, build_graph_code: s
     `timing_report` is the pretty-printed analyze_timing() output for the
     *translated* build_graph. `baseline_cycles` is the cycle count at the start
     of the tuning run; `best_cycles` is the best we've seen so far.
+    `feasibility`, if provided, is a dict of mem_info-field -> upper bound that
+    the proposal must satisfy for the pass to be considered feasible.
     """
-    return "\n".join([
+    sections = [
         f"## Kernel: {kernel_name}",
         "",
         "### Dimensions",
@@ -365,9 +371,21 @@ def build_autotune_user_prompt(kernel_name: str, dims: dict, build_graph_code: s
         timing_report.rstrip(),
         "```",
         "",
-        "Propose a change that reduces total_cycles. Output the full updated "
+        "If the current best is not feasible, propose a change that restores feasibility or reduces infeasibility. Otherwise, propose a change that reduces total_cycles", 
+        " while maintaining feasibility. Output the full updated ",
         "`tiled_reference(dims, tensors)` in a single ```python block.",
-    ])
+    ]
+    if feasibility:
+        bullets = "\n".join(f"  - {k} <= {v}" for k, v in feasibility.items())
+        sections.extend([
+            "",
+            "## Hard feasibility constraints",
+            "Your final proposal MUST satisfy:",
+            bullets,
+            "Proposals that violate these may still be tried, but the pass "
+            "will be marked infeasible if no proposal satisfies all bounds.",
+        ])
+    return "\n".join(sections)
 
 
 def build_judge_system_prompt(pass_name: str) -> str:

@@ -13,5 +13,9 @@
         "max_par_dispatch": 16,
         "pmu_bw_bytes_per_cycle": 64
     },
-    "max_turns": 12
+    "max_turns": 12,
+    "passes": [
+        {"agent": "memory", "max_turns": 12, "feasibility": {"on_chip_bytes": 393216}},
+        {"agent": "general",  "max_turns": 12, "feasibility": {"on_chip_bytes": 393216}}
+    ]
 }

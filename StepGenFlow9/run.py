@@ -9,6 +9,27 @@ from src.config_loader import load_llm_config
 from src.orchestrator import run_kernel
 
 
+def _build_autotune_options(args, autotune_cfg: dict) -> dict:
+    """Construct autotune_options for the orchestrator.
+
+    If autotune_cfg["passes"] is set, use it verbatim. Otherwise synthesize
+    a single-element passes list from the legacy --autotune-agent /
+    --autotune-max-turns flags so existing callers keep working.
+    """
+    if "passes" in autotune_cfg:
+        passes = autotune_cfg["passes"]
+        assert isinstance(passes, list) and passes, (
+            "autotune_config['passes'] must be a non-empty list")
+        for i, spec in enumerate(passes):
+            assert "agent" in spec, f"pass {i} is missing 'agent' key: {spec}"
+    else:
+        passes = [{
+            "agent": args.autotune_agent,
+            "max_turns": args.autotune_max_turns,
+        }]
+    return {"config": autotune_cfg, "passes": passes}
+
+
 def main():
     parser = argparse.ArgumentParser(description="StepGenFlow — generate STeP programs from PyTorch references")
     parser.add_argument("kernel", help="Kernel name from StepDB (e.g., element_wise_add)")
@@ -53,8 +74,9 @@ def main():
     parser.add_argument("--autotune-max-turns", type=int, default=None,
                         help="Override max_turns from autotune_config.")
     parser.add_argument("--autotune-agent", default="general",
-                        choices=["general", "parallel"],
-                        help="Which autotuner agent to run.")
+                        help="Autotuner agent variant (e.g. 'general', 'parallel'). "
+                             "Ignored when autotune_config.json defines 'passes'. "
+                             "Validated by the agent factory at run time.")
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
@@ -63,11 +85,7 @@ def main():
     if args.autotune:
         with open(args.autotune_config) as f:
             autotune_cfg = json.load(f)
-        autotune_options = {
-            "config": autotune_cfg,
-            "max_turns": args.autotune_max_turns,
-            "agent_variant": args.autotune_agent,
-        }
+        autotune_options = _build_autotune_options(args, autotune_cfg)
 
     result = asyncio.run(run_kernel(
         kernel_name=args.kernel,

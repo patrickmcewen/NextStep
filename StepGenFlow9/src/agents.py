@@ -116,6 +116,7 @@ def make_pass_agent(llm_config: dict, pass_name: str,
 _AUTOTUNE_VARIANTS = {
     "general": "autotune_system.txt",
     "parallel": "autotune_parallel_system.txt",
+    "memory": "autotune_memory_system.txt",
 }
 
 

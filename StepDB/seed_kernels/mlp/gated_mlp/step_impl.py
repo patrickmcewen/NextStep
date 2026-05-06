@@ -71,7 +71,7 @@ def build_graph(dims):
     # --- Down projection via Linear: [B, F] @ [F, D] -> [B, D] ---
     # Bufferize/streamify to convert on-chip stream to Linear-compatible input
     buff = Bufferize(step_graph, gated, 1)
-    gated_stream = Streamify(step_graph, buff, [], 1)
+    gated_stream = Streamify(step_graph, buff, stride=[1], out_shape_tiled=[F // tile_f])
 
     down_out = Linear(
         step_graph=step_graph,

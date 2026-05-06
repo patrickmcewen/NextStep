@@ -146,8 +146,10 @@ def _load_autotune_progress(autotune_kernel_dir: Path) -> dict:
     """Read `progress.json` written by run_autotune, or return {} if absent.
 
     `autotune_kernel_dir` is the inner kernel-named directory created by
-    run_autotune (i.e. <outer_dir>/autotune/<kernel_name>). When run_autotune
-    raises before writing baseline progress, the file may not exist.
+    run_autotune for a given pass (i.e.
+    `<outer_dir>/autotune/pass_<idx>_<agent>/<kernel_name>`). When
+    run_autotune raises before writing baseline progress, the file may not
+    exist.
     """
     path = autotune_kernel_dir / "progress.json"
     if not path.exists():
@@ -164,46 +166,127 @@ run_autotune = None
 async def _run_outer_autotune(*, outer_dir: Path, kernel_name: str, preset: str,
                               llm_config: dict, autotune_options: dict,
                               log, tag: str) -> dict:
-    """Run the autotuner against an outer's verified build_graph.
+    """Run a sequence of autotuner passes against an outer's verified build_graph.
 
-    Trapping is deliberate: a midway autotune crash must not undo the
-    functional pipeline's success on this outer. On exception we recover
-    best-so-far from progress.json (written incrementally by run_autotune).
+    Each pass's `best.py` becomes the next pass's baseline. Halts on:
+      - a pass returning `feasible=False` (chain stops, status='halted')
+      - an exception inside a pass (status='error', partial best recovered
+        from progress.json so the harness still surfaces work-in-progress).
     """
     global run_autotune
     if run_autotune is None:
         from src.autotune import run_autotune as _ra
         run_autotune = _ra
 
-    autotune_ckpt = outer_dir / "autotune"
-    try:
-        result = await run_autotune(
-            kernel_name=kernel_name,
-            preset=preset,
-            llm_config=llm_config,
-            autotune_config=autotune_options["config"],
-            resume_from=str(outer_dir),
-            max_turns=autotune_options["max_turns"],
-            checkpoint_dir=str(autotune_ckpt),
-            agent_variant=autotune_options["agent_variant"],
-        )
-        return {"status": "ok", **result}
-    except Exception as e:
-        msg = f"{tag} autotune FAILED: {type(e).__name__}: {e}"
-        log(msg)
-        print(msg)
-        progress = _load_autotune_progress(autotune_ckpt / kernel_name)
-        baseline = progress.get("baseline_cycles")
-        best = progress.get("best_cycles")
-        speedup = (baseline / best) if (baseline is not None and best is not None) else None
-        return {
-            "status": "error",
-            "error": f"{type(e).__name__}: {e}",
-            "checkpoint_dir": str(autotune_ckpt),
-            "baseline_cycles": baseline,
-            "best_cycles": best,
-            "speedup": speedup,
-        }
+    autotune_root = outer_dir / "autotune"
+    passes = autotune_options["passes"]
+    config = autotune_options["config"]
+    assert passes, "autotune_options['passes'] must be a non-empty list"
+
+    pass_results: list[dict] = []
+    halt_reason: str | None = None
+    halted_pass_index: int | None = None
+    error_msg: str | None = None
+    resume_from = str(outer_dir)
+
+    for idx, spec in enumerate(passes):
+        agent = spec["agent"]
+        max_turns = spec.get("max_turns")
+        feasibility = spec.get("feasibility")
+        pass_dir = autotune_root / f"pass_{idx}_{agent}"
+        log(f"{tag} autotune pass {idx} ({agent}) starting; resume_from={resume_from}")
+        print(f"{tag} autotune pass {idx} ({agent}) starting")
+
+        try:
+            r = await run_autotune(
+                kernel_name=kernel_name,
+                preset=preset,
+                llm_config=llm_config,
+                autotune_config=config,
+                resume_from=resume_from,
+                max_turns=max_turns,
+                checkpoint_dir=str(pass_dir),
+                agent_variant=agent,
+                feasibility=feasibility,
+                log_prefix=f"{tag} ",
+            )
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            msg = f"{tag} autotune FAILED at pass {idx} ({agent}): {err}"
+            log(msg)
+            print(msg)
+            progress = _load_autotune_progress(pass_dir / kernel_name)
+            # Mirrors the success-path key set so callers iterating
+            # pass_results don't have to special-case error entries.
+            # Unknown values are None; `feasible` is False (a crashed pass
+            # is by definition not feasible).
+            partial = {
+                "index": idx,
+                "agent": agent,
+                "status": "error",
+                "error": err,
+                "success": False,
+                "kernel": kernel_name,
+                "preset": preset,
+                "checkpoint_dir": str(pass_dir / kernel_name),
+                "resume_from": resume_from,
+                "agent_variant": agent,
+                "feasibility": feasibility,
+                "feasible": False,
+                "baseline_feasible": None,
+                "baseline_cycles": progress.get("baseline_cycles"),
+                "best_cycles": progress.get("best_cycles"),
+                "speedup": None,
+                "baseline_on_chip_bytes": progress.get("baseline_on_chip_bytes"),
+                "baseline_off_chip_bytes": progress.get("baseline_off_chip_bytes"),
+                "best_on_chip_bytes": progress.get("best_on_chip_bytes"),
+                "best_off_chip_bytes": progress.get("best_off_chip_bytes"),
+                "turns": progress.get("turn"),
+            }
+            pass_results.append(partial)
+            halt_reason = "error"
+            halted_pass_index = idx
+            error_msg = err
+            break
+
+        pass_results.append({"index": idx, "agent": agent, "status": "ok", **r})
+
+        if not r["feasible"]:
+            log(f"{tag} autotune pass {idx} infeasible; halting chain")
+            print(f"{tag} autotune pass {idx} infeasible; halting chain")
+            halt_reason = "infeasible"
+            halted_pass_index = idx
+            break
+
+        # Feed best.py forward as next pass's baseline.
+        resume_from = str(pass_dir / kernel_name / "best.py")
+
+    # Aggregate overall: pass 0's baseline -> last completed pass's best.
+    first = pass_results[0]
+    last = pass_results[-1]
+    overall_baseline = first.get("baseline_cycles")
+    overall_best = last.get("best_cycles")
+    overall_speedup = (overall_baseline / overall_best
+                       if overall_baseline and overall_best else None)
+    overall_feasible = last.get("feasible", False)
+
+    status = "ok" if halt_reason is None else (
+        "halted" if halt_reason == "infeasible" else "error")
+
+    return {
+        "status": status,
+        "passes": pass_results,
+        "halt_reason": halt_reason,
+        "halted_pass_index": halted_pass_index,
+        "error": error_msg,
+        "checkpoint_dir": str(autotune_root),
+        "overall": {
+            "baseline_cycles": overall_baseline,
+            "best_cycles": overall_best,
+            "speedup": overall_speedup,
+            "feasible": overall_feasible,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
