@@ -265,6 +265,39 @@ METRIC_FNS["offchip_store"]       = _metrics_offchip_store
 METRIC_FNS["random_offchip_store"] = _metrics_random_offchip_store
 
 
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — binary map family
+# ---------------------------------------------------------------------------
+
+
+def _tensor_of(x):
+    """Underlying tensor for shape/dtype lookup. Handles Buffered and _OffsetTile."""
+    if isinstance(x, step_dsl.Buffered):
+        return x.tensor
+    if isinstance(x, step_dsl._OffsetTile):
+        return x.data
+    return x
+
+
+def _metrics_binary_map(args, kwargs, output, mock_bf16):
+    """BinaryMap: off_chip = 0, on_chip(False) = 0, on_chip(True) = in1+in2+out."""
+    in1 = _tensor_of(args[0])
+    in2 = _tensor_of(args[1])
+    out = _tensor_of(output)
+    in1_b = _stream_dtype_size_bytes(in1, mock_bf16)
+    in2_b = _stream_dtype_size_bytes(in2, mock_bf16)
+    out_b = _stream_dtype_size_bytes(out, mock_bf16)
+    return 0, 0, in1_b + in2_b + out_b, {"in1_bytes": in1_b, "in2_bytes": in2_b, "out_bytes": out_b}
+
+
+for _bname in [
+    "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
+    "binary_set_offset", "binary_row_wise_append", "binary_cache_write_addr_gen",
+]:
+    METRIC_FNS[_bname] = _metrics_binary_map
+del _bname
+
+
 for _name in step_dsl.DSL_FUNCTIONS:
     assert hasattr(step_dsl, _name), f"step_dsl missing function listed in DSL_FUNCTIONS: {_name}"
     globals()[_name] = _make_wrapper(_name, getattr(step_dsl, _name))

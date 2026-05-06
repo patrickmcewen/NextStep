@@ -58,10 +58,10 @@ def test_dsl_functions_reexported():
 def test_records_empty_when_no_metric_fn_yet():
     # Until ops are registered in METRIC_FNS, records list stays empty even
     # if a wrapped DSL function is called inside a tracker.
+    # unary_silu has no metric function registered yet (unary family is a later task).
     a = torch.randn(2, 4, 4, dtype=torch.float32)
-    b = torch.randn(2, 4, 4, dtype=torch.float32)
     with sdm.tracker() as t:
-        sdm.binary_add(a, b)
+        sdm.unary_silu(a)
     assert t.records == []
 
 
@@ -284,3 +284,35 @@ def tiled_reference(dims, tensors):
         f"  shim (off, on, on_fifo) = {shim}\n"
         f"  ir   (off, on, on_fifo) = {ir}"
     )
+
+
+def test_parity_binary_matmul():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = offchip_load(tensors["B"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    c = binary_matmul(a, b)
+    return offchip_store(c)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    B = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A, "B": B})
+
+
+def test_parity_binary_mul_add_div():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = offchip_load(tensors["B"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    c = binary_mul(a, b)
+    d = binary_add(c, b)
+    e = binary_div(d, a)
+    return offchip_store(e)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    B = torch.randn(8, 4, dtype=torch.float32) + 1.0
+    _assert_parity(src, dims={}, tensors={"A": A, "B": B})
