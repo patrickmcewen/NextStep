@@ -68,6 +68,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Pass-through override for autotune max_turns.")
     p.add_argument("--autotune-agent", default=None, choices=[None, "general", "parallel"],
                    help="Pass-through autotune agent variant.")
+    p.add_argument("--check-order", default=None,
+                   choices=[None, "correctness-first", "compliance-first"],
+                   help="Pass-through gate ordering for each per-job run.py invocation.")
     return p.parse_args(argv)
 
 
@@ -131,6 +134,7 @@ async def _amain(args: argparse.Namespace) -> int:
         "max_turns": args.max_turns,
         "pipeline": args.pipeline,
         "translator": args.translator,
+        "check_order": args.check_order,
         "autotune": args.autotune,
         "autotune_config": args.autotune_config,
         "autotune_max_turns": args.autotune_max_turns,
@@ -159,6 +163,7 @@ async def _amain(args: argparse.Namespace) -> int:
             autotune_config=args.autotune_config,
             autotune_max_turns=args.autotune_max_turns,
             autotune_agent=args.autotune_agent,
+            check_order=args.check_order,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)

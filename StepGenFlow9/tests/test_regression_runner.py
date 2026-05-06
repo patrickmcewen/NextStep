@@ -398,3 +398,48 @@ def test_write_summary_autotune_overall_omitted_without_data(tmp_path: Path):
         "jobs_with_data": 0,
         "min_speedup": None, "max_speedup": None, "geomean_speedup": None,
     }
+
+
+def test_build_run_py_command_with_check_order():
+    job = Job("gemm", "small")
+    cmd = build_run_py_command(
+        job,
+        python_exe="py",
+        run_py_path=Path("run.py"),
+        model="m",
+        config=None,
+        max_outer=None,
+        max_turns=None,
+        pipeline=None,
+        translator=None,
+        checkpoint_dir=None,
+        autotune=False,
+        autotune_config=None,
+        autotune_max_turns=None,
+        autotune_agent=None,
+        check_order="compliance-first",
+    )
+    assert "--check-order" in cmd
+    assert cmd[cmd.index("--check-order") + 1] == "compliance-first"
+
+
+def test_build_run_py_command_without_check_order_omits_flag():
+    job = Job("gemm", "small")
+    cmd = build_run_py_command(
+        job,
+        python_exe="py",
+        run_py_path=Path("run.py"),
+        model="m",
+        config=None,
+        max_outer=None,
+        max_turns=None,
+        pipeline=None,
+        translator=None,
+        checkpoint_dir=None,
+        autotune=False,
+        autotune_config=None,
+        autotune_max_turns=None,
+        autotune_agent=None,
+        check_order=None,
+    )
+    assert "--check-order" not in cmd
