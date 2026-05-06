@@ -592,3 +592,128 @@ def test_e2e_moe_routed_parity():
             tensors["expert_onehot"][b, k, e] = 1.0
 
     _assert_parity(src, dims, tensors)
+
+
+# ---------------------------------------------------------------------------
+# Parity tests for unary ops with potentially-divergent IR output types
+# ---------------------------------------------------------------------------
+
+
+def test_parity_unary_to_const_int():
+    """unary_to_const_int: IR output is Tile(Uint64, (1,1)); eager returns float32 same shape.
+
+    The downstream offchip_store sees the eager (wrong-shape) output, so we compare
+    only the unary op's metric directly against the IR's UnaryMap node to isolate
+    the fix from cascaded downstream errors.
+    """
+    import step_py.ops as ir_ops
+    from graph.graph import MultiDiGraph as Graph
+    from rewrite.broadcast import infer_broadcast
+
+    A = torch.randn(8, 4, dtype=torch.float32)
+
+    # --- IR side: build graph, measure only the UnaryMap node ---
+    ir_ops.StepOps._counter = 0
+    g = Graph()
+    load_a = ir_ops.LinearOffChipLoad(
+        underlying=A, stride=(1,), out_shape_tiled=(2,),
+        tile_row=4, tile_col=4, par_dispatch=1,
+    )
+    g.add_node(load_a)
+    from step_py.functions import map_fn
+    unary = ir_ops.UnaryMap(g, load_a, fn=map_fn.ToConstInt(7), write_back_mu=False, compute_bw=1)
+    g = infer_broadcast(g)
+    ir_unary_off = int(unary.off_chip_traffic())
+    ir_unary_on = int(unary.on_chip_requirement(count_fifos=False))
+    ir_unary_on_fifo = int(unary.on_chip_requirement(count_fifos=True))
+
+    # --- shim side: run DSL program, extract only the unary op record ---
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = unary_to_const_int(a, 7)
+    return offchip_store(b)
+'''
+    namespace: dict = {}
+    exec("import torch\nimport torch.nn.functional as F\nimport math\n", namespace)
+    namespace.update({n: getattr(sdm, n) for n in step_dsl.DSL_FUNCTIONS})
+    namespace["Buffered"] = sdm.Buffered
+    exec(src, namespace)
+    fn = namespace["tiled_reference"]
+    with sdm.tracker(mock_bf16=False) as t:
+        fn({}, {"A": A})
+    unary_records = [r for r in t.records if r.op_name == "unary_to_const_int"]
+    assert len(unary_records) == 1
+    r = unary_records[0]
+    assert (r.off_chip_bytes, r.on_chip_bytes, r.on_chip_bytes_fifo) == (
+        ir_unary_off, ir_unary_on, ir_unary_on_fifo
+    ), (
+        f"unary_to_const_int metric mismatch:\n"
+        f"  shim (off, on, on_fifo) = {(r.off_chip_bytes, r.on_chip_bytes, r.on_chip_bytes_fifo)}\n"
+        f"  ir   (off, on, on_fifo) = {(ir_unary_off, ir_unary_on, ir_unary_on_fifo)}"
+    )
+
+
+def test_parity_unary_select_to_scalar():
+    """unary_select_to_scalar: IR output is Tile(Uint64, (1,1)) = 8 bytes.
+
+    The IR's SelectToScalar.apply() requires a MultiHot input and the translator
+    always feeds it a Tile — so building a full IR graph via the translator fails.
+    We verify the shim metric directly: out_b must be 8 (Uint64 scalar), not the
+    input tile's bytes, since the IR fixes the output to Tile(Uint64, (1,1)).
+    """
+    A = torch.randn(8, 4, dtype=torch.float32)
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = unary_select_to_scalar(a)
+    return offchip_store(b)
+'''
+    namespace: dict = {}
+    exec("import torch\nimport torch.nn.functional as F\nimport math\n", namespace)
+    namespace.update({n: getattr(sdm, n) for n in step_dsl.DSL_FUNCTIONS})
+    namespace["Buffered"] = sdm.Buffered
+    exec(src, namespace)
+    fn = namespace["tiled_reference"]
+    with sdm.tracker(mock_bf16=False) as t:
+        fn({}, {"A": A})
+    sts_records = [r for r in t.records if r.op_name == "unary_select_to_scalar"]
+    assert len(sts_records) == 1
+    r = sts_records[0]
+    # IR: UnaryMap(SelectToScalar) on_chip(True) = in_b + out_b where out_b = 8 (Uint64 (1,1)).
+    # The in_b from eager tensor = 4*4*4 = 64 bytes (float32, mock_bf16=False).
+    in_b = 4 * 4 * 4  # tile (4,4) float32 at 4 bytes
+    out_b = 8          # Tile(Uint64, (1,1)) = 1*1*8
+    assert r.off_chip_bytes == 0
+    assert r.on_chip_bytes == 0
+    assert r.on_chip_bytes_fifo == in_b + out_b, (
+        f"unary_select_to_scalar on_chip_fifo: expected {in_b + out_b}, got {r.on_chip_bytes_fifo}"
+    )
+
+
+def test_parity_unary_rowwise_sum():
+    """unary_rowwise_sum: IR output is Tile(input.dtype, (rows, 1)); eager matches exactly."""
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=8)
+    b = unary_rowwise_sum(a)
+    return offchip_store(b)
+'''
+    A = torch.randn(8, 8, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_unary_mask_row():
+    """unary_mask_row: IR output is Tile(input.dtype, (rows, 1)); eager matches exactly."""
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=8)
+    b = unary_mask_row(a)
+    return offchip_store(b)
+'''
+    A = torch.randn(8, 8, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})

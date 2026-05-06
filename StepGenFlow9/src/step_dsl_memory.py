@@ -362,6 +362,23 @@ for _uname in [
 del _uname
 
 
+def _metrics_unary_to_uint64_scalar(args, kwargs, output, mock_bf16):
+    """unary_to_const_int / unary_select_to_scalar: IR output is Tile(Uint64, (1,1)).
+
+    Eager DSL returns a tile of the input's shape and dtype; the IR fixes the
+    output to a 1x1 Uint64 tile (8 bytes) regardless. We compute on_chip from
+    the IR's true output size.
+    """
+    inp = _tensor_of(args[0])
+    in_b = _stream_dtype_size_bytes(inp, mock_bf16)
+    out_b = _n_byte_for_name("Uint64", mock_bf16)  # 8 bytes per scalar tile
+    return 0, 0, in_b + out_b, {"in_bytes": in_b, "out_bytes": out_b}
+
+
+METRIC_FNS["unary_to_const_int"] = _metrics_unary_to_uint64_scalar
+METRIC_FNS["unary_select_to_scalar"] = _metrics_unary_to_uint64_scalar
+
+
 # ---------------------------------------------------------------------------
 # Per-op metric implementations — accum family
 # ---------------------------------------------------------------------------
