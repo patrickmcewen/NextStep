@@ -58,11 +58,10 @@ def test_dsl_functions_reexported():
 def test_records_empty_when_no_metric_fn_yet():
     # Until ops are registered in METRIC_FNS, records list stays empty even
     # if a wrapped DSL function is called inside a tracker.
-    # select_gen is from the source-control family (not yet registered).
-    ctrl = torch.zeros(2, 2, dtype=torch.int32)
-    ctrl[:, 0] = 1
+    # metadata_gen is from the source-control family (not yet registered in Task 10).
+    A = torch.zeros(2, 2, dtype=torch.int32)
     with sdm.tracker() as t:
-        sdm.select_gen(ctrl, is_multihot=True, n=2)
+        sdm.metadata_gen(A)
     assert t.records == []
 
 
@@ -409,3 +408,106 @@ def tiled_reference(dims, tensors):
 '''
     A = torch.randn(8, 4, dtype=torch.float32)
     _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_broadcast():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    bs = broadcast(a, n=3)
+    return offchip_store(bs[0])
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
+
+
+def test_parity_flat_partition_and_reassemble():
+    """Parity test for flat_partition + flat_reassemble.
+
+    These ops produce DynDim-shaped outputs, so OffChipStore on top of them
+    returns a symbolic off_chip_traffic that cannot be cast to int.  We build
+    the IR graph directly (mirroring test_parity_random_offchip_store) and
+    measure only FlatPartition and FlatReassemble — the nodes where our shim
+    must match the IR formula.
+    """
+    import step_py.ops as ir_ops
+    import step_py.utility_ops as ir_util
+    from graph.graph import MultiDiGraph as Graph
+    from rewrite.broadcast import infer_broadcast
+
+    A = torch.randn(4, 4, dtype=torch.float32)
+    ctrl = torch.tensor([[1, 0], [0, 1], [1, 0], [0, 1]], dtype=torch.int32)
+
+    # --- IR side: build graph directly ---
+    ir_ops.StepOps._counter = 0
+    g = Graph()
+    load_a = ir_ops.LinearOffChipLoad(
+        underlying=A, stride=(1,), out_shape_tiled=(4,),
+        tile_row=1, tile_col=4, par_dispatch=1,
+    )
+    g.add_node(load_a)
+    sel = ir_util.SelectGen(is_multihot=True, tensor=ctrl, n=2)
+    g.add_node(sel)
+    fp = ir_ops.FlatPartition(
+        graph=g, input=load_a, control=sel,
+        partition_rank=1, switch_cycles=[1, 1], write_back_mu=False,
+        num_consumers=2,
+    )
+    fr = ir_ops.FlatReassemble(
+        graph=g, inputs=[(fp, 0), (fp, 1)],
+        control=sel,
+        reassemble_rank=1,
+        switch_cycles=[1, 1],
+        write_back_mu=False,
+    )
+    g = infer_broadcast(g)
+
+    # Only sum nodes that have concrete (non-symbolic) metrics.
+    # FlatPartition and FlatReassemble both have off_chip=0 (always concrete).
+    # Their on_chip(True) is in_tile_size*(n+1) which is also concrete.
+    ir_off = sum(int(n.off_chip_traffic()) for n in g.nodes()
+                 if not isinstance(n, ir_ops.OffChipStore))
+    ir_on = sum(int(n.on_chip_requirement(count_fifos=False)) for n in g.nodes()
+                if not isinstance(n, ir_ops.OffChipStore))
+    ir_on_fifo = sum(int(n.on_chip_requirement(count_fifos=True)) for n in g.nodes()
+                     if not isinstance(n, ir_ops.OffChipStore))
+
+    # --- shim side: run DSL program, exclude offchip_store from totals ---
+    namespace: dict = {}
+    exec("import torch\nimport torch.nn.functional as F\nimport math\n", namespace)
+    from src import step_dsl
+    namespace.update({n: getattr(sdm, n) for n in step_dsl.DSL_FUNCTIONS})
+    namespace["Buffered"] = sdm.Buffered
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(4,),
+                     tile_row=1, tile_col=4)
+    ctrl = select_gen(tensors["ctrl"], is_multihot=True, n=2)
+    parts = flat_partition(a, ctrl, n=2)
+    out = flat_reassemble(parts, ctrl)
+    return offchip_store(out)
+'''
+    exec(src, namespace)
+    fn = namespace["tiled_reference"]
+    with sdm.tracker(mock_bf16=False) as t:
+        fn({}, {"A": A, "ctrl": ctrl})
+    # Exclude offchip_load (counted in IR via load_a) and offchip_store (excluded in IR too).
+    # We compare only the routing op nodes: select_gen, flat_partition, flat_reassemble.
+    routing_names = {"select_gen", "flat_partition", "flat_reassemble"}
+    shim_off = sum(r.off_chip_bytes for r in t.records if r.op_name in routing_names)
+    shim_on = sum(r.on_chip_bytes for r in t.records if r.op_name in routing_names)
+    shim_on_fifo = sum(r.on_chip_bytes_fifo for r in t.records if r.op_name in routing_names)
+
+    # IR side: measure only FlatPartition and FlatReassemble (SelectGen is 0 always).
+    ir_routing_off = int(fp.off_chip_traffic()) + int(fr.off_chip_traffic())
+    ir_routing_on = (int(fp.on_chip_requirement(count_fifos=False))
+                     + int(fr.on_chip_requirement(count_fifos=False)))
+    ir_routing_on_fifo = (int(fp.on_chip_requirement(count_fifos=True))
+                          + int(fr.on_chip_requirement(count_fifos=True)))
+
+    assert (shim_off, shim_on, shim_on_fifo) == (ir_routing_off, ir_routing_on, ir_routing_on_fifo), (
+        f"shim routing totals != IR routing totals\n"
+        f"  shim (off, on, on_fifo) = {(shim_off, shim_on, shim_on_fifo)}\n"
+        f"  ir   (off, on, on_fifo) = {(ir_routing_off, ir_routing_on, ir_routing_on_fifo)}"
+    )

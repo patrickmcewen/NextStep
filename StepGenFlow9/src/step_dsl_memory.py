@@ -478,6 +478,97 @@ METRIC_FNS["streamify"]    = _metrics_streamify_family
 METRIC_FNS["dyn_streamify"] = _metrics_streamify_family
 
 
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — routing / multi-output family
+# ---------------------------------------------------------------------------
+#
+# Multi-output ops return list[Tensor]; use _list_first_tensor to get the
+# representative tensor for shape/dtype queries.
+#
+# IR formulas (count_fifos=False always returns 0 for all these ops):
+#   Broadcast:        on_chip(T) = 0                   (no FIFOs needed)
+#   Parallelize:      on_chip(T) = in_tile * (n+1)
+#   StaticReassemble: on_chip(T) = in_tile * (n_inputs+1)
+#   FlatPartition:    on_chip(T) = in_tile * (n+1)
+#   FlatReassemble:   on_chip(T) = in_tile * (n_inputs+1)  (write_back_mu=False)
+#   EagerMerge:       on_chip(T) = (in_tile + sel_dtype_size) * (n_inputs+1)
+#                     where sel_dtype_size = MultiHot(total_n=n_inputs).size_in_bytes()
+#                                         = n_inputs  (one byte per hot bit)
+#   SelectGen:        always 0
+
+
+def _list_first_tensor(out):
+    if isinstance(out, list) and out:
+        return out[0]
+    return out
+
+
+def _metrics_broadcast(args, kwargs, output, mock_bf16):
+    """Broadcast: off_chip=0, on_chip(F)=0, on_chip(T)=0."""
+    return 0, 0, 0, {}
+
+
+def _metrics_parallelize(args, kwargs, output, mock_bf16):
+    """Parallelize: on_chip(T) = in_tile_size * (num_consumers + 1)."""
+    x = _tensor_of(args[0])
+    n = int(args[1]) if len(args) > 1 else int(kwargs["n"])
+    in_tile_b = _stream_dtype_size_bytes(x, mock_bf16)
+    return 0, 0, in_tile_b * (n + 1), {"in_bytes": in_tile_b, "n": n}
+
+
+def _metrics_static_reassemble(args, kwargs, output, mock_bf16):
+    """StaticReassemble: on_chip(T) = in_tile_size * (n_inputs + 1)."""
+    inputs = args[0]
+    assert isinstance(inputs, list) and inputs
+    n = len(inputs)
+    in_tile_b = _stream_dtype_size_bytes(_tensor_of(inputs[0]), mock_bf16)
+    return 0, 0, in_tile_b * (n + 1), {"in_bytes": in_tile_b, "n_inputs": n}
+
+
+def _metrics_flat_partition(args, kwargs, output, mock_bf16):
+    """FlatPartition: on_chip(T) = in_tile_size * (num_consumers + 1)."""
+    x = _tensor_of(args[0])
+    n = int(args[2]) if len(args) > 2 else int(kwargs["n"])
+    in_tile_b = _stream_dtype_size_bytes(x, mock_bf16)
+    return 0, 0, in_tile_b * (n + 1), {"in_bytes": in_tile_b, "n": n}
+
+
+def _metrics_flat_reassemble(args, kwargs, output, mock_bf16):
+    """FlatReassemble (write_back_mu=False): on_chip(T) = in_tile_size * (n_inputs + 1)."""
+    inputs = args[0]
+    assert isinstance(inputs, list) and inputs
+    n = len(inputs)
+    in_tile_b = _stream_dtype_size_bytes(_tensor_of(inputs[0]), mock_bf16)
+    return 0, 0, in_tile_b * (n + 1), {"in_bytes": in_tile_b, "n_inputs": n}
+
+
+def _metrics_eager_merge(args, kwargs, output, mock_bf16):
+    """EagerMerge: on_chip(T) = (in_tile_size + n_inputs) * (n_inputs + 1).
+
+    sel_stream_dtype_size = MultiHot(total_n=n_inputs).size_in_bytes() = n_inputs bytes.
+    """
+    inputs = args[0]
+    assert isinstance(inputs, list) and inputs
+    n = len(inputs)
+    in_tile_b = _stream_dtype_size_bytes(_tensor_of(inputs[0]), mock_bf16)
+    sel_size = n  # MultiHot(total_n=n).size_in_bytes() == n
+    return 0, 0, (in_tile_b + sel_size) * (n + 1), {"in_bytes": in_tile_b, "n_inputs": n}
+
+
+def _metrics_select_gen(args, kwargs, output, mock_bf16):
+    """SelectGen: always returns 0 for all metrics."""
+    return 0, 0, 0, {}
+
+
+METRIC_FNS["broadcast"]         = _metrics_broadcast
+METRIC_FNS["parallelize"]       = _metrics_parallelize
+METRIC_FNS["static_reassemble"] = _metrics_static_reassemble
+METRIC_FNS["flat_partition"]    = _metrics_flat_partition
+METRIC_FNS["flat_reassemble"]   = _metrics_flat_reassemble
+METRIC_FNS["eager_merge"]       = _metrics_eager_merge
+METRIC_FNS["select_gen"]        = _metrics_select_gen
+
+
 for _name in step_dsl.DSL_FUNCTIONS:
     assert hasattr(step_dsl, _name), f"step_dsl missing function listed in DSL_FUNCTIONS: {_name}"
     globals()[_name] = _make_wrapper(_name, getattr(step_dsl, _name))
