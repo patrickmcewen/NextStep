@@ -77,6 +77,15 @@ def main():
                         help="Autotuner agent variant (e.g. 'general', 'parallel'). "
                              "Ignored when autotune_config.json defines 'passes'. "
                              "Validated by the agent factory at run time.")
+    parser.add_argument(
+        "--check-order", default="correctness-first",
+        choices=["correctness-first", "compliance-first"],
+        help="Order of per-turn gates. 'correctness-first' (default) runs the "
+             "code first, then compliance/judge/post-validator — exactly as before. "
+             "'compliance-first' runs the regex compliance and LLM judge before "
+             "executing the code, so structurally noncompliant code is rejected "
+             "without being run.",
+    )
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
@@ -102,6 +111,7 @@ def main():
         few_shot_paths=args.few_shot,
         bundle_dir=args.bundle_dir,
         autotune_options=autotune_options,
+        check_order=args.check_order,
     ))
 
     if result["success"]:
