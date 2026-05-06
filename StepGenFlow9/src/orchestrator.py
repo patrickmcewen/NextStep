@@ -948,7 +948,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          prev_code=None, log=print,
                          judge_agent=None, dsl_code=None,
                          post_validator=None,
-                         compliance_override: dict | None = None):
+                         compliance_override: dict | None = None,
+                         check_order: str = "correctness-first"):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1009,148 +1010,64 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         _write(turn_dir / "extracted_code.py", code)
         log(f"      Extracted code: {len(code)} chars")
 
-        # Run correctness check. Capture stdout so the per-op shape trace
-        # printed by step_dsl ops can be fed back to the model on failure.
-        log(f"      Running correctness check ({executor})...")
-        feedback = ""
+        # ----- Per-turn gate cascade -----
+        assert check_order in ("correctness-first", "compliance-first"), \
+            f"Unknown check_order={check_order!r}"
+
+        if check_order == "correctness-first":
+            gate_order = ["correctness", "compliance", "judge", "post_validator"]
+            correctness_verified = True
+        else:  # "compliance-first"
+            gate_order = ["compliance", "judge", "correctness", "post_validator"]
+            correctness_verified = False
+
         shape_trace = ""
-        _trace_buf = io.StringIO()
+        turn_feedback = None
+        turn_status = None
+        success_this_turn = False
+
         try:
-            with contextlib.redirect_stdout(_trace_buf):
-                result = check_correctness(code, kernel_name, dims, tensors)
-            shape_trace = _trace_buf.getvalue()
-            if shape_trace:
-                _write(turn_dir / "shape_trace.txt", shape_trace)
-            _write(turn_dir / "correctness_result.txt", result)
-
-            if "match=True" in result:
-                # Bundle mode (compliance_override set) drives the regex
-                # checker from the bundle's manifest so it speaks the
-                # abstraction's invented vocabulary; non-bundle mode falls
-                # back to the hard-coded step_dsl tables.
-                if compliance_override is not None:
-                    violations = _check_bundle_compliance(code, compliance_override)
-                else:
-                    violations = _check_banned_ops(code, pass_name)
-                if violations:
-                    _write(turn_dir / "status.txt", "CORRECT_BUT_NONCOMPLIANT")
-                    log(f"      -> CORRECT but {len(violations)} violation(s) remain")
-                    if pass_name in _TRANSLATION_PASSES:
-                        fix_hint = "Replace these with the corresponding STeP operations."
-                    else:
-                        fix_hint = "Replace these with the corresponding DSL function calls listed in the instructions."
-
-                    # On the refactor pass, also run the judge on noncompliant
-                    # code so the LLM gets richer line-specific guidance
-                    # alongside the regex violations (the regex message alone
-                    # isn't enough for shape/routing rewrites).
-                    judge_feedback = ""
-                    if judge_agent is not None and pass_name == "refactor_final":
-                        log(f"      Also running judge for richer feedback...")
-                        judge_ctx = ""
-                        if tensors is not None:
-                            judge_ctx = "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
-                        judge_violations, judge_tokens = await _run_judge(
-                            judge_agent, code, turn_dir, log, context=judge_ctx)
-                        total_tokens += judge_tokens
-                        if judge_violations is not None:
-                            judge_feedback = "\n\n## Judge feedback (line-specific):\n\n" + judge_violations
-
-                    feedback = (
-                        "## Correctness: PASS\n\n"
-                        "Your code produces the correct output, but still contains "
-                        "disallowed operations:\n\n"
-                        + "\n".join(violations)
-                        + f"\n\n{fix_hint}"
-                        + judge_feedback
-                    )
-                else:
-                    # Regex compliance passed. Run the LLM judge first (its
-                    # structural feedback is the most actionable signal we have
-                    # at this stage), then the deterministic post_validator —
-                    # the translator's errors are last because they're often
-                    # downstream symptoms of the same canonical-form issues the
-                    # judge catches.
-                    judge_violations = None
-                    if judge_agent is not None:
-                        log(f"      Running judge...")
-                        judge_ctx = (
-                            "## Correctness status\n"
-                            "This code has ALREADY been executed and its output matches the reference "
-                            "to within floating-point tolerance. Numerical correctness is verified. "
-                            "Only evaluate the three structural checks.\n\n"
-                        )
-                        if tensors is not None:
-                            judge_ctx += "## Input tensors\n" + _format_tensors_description(tensors) + "\n\n"
-                        judge_violations, judge_tokens = await _run_judge(
-                            judge_agent, code, turn_dir, log, context=judge_ctx)
-                        total_tokens += judge_tokens
-
-                    if judge_violations is not None:
-                        _write(turn_dir / "status.txt", "CORRECT_BUT_JUDGE_REJECTED")
-                        log(f"      -> CORRECT but judge rejected")
-                        feedback = (
-                            "## Correctness: PASS\n\n"
-                            "Your code produces the correct output and uses allowed operations, "
-                            "but does not follow canonical form:\n\n"
-                            + judge_violations
-                            + "\n\nFix these structural issues while keeping the output correct."
-                        )
-                    else:
-                        post_feedback = None
-                        if post_validator is not None:
-                            log(f"      Running post-validator...")
-                            post_feedback = post_validator(code, turn_dir)
-
-                        if post_feedback is not None:
-                            _write(turn_dir / "status.txt", "CORRECT_BUT_POST_VALIDATOR_REJECTED")
-                            log(f"      -> CORRECT but post-validator rejected")
-                            feedback = post_feedback
-                        else:
-                            success = True
-                            _write(turn_dir / "status.txt", "PASS")
-                            log(f"      -> PASS{' (judge approved)' if judge_agent is not None else ''}")
-                            break
+            for gate_name in gate_order:
+                if gate_name == "correctness":
+                    res, shape_trace = await _gate_correctness(
+                        code, kernel_name, dims, tensors, executor,
+                        turn_dir, log)
+                    correctness_verified = (res.feedback is None)
+                elif gate_name == "compliance":
+                    res = await _gate_compliance(
+                        code, pass_name, compliance_override, judge_agent,
+                        tensors, turn_dir, log,
+                        correctness_verified=correctness_verified)
+                elif gate_name == "judge":
+                    res = await _gate_judge(
+                        judge_agent, code, tensors, turn_dir, log,
+                        correctness_verified=correctness_verified)
+                else:  # "post_validator"
+                    res = _gate_post_validator(post_validator, code, turn_dir, log)
+                total_tokens += res.tokens
+                if res.feedback is not None:
+                    turn_feedback = res.feedback
+                    turn_status = res.status
+                    break
             else:
-                _write(turn_dir / "status.txt", f"FAIL: {result.splitlines()[0]}")
-                log(f"      -> FAIL: {result.splitlines()[0]}")
-                feedback = f"## Correctness check result\n{result}"
+                turn_status = "PASS"
+                success_this_turn = True
         except Exception:
-            shape_trace = _trace_buf.getvalue()
-            if shape_trace:
-                _write(turn_dir / "shape_trace.txt", shape_trace)
             err = traceback.format_exc()
-            _write(turn_dir / "correctness_result.txt", f"ERROR:\n{err}")
-            log(f"      -> ERROR: {_error_summary(err)}")
-            feedback = f"## Error running code\n{err}"
-            if "ModuleNotFoundError" in err or "ImportError" in err:
-                feedback += (
-                    "\n\n**IMPORTANT: Do NOT include any import statements in your code.** "
-                    "All imports are injected automatically. Remove ALL import/from lines."
-                )
-            if "missing 1 required positional argument" in err:
-                feedback += (
-                    "\n\n**IMPORTANT: Most STeP ops require `graph` as the FIRST positional arg.** "
-                    "Source ops (LinearOffChipLoad, SelectGen, MetadataGen) do NOT take graph. "
-                    "ALL other ops take `graph` as their first argument: "
-                    "`Promote(graph, input, promote_rank=2)` not `Promote(input, promote_rank=2)`."
-                )
-            if "FlatPartition" in err and ("not subscriptable" in err or "not iterable" in err):
-                feedback += (
-                    "\n\n**IMPORTANT: FlatPartition returns a single node, NOT a list.** "
-                    "To access per-branch streams, pass a TUPLE `(partitioned, i)` as the input "
-                    "to downstream ops. Example:\n"
-                    "```python\n"
-                    "partitioned = FlatPartition(graph, input_node, select_gen, ...)\n"
-                    "# Access branch i:\n"
-                    "branch_op = BinaryMap(graph, (partitioned, i), weight_load, ...)\n"
-                    "```\n"
-                    "Do NOT index `partitioned[i]` or iterate `for x in partitioned`."
-                )
+            turn_feedback = f"## Error running code\n{err}"
+            turn_status = f"FAIL: {_error_summary(err)}"
 
+        _write(turn_dir / "status.txt", turn_status)
+        log(f"      -> {turn_status}")
+
+        if success_this_turn:
+            success = True
+            break
+
+        feedback = turn_feedback
+
+        # Shape-trace tail truncation (preserved verbatim from pre-refactor).
         if shape_trace:
-            # Cap at the last MAX_LINES so the trace nearest the failure point
-            # is preserved without blowing up the context window on long runs.
             lines = shape_trace.splitlines()
             MAX_LINES = 200
             if len(lines) > MAX_LINES:
@@ -1169,6 +1086,32 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 "identical stream shapes); when the run errored, the trace "
                 "ends just before the failing op.\n"
                 "```\n" + trace_body + "\n```"
+            )
+
+        # Import-hint augmentation predicates (preserved verbatim).
+        if "ModuleNotFoundError" in feedback or "ImportError" in feedback:
+            feedback += (
+                "\n\n**IMPORTANT: Do NOT include any import statements in your code.** "
+                "All imports are injected automatically. Remove ALL import/from lines."
+            )
+        if "missing 1 required positional argument" in feedback:
+            feedback += (
+                "\n\n**IMPORTANT: Most STeP ops require `graph` as the FIRST positional arg.** "
+                "Source ops (LinearOffChipLoad, SelectGen, MetadataGen) do NOT take graph. "
+                "ALL other ops take `graph` as their first argument: "
+                "`Promote(graph, input, promote_rank=2)` not `Promote(input, promote_rank=2)`."
+            )
+        if "FlatPartition" in feedback and ("not subscriptable" in feedback or "not iterable" in feedback):
+            feedback += (
+                "\n\n**IMPORTANT: FlatPartition returns a single node, NOT a list.** "
+                "To access per-branch streams, pass a TUPLE `(partitioned, i)` as the input "
+                "to downstream ops. Example:\n"
+                "```python\n"
+                "partitioned = FlatPartition(graph, input_node, select_gen, ...)\n"
+                "# Access branch i:\n"
+                "branch_op = BinaryMap(graph, (partitioned, i), weight_load, ...)\n"
+                "```\n"
+                "Do NOT index `partitioned[i]` or iterate `for x in partitioned`."
             )
 
         feedback += (

@@ -275,3 +275,95 @@ def test_gate_post_validator_fail(tmp_path):
     assert res.feedback == "## Translation failed\n..."
     assert res.status == "CORRECT_BUT_POST_VALIDATOR_REJECTED"
     assert res.tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# _run_pass_loop integration tests
+# ---------------------------------------------------------------------------
+
+class _FakeUsage:
+    def __init__(self, total_tokens):
+        self.total_tokens = total_tokens
+
+class _FakeContextWrapper:
+    def __init__(self, total_tokens):
+        self.usage = _FakeUsage(total_tokens)
+
+class _FakeRunResult:
+    def __init__(self, text, total_tokens=0):
+        self.final_output = text
+        self.context_wrapper = _FakeContextWrapper(total_tokens)
+        self.new_items = []  # required by _reasoning_text
+
+
+class _FakeAgent:
+    """Minimal agent stub — only .instructions is required by _run_pass_loop."""
+    instructions = "# fake system prompt"
+
+
+def _stub_runner_run(monkeypatch, responses):
+    """Patch Runner.run to yield the next response from `responses` per call."""
+    queue = list(responses)
+    async def fake_run(agent, conversation):
+        return _FakeRunResult(queue.pop(0))
+    monkeypatch.setattr(orch_mod.Runner, "run", fake_run)
+
+
+def _stub_pass_loop_infra(monkeypatch):
+    """Patch build_pass_user_prompt so _run_pass_loop doesn't need a real StepDB."""
+    import src.orchestrator as _o
+    monkeypatch.setattr(_o, "build_pass_user_prompt",
+                        lambda *a, **kw: "## fake user prompt")
+
+
+def test_run_pass_loop_correctness_first_clean_pass(tmp_path, monkeypatch):
+    """Smoke test: _run_pass_loop under correctness-first; one turn, all gates pass."""
+    monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl",
+                        lambda c, k, d, t: "match=True\nmax_diff=0.0")
+    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn: [])
+    _stub_pass_loop_infra(monkeypatch)
+    _stub_runner_run(monkeypatch, ["```python\ndef tiled_reference(d, t): return 0\n```"])
+
+    log, _ = _make_log_capture()
+    out = _run(orch_mod._run_pass_loop(
+        agent=_FakeAgent(), pass_name="refactor_final", kernel_name="k",
+        dims={}, max_turns=2, ckpt_dir=tmp_path,
+        executor="dsl", tensors=None, log=log,
+        judge_agent=None, post_validator=None, compliance_override=None,
+        check_order="correctness-first",
+    ))
+
+    assert out["success"] is True
+    turn0 = tmp_path / "refactor_final" / "turn_0"
+    assert (turn0 / "status.txt").read_text() == "PASS"
+
+
+def test_run_pass_loop_correctness_first_compliance_fail_then_pass(tmp_path, monkeypatch):
+    """Compliance fails on turn 0, agent fixes it on turn 1."""
+    monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl",
+                        lambda c, k, d, t: "match=True\nmax_diff=0.0")
+    state = {"violations": ["torch.matmul: line 1"]}
+    monkeypatch.setattr(orch_mod, "_check_banned_ops",
+                        lambda code, pn: state["violations"])
+    _stub_pass_loop_infra(monkeypatch)
+
+    def runner_responses():
+        yield "```python\nbad\n```"
+        state["violations"] = []  # second turn: clean
+        yield "```python\ngood\n```"
+    gen = runner_responses()
+    async def fake_run(agent, conv):
+        return _FakeRunResult(next(gen))
+    monkeypatch.setattr(orch_mod.Runner, "run", fake_run)
+
+    log, _ = _make_log_capture()
+    out = _run(orch_mod._run_pass_loop(
+        agent=_FakeAgent(), pass_name="refactor_final", kernel_name="k",
+        dims={}, max_turns=3, ckpt_dir=tmp_path,
+        executor="dsl", tensors=None, log=log,
+        judge_agent=None, post_validator=None, compliance_override=None,
+        check_order="correctness-first",
+    ))
+    assert out["success"] is True
+    assert (tmp_path / "refactor_final" / "turn_0" / "status.txt").read_text() == "CORRECT_BUT_NONCOMPLIANT"
+    assert (tmp_path / "refactor_final" / "turn_1" / "status.txt").read_text() == "PASS"
