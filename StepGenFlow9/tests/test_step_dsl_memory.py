@@ -56,12 +56,14 @@ def test_dsl_functions_reexported():
 
 
 def test_records_empty_when_no_metric_fn_yet():
-    # Until ops are registered in METRIC_FNS, records list stays empty even
-    # if a wrapped DSL function is called inside a tracker.
-    # metadata_gen is from the source-control family (not yet registered in Task 10).
-    A = torch.zeros(2, 2, dtype=torch.int32)
+    # Ops absent from METRIC_FNS are forwarded transparently without recording.
+    # Temporarily remove a key to exercise that path.
+    A = torch.zeros(4, 4, dtype=torch.float32)
+    saved = sdm.METRIC_FNS.pop("broadcast", None)
     with sdm.tracker() as t:
-        sdm.metadata_gen(A)
+        sdm.broadcast(A, n=2)
+    if saved is not None:
+        sdm.METRIC_FNS["broadcast"] = saved
     assert t.records == []
 
 
@@ -511,3 +513,16 @@ def tiled_reference(dims, tensors):
         f"  shim (off, on, on_fifo) = {(shim_off, shim_on, shim_on_fifo)}\n"
         f"  ir   (off, on, on_fifo) = {(ir_routing_off, ir_routing_on, ir_routing_on_fifo)}"
     )
+
+
+def test_parity_metadata_gen():
+    src = '''
+def tiled_reference(dims, tensors):
+    n = metadata_gen(tensors["n"])
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    return offchip_store(a)
+'''
+    n = torch.tensor([3], dtype=torch.float32)
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"n": n, "A": A})

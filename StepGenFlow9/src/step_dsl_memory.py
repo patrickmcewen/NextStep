@@ -482,9 +482,6 @@ METRIC_FNS["dyn_streamify"] = _metrics_streamify_family
 # Per-op metric implementations — routing / multi-output family
 # ---------------------------------------------------------------------------
 #
-# Multi-output ops return list[Tensor]; use _list_first_tensor to get the
-# representative tensor for shape/dtype queries.
-#
 # IR formulas (count_fifos=False always returns 0 for all these ops):
 #   Broadcast:        on_chip(T) = 0                   (no FIFOs needed)
 #   Parallelize:      on_chip(T) = in_tile * (n+1)
@@ -495,12 +492,6 @@ METRIC_FNS["dyn_streamify"] = _metrics_streamify_family
 #                     where sel_dtype_size = MultiHot(total_n=n_inputs).size_in_bytes()
 #                                         = n_inputs  (one byte per hot bit)
 #   SelectGen:        always 0
-
-
-def _list_first_tensor(out):
-    if isinstance(out, list) and out:
-        return out[0]
-    return out
 
 
 def _metrics_broadcast(args, kwargs, output, mock_bf16):
@@ -567,6 +558,38 @@ METRIC_FNS["flat_partition"]    = _metrics_flat_partition
 METRIC_FNS["flat_reassemble"]   = _metrics_flat_reassemble
 METRIC_FNS["eager_merge"]       = _metrics_eager_merge
 METRIC_FNS["select_gen"]        = _metrics_select_gen
+
+
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — source-control family
+# ---------------------------------------------------------------------------
+#
+# IR classes: MetadataGen, SelectGen (already registered above), CacheReadAddrGen,
+#   FilterLastTile, ExpertAddrGen, FlatmapFilterRowStreamify, FlatmapCounter.
+#
+# All return on_chip_requirement = 0 for both count_fifos modes (verified in
+# utility_ops.py and ops.py). off_chip_traffic is also 0 for all of them.
+
+
+def _metrics_source_control_zero(args, kwargs, output, mock_bf16):
+    """Metric for source-control ops whose IR on_chip_requirement is always 0.
+
+    Covers: MetadataGen, CacheReadAddrGen, FilterLastTile, ExpertAddrGen,
+            FlatmapFilterRowStreamify, FlatmapCounter.
+    """
+    return 0, 0, 0, {}
+
+
+for _scname in [
+    "metadata_gen",
+    "expert_addr_gen",
+    "cache_read_addr_gen",
+    "filter_last_tile",
+    "flatmap_filter_row_streamify",
+    "flatmap_counter",
+]:
+    METRIC_FNS[_scname] = _metrics_source_control_zero
+del _scname
 
 
 for _name in step_dsl.DSL_FUNCTIONS:
