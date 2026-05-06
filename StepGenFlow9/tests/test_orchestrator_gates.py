@@ -367,3 +367,78 @@ def test_run_pass_loop_correctness_first_compliance_fail_then_pass(tmp_path, mon
     assert out["success"] is True
     assert (tmp_path / "refactor_final" / "turn_0" / "status.txt").read_text() == "CORRECT_BUT_NONCOMPLIANT"
     assert (tmp_path / "refactor_final" / "turn_1" / "status.txt").read_text() == "PASS"
+
+
+def test_run_pass_loop_compliance_first_compliance_short_circuits_correctness(tmp_path, monkeypatch):
+    """Under compliance-first, a banned-op turn is rejected before correctness runs."""
+    correctness_calls = []
+    def boom(code, kernel, dims, tensors):
+        correctness_calls.append(1)
+        return "match=True"
+    monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl", boom)
+
+    state = {"violations": ["torch.matmul: line 1"]}
+    monkeypatch.setattr(orch_mod, "_check_banned_ops",
+                        lambda code, pn: state["violations"])
+
+    _stub_pass_loop_infra(monkeypatch)
+
+    def gen():
+        yield "```python\nbad\n```"
+        state["violations"] = []
+        yield "```python\ngood\n```"
+    g = gen()
+    async def fake_run(agent, conv):
+        return _FakeRunResult(next(g))
+    monkeypatch.setattr(orch_mod.Runner, "run", fake_run)
+
+    log, _ = _make_log_capture()
+    out = _run(orch_mod._run_pass_loop(
+        agent=_FakeAgent(), pass_name="refactor_final", kernel_name="k",
+        dims={}, max_turns=3, ckpt_dir=tmp_path,
+        executor="dsl", tensors=None, log=log,
+        judge_agent=None, post_validator=None, compliance_override=None,
+        check_order="compliance-first",
+    ))
+
+    assert out["success"] is True
+    # Turn 0: compliance fail short-circuits — correctness must NOT have been called.
+    turn0_status = (tmp_path / "refactor_final" / "turn_0" / "status.txt").read_text()
+    assert turn0_status == "NONCOMPLIANT", f"got {turn0_status!r}"
+    # No correctness_result.txt because correctness never ran.
+    assert not (tmp_path / "refactor_final" / "turn_0" / "correctness_result.txt").exists()
+    # Turn 1 (clean) ran correctness exactly once.
+    assert correctness_calls == [1]
+
+
+def test_run_pass_loop_compliance_first_judge_runs_with_not_yet_verified_ctx(tmp_path, monkeypatch):
+    monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl",
+                        lambda c, k, d, t: "match=True")
+    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn: [])
+
+    captured = {}
+    async def fake_run_judge(judge_agent, code, turn_dir, log, *, context):
+        captured.setdefault("ctxs", []).append(context)
+        # First turn: judge rejects. Second turn: judge approves.
+        if len(captured["ctxs"]) == 1:
+            return ("VIOLATIONS:\n- bad", 5)
+        return (None, 5)
+    monkeypatch.setattr(orch_mod, "_run_judge", fake_run_judge)
+
+    _stub_pass_loop_infra(monkeypatch)
+    _stub_runner_run(monkeypatch, ["```python\nx\n```", "```python\ny\n```"])
+
+    log, _ = _make_log_capture()
+    out = _run(orch_mod._run_pass_loop(
+        agent=_FakeAgent(), pass_name="refactor_final", kernel_name="k",
+        dims={}, max_turns=3, ckpt_dir=tmp_path,
+        executor="dsl", tensors=None, log=log,
+        judge_agent=object(), post_validator=None, compliance_override=None,
+        check_order="compliance-first",
+    ))
+
+    assert out["success"] is True
+    assert (tmp_path / "refactor_final" / "turn_0" / "status.txt").read_text() == "JUDGE_REJECTED"
+    # Both judge invocations must have used the not-yet-verified preamble.
+    for ctx in captured["ctxs"]:
+        assert "NOT yet been executed" in ctx
