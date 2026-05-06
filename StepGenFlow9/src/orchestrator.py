@@ -971,8 +971,6 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     # already contains any {few_shot_examples} substitutions from make_pass_agent).
     _write(pass_dir / "system_prompt.txt", agent.instructions)
 
-    check_correctness = _CORRECTNESS_CHECKERS[executor]
-
     last_code = None
     success = False
     total_tokens = 0
