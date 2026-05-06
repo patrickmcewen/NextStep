@@ -893,6 +893,41 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
     return _GateResult(feedback, status, judge_tokens)
 
 
+async def _gate_judge(judge_agent, code, tensors, turn_dir: Path, log,
+                      *, correctness_verified: bool) -> _GateResult:
+    """LLM judge over canonical-form structural checks."""
+    if judge_agent is None:
+        return _GateResult(None, "PASS", 0)
+
+    log(f"      Running judge...")
+    judge_ctx = _build_judge_context(tensors, correctness_verified=correctness_verified)
+    judge_violations, judge_tokens = await _run_judge(
+        judge_agent, code, turn_dir, log, context=judge_ctx)
+
+    if judge_violations is None:
+        return _GateResult(None, "PASS", judge_tokens)
+
+    if correctness_verified:
+        feedback = (
+            "## Correctness: PASS\n\n"
+            "Your code produces the correct output and uses allowed operations, "
+            "but does not follow canonical form:\n\n"
+            + judge_violations
+            + "\n\nFix these structural issues while keeping the output correct."
+        )
+        status = "CORRECT_BUT_JUDGE_REJECTED"
+    else:
+        feedback = (
+            "## Judge rejected\n\n"
+            "Your code does not follow canonical form:\n\n"
+            + judge_violations
+            + "\n\nFix these structural issues."
+        )
+        status = "JUDGE_REJECTED"
+
+    return _GateResult(feedback, status, judge_tokens)
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, *, executor: str, tensors: dict,
                          prev_code=None, log=print,

@@ -183,3 +183,70 @@ def test_gate_compliance_translation_pass_skips_carveout(tmp_path, monkeypatch):
     assert res.status == "CORRECT_BUT_NONCOMPLIANT"
     assert res.tokens == 0
     assert "## Judge feedback" not in res.feedback
+
+
+def test_gate_judge_no_agent(tmp_path):
+    """No judge agent => immediate pass with zero tokens."""
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_judge(
+        judge_agent=None, code="x", tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert res == orch_mod._GateResult(None, "PASS", 0)
+
+
+def test_gate_judge_pass_correctness_verified_true(tmp_path, monkeypatch):
+    captured = {}
+    async def fake_run_judge(judge_agent, code, turn_dir, log, *, context):
+        captured["ctx"] = context
+        return (None, 17)
+
+    monkeypatch.setattr(orch_mod, "_run_judge", fake_run_judge)
+
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_judge(
+        judge_agent=object(), code="x", tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert res.feedback is None
+    assert res.status == "PASS"
+    assert res.tokens == 17
+    assert "ALREADY been executed" in captured["ctx"]
+
+
+def test_gate_judge_fail_correctness_verified_true(tmp_path, monkeypatch):
+    async def fake_run_judge(judge_agent, code, turn_dir, log, *, context):
+        return ("VIOLATIONS:\n- bad shape", 9)
+    monkeypatch.setattr(orch_mod, "_run_judge", fake_run_judge)
+
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_judge(
+        judge_agent=object(), code="x", tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=True,
+    ))
+    assert res.status == "CORRECT_BUT_JUDGE_REJECTED"
+    assert res.tokens == 9
+    assert res.feedback.startswith(
+        "## Correctness: PASS\n\nYour code produces the correct output and uses allowed operations, "
+        "but does not follow canonical form:\n\n"
+    )
+    assert "VIOLATIONS:\n- bad shape" in res.feedback
+    assert res.feedback.endswith("Fix these structural issues while keeping the output correct.")
+
+
+def test_gate_judge_fail_correctness_verified_false(tmp_path, monkeypatch):
+    async def fake_run_judge(judge_agent, code, turn_dir, log, *, context):
+        assert "NOT yet been executed" in context, "judge ctx must reflect not-yet-verified"
+        return ("VIOLATIONS:\n- bad shape", 9)
+    monkeypatch.setattr(orch_mod, "_run_judge", fake_run_judge)
+
+    log, _ = _make_log_capture()
+    res = _run(orch_mod._gate_judge(
+        judge_agent=object(), code="x", tensors=None,
+        turn_dir=tmp_path, log=log, correctness_verified=False,
+    ))
+    assert res.status == "JUDGE_REJECTED"
+    assert res.tokens == 9
+    assert res.feedback.startswith("## Judge rejected\n\nYour code does not follow canonical form:\n\n")
+    assert "VIOLATIONS:\n- bad shape" in res.feedback
+    assert res.feedback.endswith("Fix these structural issues.")
