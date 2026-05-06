@@ -298,6 +298,29 @@ for _bname in [
 del _bname
 
 
+# ---------------------------------------------------------------------------
+# Per-op metric implementations — unary map family
+# ---------------------------------------------------------------------------
+
+
+def _metrics_unary_map(args, kwargs, output, mock_bf16):
+    """UnaryMap: off_chip = 0, on_chip(False) = 0, on_chip(True) = in_size + out_size."""
+    inp = _tensor_of(args[0])
+    out = _tensor_of(output)
+    in_b = _stream_dtype_size_bytes(inp, mock_bf16)
+    out_b = _stream_dtype_size_bytes(out, mock_bf16)
+    return 0, 0, in_b + out_b, {"in_bytes": in_b, "out_bytes": out_b}
+
+
+for _uname in [
+    "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
+    "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
+    "unary_mask_row", "unary_select_to_scalar", "unary_to_const_int",
+]:
+    METRIC_FNS[_uname] = _metrics_unary_map
+del _uname
+
+
 for _name in step_dsl.DSL_FUNCTIONS:
     assert hasattr(step_dsl, _name), f"step_dsl missing function listed in DSL_FUNCTIONS: {_name}"
     globals()[_name] = _make_wrapper(_name, getattr(step_dsl, _name))

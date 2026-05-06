@@ -58,10 +58,11 @@ def test_dsl_functions_reexported():
 def test_records_empty_when_no_metric_fn_yet():
     # Until ops are registered in METRIC_FNS, records list stays empty even
     # if a wrapped DSL function is called inside a tracker.
-    # unary_silu has no metric function registered yet (unary family is a later task).
-    a = torch.randn(2, 4, 4, dtype=torch.float32)
+    # select_gen is from the source-control family (not yet registered).
+    ctrl = torch.zeros(2, 2, dtype=torch.int32)
+    ctrl[:, 0] = 1
     with sdm.tracker() as t:
-        sdm.unary_silu(a)
+        sdm.select_gen(ctrl, is_multihot=True, n=2)
     assert t.records == []
 
 
@@ -316,3 +317,19 @@ def tiled_reference(dims, tensors):
     A = torch.randn(8, 4, dtype=torch.float32)
     B = torch.randn(8, 4, dtype=torch.float32) + 1.0
     _assert_parity(src, dims={}, tensors={"A": A, "B": B})
+
+
+def test_parity_unary_chain():
+    src = '''
+def tiled_reference(dims, tensors):
+    a = offchip_load(tensors["A"], stride=(1,), out_shape_tiled=(2,),
+                     tile_row=4, tile_col=4)
+    b = unary_silu(a)
+    c = unary_square(b)
+    d = unary_exp(c)
+    e = unary_mul_imm(d, 2.5)
+    f = unary_add_imm(e, 1.0)
+    return offchip_store(f)
+'''
+    A = torch.randn(8, 4, dtype=torch.float32)
+    _assert_parity(src, dims={}, tensors={"A": A})
