@@ -1332,6 +1332,7 @@ async def run_kernel(
         "max_turns": max_turns,
         "resume_from": resume_from,
         "translator": translator,
+        "check_order": check_order,
         "few_shot_paths": list(few_shot_paths) if few_shot_paths else [],
     }, indent=2))
 
@@ -1351,6 +1352,7 @@ async def run_kernel(
             compliance_override=bundle_compliance,
             llm_config=llm_config,
             autotune_options=autotune_options,
+            check_order=check_order,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1401,6 +1403,7 @@ async def _run_outer_iteration(
     translate_fn=None,
     compliance_override: dict | None = None,
     autotune_options: dict = None,
+    check_order: str = "correctness-first",
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 

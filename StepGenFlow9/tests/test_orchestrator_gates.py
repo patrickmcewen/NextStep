@@ -442,3 +442,48 @@ def test_run_pass_loop_compliance_first_judge_runs_with_not_yet_verified_ctx(tmp
     # Both judge invocations must have used the not-yet-verified preamble.
     for ctx in captured["ctxs"]:
         assert "NOT yet been executed" in ctx
+
+
+def test_run_outer_iteration_passes_check_order_to_run_pass_loop(tmp_path, monkeypatch):
+    """Regression: _run_outer_iteration must forward check_order to _run_pass_loop.
+
+    Previously the bare name `check_order` was referenced inside
+    _run_outer_iteration without being in scope, causing a NameError at runtime.
+    """
+    captured = {}
+
+    async def fake_run_pass_loop(*args, **kwargs):
+        captured.setdefault("check_orders", []).append(kwargs.get("check_order"))
+        return {"success": True, "code": "x", "total_tokens": 0}
+
+    monkeypatch.setattr(orch_mod, "_run_pass_loop", fake_run_pass_loop)
+    # Other plumbing _run_outer_iteration touches:
+    monkeypatch.setattr(orch_mod, "_load_stepdb_config",
+                        lambda: {"kernels": {"k": {"presets": {"p": {"dims": {}}}}}})
+    monkeypatch.setattr(orch_mod, "precompute_tensors", lambda *a, **kw: {})
+
+    pass_agents = {"refactor_final": object()}
+    judge_agents = {"refactor_final": None}
+    lowering_passes = [{"name": "refactor_final", "executor": "dsl"}]
+    translator_passes = []
+
+    out = _run(orch_mod._run_outer_iteration(
+        i=0, max_outer=1, outer_dir=tmp_path,
+        kernel_name="k", dims={}, tensors={},
+        pass_agents=pass_agents, judge_agents=judge_agents,
+        max_turns=1, ckpt_root=tmp_path, preset="p",
+        experience_dir="exp", llm_config={},
+        lowering_passes=lowering_passes,
+        translator_passes=translator_passes,
+        resume_dsl_code=None,
+        translator="llm",
+        translate_fn=None,
+        compliance_override=None,
+        autotune_options=None,
+        check_order="compliance-first",
+    ))
+
+    # The fake _run_pass_loop was called at least once and saw the right value.
+    assert "check_orders" in captured, "_run_pass_loop was never called"
+    assert captured["check_orders"][0] == "compliance-first", \
+        f"expected 'compliance-first' propagated, got {captured['check_orders']!r}"
