@@ -437,32 +437,15 @@ def _metrics_bufferize(args, kwargs, output, mock_bf16):
     return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
 
 
-def _metrics_streamify(args, kwargs, output, mock_bf16):
-    """Streamify: on_chip = buffer_size + tile_size (same for both modes).
+def _metrics_streamify_family(args, kwargs, output, mock_bf16):
+    """Streamify / DynStreamify: on_chip = buffer_size + tile_size (same for both modes).
 
     IR: input is Buffer, output stream_dtype is Tile.
       tile_size   = output.stream_dtype.size_in_bytes()  (same tile as buffer's buff_dtype)
       buffer_size = in_buffer.size_in_bytes()
                   = prod(buffer.shape) * tile_bytes
 
-    DSL: streamify(buf, stride, out_shape_tiled) where buf is Buffered.
-    """
-    buf = args[0]                     # Buffered
-    assert isinstance(buf, step_dsl.Buffered)
-    tile_b = _tile_bytes(buf.tensor, mock_bf16)
-    buffer_grid = buf.buffer_shape
-    n_buffer_tiles = 1
-    for d in buffer_grid:
-        n_buffer_tiles *= int(d)
-    buffer_b = n_buffer_tiles * tile_b
-    total = buffer_b + tile_b
-    return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
-
-
-def _metrics_dyn_streamify(args, kwargs, output, mock_bf16):
-    """DynStreamify: on_chip = buffer_size + tile_size (same for both modes).
-
-    Same structure as Streamify: input is Buffered, output expands the ref stream.
+    DSL: streamify(buf, stride, out_shape_tiled) or dyn_streamify(buf, ...) where buf is Buffered.
     """
     buf = args[0]                     # Buffered
     assert isinstance(buf, step_dsl.Buffered)
@@ -491,8 +474,8 @@ METRIC_FNS["retile_streamify"] = _metrics_retile_streamify
 
 # Group D
 METRIC_FNS["bufferize"]    = _metrics_bufferize
-METRIC_FNS["streamify"]    = _metrics_streamify
-METRIC_FNS["dyn_streamify"] = _metrics_dyn_streamify
+METRIC_FNS["streamify"]    = _metrics_streamify_family
+METRIC_FNS["dyn_streamify"] = _metrics_streamify_family
 
 
 for _name in step_dsl.DSL_FUNCTIONS:
