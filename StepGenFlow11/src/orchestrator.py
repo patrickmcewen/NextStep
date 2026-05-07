@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
+import torch
 import yaml
 
 # Enable shape-trace logging in step_dsl ops before tools.py exec's the scaffold.
@@ -928,7 +929,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          judge_agent=None, dsl_code=None,
                          post_validator=None,
                          compliance_override: dict | None = None,
-                         check_order: str):
+                         check_order: str,
+                         prebuilt_user_prompt: str | None = None):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -939,10 +941,13 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
     Returns dict with success, code.
     """
-    user_prompt = build_pass_user_prompt(pass_name, kernel_name, dims,
-                                         prev_code=prev_code,
-                                         tensors=tensors,
-                                         dsl_code=dsl_code)
+    if prebuilt_user_prompt is not None:
+        user_prompt = prebuilt_user_prompt
+    else:
+        user_prompt = build_pass_user_prompt(pass_name, kernel_name, dims,
+                                             prev_code=prev_code,
+                                             tensors=tensors,
+                                             dsl_code=dsl_code)
     conversation = [{"role": "user", "content": user_prompt}]
 
     pass_dir = ckpt_dir / pass_name
@@ -1103,6 +1108,140 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         conversation.append({"role": "user", "content": feedback})
 
     return {"success": success, "code": last_code, "total_tokens": total_tokens}
+
+
+# ---------------------------------------------------------------------------
+# Per-node refactor walker (planner tree traversal)
+# ---------------------------------------------------------------------------
+
+def _synth_kernel_name(root_kernel: str, node_path: str) -> str:
+    safe = node_path.replace("/", "_")
+    return f"__plan_{root_kernel}_{safe}__"
+
+
+def _extract_get_inputs_source(reference_code: str) -> str:
+    """Return the literal source of the ``def get_inputs(dims):`` block."""
+    import ast as _ast
+    tree = _ast.parse(reference_code)
+    for node in tree.body:
+        if isinstance(node, _ast.FunctionDef) and node.name == "get_inputs":
+            return _ast.get_source_segment(reference_code, node) or ""
+    raise AssertionError("reference_code does not define get_inputs(dims)")
+
+
+class _NodeFailure(Exception):
+    def __init__(self, result: dict):
+        self.result = result
+
+
+async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
+                              agent_factory, max_turns, log,
+                              children_dsls):
+    """Refactor a single tree node. Returns the same dict shape as ``_run_pass_loop``.
+
+    Gold is always computed from ``node.reference_code`` (the original Model,
+    no child dependencies). The refactor agent sees ``node.refactored_code``
+    when it exists, since that is the form decomposed into children.
+    """
+    from src.planner import build_node_tensors
+
+    synth_name = _synth_kernel_name(root_kernel, node.path)
+
+    ref_ns: dict = {}
+    exec(node.reference_code, ref_ns)
+    assert "get_inputs" in ref_ns and "Model" in ref_ns, (
+        f"node {node.path!r}: reference_code must define Model and get_inputs"
+    )
+    inputs = ref_ns["get_inputs"](dims)
+    if not isinstance(inputs, tuple):
+        inputs = (inputs,)
+    with torch.no_grad():
+        gold = ref_ns["Model"]()(*inputs)
+    _inject_gold(synth_name, dims, gold)
+
+    agent_facing_code = (
+        node.refactored_code if node.refactored_code is not None
+        else node.reference_code
+    )
+
+    tensors = build_node_tensors(node.reference_code, dims)
+    precompute_src = _extract_get_inputs_source(node.reference_code)
+    user_prompt = build_pass_user_prompt(
+        "refactor_final", synth_name, dims,
+        tensors=tensors,
+        reference_code_override=agent_facing_code,
+        precompute_source_override=precompute_src,
+    )
+    if children_dsls:
+        few_shot_block = "\n\n## Verified sub-task DSLs (reference material)\n"
+        for child_path, dsl in children_dsls:
+            few_shot_block += f"\n### {child_path}\n```python\n{dsl.rstrip()}\n```\n"
+        user_prompt = user_prompt + few_shot_block
+
+    node_dir = ckpt_root / "refactor" / node.path
+    node_dir.mkdir(parents=True, exist_ok=True)
+    agent = agent_factory(children_dsls)
+
+    result = await _run_pass_loop(
+        agent, "refactor_final",
+        kernel_name=synth_name, dims=dims, max_turns=max_turns,
+        ckpt_dir=node_dir, executor="dsl", tensors=tensors, log=log,
+        check_order="correctness-first",
+        prebuilt_user_prompt=user_prompt,
+    )
+    if not result.get("success"):
+        result.setdefault("failing_node", _synth_kernel_name(root_kernel, node.path))
+        result.setdefault("last_messages", [])
+    return result
+
+
+async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
+                        agent_factory, max_turns, log) -> dict:
+    """Walk tree leaves->root, refactor each node, sibling-parallel.
+
+    Returns:
+        {"success": True, "root_dsl": <str>}  on success
+        {"success": False, "failing_node": <path>, "last_messages": [...]} on failure
+    """
+    verified: dict[str, str] = {}
+
+    async def _run_subtree(node) -> dict:
+        if node.children:
+            tasks = [asyncio.create_task(_run_subtree(c)) for c in node.children]
+            try:
+                results = await asyncio.gather(*tasks)
+            except _NodeFailure:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                raise
+            for r in results:
+                if not r["success"]:
+                    raise _NodeFailure(r)
+
+        children_dsls = [(c.path, verified[c.path]) for c in node.children]
+        result = await _refactor_one_node(
+            node=node, dims=dims, root_kernel=root_kernel,
+            ckpt_root=ckpt_root, agent_factory=agent_factory,
+            max_turns=max_turns, log=log, children_dsls=children_dsls,
+        )
+        if result["success"]:
+            verified[node.path] = result["code"]
+        return result
+
+    try:
+        root_result = await _run_subtree(tree.root)
+    except _NodeFailure as exc:
+        return {"success": False,
+                "failing_node": exc.result.get("failing_node", tree.root.path),
+                "last_messages": exc.result.get("last_messages", [])}
+
+    if not root_result["success"]:
+        return {"success": False,
+                "failing_node": tree.root.path,
+                "last_messages": root_result.get("last_messages", [])}
+
+    return {"success": True, "root_dsl": verified[tree.root.path]}
 
 
 # ---------------------------------------------------------------------------
