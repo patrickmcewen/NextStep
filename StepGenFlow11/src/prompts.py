@@ -592,3 +592,68 @@ def build_planner_system_prompt() -> str:
     template_path = _PROMPTS_DIR / "planner_system.txt"
     assert template_path.exists(), f"Template not found: {template_path}"
     return template_path.read_text()
+
+
+def build_planner_user_prompt(*, reference_code: str, dims: dict) -> str:
+    """Initial planner-call user prompt: just reference + dims."""
+    dims_json = json.dumps(dims, indent=2)
+    return (
+        "## Reference code (the node you are deciding on)\n\n"
+        "```python\n"
+        f"{reference_code.rstrip()}\n"
+        "```\n\n"
+        "## Dimensions\n\n"
+        "```json\n"
+        f"{dims_json}\n"
+        "```\n\n"
+        "Decide whether to leaf this kernel or split it. "
+        "Use the response format described in your system prompt."
+    )
+
+
+def build_replan_user_prompt(*, reference_code: str, dims: dict,
+                              replan_iteration: int,
+                              node_path: str,
+                              failing_node: str,
+                              last_turn_messages: list[str],
+                              sibling_results: list[tuple[str, str]]) -> str:
+    """Re-plan user prompt with failure context."""
+    dims_json = json.dumps(dims, indent=2)
+    last_turns = "\n".join(
+        f"  Turn -{len(last_turn_messages) - i}: {msg}"
+        for i, msg in enumerate(last_turn_messages)
+    ) or "  (no per-turn messages captured)"
+
+    if sibling_results:
+        siblings_block = "\n".join(
+            f"  {path}:\n```python\n{dsl.rstrip()}\n```"
+            for path, dsl in sibling_results
+        )
+    else:
+        siblings_block = "  (no successful siblings)"
+
+    return (
+        "RE-PLAN CONTEXT\n"
+        f"This is your re-plan #{replan_iteration} for subtree at {node_path}.\n"
+        f"Refactor pass at node {failing_node} failed.\n"
+        "Last turns' error / judge feedback:\n"
+        f"{last_turns}\n"
+        "Sibling nodes that succeeded (verified DSLs as reference):\n"
+        f"{siblings_block}\n"
+        "\n"
+        "Common reasons your prior split failed:\n"
+        "  - the failing piece is still too complex; split it further\n"
+        "  - the failing piece has odd shape constraints; consider a different "
+        "splitting axis\n"
+        "  - the parent's compose may be cleaner with a different child boundary\n"
+        "\n"
+        "## Reference code (the subtree you are re-planning)\n\n"
+        "```python\n"
+        f"{reference_code.rstrip()}\n"
+        "```\n\n"
+        "## Dimensions\n\n"
+        "```json\n"
+        f"{dims_json}\n"
+        "```\n\n"
+        "Re-plan this subtree. Use the response format from your system prompt."
+    )
