@@ -62,7 +62,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # Autotune pass-through to run.py
     p.add_argument("--autotune", action="store_true",
                    help="Enable per-outer autotune in each run.py invocation.")
-    p.add_argument("--autotune-config", default=None,
+    p.add_argument("--autotune-config", default="autotune_config.json",
                    help="Pass-through path to autotune_config JSON.")
     p.add_argument("--autotune-max-turns", type=int, default=None,
                    help="Pass-through override for autotune max_turns.")
