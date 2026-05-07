@@ -66,3 +66,17 @@ def test_replan_user_prompt_with_no_sibling_results():
     )
     assert "no successful siblings" in prompt.lower() \
         or "no sibling" in prompt.lower()
+
+
+def test_make_planner_agent_returns_agent_with_planner_instructions():
+    from src.agents import make_planner_agent
+
+    llm_config = {
+        "url": "https://example.invalid",
+        "api_key": "test-key",
+        "model": "test-model",
+    }
+    agent = make_planner_agent(llm_config)
+    assert agent.name == "StepPlanner"
+    assert "DECISION: leaf" in agent.instructions
+    assert "DECISION: split" in agent.instructions

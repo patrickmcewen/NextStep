@@ -21,7 +21,8 @@ from openai.types.shared import Reasoning
 
 from src.prompts import (build_pass_system_prompt, build_judge_system_prompt,
                          build_bundle_judge_system_prompt,
-                          build_autotune_system_prompt)
+                         build_autotune_system_prompt,
+                         build_planner_system_prompt)
 
 
 _VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
@@ -173,6 +174,22 @@ def make_bundle_judge_agent(llm_config: dict, compliance: dict) -> Agent:
     return Agent(
         name="StepJudge_bundle",
         instructions=system_prompt,
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_planner_agent(llm_config: dict) -> Agent:
+    """Create the decomposition-planner agent.
+
+    The planner is invoked once per tree node (and re-invoked with failure
+    context on Phase 1 failures). Its system prompt is static.
+    """
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepPlanner",
+        instructions=build_planner_system_prompt(),
         model=model,
         model_settings=_build_model_settings(llm_config),
     )
