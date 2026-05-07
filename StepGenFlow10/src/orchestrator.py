@@ -48,6 +48,7 @@ from src.agents import (make_judge_agent, make_bundle_judge_agent,
                         make_pass_agent)
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES, PIPELINES,
                          build_pass_user_prompt,
+                         build_subdivide_results_block,
                          _format_tensors_description,
                          resolve_few_shot_examples)
 from src.tools import (_exec_build_graph, _exec_dsl_ref,
@@ -993,7 +994,13 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          judge_agent=None, dsl_code=None,
                          post_validator=None,
                          compliance_override: dict | None = None,
-                         check_order: str):
+                         check_order: str,
+                         prebuilt_user_prompt: str | None = None,
+                         subdivide_options=None,
+                         registry: list | None = None,
+                         depth: int = 0,
+                         counter=None,
+                         llm_config: dict | None = None):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1004,10 +1011,18 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
     Returns dict with success, code.
     """
-    user_prompt = build_pass_user_prompt(pass_name, kernel_name, dims,
-                                         prev_code=prev_code,
-                                         tensors=tensors,
-                                         dsl_code=dsl_code)
+    if prebuilt_user_prompt is not None:
+        user_prompt = prebuilt_user_prompt
+    else:
+        user_prompt = build_pass_user_prompt(
+            pass_name, kernel_name, dims,
+            prev_code=prev_code,
+            tensors=tensors,
+            dsl_code=dsl_code,
+            subdivide_results_block=(
+                build_subdivide_results_block(registry) if registry else ""
+            ),
+        )
     conversation = [{"role": "user", "content": user_prompt}]
 
     pass_dir = ckpt_dir / pass_name
@@ -1051,6 +1066,59 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         last_code = code
         _write(turn_dir / "extracted_code.py", code)
         log(f"      Extracted code: {len(code)} chars")
+
+        # ----- Subdivide directive branch -----
+        if subdivide_options is not None and registry is not None and counter is not None:
+            assert pass_name == "refactor_final", (
+                "subdivide is only supported for refactor_final"
+            )
+            from src.subdivide import parse_directive, NotADirective
+            try:
+                parsed_sub_tasks = parse_directive(
+                    code, registry=registry, depth=depth,
+                    counter=counter, options=subdivide_options,
+                )
+            except NotADirective:
+                parsed_sub_tasks = None
+            except AssertionError as exc:
+                log(f"      Directive validation failed: {exc}")
+                _write(turn_dir / "status.txt", "DIRECTIVE_INVALID")
+                feedback = (
+                    f"## Subdivide directive: validation failed\n{exc}\n\n"
+                    f"Fix the directive or write tiled_reference instead."
+                )
+                conversation.append({"role": "user", "content": feedback})
+                continue
+
+            if parsed_sub_tasks is not None:
+                from src import subdivide as _sub_mod
+                log(f"      Directive with {len(parsed_sub_tasks)} sub-task(s); dispatching...")
+                directive_outcome = await _sub_mod.dispatch_directive(
+                    parsed_sub_tasks, dims=dims, parent_tensors=tensors,
+                    registry=registry, depth=depth, counter=counter,
+                    options=subdivide_options, ckpt_dir=turn_dir,
+                    llm_config=llm_config or {},
+                    log=log,
+                )
+                if directive_outcome["success"]:
+                    _write(turn_dir / "status.txt", "DIRECTIVE_SUCCESS")
+                    names = [v.name for v in registry[-len(parsed_sub_tasks):]]
+                    feedback = (
+                        f"## Subdivide: sub-task(s) {names} verified\n\n"
+                        f"The verified DSL forms are now shown above as "
+                        f"reference material under '## Verified sub-task results'. "
+                        f"Adapt them as needed and emit `tiled_reference` next."
+                    )
+                else:
+                    _write(turn_dir / "status.txt", "DIRECTIVE_FAILED")
+                    feedback = directive_outcome["feedback"]
+
+                rendered = build_subdivide_results_block(registry)
+                if rendered:
+                    feedback = rendered + "\n\n" + feedback
+                conversation.append({"role": "user", "content": feedback})
+                continue
+        # ----- End subdivide branch -----
 
         # ----- Per-turn gate cascade -----
         assert check_order in ("correctness-first", "compliance-first"), \
@@ -1521,6 +1589,7 @@ async def _run_outer_iteration(
             post_validator=post_validator,
             compliance_override=compliance_override,
             check_order=check_order,
+            llm_config=llm_config,
         )
         outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
@@ -1652,3 +1721,70 @@ async def _run_outer_iteration(
         "cycle_count": None,
         "tiled_code": dsl_code,
     }
+
+
+# ---------------------------------------------------------------------------
+# Subdivide runner wiring (module-load-time)
+# ---------------------------------------------------------------------------
+
+from src import subdivide as _sub_mod
+from src.agents import make_pass_agent as _make_pass_agent
+from src.prompts import build_subdivide_user_prompt, build_pass_system_prompt
+
+
+def _subdivide_pass_loop_runner(*, agent, name, kernel_name, dims,
+                                 sub_tensors, sub_dir, options,
+                                 sub_reference_source, preamble_source,
+                                 registry, depth, counter,
+                                 llm_config, log):
+    """Bridge from subdivide module → _run_pass_loop with sub-task context."""
+    user_prompt = build_subdivide_user_prompt(
+        name=name,
+        sub_reference_source=sub_reference_source,
+        preamble_source=preamble_source,
+        dims=dims,
+        sub_tensors=sub_tensors,
+    )
+    return _run_pass_loop(
+        agent, "refactor_final", kernel_name, dims,
+        max_turns=options.max_subdivide_turns,
+        ckpt_dir=sub_dir,
+        executor="dsl",
+        tensors=sub_tensors,
+        log=log,
+        judge_agent=None,
+        post_validator=None,
+        compliance_override=None,
+        check_order="correctness-first",
+        prebuilt_user_prompt=user_prompt,
+        subdivide_options=options,
+        registry=registry,
+        depth=depth,
+        counter=counter,
+        llm_config=llm_config,
+    )
+
+
+def _make_subdivide_pass_agent(llm_config: dict, options: _sub_mod.SubdivideOptions):
+    """Build a refactor_final agent with a system prompt formatted for the
+    given subdivide options (so the agent's prompt mentions the actual depth/cap).
+    """
+    system_prompt = build_pass_system_prompt(
+        "refactor_final",
+        few_shot_examples=None,
+        subdivide_options={
+            "max_subdivide_depth": options.max_subdivide_depth,
+            "max_subdivides_per_outer": options.max_subdivides_per_outer,
+        },
+    )
+    return _make_pass_agent(
+        llm_config, "refactor_final",
+        few_shot_examples=None,
+        system_prompt_override=system_prompt,
+    )
+
+
+_sub_mod.set_runners(
+    pass_loop_runner=_subdivide_pass_loop_runner,
+    pass_agent_factory=_make_subdivide_pass_agent,
+)
