@@ -110,3 +110,61 @@ def test_analyze_performance():
     assert "total_cycles" in result
     assert "per_node" in result
     assert int(result["total_cycles"]) > 0
+
+
+import torch
+import pytest
+from src.tools import _exec_dsl_ref
+
+
+def _trivial_dsl_scaffold_monkeypatch(monkeypatch):
+    """Replace _build_dsl_scaffold with an empty scaffold so the test does not
+    depend on step_dsl being importable in the test process. The user code
+    uses only torch, which is in the namespace via the import in tools.py."""
+    from src import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "_build_dsl_scaffold", lambda: "import torch\n")
+
+
+def test_exec_dsl_ref_single_tensor(monkeypatch):
+    _trivial_dsl_scaffold_monkeypatch(monkeypatch)
+    code = (
+        "def tiled_reference(dims, tensors):\n"
+        "    return tensors['x'] * 2\n"
+    )
+    out = _exec_dsl_ref(code, dims={}, tensors={"x": torch.tensor([1.0, 2.0])})
+    assert isinstance(out, torch.Tensor)
+    assert torch.equal(out, torch.tensor([2.0, 4.0]))
+
+
+def test_exec_dsl_ref_tuple_return(monkeypatch):
+    _trivial_dsl_scaffold_monkeypatch(monkeypatch)
+    code = (
+        "def tiled_reference(dims, tensors):\n"
+        "    x = tensors['x']\n"
+        "    return (x * 2, x * 3)\n"
+    )
+    out = _exec_dsl_ref(code, dims={}, tensors={"x": torch.tensor([1.0, 2.0])})
+    assert isinstance(out, tuple)
+    assert len(out) == 2
+    assert torch.equal(out[0], torch.tensor([2.0, 4.0]))
+    assert torch.equal(out[1], torch.tensor([3.0, 6.0]))
+
+
+def test_exec_dsl_ref_rejects_non_tensor_tuple_element(monkeypatch):
+    _trivial_dsl_scaffold_monkeypatch(monkeypatch)
+    code = (
+        "def tiled_reference(dims, tensors):\n"
+        "    return (tensors['x'] * 2, 'not a tensor')\n"
+    )
+    with pytest.raises(AssertionError, match="must be a torch.Tensor or tuple"):
+        _exec_dsl_ref(code, dims={}, tensors={"x": torch.tensor([1.0])})
+
+
+def test_exec_dsl_ref_rejects_empty_tuple(monkeypatch):
+    _trivial_dsl_scaffold_monkeypatch(monkeypatch)
+    code = (
+        "def tiled_reference(dims, tensors):\n"
+        "    return ()\n"
+    )
+    with pytest.raises(AssertionError, match="non-empty"):
+        _exec_dsl_ref(code, dims={}, tensors={})

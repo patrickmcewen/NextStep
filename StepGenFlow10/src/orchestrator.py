@@ -327,11 +327,9 @@ def _get_gold(kernel_name, dims):
     return gold
 
 
-def _compare_against_gold(result, kernel_name, dims, label="result"):
-    """Compare a tensor result against gold reference. Returns formatted string."""
+def _compare_single(result, gold, label):
+    """Compare a single result tensor against a single gold tensor. Returns formatted string."""
     import torch
-
-    gold = _get_gold(kernel_name, dims)
 
     if gold.shape != result.shape:
         return f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs {label} {tuple(result.shape)}\nmatch=False"
@@ -350,6 +348,36 @@ def _compare_against_gold(result, kernel_name, dims, label="result"):
             f"\n{label}_value={result[worst_multi].item():.6e}"
         )
     return out
+
+
+def _compare_against_gold(result, kernel_name, dims, label="result"):
+    """Compare a result (tensor or tuple of tensors) against gold reference. Returns formatted string."""
+    gold = _get_gold(kernel_name, dims)
+    if isinstance(gold, tuple) or isinstance(result, tuple):
+        if not (isinstance(gold, tuple) and isinstance(result, tuple)):
+            return (
+                f"match=False\n"
+                f"arity mismatch: gold is {'tuple' if isinstance(gold, tuple) else 'single'}, "
+                f"candidate is {'tuple' if isinstance(result, tuple) else 'single'}"
+            )
+        if len(gold) != len(result):
+            return (
+                f"match=False\n"
+                f"arity mismatch: gold has {len(gold)} elements, "
+                f"candidate has {len(result)} elements"
+            )
+        elem_reports = []
+        all_match = True
+        for i, (g, r) in enumerate(zip(gold, result)):
+            elem_label = f"{label}[{i}]"
+            elem_report = _compare_single(r, g, elem_label)
+            if "match=False" in elem_report:
+                all_match = False
+                elem_reports.append(f"## element[{i}]\n{elem_report}")
+        if all_match:
+            return f"match=True\nall {len(gold)} tuple elements matched"
+        return "match=False\n" + "\n\n".join(elem_reports)
+    return _compare_single(result, gold, label)
 
 
 def _run_dsl_correctness(code, kernel_name, dims, tensors):

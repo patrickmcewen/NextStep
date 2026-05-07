@@ -487,3 +487,41 @@ def test_run_outer_iteration_passes_check_order_to_run_pass_loop(tmp_path, monke
     assert "check_orders" in captured, "_run_pass_loop was never called"
     assert captured["check_orders"][0] == "compliance-first", \
         f"expected 'compliance-first' propagated, got {captured['check_orders']!r}"
+
+
+import torch
+from unittest.mock import patch
+
+
+def test_compare_against_gold_tuple_match():
+    gold = (torch.zeros(4), torch.ones(4))
+    result = (torch.zeros(4), torch.ones(4))
+    with patch.object(orch_mod, "_get_gold", return_value=gold):
+        out = orch_mod._compare_against_gold(result, kernel_name="k", dims={})
+    assert "match=True" in out
+
+
+def test_compare_against_gold_tuple_arity_mismatch():
+    gold = (torch.zeros(4), torch.ones(4))
+    result = (torch.zeros(4),)
+    with patch.object(orch_mod, "_get_gold", return_value=gold):
+        out = orch_mod._compare_against_gold(result, kernel_name="k", dims={})
+    assert "match=False" in out
+    assert "arity" in out.lower()
+
+
+def test_compare_against_gold_tuple_element_mismatch():
+    gold = (torch.zeros(4), torch.ones(4))
+    result = (torch.zeros(4), torch.zeros(4))
+    with patch.object(orch_mod, "_get_gold", return_value=gold):
+        out = orch_mod._compare_against_gold(result, kernel_name="k", dims={})
+    assert "match=False" in out
+    assert "element[1]" in out or "element 1" in out
+
+
+def test_compare_against_gold_tuple_vs_single_mismatch():
+    gold = torch.zeros(4)
+    result = (torch.zeros(4), torch.zeros(4))
+    with patch.object(orch_mod, "_get_gold", return_value=gold):
+        out = orch_mod._compare_against_gold(result, kernel_name="k", dims={})
+    assert "match=False" in out

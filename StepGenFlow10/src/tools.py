@@ -243,8 +243,8 @@ def _build_dsl_scaffold() -> str:
     return _DSL_IMPORTS + src_path.read_text() + "\n"
 
 
-def _exec_dsl_ref(code: str, dims: dict, tensors: dict) -> torch.Tensor:
-    """Execute user code with DSL functions available. Returns the output tensor.
+def _exec_dsl_ref(code: str, dims: dict, tensors: dict):
+    """Execute user code with DSL functions available. Returns the output tensor or tuple of tensors.
 
     The DSL scaffold injects the active step_dsl source — the standalone
     ``src/step_dsl.py`` in normal runs, or the bundle's ``abstraction.py``
@@ -261,7 +261,18 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict) -> torch.Tensor:
         result = namespace["tiled_reference"](dims, tensors)
     except Exception as exc:
         raise _enhance_user_code_error(exc, code, scaffold_lines) from exc
-    assert isinstance(result, torch.Tensor), f"tiled_reference must return a torch.Tensor, got {type(result)}"
+    if isinstance(result, tuple):
+        assert len(result) > 0, "tiled_reference returned an empty tuple; must be non-empty"
+        for i, elem in enumerate(result):
+            assert isinstance(elem, torch.Tensor), (
+                f"tiled_reference: each element must be a torch.Tensor or tuple of torch.Tensor; "
+                f"got tuple element [{i}] of type {type(elem)}"
+            )
+        return result
+    assert isinstance(result, torch.Tensor), (
+        f"tiled_reference must return a torch.Tensor or tuple of torch.Tensor, "
+        f"got {type(result)}"
+    )
     return result
 
 
