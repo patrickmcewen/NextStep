@@ -157,6 +157,16 @@ def parse_directive(
 
 
 @dataclass(frozen=True)
+class SubTaskOutcome:
+    name: str
+    success: bool
+    failure_reason: str | None = None
+    sub_reference_source: str | None = None
+    preamble_source: str | None = None
+    verified_sub_dsl_source: str | None = None
+
+
+@dataclass(frozen=True)
 class PreparedSubTask:
     name: str
     sub_tensors: dict
@@ -276,6 +286,8 @@ async def dispatch_directive(parsed_sub_tasks: list, *,
     Returns ``{"success": bool, "feedback": str | None}``. Counter is debited
     len(parsed_sub_tasks) regardless of outcome.
     """
+    # Debit counter up front so a failed dispatch can't be retried into the same
+    # slot — the counter is not a refundable resource.
     counter.used += len(parsed_sub_tasks)
     ckpt_dir = Path(ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -294,9 +306,9 @@ async def dispatch_directive(parsed_sub_tasks: list, *,
     summary = {
         "sub_tasks": [
             {
-                "name": o["name"],
-                "status": "ok" if o["success"] else "failed",
-                "failure_reason": o.get("failure_reason"),
+                "name": o.name,
+                "status": "ok" if o.success else "failed",
+                "failure_reason": o.failure_reason,
             }
             for o in outcomes
         ]
@@ -305,26 +317,26 @@ async def dispatch_directive(parsed_sub_tasks: list, *,
         json.dumps(summary, indent=2)
     )
 
-    if all(o["success"] for o in outcomes):
+    if all(o.success for o in outcomes):
         for o in outcomes:
             registry.append(VerifiedSubTask(
-                name=o["name"],
-                sub_reference_source=o["sub_reference_source"],
-                preamble_source=o["preamble_source"],
-                verified_sub_dsl_source=o["verified_sub_dsl_source"],
+                name=o.name,
+                sub_reference_source=o.sub_reference_source,
+                preamble_source=o.preamble_source,
+                verified_sub_dsl_source=o.verified_sub_dsl_source,
             ))
         return {"success": True, "feedback": None}
 
     failure_lines = ["## Subdivide directive: one or more sub-tasks failed"]
     for o in outcomes:
-        if o["success"]:
+        if o.success:
             failure_lines.append(
-                f"- sub-task {o['name']!r}: succeeded (discarded due to "
+                f"- sub-task {o.name!r}: succeeded (discarded due to "
                 f"sibling failure)"
             )
         else:
             failure_lines.append(
-                f"- sub-task {o['name']!r}: {o['failure_reason']}"
+                f"- sub-task {o.name!r}: {o.failure_reason}"
             )
     failure_lines.append(
         "\nReconsider the decomposition or implement the work directly. "
@@ -339,7 +351,7 @@ async def _run_one_sub_task(*, parsed: dict, dims: dict, parent_tensors: dict,
                              registry: list, depth: int,
                              counter: SubdivideCounter,
                              options: SubdivideOptions, ckpt_dir: Path,
-                             llm_config: dict, log) -> dict:
+                             llm_config: dict, log) -> SubTaskOutcome:
     name = parsed["name"]
     sub_dir = ckpt_dir / f"sub_{name}"
     sub_dir.mkdir(parents=True, exist_ok=True)
@@ -347,10 +359,10 @@ async def _run_one_sub_task(*, parsed: dict, dims: dict, parent_tensors: dict,
     try:
         prepared = prepare_sub_task(parsed, dims=dims, parent_tensors=parent_tensors)
     except AssertionError as exc:
-        return {
-            "name": name, "success": False,
-            "failure_reason": f"preparation failed: {exc}",
-        }
+        return SubTaskOutcome(
+            name=name, success=False,
+            failure_reason=f"preparation failed: {exc}",
+        )
 
     synth_kernel = f"__sub_{name}_{uuid.uuid4().hex[:8]}__"
     from src.orchestrator import _inject_gold  # lazy: avoids circular import
@@ -368,16 +380,16 @@ async def _run_one_sub_task(*, parsed: dict, dims: dict, parent_tensors: dict,
 
     if result["success"]:
         (sub_dir / "verified_sub_dsl.py").write_text(result["code"])
-        return {
-            "name": name, "success": True,
-            "sub_reference_source": prepared.sub_reference_source,
-            "preamble_source": prepared.preamble_source,
-            "verified_sub_dsl_source": result["code"],
-        }
-    return {
-        "name": name, "success": False,
-        "failure_reason": (
+        return SubTaskOutcome(
+            name=name, success=True,
+            sub_reference_source=prepared.sub_reference_source,
+            preamble_source=prepared.preamble_source,
+            verified_sub_dsl_source=result["code"],
+        )
+    return SubTaskOutcome(
+        name=name, success=False,
+        failure_reason=(
             f"refactor pass exhausted {options.max_subdivide_turns} turns "
             f"without producing a verified DSL"
         ),
-    }
+    )

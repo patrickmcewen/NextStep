@@ -326,10 +326,14 @@ SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
 
 import asyncio
 
+_FAKE_PASS_LOOP_SUCCESS_CODE = (
+    "def tiled_reference(dims, tensors):\n    return tensors['x'] * 2\n"
+)
+
 
 async def _fake_pass_loop_success(*args, **kwargs):
     """Fake _run_pass_loop that always succeeds with a fixed DSL output."""
-    return {"success": True, "code": "def tiled_reference(dims, tensors):\n    return tensors['x'] * 2\n", "total_tokens": 0}
+    return {"success": True, "code": _FAKE_PASS_LOOP_SUCCESS_CODE, "total_tokens": 0}
 
 
 async def _fake_pass_loop_fail(*args, **kwargs):
@@ -413,3 +417,30 @@ def test_dispatch_directive_writes_per_sub_task_subdir(monkeypatch, tmp_path):
     assert sub_dir.is_dir()
     assert (sub_dir / "verified_sub_dsl.py").is_file()
     assert (tmp_path / "subdivide_result.json").is_file()
+
+    import json
+    data = json.loads((tmp_path / "subdivide_result.json").read_text())
+    assert data["sub_tasks"][0]["name"] == "doubler"
+    assert data["sub_tasks"][0]["status"] == "ok"
+
+    assert (sub_dir / "verified_sub_dsl.py").read_text() == _FAKE_PASS_LOOP_SUCCESS_CODE
+
+
+def test_set_runners_wires_module_globals():
+    """set_runners replaces the module-level seams; restore after."""
+    original_runner = sub_mod._run_pass_loop_for_sub_task
+    original_factory = sub_mod._make_subdivide_pass_agent
+
+    def fake_factory(*args, **kwargs):
+        return "FAKE_AGENT"
+
+    sub_mod.set_runners(
+        pass_loop_runner=_fake_pass_loop_success,
+        pass_agent_factory=fake_factory,
+    )
+    try:
+        assert sub_mod._run_pass_loop_for_sub_task is _fake_pass_loop_success
+        assert sub_mod._make_subdivide_pass_agent is fake_factory
+    finally:
+        sub_mod._run_pass_loop_for_sub_task = original_runner
+        sub_mod._make_subdivide_pass_agent = original_factory
