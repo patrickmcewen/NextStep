@@ -111,6 +111,12 @@ class ParsedSplit:
 _DECISION_RE = re.compile(r"^\s*DECISION:\s*(leaf|split)\s*$", re.MULTILINE)
 _CHILD_HEADER_RE = re.compile(r"^#\s*child:\s*(\w+)\s*$", re.MULTILINE)
 _PARENT_HEADER_RE = re.compile(r"^#\s*refactored parent\s*$", re.MULTILINE)
+_CODE_FENCE_RE = re.compile(r"^```(?:python|py)?\s*$", re.MULTILINE)
+
+
+def _strip_code_fences(body: str) -> str:
+    """Remove markdown ``` fences that LLMs sometimes wrap around block bodies."""
+    return _CODE_FENCE_RE.sub("", body).strip()
 
 
 def parse_planner_response(text: str):
@@ -144,7 +150,7 @@ def parse_planner_response(text: str):
     seen_names: set[str] = set()
     for i, (kind, name, _, header_end) in enumerate(markers):
         next_start = markers[i + 1][2] if i + 1 < len(markers) else len(after_decision)
-        body = after_decision[header_end:next_start].strip()
+        body = _strip_code_fences(after_decision[header_end:next_start].strip())
         if kind == "child":
             assert name is not None
             if name in seen_names:

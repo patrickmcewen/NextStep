@@ -168,6 +168,49 @@ class Model(nn.Module):
         parse_planner_response(bad)
 
 
+def test_parse_split_strips_markdown_code_fences_in_bodies():
+    """Some LLMs wrap each block in ```python ... ``` fences. The parser must
+    strip them before returning the reference_code, otherwise downstream
+    ast.parse() chokes on the literal backticks."""
+    fenced = """
+DECISION: split
+
+# child: a
+```python
+class Model(nn.Module):
+    def forward(self, x):
+        return x * 2
+def get_inputs(dims):
+    return (torch.randn(4),)
+```
+
+# child: b
+```python
+class Model(nn.Module):
+    def forward(self, x):
+        return x + 1
+def get_inputs(dims):
+    return (torch.randn(4),)
+```
+
+# refactored parent
+```python
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = AModel()
+        self.b = BModel()
+    def forward(self, x):
+        return self.b(self.a(x))
+```
+"""
+    result = parse_planner_response(fenced)
+    assert isinstance(result, ParsedSplit)
+    for child in result.children:
+        assert "```" not in child.reference_code
+    assert "```" not in result.refactored_parent_code
+
+
 def test_parse_split_child_missing_get_inputs_raises_MalformedSplit():
     bad = """
 DECISION: split
