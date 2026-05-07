@@ -1428,6 +1428,8 @@ async def run_kernel(
     bundle_dir: str | None = None,
     autotune_options: dict = None,
     check_order: str = "correctness-first",
+    plan_enabled: bool = True,
+    max_replans: int = 3,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1450,6 +1452,17 @@ async def run_kernel(
     )
     assert check_order in {"correctness-first", "compliance-first"}, \
         f"Unknown check_order={check_order!r}. Known: correctness-first, compliance-first"
+
+    if plan_enabled:
+        assert bundle_dir is None, (
+            "plan_enabled=True is incompatible with --bundle-dir"
+        )
+        assert pipeline == "standard", (
+            "plan_enabled=True requires --pipeline=standard"
+        )
+        assert resume_from is None, (
+            "plan_enabled=True is incompatible with --resume-from"
+        )
 
     # --- Step 1: bundle-dir path resolution ---
     bundle_path = None
@@ -1577,6 +1590,42 @@ async def run_kernel(
         "few_shot_paths": list(few_shot_paths) if few_shot_paths else [],
     }, indent=2))
 
+    plan_resume_dsl = None
+    if plan_enabled:
+        ref_path = _STEPDB_DIR / config[kernel_name]["problem"]
+        root_reference = ref_path.read_text()
+
+        from src.agents import make_planner_agent
+        planner_agent = make_planner_agent(llm_config)
+
+        def _agent_factory(_few_shot):
+            return pass_agents["refactor_final"]
+        _agent_factory.__planner_agent__ = planner_agent
+
+        plan_result = await _run_planner_phase(
+            root_reference=root_reference, dims=dims,
+            root_kernel=kernel_name, ckpt_root=ckpt_root,
+            agent_factory=_agent_factory, max_turns=max_turns,
+            log=print, max_replans=max_replans,
+        )
+        if not plan_result["success"]:
+            failure = {
+                "success": False,
+                "outer_iteration": -1,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "total_tokens": 0,
+                "cycle_count": None,
+                "final_diagnosis": (
+                    f"Planner phase failed at {plan_result['failing_node']}: "
+                    f"{plan_result.get('last_messages', [])}"
+                ),
+                "per_outer": [],
+            }
+            _write(ckpt_root / "result.json", json.dumps(failure, indent=2, default=str))
+            return failure
+        plan_resume_dsl = plan_result["root_dsl"]
+
     # Run all outer iterations in parallel — they are independent attempts
     tasks = []
     for i in range(max_outer):
@@ -1587,7 +1636,7 @@ async def run_kernel(
             max_turns, ckpt_root, preset, experience_dir,
             lowering_passes=lowering_passes,
             translator_passes=translator_passes,
-            resume_dsl_code=resume_dsl_code,
+            resume_dsl_code=(plan_resume_dsl if plan_resume_dsl is not None else resume_dsl_code),
             translator=translator,
             translate_fn=translate_fn,
             compliance_override=bundle_compliance,

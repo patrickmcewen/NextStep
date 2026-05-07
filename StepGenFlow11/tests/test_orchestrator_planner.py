@@ -134,3 +134,39 @@ async def test_planner_phase_re_plans_failing_subtree_then_succeeds(tmp_path, mo
     assert refactor_attempts == ["a", "c"]
     assert plan_calls[0][0] == "initial"
     assert plan_calls[1][0] == "replan"
+
+
+@pytest.mark.asyncio
+async def test_run_kernel_invokes_planner_when_enabled(tmp_path, monkeypatch):
+    """Smoke: run_kernel calls _run_planner_phase, then runs outer iterations
+    with the verified root DSL as resume_dsl_code."""
+    captured = {}
+    async def fake_planner_phase(**kwargs):
+        captured["called"] = True
+        captured["root_kernel"] = kwargs["root_kernel"]
+        return {"success": True, "root_dsl": "# verified root dsl"}
+
+    async def fake_outer_iteration(*args, **kwargs):
+        captured.setdefault("outer_resume_codes", []).append(kwargs.get("resume_dsl_code"))
+        return {"success": True, "outer_iteration": 0, "outer_iterations": 1,
+                "total_tokens": 0, "total_tool_calls": 0, "cycle_count": 1,
+                "final_diagnosis": "ok"}
+
+    monkeypatch.setattr(orch_mod, "_run_planner_phase", fake_planner_phase)
+    monkeypatch.setattr(orch_mod, "_run_outer_iteration", fake_outer_iteration)
+
+    from src.prompts import _load_stepdb_config
+    config = _load_stepdb_config()
+    kernel = next(iter(config))
+    preset = next(iter(config[kernel]["presets"]))
+
+    result = await orch_mod.run_kernel(
+        kernel_name=kernel, preset=preset,
+        llm_config={"url": "http://x", "api_key": "k", "model": "m"},
+        max_outer=1, max_turns=1,
+        checkpoint_dir=str(tmp_path),
+        plan_enabled=True, max_replans=0,
+    )
+    assert captured["called"] is True
+    assert captured["outer_resume_codes"] == ["# verified root dsl"]
+    assert result["success"] is True
