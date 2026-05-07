@@ -7,6 +7,7 @@ to produce a ``Tree`` that Phase 1's per-node refactor walker consumes.
 """
 
 import ast
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import Iterator
@@ -338,3 +339,108 @@ def build_node_tensors(reference_code: str, dims: dict) -> dict:
         f"get_inputs returned {len(inputs)} tensor(s)"
     )
     return dict(zip(arg_names, inputs))
+
+
+class PlannerExhausted(RuntimeError):
+    """Raised when a planner call exhausts its retry budget without a valid response."""
+
+    def __init__(self, node_path: str, last_message: str):
+        self.node_path = node_path
+        self.last_message = last_message
+        super().__init__(
+            f"planner exhausted retry budget at node {node_path!r}: {last_message}"
+        )
+
+
+def _path_tail(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
+
+
+async def plan(*, reference_code: str, dims: dict, agent, path: str,
+               runner_fn, retry_budget: int = 3,
+               replan_context: dict | None = None) -> "PlanNode":
+    """Recursively decompose a node.
+
+    ``runner_fn(agent, conversation)`` is called per LLM turn (the default real
+    implementation passes ``Runner.run`` from agents-SDK; tests pass a fake).
+    ``replan_context`` (when set) renders a re-plan user prompt instead of the
+    initial one.
+    """
+    from src.prompts import build_planner_user_prompt, build_replan_user_prompt
+
+    if replan_context is None:
+        user = build_planner_user_prompt(reference_code=reference_code, dims=dims)
+    else:
+        user = build_replan_user_prompt(
+            reference_code=reference_code, dims=dims,
+            replan_iteration=replan_context["replan_iteration"],
+            node_path=replan_context["node_path"],
+            failing_node=replan_context["failing_node"],
+            last_turn_messages=replan_context["last_turn_messages"],
+            sibling_results=replan_context["sibling_results"],
+        )
+
+    conversation = [{"role": "user", "content": user}]
+    last_message = "no LLM call made"
+
+    for attempt in range(retry_budget):
+        result = await runner_fn(agent, conversation)
+        text = result.final_output
+        last_message = text
+
+        try:
+            parsed = parse_planner_response(text)
+        except NotADecision as exc:
+            conversation.append({"role": "assistant", "content": text})
+            conversation.append({"role": "user", "content": (
+                f"Your previous response had no DECISION: marker ({exc}). "
+                f"Respond with exactly DECISION: leaf or DECISION: split + bodies."
+            )})
+            continue
+        except MalformedSplit as exc:
+            conversation.append({"role": "assistant", "content": text})
+            conversation.append({"role": "user", "content": (
+                f"Your split response was malformed: {exc}. Fix and retry."
+            )})
+            continue
+
+        if parsed == "leaf":
+            return PlanNode(name=_path_tail(path), path=path,
+                            reference_code=reference_code,
+                            refactored_code=None,
+                            is_leaf=True, children=())
+
+        children_full = tuple(
+            ParsedChild(name=child.name,
+                        reference_code=synthesize_reference_module(child.reference_code))
+            for child in parsed.children
+        )
+        refactored_full = synthesize_reference_module(parsed.refactored_parent_code)
+
+        try:
+            check_anti_passthrough(list(children_full))
+            check_anti_monolith(reference_code, refactored_full)
+            check_compose(reference_code, refactored_full,
+                          list(children_full), dims)
+        except GuardFailure as exc:
+            conversation.append({"role": "assistant", "content": text})
+            conversation.append({"role": "user", "content": (
+                f"Mechanical guard rejected your split: {exc}. Fix and retry."
+            )})
+            continue
+
+        child_tasks = [
+            plan(reference_code=child.reference_code, dims=dims, agent=agent,
+                 path=f"{path}/{child.name}", runner_fn=runner_fn,
+                 retry_budget=retry_budget)
+            for child in children_full
+        ]
+        child_subtrees = await asyncio.gather(*child_tasks)
+
+        return PlanNode(name=_path_tail(path), path=path,
+                        reference_code=reference_code,
+                        refactored_code=refactored_full,
+                        is_leaf=False,
+                        children=tuple(child_subtrees))
+
+    raise PlannerExhausted(path, last_message)
