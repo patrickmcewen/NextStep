@@ -6,6 +6,7 @@ in subsequent tasks. Phase 0 of the orchestrator calls ``plan(root_reference)``
 to produce a ``Tree`` that Phase 1's per-node refactor walker consumes.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -81,3 +82,87 @@ def _find_owner(node: PlanNode, path: str) -> PlanNode | None:
         if found is not None:
             return found
     return None
+
+
+class NotADecision(Exception):
+    """Raised when LLM output contains no ``DECISION:`` marker."""
+
+
+class MalformedSplit(AssertionError):
+    """Raised when a split response is structurally invalid."""
+
+
+@dataclass(frozen=True)
+class ParsedChild:
+    name: str
+    reference_code: str
+
+
+@dataclass(frozen=True)
+class ParsedSplit:
+    children: tuple[ParsedChild, ...]
+    refactored_parent_code: str
+
+
+_DECISION_RE = re.compile(r"^\s*DECISION:\s*(leaf|split)\s*$", re.MULTILINE)
+_CHILD_HEADER_RE = re.compile(r"^#\s*child:\s*(\w+)\s*$", re.MULTILINE)
+_PARENT_HEADER_RE = re.compile(r"^#\s*refactored parent\s*$", re.MULTILINE)
+
+
+def parse_planner_response(text: str):
+    """Parse a planner LLM response.
+
+    Returns ``"leaf"`` for a leaf decision, or ``ParsedSplit`` for a split.
+    Raises ``NotADecision`` if no DECISION marker is found, or
+    ``MalformedSplit`` if the split structure is invalid.
+    """
+    m = _DECISION_RE.search(text)
+    if m is None:
+        raise NotADecision("response contains no DECISION: marker")
+    if m.group(1) == "leaf":
+        return "leaf"
+
+    after_decision = text[m.end():]
+
+    markers = []
+    for cm in _CHILD_HEADER_RE.finditer(after_decision):
+        markers.append(("child", cm.group(1), cm.start(), cm.end()))
+    pm = _PARENT_HEADER_RE.search(after_decision)
+    if pm is None:
+        raise MalformedSplit(
+            "split response is missing the '# refactored parent' section"
+        )
+    markers.append(("parent", None, pm.start(), pm.end()))
+    markers.sort(key=lambda m: m[2])
+
+    children: list[ParsedChild] = []
+    refactored_parent_code: str | None = None
+    seen_names: set[str] = set()
+    for i, (kind, name, _, header_end) in enumerate(markers):
+        next_start = markers[i + 1][2] if i + 1 < len(markers) else len(after_decision)
+        body = after_decision[header_end:next_start].strip()
+        if kind == "child":
+            assert name is not None
+            if name in seen_names:
+                raise MalformedSplit(f"duplicate child name: {name!r}")
+            seen_names.add(name)
+            assert "class Model" in body, (
+                f"child {name!r}: missing 'class Model' in body"
+            )
+            assert "def get_inputs" in body, (
+                f"child {name!r}: missing 'def get_inputs' in body"
+            )
+            children.append(ParsedChild(name=name, reference_code=body))
+        else:
+            refactored_parent_code = body
+
+    if len(children) < 2:
+        raise MalformedSplit(
+            f"split response must contain at least 2 children, got {len(children)}"
+        )
+    assert refactored_parent_code is not None
+
+    return ParsedSplit(
+        children=tuple(children),
+        refactored_parent_code=refactored_parent_code,
+    )
