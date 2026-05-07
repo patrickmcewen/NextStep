@@ -29,6 +29,8 @@ These functions are pre-imported and available at runtime. Here are their exact 
 
 ## HINT: Arbitrary permutation of tensor can be expressed through a Bufferize + Streamify pair with proper strides.
 
+## HINT: There is a correct answer possible to this problem. You should never give up.
+
 ## Function Signature
 
 ```python
