@@ -193,3 +193,48 @@ def compute_gold(dims):
     full = synthesize_reference_module(body_with_gold)
     assert full.count("def compute_gold(dims):") == 1
     assert full.count("def get_init_inputs(dims):") == 1
+
+
+from src.planner import build_node_tensors
+
+
+def test_build_node_tensors_zips_forward_args_with_get_inputs():
+    code = """\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def forward(self, Q, K, V):
+        return Q @ K.T @ V
+def get_inputs(dims):
+    torch.manual_seed(7)
+    M, N, D = dims["M"], dims["N"], dims["D"]
+    return torch.randn(M, D), torch.randn(N, D), torch.randn(N, D)
+def get_init_inputs(dims):
+    return []
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+"""
+    tensors = build_node_tensors(code, dims={"M": 2, "N": 3, "D": 4})
+    assert sorted(tensors) == ["K", "Q", "V"]
+    assert tensors["Q"].shape == (2, 4)
+    assert tensors["K"].shape == (3, 4)
+    assert tensors["V"].shape == (3, 4)
+
+
+def test_build_node_tensors_handles_single_arg_returning_single_tensor():
+    code = """\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def forward(self, x):
+        return x * 2
+def get_inputs(dims):
+    return torch.randn(dims["M"]),  # tuple with trailing comma
+def get_init_inputs(dims):
+    return []
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+"""
+    tensors = build_node_tensors(code, dims={"M": 5})
+    assert list(tensors) == ["x"]
+    assert tensors["x"].shape == (5,)

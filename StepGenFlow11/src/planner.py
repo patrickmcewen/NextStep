@@ -315,3 +315,26 @@ def check_compose(original_reference_code: str,
                 f"(max_abs_err={max_abs:.3e}). The refactored parent does not "
                 f"reproduce the original's output."
             )
+
+
+def build_node_tensors(reference_code: str, dims: dict) -> dict:
+    """Run ``get_inputs(dims)`` and zip the resulting tuple with the names of
+    ``Model.forward``'s positional arguments (excluding ``self``).
+
+    Returns a ``{arg_name: Tensor, ...}`` dict.
+    """
+    forward = _extract_model_forward(reference_code)
+    arg_names = [a.arg for a in forward.args.args if a.arg != "self"]
+
+    ns: dict = {}
+    exec(reference_code, ns)
+    assert "get_inputs" in ns, "reference must define get_inputs(dims)"
+    inputs = ns["get_inputs"](dims)
+    if not isinstance(inputs, tuple):
+        inputs = (inputs,)
+
+    assert len(arg_names) == len(inputs), (
+        f"forward() declares {len(arg_names)} args ({arg_names}) but "
+        f"get_inputs returned {len(inputs)} tensor(s)"
+    )
+    return dict(zip(arg_names, inputs))
