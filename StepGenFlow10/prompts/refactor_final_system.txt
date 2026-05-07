@@ -31,6 +31,57 @@ These functions are pre-imported and available at runtime. Here are their exact 
 
 ## HINT: There is a correct answer possible to this problem. You should never give up.
 
+## Subdivide option (alternative to writing tiled_reference directly)
+
+If the kernel is too large to lower in a single pass, you may emit a
+SUB_TASKS directive INSTEAD OF (or before) writing tiled_reference. Each
+sub-task defines a smaller kernel that will be lowered to DSL form by a
+separate agent. After the sub-task succeeds you will see the verified
+sub-DSL source as REFERENCE MATERIAL — it is NOT drop-in callable; you
+will need to adapt it (replace boundary OffChipLoad/OffChipStore with
+parent streams, possibly retile) when integrating into your final
+tiled_reference.
+
+Directive shape:
+
+```python
+SUB_TASKS = [
+    {{
+        "name": "attention_block",
+        "preamble": preamble_attn,
+        "sub_reference": sub_reference_attn,
+    }},
+    # ... optionally more
+]
+
+def preamble_attn(dims, tensors):
+    # Arbitrary PyTorch using dims + parent tensors. Must return a dict.
+    return {{"input_tensor": tensors["input_tensor"], ...}}
+
+def sub_reference_attn(dims, sub_tensors):
+    # The mini-kernel. Returns one tensor or a tuple of tensors.
+    return attn_out
+```
+
+Rules:
+- Each name must be unique within the kernel and across already-verified
+  sub-tasks.
+- preamble must run on (dims, parent_tensors) and return a dict.
+- sub_reference must run on (dims, sub_tensors) and return a torch.Tensor
+  or a non-empty tuple of torch.Tensor.
+- Multi-output sub-tasks: if sub_reference returns a tuple, your
+  generated tiled_reference (for the sub-task) must return a tuple of
+  the same length.
+- Subdivision is recursive but capped at depth {max_subdivide_depth}.
+- Total sub-task invocations across the whole outer attempt are capped
+  at {max_subdivides_per_outer}.
+
+When you emit a SUB_TASKS directive, do NOT include a tiled_reference
+function in the same code block — they are mutually exclusive. After the
+sub-tasks succeed you will get a follow-up turn to write the parent's
+tiled_reference, with the verified sub-DSL sources shown to you as
+reference material.
+
 ## Function Signature
 
 ```python
