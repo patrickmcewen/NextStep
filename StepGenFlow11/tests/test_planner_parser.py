@@ -145,6 +145,53 @@ class Model(nn.Module):
         parse_planner_response(bad)
 
 
+def test_parse_split_child_missing_class_model_raises_MalformedSplit():
+    bad = """
+DECISION: split
+
+# child: rowwise_softmax
+def get_inputs(dims):
+    return (torch.randn(4),)
+
+# child: other
+class Model(nn.Module):
+    def forward(self, x):
+        return x * 2
+def get_inputs(dims):
+    return (torch.randn(4),)
+
+# refactored parent
+class Model(nn.Module):
+    pass
+"""
+    with pytest.raises(MalformedSplit, match="missing 'class Model'"):
+        parse_planner_response(bad)
+
+
+def test_parse_split_child_missing_get_inputs_raises_MalformedSplit():
+    bad = """
+DECISION: split
+
+# child: a
+class Model(nn.Module):
+    def forward(self, x):
+        return x
+
+# child: b
+class Model(nn.Module):
+    def forward(self, x):
+        return x * 2
+def get_inputs(dims):
+    return (torch.randn(4),)
+
+# refactored parent
+class Model(nn.Module):
+    pass
+"""
+    with pytest.raises(MalformedSplit, match="missing 'def get_inputs'"):
+        parse_planner_response(bad)
+
+
 def test_synthesize_appends_compute_gold_and_init_inputs():
     body = """\
 import torch

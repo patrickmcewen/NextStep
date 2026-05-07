@@ -150,12 +150,14 @@ def parse_planner_response(text: str):
             if name in seen_names:
                 raise MalformedSplit(f"duplicate child name: {name!r}")
             seen_names.add(name)
-            assert "class Model" in body, (
-                f"child {name!r}: missing 'class Model' in body"
-            )
-            assert "def get_inputs" in body, (
-                f"child {name!r}: missing 'def get_inputs' in body"
-            )
+            if "class Model" not in body:
+                raise MalformedSplit(
+                    f"child {name!r}: missing 'class Model' in body"
+                )
+            if "def get_inputs" not in body:
+                raise MalformedSplit(
+                    f"child {name!r}: missing 'def get_inputs' in body"
+                )
             children.append(ParsedChild(name=name, reference_code=body))
         else:
             refactored_parent_code = body
