@@ -308,6 +308,10 @@ def _load_stepdb_config() -> dict:
 _GOLD_CACHE: dict = {}
 
 
+def _gold_key(kernel_name: str, dims: dict) -> tuple:
+    return (kernel_name, json.dumps(dims, sort_keys=True, default=str))
+
+
 def _get_gold(kernel_name, dims):
     """Return the cached gold tensor for (kernel_name, dims), computing once.
 
@@ -317,7 +321,7 @@ def _get_gold(kernel_name, dims):
     correctness check, which otherwise OOMs the cgroup on heavy kernels (e.g.
     end_to_end Mixtral).
     """
-    key = (kernel_name, json.dumps(dims, sort_keys=True, default=str))
+    key = _gold_key(kernel_name, dims)
     cached = _GOLD_CACHE.get(key)
     if cached is not None:
         return cached
@@ -327,7 +331,7 @@ def _get_gold(kernel_name, dims):
     return gold
 
 
-def _inject_gold(kernel_name: str, dims: dict, gold) -> None:
+def _inject_gold(kernel_name: str, dims: dict, gold: "torch.Tensor | tuple[torch.Tensor, ...]") -> None:
     """Pre-populate the gold cache for a synthetic kernel name.
 
     Used by the subdivide flow: a sub-task's gold is computed from the
@@ -335,7 +339,7 @@ def _inject_gold(kernel_name: str, dims: dict, gold) -> None:
     under a synthetic ``kernel_name`` so the subagent's pass-loop can use
     the existing _compare_against_gold path unchanged.
     """
-    key = (kernel_name, json.dumps(dims, sort_keys=True, default=str))
+    key = _gold_key(kernel_name, dims)
     _GOLD_CACHE[key] = gold
 
 

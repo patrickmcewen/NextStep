@@ -525,7 +525,6 @@ def test_compare_against_gold_tuple_vs_single_mismatch():
 
 
 def test_inject_gold_lookup_returns_injected():
-    from src import orchestrator as orch_mod
     fake_dims = {"seq_len": 7}
     fake_gold = torch.zeros(3, 4)
     orch_mod._inject_gold("__sub_fake_test__", fake_dims, fake_gold)
@@ -534,10 +533,11 @@ def test_inject_gold_lookup_returns_injected():
 
 
 def test_inject_gold_tuple():
-    from src import orchestrator as orch_mod
     fake_dims = {"seq_len": 8}
     fake_gold = (torch.zeros(3), torch.ones(3))
     orch_mod._inject_gold("__sub_fake_tuple__", fake_dims, fake_gold)
     out = orch_mod._get_gold("__sub_fake_tuple__", fake_dims)
     assert isinstance(out, tuple)
     assert len(out) == 2
+    assert torch.equal(out[0], fake_gold[0])
+    assert torch.equal(out[1], fake_gold[1])
