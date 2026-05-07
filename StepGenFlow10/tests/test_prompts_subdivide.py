@@ -47,7 +47,10 @@ def test_build_subdivide_results_block_single_entry():
     assert "Verified sub-task results" in out
     assert "attention_block" in out
     assert "preamble" in out
+    assert "def preamble(dims, tensors):" in out  # source rendered, not just label
     assert "sub_reference" in out
+    assert "def sub_reference(dims, sub_tensors):" in out
+    assert "def tiled_reference(dims, tensors):" in out
     assert "verified DSL form" in out
     assert "NOT drop-in callable" in out or "not drop-in callable" in out.lower()
     assert "OffChipLoad" in out or "off-chip" in out.lower()
