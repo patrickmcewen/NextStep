@@ -48,6 +48,17 @@ _vf_spec.loader.exec_module(_validate_functional_mod)
 IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 
 # ---------------------------------------------------------------------------
+# Shared prompt string constants
+# ---------------------------------------------------------------------------
+_NO_SEED_GUARD = (
+    "**You MUST NOT call `torch.manual_seed`, `torch.randn`, `torch.rand`, "
+    "or use the `@` operator.**"
+)
+_TENSORS_PRECREATED_NOTE = (
+    "All tensors are pre-created. Access them via `tensors[\"key\"]`."
+)
+
+# ---------------------------------------------------------------------------
 # Helper: load StepDB config
 # ---------------------------------------------------------------------------
 def _load_stepdb_config() -> dict:
@@ -551,8 +562,8 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
             precompute_src,
             "```",
             "",
-            "**You MUST NOT call `torch.manual_seed`, `torch.randn`, `torch.rand`, or use the `@` operator.**",
-            "All tensors are pre-created. Access them via `tensors[\"key\"]`.",
+            _NO_SEED_GUARD,
+            _TENSORS_PRECREATED_NOTE,
         ])
 
     if prev_code is not None:
@@ -596,6 +607,9 @@ def build_subdivide_user_prompt(*, name: str,
     sub_tensors instead of the parent's tensors. No parent context is
     included — the subagent treats this as a standalone kernel.
     """
+    assert isinstance(name, str) and len(name) > 0 and "\n" not in name, (
+        f"name must be a non-empty single-line string, got {name!r}"
+    )
     dims_json = json.dumps(dims, indent=2)
     lines = [
         f"## Sub-kernel: {name}",
@@ -626,8 +640,8 @@ def build_subdivide_user_prompt(*, name: str,
         preamble_source.rstrip(),
         "```",
         "",
-        "**You MUST NOT call `torch.manual_seed`, `torch.randn`, `torch.rand`, or use the `@` operator.**",
-        "All tensors are pre-created. Access them via `tensors[\"key\"]`.",
+        _NO_SEED_GUARD,
+        _TENSORS_PRECREATED_NOTE,
         "",
         "Rewrite this as a `tiled_reference(dims, tensors)` function that "
         "computes the same result as `sub_reference`. If `sub_reference` "

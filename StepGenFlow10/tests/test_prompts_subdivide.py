@@ -1,7 +1,3 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import torch
 from src.prompts import build_subdivide_user_prompt
 
@@ -23,9 +19,9 @@ def test_build_subdivide_user_prompt_contains_required_sections():
         dims={"seq_len": 7},
         sub_tensors=sub_tensors,
     )
-    assert "Sub-kernel: doubler" in out or "Kernel: doubler" in out
+    assert "## Sub-kernel: doubler" in out
     assert "sub_reference" in out
-    assert "preamble" in out
+    assert "def preamble" in out
     assert "tiled_reference(dims, tensors)" in out
     assert "torch.manual_seed" in out  # the "do not call" guard line
     # The parent kernel must NOT leak in:
