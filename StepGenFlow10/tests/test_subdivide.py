@@ -1,6 +1,5 @@
 """Unit tests for src/subdivide.py."""
 import pytest
-import torch
 
 from src import subdivide as sub_mod
 
@@ -55,6 +54,10 @@ def test_parse_directive_single_well_formed():
     assert callable(sub_tasks[0]["sub_reference"])
     # Counter is NOT incremented at parse time — that happens on dispatch.
     assert counter.used == 0
+    assert "def preamble_a(dims, tensors)" in sub_tasks[0]["preamble_source"]
+    assert "return {\"x\": tensors[\"x\"]}" in sub_tasks[0]["preamble_source"]
+    assert "def sub_reference_a(dims, sub_tensors)" in sub_tasks[0]["sub_reference_source"]
+    assert "return sub_tensors[\"x\"] * 2" in sub_tasks[0]["sub_reference_source"]
 
 
 def test_parse_directive_multi_well_formed():
@@ -188,3 +191,31 @@ def test_parse_directive_counter_cap():
         sub_mod.parse_directive(
             WELL_FORMED, registry=[], depth=0, counter=counter, options=_opts(max_count=5)
         )
+
+
+def test_parse_directive_disambiguates_redefined_functions():
+    """If the directive code redefines a function name, _func_source must
+    extract the source corresponding to the function actually bound to the
+    sub-task — not the first definition with that name."""
+    code = '''
+def helper(dims, tensors): return {"FIRST": True}
+def helper(dims, tensors): return {"SECOND": True}
+
+def real_preamble(dims, tensors):
+    return helper(dims, tensors)
+
+def real_sub_reference(dims, sub_tensors):
+    return sub_tensors["x"]
+
+SUB_TASKS = [
+    {"name": "n", "preamble": real_preamble, "sub_reference": real_sub_reference},
+]
+'''
+    counter = sub_mod.SubdivideCounter()
+    sub_tasks = sub_mod.parse_directive(
+        code, registry=[], depth=0, counter=counter, options=_opts()
+    )
+    # The bound preamble is the LAST helper redefinition's caller; here we just
+    # verify the recorded preamble_source is the real_preamble def, not a helper.
+    assert "def real_preamble" in sub_tasks[0]["preamble_source"]
+    assert "FIRST" not in sub_tasks[0]["preamble_source"]

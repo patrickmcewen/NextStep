@@ -1,10 +1,12 @@
-"""Subdivide directive: parse, dispatch, registry.
+"""Subdivide directive parsing.
 
 The refactor agent may emit a ``SUB_TASKS`` directive instead of a
-``tiled_reference`` candidate. The orchestrator parses the directive here,
-dispatches each sub-task as a fresh recursive ``refactor_final`` pass on a
-smaller mini-kernel (preamble + sub_reference), collects verified sub-DSLs,
-and adds them to the parent's per-outer registry as reference material.
+``tiled_reference`` candidate. This module provides the parser and the
+shared types (``VerifiedSubTask``, ``SubdivideOptions``, ``SubdivideCounter``)
+that subsequent tasks build on.
+
+The dispatch layer (parallel sub-task execution against fresh refactor passes)
+and the registry mutation logic are added in later tasks.
 
 The verified sub-DSL is text-only — never callable from the parent's
 tiled_reference. The parent agent reads it as worked code and adapts it.
@@ -21,7 +23,7 @@ class NotADirective(Exception):
     """
 
 
-@dataclass
+@dataclass(frozen=True)
 class VerifiedSubTask:
     name: str
     sub_reference_source: str
@@ -29,9 +31,9 @@ class VerifiedSubTask:
     verified_sub_dsl_source: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class SubdivideOptions:
-    max_subdivide_turns: int
+    max_subdivide_turns: int  # used by dispatch (T9), not parser
     max_subdivides_per_outer: int
     max_subdivide_depth: int
 
@@ -49,26 +51,32 @@ def _func_source(fn: Callable, full_source: str) -> str:
     """Extract the source of a function defined inside ``full_source``.
 
     The function was just exec'd from ``full_source``, so inspect.getsource
-    cannot locate a file for it. We walk the AST of full_source to find the
-    matching FunctionDef.
+    cannot locate a file for it. We walk the AST of ``full_source`` and match
+    by both name and starting line number — name alone is not unique if the
+    directive code redefines a function.
     """
     import ast
     tree = ast.parse(full_source)
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == fn.__name__:
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == fn.__name__
+                and node.lineno == fn.__code__.co_firstlineno):
             segment = ast.get_source_segment(full_source, node)
             assert segment is not None, (
                 f"AST source extraction failed for {fn.__name__!r}; "
                 f"this should not happen for code defined in full_source"
             )
             return segment
-    assert False, f"function {fn.__name__!r} not found in source"
+    assert False, (
+        f"function {fn.__name__!r} (lineno={fn.__code__.co_firstlineno}) "
+        f"not found in source"
+    )
 
 
 def parse_directive(
     code: str,
     *,
-    registry: list,
+    registry: list[VerifiedSubTask],
     depth: int,
     counter: SubdivideCounter,
     options: SubdivideOptions,
@@ -124,8 +132,11 @@ def parse_directive(
 
         preamble = st["preamble"]
         sub_reference = st["sub_reference"]
-        assert callable(preamble) and callable(sub_reference), (
-            f"sub-task {name!r}: 'preamble' and 'sub_reference' must be callable"
+        assert callable(preamble), (
+            f"sub-task {name!r}: 'preamble' must be callable, got {type(preamble).__name__}"
+        )
+        assert callable(sub_reference), (
+            f"sub-task {name!r}: 'sub_reference' must be callable, got {type(sub_reference).__name__}"
         )
 
         parsed.append({
