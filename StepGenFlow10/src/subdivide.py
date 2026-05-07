@@ -20,6 +20,8 @@ import torch
 from dataclasses import dataclass
 from typing import Callable
 
+from src.gold_cache import _inject_gold
+
 
 class NotADirective(Exception):
     """Raised when candidate code defines no top-level SUB_TASKS attribute.
@@ -382,7 +384,6 @@ async def _run_one_sub_task(*, parsed: dict, dims: dict, parent_tensors: dict,
         )
 
     synth_kernel = f"__sub_{name}_{uuid.uuid4().hex[:8]}__"
-    from src.orchestrator import _inject_gold  # lazy: avoids circular import
     _inject_gold(synth_kernel, dims, prepared.sub_gold)
 
     agent = _make_subdivide_pass_agent(llm_config, options)

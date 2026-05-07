@@ -55,6 +55,7 @@ from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES, PIPELINES,
                          resolve_few_shot_examples)
 from src.tools import (_exec_build_graph, _exec_dsl_ref,
                        _validate_functional_mod, enhance_emulator_error)
+from src.gold_cache import _GOLD_CACHE, _gold_key, _get_gold, _inject_gold
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -308,43 +309,6 @@ def _load_stepdb_config() -> dict:
 # ---------------------------------------------------------------------------
 # Correctness checkers for each executor type
 # ---------------------------------------------------------------------------
-
-_GOLD_CACHE: dict = {}
-
-
-def _gold_key(kernel_name: str, dims: dict) -> tuple:
-    return (kernel_name, json.dumps(dims, sort_keys=True, default=str))
-
-
-def _get_gold(kernel_name, dims):
-    """Return the cached gold tensor for (kernel_name, dims), computing once.
-
-    `compute_gold(dims)` is deterministic (fixed seeds inside the reference) and
-    only depends on `dims`, so the result is safe to memoize for the lifetime of
-    the process.  This avoids re-allocating multi-GiB reference tensors on every
-    correctness check, which otherwise OOMs the cgroup on heavy kernels (e.g.
-    end_to_end Mixtral).
-    """
-    key = _gold_key(kernel_name, dims)
-    cached = _GOLD_CACHE.get(key)
-    if cached is not None:
-        return cached
-    config = _validate_functional_mod.load_config()
-    gold = _validate_functional_mod.run_reference(kernel_name, dims, config)
-    _GOLD_CACHE[key] = gold
-    return gold
-
-
-def _inject_gold(kernel_name: str, dims: dict, gold: "torch.Tensor | tuple[torch.Tensor, ...]") -> None:
-    """Pre-populate the gold cache for a synthetic kernel name.
-
-    Used by the subdivide flow: a sub-task's gold is computed from the
-    parent's tensors via the preamble + sub_reference, then injected here
-    under a synthetic ``kernel_name`` so the subagent's pass-loop can use
-    the existing _compare_against_gold path unchanged.
-    """
-    key = _gold_key(kernel_name, dims)
-    _GOLD_CACHE[key] = gold
 
 
 def _compare_single(result, gold, label):
