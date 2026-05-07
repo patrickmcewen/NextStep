@@ -1,6 +1,8 @@
 import pytest
+import torch  # noqa: F401  used in exec'd code
 from src.planner import (parse_planner_response, ParsedSplit,
-                         NotADecision, MalformedSplit)
+                         NotADecision, MalformedSplit,
+                         synthesize_reference_module)
 
 
 _SAMPLE_LEAF_RESPONSE = """
@@ -141,3 +143,53 @@ class Model(nn.Module):
 """
     with pytest.raises(MalformedSplit, match="duplicate"):
         parse_planner_response(bad)
+
+
+def test_synthesize_appends_compute_gold_and_init_inputs():
+    body = """\
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return x * 2
+
+def get_inputs(dims):
+    torch.manual_seed(7)
+    return (torch.randn(dims["M"]),)
+"""
+    full = synthesize_reference_module(body)
+    assert "def get_init_inputs(dims):" in full
+    assert "return []" in full
+    assert "def compute_gold(dims):" in full
+    namespace = {}
+    exec(full, namespace)
+    out = namespace["compute_gold"]({"M": 4})
+    inputs = namespace["get_inputs"]({"M": 4})
+    expected = namespace["Model"]()(*inputs)
+    assert torch.equal(out, expected)
+
+
+def test_synthesize_idempotent_when_compute_gold_already_present():
+    body_with_gold = """\
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, x):
+        return x
+
+def get_inputs(dims):
+    return (torch.randn(4),)
+
+def get_init_inputs(dims):
+    return []
+
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+"""
+    full = synthesize_reference_module(body_with_gold)
+    assert full.count("def compute_gold(dims):") == 1
+    assert full.count("def get_init_inputs(dims):") == 1

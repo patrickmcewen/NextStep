@@ -166,3 +166,31 @@ def parse_planner_response(text: str):
         children=tuple(children),
         refactored_parent_code=refactored_parent_code,
     )
+
+
+def synthesize_reference_module(body: str) -> str:
+    """Take a body containing ``class Model`` + ``def get_inputs`` and return
+    a full, runnable reference.py text.
+
+    Adds ``import torch`` / ``import torch.nn as nn`` at the top if missing,
+    plus ``get_init_inputs(dims) -> []`` and a default ``compute_gold(dims)``
+    that runs ``Model()(*get_inputs(dims))``. Idempotent.
+    """
+    out = body.lstrip("\n")
+
+    if "import torch" not in out:
+        out = "import torch\nimport torch.nn as nn\n\n" + out
+    elif "import torch.nn as nn" not in out:
+        out = "import torch.nn as nn\n" + out
+
+    if "def get_init_inputs(dims):" not in out:
+        out = out.rstrip() + "\n\n\ndef get_init_inputs(dims):\n    return []\n"
+
+    if "def compute_gold(dims):" not in out:
+        out = out.rstrip() + (
+            "\n\n\ndef compute_gold(dims):\n"
+            "    inputs = get_inputs(dims)\n"
+            "    return Model()(*inputs)\n"
+        )
+
+    return out
