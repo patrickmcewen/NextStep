@@ -224,7 +224,8 @@ def _format_few_shot_examples(examples: list) -> str:
     return "\n".join(lines)
 
 
-def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
+def build_pass_system_prompt(pass_name: str, few_shot_examples=None,
+                              subdivide_options: dict | None = None) -> str:
     """Build a lowering/translator pass agent's system prompt from its template.
 
     Templates contain {placeholder} tokens that are filled from source files:
@@ -295,6 +296,15 @@ def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
     if "{few_shot_examples}" in template:
         replacements["few_shot_examples"] = _format_few_shot_examples(
             few_shot_examples or [])
+
+    if subdivide_options is None:
+        subdivide_options = {"max_subdivide_depth": 2, "max_subdivides_per_outer": 5}
+    assert isinstance(subdivide_options, dict) and \
+           "max_subdivide_depth" in subdivide_options and \
+           "max_subdivides_per_outer" in subdivide_options, \
+           f"subdivide_options must be a dict with keys 'max_subdivide_depth' and 'max_subdivides_per_outer', got {subdivide_options!r}"
+    replacements["max_subdivide_depth"] = subdivide_options["max_subdivide_depth"]
+    replacements["max_subdivides_per_outer"] = subdivide_options["max_subdivides_per_outer"]
 
     if replacements:
         template = template.format(**replacements)

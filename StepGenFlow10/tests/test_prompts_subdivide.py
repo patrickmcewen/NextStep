@@ -105,3 +105,25 @@ def test_build_subdivide_user_prompt_renders_tuple_aware_signature():
         sub_tensors={"x": torch.zeros(2)},
     )
     assert "tiled_reference(dims, tensors)" in out
+
+
+def test_build_pass_system_prompt_substitutes_subdivide_limits():
+    from src.prompts import build_pass_system_prompt
+    out = build_pass_system_prompt(
+        "refactor_final",
+        few_shot_examples=None,
+        subdivide_options={"max_subdivide_depth": 3, "max_subdivides_per_outer": 7},
+    )
+    assert "{max_subdivide_depth}" not in out
+    assert "{max_subdivides_per_outer}" not in out
+    assert "depth 3" in out or "depth=3" in out or "at depth 3" in out or "depth of 3" in out or "capped at 3" in out
+    assert "7" in out
+
+
+def test_build_pass_system_prompt_no_subdivide_options_keeps_placeholders_safe():
+    """When the caller doesn't pass subdivide_options, the placeholders must
+    still be substituted with sane defaults so the prompt is well-formed."""
+    from src.prompts import build_pass_system_prompt
+    out = build_pass_system_prompt("refactor_final", few_shot_examples=None)
+    assert "{max_subdivide_depth}" not in out
+    assert "{max_subdivides_per_outer}" not in out
