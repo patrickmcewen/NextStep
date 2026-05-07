@@ -6,9 +6,10 @@ parity contract) and `--check-order=compliance-first` (new ordering).
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import torch
 
 from src import orchestrator as orch_mod
 
@@ -487,10 +488,6 @@ def test_run_outer_iteration_passes_check_order_to_run_pass_loop(tmp_path, monke
     assert "check_orders" in captured, "_run_pass_loop was never called"
     assert captured["check_orders"][0] == "compliance-first", \
         f"expected 'compliance-first' propagated, got {captured['check_orders']!r}"
-
-
-import torch
-from unittest.mock import patch
 
 
 def test_compare_against_gold_tuple_match():

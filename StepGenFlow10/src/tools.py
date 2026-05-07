@@ -265,7 +265,7 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict):
         assert len(result) > 0, "tiled_reference returned an empty tuple; must be non-empty"
         for i, elem in enumerate(result):
             assert isinstance(elem, torch.Tensor), (
-                f"tiled_reference: each element must be a torch.Tensor or tuple of torch.Tensor; "
+                f"tiled_reference must return a torch.Tensor or tuple of torch.Tensor, "
                 f"got tuple element [{i}] of type {type(elem)}"
             )
         return result

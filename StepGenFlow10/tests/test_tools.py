@@ -13,6 +13,9 @@ sys.path.insert(0, STEP_TL_SRC)
 sys.path.insert(0, STEP_TL_PROTO)
 
 import pytest
+import torch
+
+from src.tools import _exec_dsl_ref
 
 ELEMENT_WISE_ADD_CODE = '''
 SEED = 42
@@ -112,15 +115,10 @@ def test_analyze_performance():
     assert int(result["total_cycles"]) > 0
 
 
-import torch
-import pytest
-from src.tools import _exec_dsl_ref
-
-
 def _trivial_dsl_scaffold_monkeypatch(monkeypatch):
-    """Replace _build_dsl_scaffold with an empty scaffold so the test does not
-    depend on step_dsl being importable in the test process. The user code
-    uses only torch, which is in the namespace via the import in tools.py."""
+    """Replace _build_dsl_scaffold with a minimal scaffold that imports torch
+    into the exec namespace, so test cases can use torch without depending on
+    step_dsl being importable in the test process."""
     from src import tools as tools_mod
     monkeypatch.setattr(tools_mod, "_build_dsl_scaffold", lambda: "import torch\n")
 
@@ -156,7 +154,7 @@ def test_exec_dsl_ref_rejects_non_tensor_tuple_element(monkeypatch):
         "def tiled_reference(dims, tensors):\n"
         "    return (tensors['x'] * 2, 'not a tensor')\n"
     )
-    with pytest.raises(AssertionError, match="must be a torch.Tensor or tuple"):
+    with pytest.raises(AssertionError, match="must return a torch.Tensor or tuple"):
         _exec_dsl_ref(code, dims={}, tensors={"x": torch.tensor([1.0])})
 
 
