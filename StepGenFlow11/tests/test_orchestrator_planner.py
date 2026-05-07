@@ -83,3 +83,54 @@ async def test_refactor_tree_cancels_siblings_on_failure(tmp_path, monkeypatch):
 
     assert result["success"] is False
     assert "_a__" in result["failing_node"]
+
+
+@pytest.mark.asyncio
+async def test_planner_phase_re_plans_failing_subtree_then_succeeds(tmp_path, monkeypatch):
+    """First refactor pass fails on subtree X; replan emits a different X; second succeeds."""
+    from src.planner import PlanNode, Tree
+
+    def _leaf(path):
+        return PlanNode(name=path.rsplit("/")[-1], path=path,
+                        reference_code=_LEAF_REF, refactored_code=None,
+                        is_leaf=True, children=())
+
+    tree_v1 = Tree(root=PlanNode(
+        name="root", path="root", reference_code=_LEAF_REF,
+        refactored_code="...", is_leaf=False,
+        children=(_leaf("root/a"), _leaf("root/b"))))
+
+    tree_v2 = Tree(root=PlanNode(
+        name="root", path="root", reference_code=_LEAF_REF,
+        refactored_code="...", is_leaf=False,
+        children=(_leaf("root/c"), _leaf("root/d"))))
+
+    plan_calls = []
+    async def fake_plan_initial(**kwargs):
+        plan_calls.append(("initial", kwargs))
+        return tree_v1.root
+    async def fake_replan(**kwargs):
+        plan_calls.append(("replan", kwargs))
+        return tree_v2.root
+
+    refactor_attempts = []
+    async def fake_refactor_tree(*, tree, **kwargs):
+        refactor_attempts.append(tree.root.children[0].name)
+        if tree.root.children[0].name == "a":
+            return {"success": False, "failing_node": "root/a",
+                    "last_messages": ["fail msg"]}
+        return {"success": True, "root_dsl": "verified root dsl"}
+
+    monkeypatch.setattr(orch_mod, "_initial_plan", fake_plan_initial)
+    monkeypatch.setattr(orch_mod, "_replan", fake_replan)
+    monkeypatch.setattr(orch_mod, "refactor_tree", fake_refactor_tree)
+
+    result = await orch_mod._run_planner_phase(
+        root_reference="...", dims={"M": 4}, root_kernel="kernel_x",
+        ckpt_root=tmp_path, agent_factory=lambda fs: None,
+        max_turns=1, log=lambda m: None, max_replans=3,
+    )
+    assert result["success"] is True
+    assert refactor_attempts == ["a", "c"]
+    assert plan_calls[0][0] == "initial"
+    assert plan_calls[1][0] == "replan"

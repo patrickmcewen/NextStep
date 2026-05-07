@@ -1244,6 +1244,129 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
     return {"success": True, "root_dsl": verified[tree.root.path]}
 
 
+async def _initial_plan(*, root_reference, dims, agent, log) -> "PlanNode":
+    """Thin wrapper around src.planner.plan for monkeypatching in tests."""
+    from src.planner import plan
+    return await plan(reference_code=root_reference, dims=dims,
+                       agent=agent, path="root",
+                       runner_fn=Runner.run, retry_budget=3)
+
+
+async def _replan(*, subtree_reference, dims, agent, node_path,
+                  failing_node, last_messages, sibling_results,
+                  replan_iteration, log) -> "PlanNode":
+    """Re-invoke the planner on a failing subtree."""
+    from src.planner import plan
+    return await plan(
+        reference_code=subtree_reference, dims=dims, agent=agent,
+        path=node_path, runner_fn=Runner.run, retry_budget=3,
+        replan_context={
+            "replan_iteration": replan_iteration,
+            "node_path": node_path,
+            "failing_node": failing_node,
+            "last_turn_messages": last_messages,
+            "sibling_results": sibling_results,
+        },
+    )
+
+
+async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
+                             agent_factory, max_turns, log, max_replans):
+    """Top-level Phase 0+1 loop with re-plan on failure.
+
+    Returns: {"success": True, "root_dsl": str} or
+             {"success": False, "failing_node": str, "last_messages": [...]}.
+    """
+    from src.planner import Tree
+
+    planner_agent = getattr(agent_factory, "__planner_agent__", None)
+
+    plan_iter = 0
+    root_node = await _initial_plan(
+        root_reference=root_reference, dims=dims,
+        agent=planner_agent, log=log,
+    )
+    tree = Tree(root=root_node)
+    _persist_tree(tree, ckpt_root / "plan" / f"iteration_{plan_iter}")
+
+    replans_used = 0
+    while True:
+        result = await refactor_tree(
+            tree=tree, dims=dims, root_kernel=root_kernel,
+            ckpt_root=ckpt_root, agent_factory=agent_factory,
+            max_turns=max_turns, log=log,
+        )
+        if result["success"]:
+            return result
+
+        if replans_used >= max_replans:
+            return result
+
+        failing = result["failing_node"]
+        owner = tree.find_owner(failing) or tree.root
+        sibling_results: list = []
+        new_subtree = await _replan(
+            subtree_reference=owner.reference_code, dims=dims,
+            agent=planner_agent, node_path=owner.path,
+            failing_node=failing,
+            last_messages=result.get("last_messages", []),
+            sibling_results=sibling_results,
+            replan_iteration=replans_used + 1, log=log,
+        )
+        tree = _replace_subtree(tree, owner.path, new_subtree)
+        replans_used += 1
+        plan_iter += 1
+        _persist_tree(tree, ckpt_root / "plan" / f"iteration_{plan_iter}")
+
+
+def _persist_tree(tree, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "tree.json").write_text(json.dumps(_tree_to_dict(tree.root), indent=2))
+    _persist_node_files(tree.root, dest)
+
+
+def _tree_to_dict(node) -> dict:
+    return {
+        "name": node.name,
+        "path": node.path,
+        "is_leaf": node.is_leaf,
+        "has_refactored": node.refactored_code is not None,
+        "children": [_tree_to_dict(c) for c in node.children],
+    }
+
+
+def _persist_node_files(node, dest: Path) -> None:
+    node_dir = dest / node.path.replace("/", "_")
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "reference.py").write_text(node.reference_code)
+    if node.refactored_code is not None:
+        (node_dir / "refactored.py").write_text(node.refactored_code)
+    for c in node.children:
+        _persist_node_files(c, dest)
+
+
+def _replace_subtree(tree, owner_path: str, new_subtree) -> "Tree":
+    """Return a new Tree with the subtree at owner_path replaced by new_subtree."""
+    from src.planner import Tree
+    if owner_path == tree.root.path:
+        return Tree(root=new_subtree)
+    return Tree(root=_replace_node(tree.root, owner_path, new_subtree))
+
+
+def _replace_node(node, target_path: str, new_subtree):
+    from src.planner import PlanNode
+    new_children = tuple(
+        new_subtree if c.path == target_path else _replace_node(c, target_path, new_subtree)
+        for c in node.children
+    )
+    return PlanNode(
+        name=node.name, path=node.path,
+        reference_code=node.reference_code,
+        refactored_code=node.refactored_code,
+        is_leaf=node.is_leaf, children=new_children,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Resume from checkpoint
 # ---------------------------------------------------------------------------
