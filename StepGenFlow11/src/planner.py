@@ -285,7 +285,9 @@ def check_compose(original_reference_code: str,
     )
 
     inputs = orig_ns["get_inputs"](dims)
-    if not isinstance(inputs, tuple):
+    if isinstance(inputs, list):
+        inputs = tuple(inputs)
+    elif not isinstance(inputs, tuple):
         inputs = (inputs,)
 
     with torch.no_grad():
@@ -339,7 +341,9 @@ def build_node_tensors(reference_code: str, dims: dict) -> dict:
     exec(reference_code, ns)
     assert "get_inputs" in ns, "reference must define get_inputs(dims)"
     inputs = ns["get_inputs"](dims)
-    if not isinstance(inputs, tuple):
+    if isinstance(inputs, list):
+        inputs = tuple(inputs)
+    elif not isinstance(inputs, tuple):
         inputs = (inputs,)
 
     assert len(arg_names) == len(inputs), (

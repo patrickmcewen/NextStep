@@ -311,6 +311,29 @@ def compute_gold(dims):
     assert tensors["V"].shape == (3, 4)
 
 
+def test_build_node_tensors_handles_list_return_from_get_inputs():
+    """Some StepDB references return ``[Q, K, cos, sin]`` (a list, not a tuple).
+    The walker must accept either."""
+    code = """\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def forward(self, Q, K, cos, sin):
+        return Q + K + cos + sin
+def get_inputs(dims):
+    M = dims["M"]
+    return [torch.randn(M), torch.randn(M), torch.randn(M), torch.randn(M)]
+def get_init_inputs(dims):
+    return []
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+"""
+    tensors = build_node_tensors(code, dims={"M": 3})
+    assert sorted(tensors) == ["K", "Q", "cos", "sin"]
+    for t in tensors.values():
+        assert t.shape == (3,)
+
+
 def test_build_node_tensors_handles_single_arg_returning_single_tensor():
     code = """\
 import torch

@@ -1149,14 +1149,13 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
 
     ref_ns: dict = {}
     exec(node.reference_code, ref_ns)
-    assert "get_inputs" in ref_ns and "Model" in ref_ns, (
-        f"node {node.path!r}: reference_code must define Model and get_inputs"
+    assert "compute_gold" in ref_ns, (
+        f"node {node.path!r}: reference_code must define compute_gold(dims). "
+        f"For LLM-synthesized children this is added by synthesize_reference_module; "
+        f"for StepDB roots it ships with the seed kernel."
     )
-    inputs = ref_ns["get_inputs"](dims)
-    if not isinstance(inputs, tuple):
-        inputs = (inputs,)
     with torch.no_grad():
-        gold = ref_ns["Model"]()(*inputs)
+        gold = ref_ns["compute_gold"](dims)
     _inject_gold(synth_name, dims, gold)
 
     agent_facing_code = (
