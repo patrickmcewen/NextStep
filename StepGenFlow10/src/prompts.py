@@ -500,7 +500,8 @@ def _format_tensors_description(tensors: dict) -> str:
 def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
                            prev_code: str = None,
                            tensors: dict = None,
-                           dsl_code: str = None) -> str:
+                           dsl_code: str = None,
+                           subdivide_results_block: str = "") -> str:
     """Build a pass's user prompt with reference code, dims, and previous output.
 
     Args:
@@ -592,6 +593,60 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
 
     lines.append("I will automatically run your code and compare the output against the reference. Above the function definition, include a comment detailing your thought process for your implementation or fix.")
 
+    if subdivide_results_block:
+        lines.append(subdivide_results_block)
+
+    return "\n".join(lines)
+
+
+def build_subdivide_results_block(registry) -> str:
+    """Render the registry as a markdown section for the parent's prompt.
+
+    Empty registry -> empty string. The parent only sees this section once at
+    least one sub-task has been verified.
+    """
+    if not registry:
+        return ""
+    lines = [
+        "",
+        "## Verified sub-task results",
+        "",
+        "The following sub-tasks have been independently lowered to DSL form "
+        "and verified against their own sub-gold. Use them as reference "
+        "material — copy patterns, adapt operators, or rewrite as needed. "
+        "They are NOT drop-in callable. In particular:",
+        "",
+        "- the sub-DSL's LinearOffChipLoad / OffChipStore at its boundaries "
+        "may need to be replaced with upstream/downstream streams from your "
+        "parent pipeline;",
+        "- the sub-DSL's tile scheme was chosen standalone and may need "
+        "retiling to align with the rest of your `tiled_reference`;",
+        "- the preamble shows how the sub-task's inputs are derived from "
+        "your parent tensors — your parent pipeline must produce the "
+        "equivalent streams (or load the original tensors directly via "
+        "LinearOffChipLoad).",
+        "",
+    ]
+    for v in registry:
+        lines.extend([
+            f"### Sub-task: {v.name}",
+            "",
+            f"# preamble: how {v.name}'s inputs derive from parent tensors",
+            "```python",
+            v.preamble_source.rstrip(),
+            "```",
+            "",
+            f"# sub_reference: the mini-kernel {v.name} solves",
+            "```python",
+            v.sub_reference_source.rstrip(),
+            "```",
+            "",
+            "# verified DSL form (use as reference, adapt to parent context):",
+            "```python",
+            v.verified_sub_dsl_source.rstrip(),
+            "```",
+            "",
+        ])
     return "\n".join(lines)
 
 
