@@ -322,3 +322,94 @@ SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
     )[0]
     with pytest.raises(AssertionError, match="empty tuple"):
         sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors={})
+
+
+import asyncio
+
+
+async def _fake_pass_loop_success(*args, **kwargs):
+    """Fake _run_pass_loop that always succeeds with a fixed DSL output."""
+    return {"success": True, "code": "def tiled_reference(dims, tensors):\n    return tensors['x'] * 2\n", "total_tokens": 0}
+
+
+async def _fake_pass_loop_fail(*args, **kwargs):
+    return {"success": False, "code": "broken", "total_tokens": 0}
+
+
+def _fake_make_pass_agent(*args, **kwargs):
+    return object()
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_dispatch_directive_all_success(monkeypatch, tmp_path):
+    parsed = sub_mod.parse_directive(
+        WELL_FORMED, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )
+    monkeypatch.setattr(sub_mod, "_run_pass_loop_for_sub_task", _fake_pass_loop_success)
+    monkeypatch.setattr(sub_mod, "_make_subdivide_pass_agent", _fake_make_pass_agent)
+
+    counter = sub_mod.SubdivideCounter()
+    registry = []
+    result = _run(sub_mod.dispatch_directive(
+        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0])},
+        registry=registry, depth=0, counter=counter, options=_opts(),
+        ckpt_dir=tmp_path, llm_config={}, log=lambda m: None,
+    ))
+    assert result["success"] is True
+    assert len(registry) == 1
+    assert registry[0].name == "doubler"
+    assert counter.used == 1
+
+
+def test_dispatch_directive_one_fails_discards_all(monkeypatch, tmp_path):
+    parsed = sub_mod.parse_directive(
+        WELL_FORMED_MULTI, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )
+
+    async def fake(*args, name=None, **kwargs):
+        # First sub-task succeeds; second fails.
+        if name == "doubler":
+            return {"success": True, "code": "def tiled_reference(dims, tensors): return tensors['x']*2\n", "total_tokens": 0}
+        return {"success": False, "code": "broken", "total_tokens": 0}
+
+    monkeypatch.setattr(sub_mod, "_run_pass_loop_for_sub_task", fake)
+    monkeypatch.setattr(sub_mod, "_make_subdivide_pass_agent", _fake_make_pass_agent)
+
+    counter = sub_mod.SubdivideCounter()
+    registry = []
+    result = _run(sub_mod.dispatch_directive(
+        parsed, dims={},
+        parent_tensors={"x": torch.tensor([1.0]), "y": torch.tensor([1.0])},
+        registry=registry, depth=0, counter=counter, options=_opts(),
+        ckpt_dir=tmp_path, llm_config={}, log=lambda m: None,
+    ))
+    assert result["success"] is False
+    assert "adder" in result["feedback"]
+    assert registry == []
+    assert counter.used == 2
+
+
+def test_dispatch_directive_writes_per_sub_task_subdir(monkeypatch, tmp_path):
+    parsed = sub_mod.parse_directive(
+        WELL_FORMED, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )
+    monkeypatch.setattr(sub_mod, "_run_pass_loop_for_sub_task", _fake_pass_loop_success)
+    monkeypatch.setattr(sub_mod, "_make_subdivide_pass_agent", _fake_make_pass_agent)
+
+    counter = sub_mod.SubdivideCounter()
+    registry = []
+    _run(sub_mod.dispatch_directive(
+        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0])},
+        registry=registry, depth=0, counter=counter, options=_opts(),
+        ckpt_dir=tmp_path, llm_config={}, log=lambda m: None,
+    ))
+    sub_dir = tmp_path / "sub_doubler"
+    assert sub_dir.is_dir()
+    assert (sub_dir / "verified_sub_dsl.py").is_file()
+    assert (tmp_path / "subdivide_result.json").is_file()

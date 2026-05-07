@@ -11,6 +11,11 @@ and the registry mutation logic are added in later tasks.
 The verified sub-DSL is text-only — never callable from the parent's
 tiled_reference. The parent agent reads it as worked code and adapts it.
 """
+import asyncio
+import json
+import uuid
+from pathlib import Path
+
 import torch
 from dataclasses import dataclass
 from typing import Callable
@@ -219,3 +224,160 @@ def prepare_sub_task(parsed: dict, *, dims: dict,
         sub_reference_source=parsed["sub_reference_source"],
         sub_reference=sub_reference,
     )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch layer (T9)
+# ---------------------------------------------------------------------------
+# These two are seams overridden by the orchestrator (real impl) or tests
+# (fakes). Keeping them as module-level callables means we don't have to
+# import _run_pass_loop into this module (avoids circular imports) and tests
+# can swap them with monkeypatch.
+
+async def _run_pass_loop_for_sub_task(*, agent, name, kernel_name, dims,
+                                      sub_tensors, sub_dir, options,
+                                      sub_reference_source,
+                                      preamble_source,
+                                      registry, depth, counter,
+                                      llm_config, log):
+    """Default impl: orchestrator wires this in via subdivide.set_runners(...)."""
+    raise NotImplementedError(
+        "subdivide._run_pass_loop_for_sub_task must be wired by the "
+        "orchestrator before dispatch_directive is called"
+    )
+
+
+def _make_subdivide_pass_agent(llm_config: dict, options: SubdivideOptions):
+    """Default impl: orchestrator wires this in via set_runners(...)."""
+    raise NotImplementedError(
+        "subdivide._make_subdivide_pass_agent must be wired by the orchestrator"
+    )
+
+
+def set_runners(*, pass_loop_runner: Callable, pass_agent_factory: Callable):
+    """Called once by the orchestrator at startup to wire the seams."""
+    global _run_pass_loop_for_sub_task, _make_subdivide_pass_agent
+    _run_pass_loop_for_sub_task = pass_loop_runner
+    _make_subdivide_pass_agent = pass_agent_factory
+
+
+async def dispatch_directive(parsed_sub_tasks: list, *,
+                              dims: dict, parent_tensors: dict,
+                              registry: list, depth: int,
+                              counter: SubdivideCounter,
+                              options: SubdivideOptions,
+                              ckpt_dir, llm_config: dict, log) -> dict:
+    """Dispatch each sub-task in parallel; collect verified results.
+
+    On all-success, every VerifiedSubTask is appended to ``registry`` (in
+    declared order). On any failure, NO sub-task is added — partial successes
+    are discarded so the parent doesn't carry half-state.
+
+    Returns ``{"success": bool, "feedback": str | None}``. Counter is debited
+    len(parsed_sub_tasks) regardless of outcome.
+    """
+    counter.used += len(parsed_sub_tasks)
+    ckpt_dir = Path(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    coros = [
+        _run_one_sub_task(
+            parsed=parsed, dims=dims, parent_tensors=parent_tensors,
+            registry=registry, depth=depth, counter=counter,
+            options=options, ckpt_dir=ckpt_dir,
+            llm_config=llm_config, log=log,
+        )
+        for parsed in parsed_sub_tasks
+    ]
+    outcomes = await asyncio.gather(*coros, return_exceptions=False)
+
+    summary = {
+        "sub_tasks": [
+            {
+                "name": o["name"],
+                "status": "ok" if o["success"] else "failed",
+                "failure_reason": o.get("failure_reason"),
+            }
+            for o in outcomes
+        ]
+    }
+    (ckpt_dir / "subdivide_result.json").write_text(
+        json.dumps(summary, indent=2)
+    )
+
+    if all(o["success"] for o in outcomes):
+        for o in outcomes:
+            registry.append(VerifiedSubTask(
+                name=o["name"],
+                sub_reference_source=o["sub_reference_source"],
+                preamble_source=o["preamble_source"],
+                verified_sub_dsl_source=o["verified_sub_dsl_source"],
+            ))
+        return {"success": True, "feedback": None}
+
+    failure_lines = ["## Subdivide directive: one or more sub-tasks failed"]
+    for o in outcomes:
+        if o["success"]:
+            failure_lines.append(
+                f"- sub-task {o['name']!r}: succeeded (discarded due to "
+                f"sibling failure)"
+            )
+        else:
+            failure_lines.append(
+                f"- sub-task {o['name']!r}: {o['failure_reason']}"
+            )
+    failure_lines.append(
+        "\nReconsider the decomposition or implement the work directly. "
+        "Successful sub-tasks above were NOT added to the registry — you "
+        "must re-emit them with a fresh directive (or different names) if "
+        "you want to retry."
+    )
+    return {"success": False, "feedback": "\n".join(failure_lines)}
+
+
+async def _run_one_sub_task(*, parsed: dict, dims: dict, parent_tensors: dict,
+                             registry: list, depth: int,
+                             counter: SubdivideCounter,
+                             options: SubdivideOptions, ckpt_dir: Path,
+                             llm_config: dict, log) -> dict:
+    name = parsed["name"]
+    sub_dir = ckpt_dir / f"sub_{name}"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        prepared = prepare_sub_task(parsed, dims=dims, parent_tensors=parent_tensors)
+    except AssertionError as exc:
+        return {
+            "name": name, "success": False,
+            "failure_reason": f"preparation failed: {exc}",
+        }
+
+    synth_kernel = f"__sub_{name}_{uuid.uuid4().hex[:8]}__"
+    from src.orchestrator import _inject_gold  # lazy: avoids circular import
+    _inject_gold(synth_kernel, dims, prepared.sub_gold)
+
+    agent = _make_subdivide_pass_agent(llm_config, options)
+    result = await _run_pass_loop_for_sub_task(
+        agent=agent, name=name, kernel_name=synth_kernel, dims=dims,
+        sub_tensors=prepared.sub_tensors, sub_dir=sub_dir, options=options,
+        sub_reference_source=prepared.sub_reference_source,
+        preamble_source=prepared.preamble_source,
+        registry=registry, depth=depth + 1, counter=counter,
+        llm_config=llm_config, log=log,
+    )
+
+    if result["success"]:
+        (sub_dir / "verified_sub_dsl.py").write_text(result["code"])
+        return {
+            "name": name, "success": True,
+            "sub_reference_source": prepared.sub_reference_source,
+            "preamble_source": prepared.preamble_source,
+            "verified_sub_dsl_source": result["code"],
+        }
+    return {
+        "name": name, "success": False,
+        "failure_reason": (
+            f"refactor pass exhausted {options.max_subdivide_turns} turns "
+            f"without producing a verified DSL"
+        ),
+    }
