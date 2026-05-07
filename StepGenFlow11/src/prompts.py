@@ -489,19 +489,28 @@ def _format_tensors_description(tensors: dict) -> str:
 def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
                            prev_code: str = None,
                            tensors: dict = None,
-                           dsl_code: str = None) -> str:
+                           dsl_code: str = None,
+                           reference_code_override: str | None = None,
+                           precompute_source_override: str | None = None) -> str:
     """Build a pass's user prompt with reference code, dims, and previous output.
+
+    ``reference_code_override`` (when set) replaces the bench_config-loaded
+    reference. ``precompute_source_override`` replaces the StepDB precompute
+    source shown to the model. Used by the planner flow for tree-node passes
+    where the kernel doesn't live in bench_config.
 
     Args:
         dsl_code: DSL-refactored code (from refactor pass). Passed to translator passes
                   as a translation guide — each DSL call maps 1:1 to a STeP node.
     """
-    config = _load_stepdb_config()
-    assert kernel_name in config, f"Kernel '{kernel_name}' not found in bench_config.yaml"
-
-    ref_path = _STEPDB_DIR / config[kernel_name]["problem"]
-    assert ref_path.exists(), f"Reference file not found: {ref_path}"
-    reference_code = ref_path.read_text()
+    if reference_code_override is not None:
+        reference_code = reference_code_override
+    else:
+        config = _load_stepdb_config()
+        assert kernel_name in config, f"Kernel '{kernel_name}' not found in bench_config.yaml"
+        ref_path = _STEPDB_DIR / config[kernel_name]["problem"]
+        assert ref_path.exists(), f"Reference file not found: {ref_path}"
+        reference_code = ref_path.read_text()
 
     dims_json = json.dumps(dims, indent=2)
 
@@ -534,7 +543,10 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
 
     # Add tensors dict description
     if tensors is not None:
-        precompute_src = _get_precompute_source(kernel_name)
+        if precompute_source_override is not None:
+            precompute_src = precompute_source_override
+        else:
+            precompute_src = _get_precompute_source(kernel_name)
         lines.extend([
             "",
             "### Pre-computed Tensors",
