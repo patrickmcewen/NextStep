@@ -327,6 +327,18 @@ def _get_gold(kernel_name, dims):
     return gold
 
 
+def _inject_gold(kernel_name: str, dims: dict, gold) -> None:
+    """Pre-populate the gold cache for a synthetic kernel name.
+
+    Used by the subdivide flow: a sub-task's gold is computed from the
+    parent's tensors via the preamble + sub_reference, then injected here
+    under a synthetic ``kernel_name`` so the subagent's pass-loop can use
+    the existing _compare_against_gold path unchanged.
+    """
+    key = (kernel_name, json.dumps(dims, sort_keys=True, default=str))
+    _GOLD_CACHE[key] = gold
+
+
 def _compare_single(result, gold, label):
     """Compare a single result tensor against a single gold tensor. Returns formatted string."""
     import torch

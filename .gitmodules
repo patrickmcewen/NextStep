@@ -4,3 +4,6 @@
 [submodule "elasticy"]
 	path = elasticy
 	url = https://github.com/const-antin/elasticy.git
+[submodule "PCL-lite"]
+	path = PCL-lite
+	url = https://github.com/patrickmcewen/PCL-lite.git
