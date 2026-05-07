@@ -151,14 +151,14 @@ def parse_directive(
     return parsed
 
 
-@dataclass
+@dataclass(frozen=True)
 class PreparedSubTask:
     name: str
     sub_tensors: dict
-    sub_gold: object  # Tensor | tuple[Tensor, ...]
+    sub_gold: torch.Tensor | tuple[torch.Tensor, ...]
     preamble_source: str
     sub_reference_source: str
-    sub_reference: Callable
+    sub_reference: Callable  # retained for re-executing gold lookup without re-parsing
 
 
 def prepare_sub_task(parsed: dict, *, dims: dict,
@@ -194,6 +194,7 @@ def prepare_sub_task(parsed: dict, *, dims: dict,
             f"sub-task {name!r}: sub_reference raised "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+    # Mirrors the tuple/tensor validation in tools.py::_exec_dsl_ref. Keep in sync.
     if isinstance(sub_gold, tuple):
         assert len(sub_gold) > 0, (
             f"sub-task {name!r}: sub_reference returned an empty tuple"
