@@ -1,0 +1,190 @@
+"""Unit tests for src/subdivide.py."""
+import pytest
+import torch
+
+from src import subdivide as sub_mod
+
+
+WELL_FORMED = """
+import torch
+
+def preamble_a(dims, tensors):
+    return {"x": tensors["x"]}
+
+def sub_reference_a(dims, sub_tensors):
+    return sub_tensors["x"] * 2
+
+SUB_TASKS = [
+    {"name": "doubler", "preamble": preamble_a, "sub_reference": sub_reference_a},
+]
+"""
+
+
+WELL_FORMED_MULTI = """
+import torch
+
+def pre1(dims, tensors): return {"x": tensors["x"]}
+def sub1(dims, sub_tensors): return sub_tensors["x"] * 2
+
+def pre2(dims, tensors): return {"y": tensors["y"]}
+def sub2(dims, sub_tensors): return sub_tensors["y"] + 1
+
+SUB_TASKS = [
+    {"name": "doubler", "preamble": pre1, "sub_reference": sub1},
+    {"name": "adder",   "preamble": pre2, "sub_reference": sub2},
+]
+"""
+
+
+def _opts(max_depth=2, max_count=5):
+    return sub_mod.SubdivideOptions(
+        max_subdivide_turns=8,
+        max_subdivides_per_outer=max_count,
+        max_subdivide_depth=max_depth,
+    )
+
+
+def test_parse_directive_single_well_formed():
+    counter = sub_mod.SubdivideCounter()
+    sub_tasks = sub_mod.parse_directive(
+        WELL_FORMED, registry=[], depth=0, counter=counter, options=_opts()
+    )
+    assert len(sub_tasks) == 1
+    assert sub_tasks[0]["name"] == "doubler"
+    assert callable(sub_tasks[0]["preamble"])
+    assert callable(sub_tasks[0]["sub_reference"])
+    # Counter is NOT incremented at parse time — that happens on dispatch.
+    assert counter.used == 0
+
+
+def test_parse_directive_multi_well_formed():
+    counter = sub_mod.SubdivideCounter()
+    sub_tasks = sub_mod.parse_directive(
+        WELL_FORMED_MULTI, registry=[], depth=0, counter=counter, options=_opts()
+    )
+    assert [t["name"] for t in sub_tasks] == ["doubler", "adder"]
+
+
+def test_parse_directive_no_sub_tasks_attribute():
+    code = "def tiled_reference(dims, tensors):\n    return tensors['x']\n"
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(sub_mod.NotADirective):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_empty_list():
+    code = "SUB_TASKS = []\n"
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="non-empty list"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_not_a_list():
+    code = "SUB_TASKS = {}\n"
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="must be a list"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_missing_keys():
+    code = """
+def pre(dims, tensors): return {}
+SUB_TASKS = [{"name": "x", "preamble": pre}]
+"""
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="sub_reference"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_extra_keys():
+    code = """
+def pre(dims, tensors): return {}
+def sub(dims, st): return st
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub, "extra": 1}]
+"""
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="unexpected keys"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_non_callable():
+    code = """
+SUB_TASKS = [{"name": "x", "preamble": 42, "sub_reference": 43}]
+"""
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="callable"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_empty_name():
+    code = """
+def pre(dims, tensors): return {}
+def sub(dims, st): return st
+SUB_TASKS = [{"name": "", "preamble": pre, "sub_reference": sub}]
+"""
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="non-empty string"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_dup_name_within_directive():
+    code = """
+def pre(dims, tensors): return {}
+def sub(dims, st): return st
+SUB_TASKS = [
+    {"name": "x", "preamble": pre, "sub_reference": sub},
+    {"name": "x", "preamble": pre, "sub_reference": sub},
+]
+"""
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="duplicate"):
+        sub_mod.parse_directive(
+            code, registry=[], depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_dup_name_against_registry():
+    counter = sub_mod.SubdivideCounter()
+    registry = [
+        sub_mod.VerifiedSubTask(
+            name="doubler",
+            sub_reference_source="x",
+            preamble_source="y",
+            verified_sub_dsl_source="z",
+        )
+    ]
+    with pytest.raises(AssertionError, match="already verified"):
+        sub_mod.parse_directive(
+            WELL_FORMED, registry=registry, depth=0, counter=counter, options=_opts()
+        )
+
+
+def test_parse_directive_depth_cap():
+    counter = sub_mod.SubdivideCounter()
+    with pytest.raises(AssertionError, match="depth"):
+        sub_mod.parse_directive(
+            WELL_FORMED, registry=[], depth=2, counter=counter, options=_opts(max_depth=2)
+        )
+
+
+def test_parse_directive_counter_cap():
+    counter = sub_mod.SubdivideCounter()
+    counter.used = 5
+    with pytest.raises(AssertionError, match="exceeds.*per-outer"):
+        sub_mod.parse_directive(
+            WELL_FORMED, registry=[], depth=0, counter=counter, options=_opts(max_count=5)
+        )
