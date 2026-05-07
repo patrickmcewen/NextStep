@@ -43,7 +43,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--subset-file", type=Path, default=REPO_ROOT / "regression_subsets.yaml",
                    help="Path to the subset YAML file (used with --subset).")
     p.add_argument("--max-parallel", type=int, default=4)
-    p.add_argument("--results-root", type=Path, default=Path("regression_results"))
+    p.add_argument("--results-root", type=Path, default=Path("../../regression_results"))
     p.add_argument("--bench-config", type=Path, default=DEFAULT_BENCH_CONFIG,
                    help="Path to StepDB bench_config.yaml (override for tests).")
     p.add_argument("--run-py", type=Path, default=DEFAULT_RUN_PY,
@@ -71,6 +71,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--check-order", default=None,
                    choices=[None, "correctness-first", "compliance-first"],
                    help="Pass-through gate ordering for each per-job run.py invocation.")
+    p.add_argument("--max-subdivide-turns", type=int, default=None)
+    p.add_argument("--max-subdivides-per-outer", type=int, default=None)
+    p.add_argument("--max-subdivide-depth", type=int, default=None)
+    p.add_argument("--no-subdivide", action="store_true")
     return p.parse_args(argv)
 
 
@@ -165,6 +169,14 @@ async def _amain(args: argparse.Namespace) -> int:
             autotune_agent=args.autotune_agent,
             check_order=args.check_order,
         )
+        if args.max_subdivide_turns is not None:
+            cmd += ["--max-subdivide-turns", str(args.max_subdivide_turns)]
+        if args.max_subdivides_per_outer is not None:
+            cmd += ["--max-subdivides-per-outer", str(args.max_subdivides_per_outer)]
+        if args.max_subdivide_depth is not None:
+            cmd += ["--max-subdivide-depth", str(args.max_subdivide_depth)]
+        if args.no_subdivide:
+            cmd += ["--no-subdivide"]
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)
         total_tokens = read_total_tokens(job_ckpt_dir)

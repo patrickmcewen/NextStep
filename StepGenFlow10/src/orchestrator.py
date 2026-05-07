@@ -1301,6 +1301,10 @@ async def run_kernel(
     bundle_dir: str | None = None,
     autotune_options: dict = None,
     check_order: str = "correctness-first",
+    max_subdivide_turns: int = 8,
+    max_subdivides_per_outer: int = 5,
+    max_subdivide_depth: int = 2,
+    subdivide_enabled: bool = True,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1316,6 +1320,14 @@ async def run_kernel(
               — will search for <kernel_name>/outer_*/dsl_code.py
             When set, lowering is skipped and translation starts from the saved DSL code.
     """
+    if subdivide_enabled:
+        assert bundle_dir is None, (
+            "subdivide is not supported in bundle mode in v1; pass --no-subdivide"
+        )
+        assert pipeline == "standard", (
+            f"subdivide is only supported with --pipeline=standard in v1; "
+            f"got --pipeline={pipeline}. Pass --no-subdivide to disable."
+        )
     assert pipeline in PIPELINES, f"Unknown pipeline '{pipeline}'. Known: {sorted(PIPELINES.keys())}"
     assert translator in ("llm", "auto"), f"Unknown translator '{translator}'. Known: llm, auto"
     assert not (translator == "auto" and (pipeline == "direct" or pipeline == "direct_no_functional")), (
@@ -1451,6 +1463,15 @@ async def run_kernel(
     }, indent=2))
 
     # Run all outer iterations in parallel — they are independent attempts
+    from src import subdivide as _sub_mod_local
+    subdivide_options = (
+        _sub_mod_local.SubdivideOptions(
+            max_subdivide_turns=max_subdivide_turns,
+            max_subdivides_per_outer=max_subdivides_per_outer,
+            max_subdivide_depth=max_subdivide_depth,
+        ) if subdivide_enabled else None
+    )
+
     tasks = []
     for i in range(max_outer):
         outer_dir = ckpt_root / f"outer_{i}"
@@ -1467,6 +1488,7 @@ async def run_kernel(
             llm_config=llm_config,
             autotune_options=autotune_options,
             check_order=check_order,
+            subdivide_options=subdivide_options,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1518,6 +1540,7 @@ async def _run_outer_iteration(
     compliance_override: dict | None = None,
     autotune_options: dict = None,
     check_order: str = "correctness-first",
+    subdivide_options=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -1552,6 +1575,9 @@ async def _run_outer_iteration(
 
     dsl_code = None  # output of refactor_final, used as translation guide
     outer_total_tokens = 0
+
+    sub_registry = []
+    sub_counter = _sub_mod.SubdivideCounter() if subdivide_options is not None else None
 
     # ============================================================
     # Phase 1: Lowering pass (refactor_final). Skipped on resume and on
@@ -1592,6 +1618,10 @@ async def _run_outer_iteration(
             compliance_override=compliance_override,
             check_order=check_order,
             llm_config=llm_config,
+            subdivide_options=subdivide_options,
+            registry=sub_registry if subdivide_options is not None else None,
+            depth=0,
+            counter=sub_counter,
         )
         outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
@@ -1691,6 +1721,7 @@ async def _run_outer_iteration(
                                            {"code": final_code, "tool_outputs": []},
                                            [], dsl_code)
             result["total_tokens"] = outer_total_tokens
+            result["subdivides"] = [v.name for v in sub_registry] if subdivide_options is not None else []
             if autotune_options is not None:
                 log(f"{tag} starting autotune...")
                 print(f"{tag} starting autotune...")

@@ -86,6 +86,24 @@ def main():
              "executing the code, so structurally noncompliant code is rejected "
              "without being run.",
     )
+    parser.add_argument(
+        "--max-subdivide-turns", type=int, default=8,
+        help="Per-subagent turn cap for the subdivide directive flow.",
+    )
+    parser.add_argument(
+        "--max-subdivides-per-outer", type=int, default=5,
+        help="Total sub-task invocations per outer attempt (across all "
+             "parent turns and recursion levels).",
+    )
+    parser.add_argument(
+        "--max-subdivide-depth", type=int, default=2,
+        help="Maximum recursion depth for the subdivide directive flow. "
+             "Depth 0 is the top-level kernel.",
+    )
+    parser.add_argument(
+        "--no-subdivide", action="store_true",
+        help="Disable the subdivide directive flow entirely.",
+    )
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
@@ -112,6 +130,10 @@ def main():
         bundle_dir=args.bundle_dir,
         autotune_options=autotune_options,
         check_order=args.check_order,
+        max_subdivide_turns=args.max_subdivide_turns,
+        max_subdivides_per_outer=args.max_subdivides_per_outer,
+        max_subdivide_depth=args.max_subdivide_depth,
+        subdivide_enabled=not args.no_subdivide,
     ))
 
     if result["success"]:
