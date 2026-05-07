@@ -48,6 +48,8 @@ from src.agents import (make_judge_agent, make_bundle_judge_agent,
                         make_pass_agent)
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES, PIPELINES,
                          build_pass_user_prompt,
+                         build_subdivide_user_prompt,
+                         build_pass_system_prompt,
                          build_subdivide_results_block,
                          _format_tensors_description,
                          resolve_few_shot_examples)
@@ -1728,15 +1730,13 @@ async def _run_outer_iteration(
 # ---------------------------------------------------------------------------
 
 from src import subdivide as _sub_mod
-from src.agents import make_pass_agent as _make_pass_agent
-from src.prompts import build_subdivide_user_prompt, build_pass_system_prompt
 
 
-def _subdivide_pass_loop_runner(*, agent, name, kernel_name, dims,
-                                 sub_tensors, sub_dir, options,
-                                 sub_reference_source, preamble_source,
-                                 registry, depth, counter,
-                                 llm_config, log):
+async def _subdivide_pass_loop_runner(*, agent, name, kernel_name, dims,
+                                       sub_tensors, sub_dir, options,
+                                       sub_reference_source, preamble_source,
+                                       registry, depth, counter,
+                                       llm_config, log):
     """Bridge from subdivide module → _run_pass_loop with sub-task context."""
     user_prompt = build_subdivide_user_prompt(
         name=name,
@@ -1745,7 +1745,7 @@ def _subdivide_pass_loop_runner(*, agent, name, kernel_name, dims,
         dims=dims,
         sub_tensors=sub_tensors,
     )
-    return _run_pass_loop(
+    return await _run_pass_loop(
         agent, "refactor_final", kernel_name, dims,
         max_turns=options.max_subdivide_turns,
         ckpt_dir=sub_dir,
@@ -1777,7 +1777,7 @@ def _make_subdivide_pass_agent(llm_config: dict, options: _sub_mod.SubdivideOpti
             "max_subdivides_per_outer": options.max_subdivides_per_outer,
         },
     )
-    return _make_pass_agent(
+    return make_pass_agent(
         llm_config, "refactor_final",
         few_shot_examples=None,
         system_prompt_override=system_prompt,
