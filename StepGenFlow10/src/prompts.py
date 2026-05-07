@@ -582,3 +582,59 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
     lines.append("I will automatically run your code and compare the output against the reference. Above the function definition, include a comment detailing your thought process for your implementation or fix.")
 
     return "\n".join(lines)
+
+
+def build_subdivide_user_prompt(*, name: str,
+                                sub_reference_source: str,
+                                preamble_source: str,
+                                dims: dict,
+                                sub_tensors: dict) -> str:
+    """Build the subagent's first-turn prompt for a refactor_final pass.
+
+    Mirrors build_pass_user_prompt's shape but sources the kernel reference
+    and precompute text from in-memory strings (not StepDB), and uses
+    sub_tensors instead of the parent's tensors. No parent context is
+    included — the subagent treats this as a standalone kernel.
+    """
+    dims_json = json.dumps(dims, indent=2)
+    lines = [
+        f"## Sub-kernel: {name}",
+        "",
+        "### PyTorch Reference (sub_reference)",
+        "",
+        "```python",
+        sub_reference_source.rstrip(),
+        "```",
+        "",
+        "### Dimensions",
+        "",
+        "```json",
+        dims_json,
+        "```",
+        "",
+        "### Pre-computed Tensors",
+        "",
+        "Your function receives a `tensors` dict as its second argument with these entries:",
+        "",
+        "```",
+        _format_tensors_description(sub_tensors),
+        "```",
+        "",
+        "These tensors are produced by the following preamble function:",
+        "",
+        "```python",
+        preamble_source.rstrip(),
+        "```",
+        "",
+        "**You MUST NOT call `torch.manual_seed`, `torch.randn`, `torch.rand`, or use the `@` operator.**",
+        "All tensors are pre-created. Access them via `tensors[\"key\"]`.",
+        "",
+        "Rewrite this as a `tiled_reference(dims, tensors)` function that "
+        "computes the same result as `sub_reference`. If `sub_reference` "
+        "returns a tuple, your `tiled_reference` must return a tuple of the "
+        "same length.",
+        "I will automatically run your code and compare the output against "
+        "the reference. Above the function definition, include a comment "
+        "detailing your thought process for your implementation or fix.",
+    ]
+    return "\n".join(lines)
