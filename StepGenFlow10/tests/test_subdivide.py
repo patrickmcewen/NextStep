@@ -1,5 +1,6 @@
 """Unit tests for src/subdivide.py."""
 import pytest
+import torch
 
 from src import subdivide as sub_mod
 
@@ -219,3 +220,90 @@ SUB_TASKS = [
     # verify the recorded preamble_source is the real_preamble def, not a helper.
     assert "def real_preamble" in sub_tasks[0]["preamble_source"]
     assert "FIRST" not in sub_tasks[0]["preamble_source"]
+
+
+def test_prepare_sub_task_single_tensor_output():
+    parsed = sub_mod.parse_directive(
+        WELL_FORMED, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    parent_tensors = {"x": torch.tensor([1.0, 2.0, 3.0])}
+    prepared = sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors=parent_tensors)
+    assert prepared.name == "doubler"
+    assert "x" in prepared.sub_tensors
+    assert torch.equal(prepared.sub_gold, torch.tensor([2.0, 4.0, 6.0]))
+
+
+def test_prepare_sub_task_tuple_output():
+    code = """
+def pre(dims, tensors): return {"x": tensors["x"]}
+def sub(dims, st): return (st["x"] * 2, st["x"] * 3)
+SUB_TASKS = [{"name": "splitter", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    prepared = sub_mod.prepare_sub_task(
+        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0, 2.0])}
+    )
+    assert isinstance(prepared.sub_gold, tuple)
+    assert len(prepared.sub_gold) == 2
+    assert torch.equal(prepared.sub_gold[0], torch.tensor([2.0, 4.0]))
+    assert torch.equal(prepared.sub_gold[1], torch.tensor([3.0, 6.0]))
+
+
+def test_prepare_sub_task_preamble_exception():
+    code = """
+def pre(dims, tensors): raise RuntimeError("preamble boom")
+def sub(dims, st): return st
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    with pytest.raises(AssertionError, match="preamble"):
+        sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors={})
+
+
+def test_prepare_sub_task_preamble_returns_non_dict():
+    code = """
+def pre(dims, tensors): return [1, 2, 3]
+def sub(dims, st): return st
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    with pytest.raises(AssertionError, match="dict"):
+        sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors={})
+
+
+def test_prepare_sub_task_sub_reference_exception():
+    code = """
+def pre(dims, tensors): return {}
+def sub(dims, st): raise ValueError("sub boom")
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    with pytest.raises(AssertionError, match="sub_reference"):
+        sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors={})
+
+
+def test_prepare_sub_task_sub_reference_bad_return():
+    code = """
+def pre(dims, tensors): return {}
+def sub(dims, st): return "not a tensor"
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    with pytest.raises(AssertionError, match="must return a torch.Tensor"):
+        sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors={})

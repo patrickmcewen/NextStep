@@ -11,6 +11,7 @@ and the registry mutation logic are added in later tasks.
 The verified sub-DSL is text-only — never callable from the parent's
 tiled_reference. The parent agent reads it as worked code and adapts it.
 """
+import torch
 from dataclasses import dataclass
 from typing import Callable
 
@@ -148,3 +149,72 @@ def parse_directive(
         })
 
     return parsed
+
+
+@dataclass
+class PreparedSubTask:
+    name: str
+    sub_tensors: dict
+    sub_gold: object  # Tensor | tuple[Tensor, ...]
+    preamble_source: str
+    sub_reference_source: str
+    sub_reference: Callable
+
+
+def prepare_sub_task(parsed: dict, *, dims: dict,
+                     parent_tensors: dict) -> PreparedSubTask:
+    """Run preamble and sub_reference to produce sub_tensors and sub_gold.
+
+    Wraps the agent-supplied callables in narrow validation: each invocation
+    must succeed and return the expected shape (dict, Tensor, or tuple of
+    Tensors). Agent-code exceptions are funneled into AssertionError so the
+    orchestrator can surface them as directive feedback (the orchestrator's
+    directive-failure channel is AssertionError per spec).
+    """
+    name = parsed["name"]
+    preamble = parsed["preamble"]
+    sub_reference = parsed["sub_reference"]
+
+    try:
+        sub_tensors = preamble(dims, parent_tensors)
+    except Exception as exc:
+        raise AssertionError(
+            f"sub-task {name!r}: preamble raised "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    assert isinstance(sub_tensors, dict), (
+        f"sub-task {name!r}: preamble must return a dict of tensors, "
+        f"got {type(sub_tensors).__name__}"
+    )
+
+    try:
+        sub_gold = sub_reference(dims, sub_tensors)
+    except Exception as exc:
+        raise AssertionError(
+            f"sub-task {name!r}: sub_reference raised "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if isinstance(sub_gold, tuple):
+        assert len(sub_gold) > 0, (
+            f"sub-task {name!r}: sub_reference returned an empty tuple"
+        )
+        for i, elem in enumerate(sub_gold):
+            assert isinstance(elem, torch.Tensor), (
+                f"sub-task {name!r}: sub_reference must return a "
+                f"torch.Tensor or tuple of torch.Tensor, got tuple element "
+                f"[{i}] of type {type(elem).__name__}"
+            )
+    else:
+        assert isinstance(sub_gold, torch.Tensor), (
+            f"sub-task {name!r}: sub_reference must return a torch.Tensor "
+            f"or tuple of torch.Tensor, got {type(sub_gold).__name__}"
+        )
+
+    return PreparedSubTask(
+        name=name,
+        sub_tensors=sub_tensors,
+        sub_gold=sub_gold,
+        preamble_source=parsed["preamble_source"],
+        sub_reference_source=parsed["sub_reference_source"],
+        sub_reference=sub_reference,
+    )
