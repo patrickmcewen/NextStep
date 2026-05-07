@@ -6,6 +6,7 @@ in subsequent tasks. Phase 0 of the orchestrator calls ``plan(root_reference)``
 to produce a ``Tree`` that Phase 1's per-node refactor walker consumes.
 """
 
+import ast
 import re
 from dataclasses import dataclass
 from typing import Iterator
@@ -194,3 +195,59 @@ def synthesize_reference_module(body: str) -> str:
         )
 
     return out
+
+
+class GuardFailure(AssertionError):
+    """Raised when a mechanical guard rejects a parsed split.
+
+    The driver catches this and feeds ``str(exc)`` back to the LLM as guard
+    feedback in the next retry within the same planner call.
+    """
+
+
+def _extract_model_forward(code: str) -> ast.FunctionDef:
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "Model":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "forward":
+                    return item
+    raise AssertionError("could not find class Model with forward() method in code")
+
+
+def _forward_body_op_count(forward_node: ast.FunctionDef) -> int:
+    count = 0
+    for node in ast.walk(forward_node):
+        if isinstance(node, (ast.BinOp, ast.Call)):
+            count += 1
+    return count
+
+
+def check_anti_passthrough(children: list) -> None:
+    """Each child's forward() must contain >=1 torch operation."""
+    for child in children:
+        forward = _extract_model_forward(child.reference_code)
+        ops = _forward_body_op_count(forward)
+        if ops == 0:
+            raise GuardFailure(
+                f"child {child.name!r}: forward() is a passthrough "
+                f"(no torch operations in body). A child must do real work."
+            )
+
+
+def _ast_node_count(node: ast.AST) -> int:
+    return sum(1 for _ in ast.walk(node))
+
+
+def check_anti_monolith(original_parent_code: str, refactored_parent_code: str) -> None:
+    """Refactored parent's forward() must be strictly smaller than original's."""
+    orig_forward = _extract_model_forward(original_parent_code)
+    new_forward = _extract_model_forward(refactored_parent_code)
+    orig_size = _ast_node_count(orig_forward)
+    new_size = _ast_node_count(new_forward)
+    if new_size >= orig_size:
+        raise GuardFailure(
+            f"refactored parent's forward() is not smaller than the original's "
+            f"(refactored AST nodes: {new_size}, original: {orig_size}). The split "
+            f"didn't actually move work into children."
+        )
