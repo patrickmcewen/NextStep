@@ -1,6 +1,6 @@
 import pytest
 from src.planner import (check_anti_passthrough, check_anti_monolith,
-                         GuardFailure, ParsedChild)
+                         check_compose, GuardFailure, ParsedChild)
 
 
 _PASSTHROUGH_CHILD = ParsedChild(name="bad", reference_code="""\
@@ -84,3 +84,85 @@ def test_anti_monolith_rejects_when_refactor_not_smaller():
 
 def test_anti_monolith_accepts_smaller_refactor():
     check_anti_monolith(_ORIGINAL_PARENT, _REFACTORED_SMALLER)
+
+
+_ORIGINAL_REFERENCE = """\
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return x * 2 + 1
+
+def get_inputs(dims):
+    torch.manual_seed(0)
+    return (torch.randn(dims["M"]),)
+
+def get_init_inputs(dims):
+    return []
+
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+"""
+
+_CORRECT_DECOMPOSITION_CHILDREN = [
+    ParsedChild(name="doubler", reference_code="""\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def forward(self, x):
+        return x * 2
+def get_inputs(dims):
+    return (torch.randn(dims["M"]),)
+"""),
+    ParsedChild(name="adder", reference_code="""\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def forward(self, x):
+        return x + 1
+def get_inputs(dims):
+    return (torch.randn(dims["M"]),)
+"""),
+]
+
+_CORRECT_REFACTORED_PARENT = """\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.doubler = DoublerModel()
+        self.adder = AdderModel()
+    def forward(self, x):
+        return self.adder(self.doubler(x))
+"""
+
+_INCORRECT_REFACTORED_PARENT = """\
+import torch
+import torch.nn as nn
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.doubler = DoublerModel()
+        self.adder = AdderModel()
+    def forward(self, x):
+        return self.doubler(self.doubler(x))
+"""
+
+
+def test_compose_check_accepts_correct_decomposition():
+    check_compose(_ORIGINAL_REFERENCE,
+                  _CORRECT_REFACTORED_PARENT,
+                  _CORRECT_DECOMPOSITION_CHILDREN,
+                  dims={"M": 8})
+
+
+def test_compose_check_rejects_wrong_decomposition():
+    with pytest.raises(GuardFailure, match="compose check failed"):
+        check_compose(_ORIGINAL_REFERENCE,
+                      _INCORRECT_REFACTORED_PARENT,
+                      _CORRECT_DECOMPOSITION_CHILDREN,
+                      dims={"M": 8})

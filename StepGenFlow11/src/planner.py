@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterator
 
+import torch
+
 
 @dataclass(frozen=True)
 class PlanNode:
@@ -251,3 +253,65 @@ def check_anti_monolith(original_parent_code: str, refactored_parent_code: str) 
             f"(refactored AST nodes: {new_size}, original: {orig_size}). The split "
             f"didn't actually move work into children."
         )
+
+
+def _camel_case(snake: str) -> str:
+    return "".join(part.capitalize() for part in snake.split("_"))
+
+
+def check_compose(original_reference_code: str,
+                  refactored_parent_code: str,
+                  children: list,
+                  dims: dict) -> None:
+    """Numerical compose check.
+
+    Run the refactored parent (which uses children's Model classes via
+    ``<ChildName>Model``) against the original parent on the original parent's
+    inputs. Outputs must agree within ``rel_err < 1e-5``.
+    """
+    orig_ns: dict = {}
+    exec(original_reference_code, orig_ns)
+    assert "Model" in orig_ns and "get_inputs" in orig_ns, (
+        "original reference must define Model and get_inputs"
+    )
+
+    inputs = orig_ns["get_inputs"](dims)
+    if not isinstance(inputs, tuple):
+        inputs = (inputs,)
+
+    with torch.no_grad():
+        original_out = orig_ns["Model"]()(*inputs)
+
+    new_ns: dict = {}
+    for child in children:
+        child_ns: dict = {}
+        exec(child.reference_code, child_ns)
+        assert "Model" in child_ns, (
+            f"child {child.name!r} reference is missing class Model"
+        )
+        new_ns[f"{_camel_case(child.name)}Model"] = child_ns["Model"]
+
+    exec(refactored_parent_code, new_ns)
+    assert "Model" in new_ns, "refactored parent code must define class Model"
+
+    with torch.no_grad():
+        refactored_out = new_ns["Model"]()(*inputs)
+
+    pairs = (
+        list(zip(original_out, refactored_out))
+        if isinstance(original_out, tuple)
+        else [(original_out, refactored_out)]
+    )
+    for i, (a, b) in enumerate(pairs):
+        assert a.shape == b.shape, (
+            f"compose check failed: shape mismatch at output {i}: "
+            f"{tuple(a.shape)} vs {tuple(b.shape)}"
+        )
+        max_abs = (a - b).abs().max().item()
+        rel = max_abs / (a.abs().max().item() + 1e-12)
+        if rel >= 1e-5:
+            raise GuardFailure(
+                f"compose check failed: output {i} has rel_err={rel:.3e} "
+                f"(max_abs_err={max_abs:.3e}). The refactored parent does not "
+                f"reproduce the original's output."
+            )
