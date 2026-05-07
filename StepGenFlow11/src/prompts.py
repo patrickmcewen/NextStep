@@ -582,3 +582,13 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
     lines.append("I will automatically run your code and compare the output against the reference. Above the function definition, include a comment detailing your thought process for your implementation or fix.")
 
     return "\n".join(lines)
+
+
+def build_planner_system_prompt() -> str:
+    """Load the planner agent's system prompt.
+
+    The template is static — no source-file substitutions.
+    """
+    template_path = _PROMPTS_DIR / "planner_system.txt"
+    assert template_path.exists(), f"Template not found: {template_path}"
+    return template_path.read_text()
