@@ -82,6 +82,25 @@ sub-tasks succeed you will get a follow-up turn to write the parent's
 tiled_reference, with the verified sub-DSL sources shown to you as
 reference material.
 
+**Subdivide is for DECOMPOSITION, not for retrying with a smaller turn budget.**
+A valid sub-task is a SMALLER piece of the parent kernel — a slice, an
+intermediate, or a distinct subroutine. The preamble must do non-trivial work:
+derive sub-tensors from parent tensors (slice, project, normalize, etc.) rather
+than forward them all unchanged. The orchestrator rejects pure-passthrough
+preambles. If you can't meaningfully decompose the kernel, write
+`tiled_reference` directly.
+
+Forbidden anti-pattern (will be rejected):
+
+```python
+# WRONG — this is not decomposition, it's an escape hatch
+def preamble(dims, tensors):
+    return {{k: tensors[k] for k in tensors}}  # all parent tensors, untouched
+
+def sub_reference(dims, sub_tensors):
+    # ... the entire parent kernel, identical to what tiled_reference would do
+```
+
 ## Function Signature
 
 ```python

@@ -227,7 +227,9 @@ def test_prepare_sub_task_single_tensor_output():
         WELL_FORMED, registry=[], depth=0,
         counter=sub_mod.SubdivideCounter(), options=_opts(),
     )[0]
-    parent_tensors = {"x": torch.tensor([1.0, 2.0, 3.0])}
+    # preamble only forwards "x"; include a second key so preamble is a
+    # subset passthrough (not a full-parent passthrough, which is rejected).
+    parent_tensors = {"x": torch.tensor([1.0, 2.0, 3.0]), "_extra": torch.zeros(1)}
     prepared = sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors=parent_tensors)
     assert prepared.name == "doubler"
     assert "x" in prepared.sub_tensors
@@ -245,8 +247,10 @@ SUB_TASKS = [{"name": "splitter", "preamble": pre, "sub_reference": sub}]
         code, registry=[], depth=0,
         counter=sub_mod.SubdivideCounter(), options=_opts(),
     )[0]
+    # preamble only forwards "x"; include a second key so preamble is a
+    # subset passthrough (not a full-parent passthrough, which is rejected).
     prepared = sub_mod.prepare_sub_task(
-        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0, 2.0])}
+        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0, 2.0]), "_extra": torch.zeros(1)}
     )
     assert isinstance(prepared.sub_gold, tuple)
     assert len(prepared.sub_gold) == 2
@@ -324,6 +328,56 @@ SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
         sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors={})
 
 
+def test_prepare_sub_task_rejects_pure_passthrough_preamble():
+    """A preamble that forwards every parent tensor unchanged is the
+    'subdivide as escape hatch' anti-pattern and must be rejected."""
+    code = """
+def pre(dims, tensors): return {"x": tensors["x"], "y": tensors["y"]}
+def sub(dims, st): return st["x"] + st["y"]
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    parent_tensors = {"x": torch.zeros(3), "y": torch.ones(3)}
+    with pytest.raises(AssertionError, match="pure passthrough"):
+        sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors=parent_tensors)
+
+
+def test_prepare_sub_task_accepts_subset_passthrough():
+    """Forwarding only a SUBSET of parent tensors is legitimate decomposition."""
+    code = """
+def pre(dims, tensors): return {"x": tensors["x"]}
+def sub(dims, st): return st["x"] * 2
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    parent_tensors = {"x": torch.tensor([1.0, 2.0]), "y": torch.tensor([3.0, 4.0])}
+    prepared = sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors=parent_tensors)
+    assert "x" in prepared.sub_tensors
+    assert "y" not in prepared.sub_tensors
+
+
+def test_prepare_sub_task_accepts_transformed_passthrough():
+    """Computing an intermediate from parent tensors is legitimate."""
+    code = """
+def pre(dims, tensors): return {"normed": tensors["x"] * 2.0}
+def sub(dims, st): return st["normed"] + 1
+SUB_TASKS = [{"name": "x", "preamble": pre, "sub_reference": sub}]
+"""
+    parsed = sub_mod.parse_directive(
+        code, registry=[], depth=0,
+        counter=sub_mod.SubdivideCounter(), options=_opts(),
+    )[0]
+    parent_tensors = {"x": torch.tensor([1.0, 2.0])}
+    prepared = sub_mod.prepare_sub_task(parsed, dims={}, parent_tensors=parent_tensors)
+    assert "normed" in prepared.sub_tensors
+
+
 import asyncio
 
 _FAKE_PASS_LOOP_SUCCESS_CODE = (
@@ -359,7 +413,7 @@ def test_dispatch_directive_all_success(monkeypatch, tmp_path):
     counter = sub_mod.SubdivideCounter()
     registry = []
     result = _run(sub_mod.dispatch_directive(
-        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0])},
+        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0]), "_extra": torch.zeros(1)},
         registry=registry, depth=0, counter=counter, options=_opts(),
         ckpt_dir=tmp_path, llm_config={}, log=lambda m: None,
     ))
@@ -409,7 +463,7 @@ def test_dispatch_directive_writes_per_sub_task_subdir(monkeypatch, tmp_path):
     counter = sub_mod.SubdivideCounter()
     registry = []
     _run(sub_mod.dispatch_directive(
-        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0])},
+        parsed, dims={}, parent_tensors={"x": torch.tensor([1.0]), "_extra": torch.zeros(1)},
         registry=registry, depth=0, counter=counter, options=_opts(),
         ckpt_dir=tmp_path, llm_config={}, log=lambda m: None,
     ))

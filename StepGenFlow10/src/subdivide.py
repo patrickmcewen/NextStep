@@ -202,6 +202,23 @@ def prepare_sub_task(parsed: dict, *, dims: dict,
         f"got {type(sub_tensors).__name__}"
     )
 
+    all_passthrough = (
+        len(parent_tensors) > 0
+        and set(sub_tensors.keys()) == set(parent_tensors.keys())
+        and all(
+            k in parent_tensors and sub_tensors[k] is parent_tensors[k]
+            for k in sub_tensors
+        )
+    )
+    assert not all_passthrough, (
+        f"sub-task {name!r}: preamble is a pure passthrough of all parent "
+        f"tensors. This is not a valid decomposition — the sub-task must "
+        f"operate on a smaller or transformed piece of the parent's "
+        f"computation. Either slice parent tensors, compute intermediates, "
+        f"or use only a subset of the parent's tensors. If you can't "
+        f"meaningfully decompose the kernel, write tiled_reference directly."
+    )
+
     try:
         sub_gold = sub_reference(dims, sub_tensors)
     except Exception as exc:

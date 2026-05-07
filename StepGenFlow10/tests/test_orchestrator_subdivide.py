@@ -97,7 +97,9 @@ def tiled_reference(dims, tensors):
     )
     registry = []
     counter = sub_mod.SubdivideCounter()
-    parent_tensors = {"x": torch.tensor([1.0, 2.0, 3.0])}
+    # preamble only forwards "x"; include a second key so preamble is a
+    # subset passthrough (not a full-parent passthrough, which is rejected).
+    parent_tensors = {"x": torch.tensor([1.0, 2.0, 3.0]), "_extra": torch.zeros(1)}
 
     orch_mod._inject_gold("test_kernel", {}, torch.tensor([2.0, 4.0, 6.0]))
 
