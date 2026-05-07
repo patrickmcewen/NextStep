@@ -49,6 +49,8 @@ def build_run_py_command(
     autotune_max_turns: int | None = None,
     autotune_agent: str | None = None,
     check_order: str | None = None,
+    no_plan: bool = False,
+    max_replans: int | None = None,
 ) -> list[str]:
     cmd = [python_exe, str(run_py_path), job.kernel, job.preset, "--model", model]
     if config is not None:
@@ -75,6 +77,10 @@ def build_run_py_command(
             cmd += ["--autotune-agent", autotune_agent]
     if check_order is not None:
         cmd += ["--check-order", check_order]
+    if no_plan:
+        cmd += ["--no-plan"]
+    if max_replans is not None:
+        cmd += ["--max-replans", str(max_replans)]
     return cmd
 
 

@@ -71,6 +71,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--check-order", default=None,
                    choices=[None, "correctness-first", "compliance-first"],
                    help="Pass-through gate ordering for each per-job run.py invocation.")
+    p.add_argument(
+        "--no-plan", action="store_true",
+        help="Forward --no-plan to each subprocess invocation.",
+    )
+    p.add_argument(
+        "--max-replans", type=int, default=None,
+        help="Forward --max-replans N to each subprocess invocation.",
+    )
     return p.parse_args(argv)
 
 
@@ -164,6 +172,8 @@ async def _amain(args: argparse.Namespace) -> int:
             autotune_max_turns=args.autotune_max_turns,
             autotune_agent=args.autotune_agent,
             check_order=args.check_order,
+            no_plan=args.no_plan,
+            max_replans=args.max_replans,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)

@@ -86,6 +86,14 @@ def main():
              "executing the code, so structurally noncompliant code is rejected "
              "without being run.",
     )
+    parser.add_argument(
+        "--no-plan", action="store_true",
+        help="Disable Phase 0 (decomposition planner). Falls back to single-node refactor.",
+    )
+    parser.add_argument(
+        "--max-replans", type=int, default=3,
+        help="Global re-plan budget on Phase 1 failure. Default 3.",
+    )
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
@@ -112,6 +120,8 @@ def main():
         bundle_dir=args.bundle_dir,
         autotune_options=autotune_options,
         check_order=args.check_order,
+        plan_enabled=not args.no_plan,
+        max_replans=args.max_replans,
     ))
 
     if result["success"]:
