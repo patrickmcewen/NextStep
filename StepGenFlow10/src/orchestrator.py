@@ -70,6 +70,7 @@ for p in (_STEPDB_DIR, _STEP_TL_SRC, _STEP_TL_PROTO):
         sys.path.insert(0, sp)
 
 from precompute import precompute_tensors  # noqa: E402  (StepDB/precompute.py)
+from src import subdivide as _sub_mod
 
 
 # ---------------------------------------------------------------------------
@@ -1463,9 +1464,8 @@ async def run_kernel(
     }, indent=2))
 
     # Run all outer iterations in parallel — they are independent attempts
-    from src import subdivide as _sub_mod_local
     subdivide_options = (
-        _sub_mod_local.SubdivideOptions(
+        _sub_mod.SubdivideOptions(
             max_subdivide_turns=max_subdivide_turns,
             max_subdivides_per_outer=max_subdivides_per_outer,
             max_subdivide_depth=max_subdivide_depth,
@@ -1759,8 +1759,6 @@ async def _run_outer_iteration(
 # ---------------------------------------------------------------------------
 # Subdivide runner wiring (module-load-time)
 # ---------------------------------------------------------------------------
-
-from src import subdivide as _sub_mod
 
 
 async def _subdivide_pass_loop_runner(*, agent, name, kernel_name, dims,
