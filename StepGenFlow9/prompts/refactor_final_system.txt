@@ -32,6 +32,6 @@ These functions are pre-imported and available at runtime. Here are their exact 
 ## Function Signature
 
 ```python
-def build_graph(dims: dict, tensors: dict) -> torch.Tensor:
+def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
 ```
 {few_shot_examples}
