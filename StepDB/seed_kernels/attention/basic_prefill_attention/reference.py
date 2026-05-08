@@ -7,27 +7,45 @@ The kernel runs:
     RMSNorm -> QKV + QK-RMSNorm + RoPE -> GQA full-sequence attention
         -> O-proj -> ResAdd
 
-GQA attention uses exp-normalize softmax (no max subtraction, no 1/sqrt(d))
-in float64, mirroring end_to_end / prefill_transformer_simple and the STeP
-streaming-softmax kernel.
+GQA attention uses numerically-stable softmax (max-subtraction, no 1/sqrt(d))
+in float32, matching the STeP streaming-softmax kernel which subtracts the
+per-row max before exp. Max-subtraction is mathematically equivalent to the
+no-max formulation since the exp(-m) factor cancels in num/denom.
 
 Single-sequence, no-batching, no-KV-cache: leading dim is seq_len.
+
+Inputs come from StepDB/precompute.py via the `tensors` arg.
 """
-import sys
-from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
-import step_py as _sp
-_STEP_TL_ROOT = str(Path(_sp.__file__).resolve().parent.parent.parent)
-if _STEP_TL_ROOT not in sys.path:
-    sys.path.insert(0, _STEP_TL_ROOT)
 
-from end_to_end.model_configs import (
-    Mixtral8x7B, SmallerMixtral8x7B, Qwen30B, SmallerQwen30B,
-)
-
-SEED = 42
+# Inlined model configs. Mirrors end_to_end.model_configs in step_tl, but
+# kept here as concrete literals so the LLM reading this reference sees
+# every value `mc.<attr>` resolves to without external imports.
+_MODEL_CONFIGS = {
+    ("mixtral", False): SimpleNamespace(
+        hidden_dim=4096, head_dim=128, num_heads=32, num_kv_heads=8,
+        query_per_kvhead=4,
+        n_routed_experts=8, n_activated_experts=2,
+        dim=4096, moe_inter_dim=14336),
+    ("mixtral", True): SimpleNamespace(
+        hidden_dim=512, head_dim=32, num_heads=16, num_kv_heads=4,
+        query_per_kvhead=4,
+        n_routed_experts=8, n_activated_experts=2,
+        dim=512, moe_inter_dim=1792),
+    ("qwen", False): SimpleNamespace(
+        hidden_dim=2048, head_dim=64, num_heads=32, num_kv_heads=4,
+        query_per_kvhead=8,
+        n_routed_experts=128, n_activated_experts=8,
+        dim=2048, moe_inter_dim=768),
+    ("qwen", True): SimpleNamespace(
+        hidden_dim=128, head_dim=16, num_heads=8, num_kv_heads=2,
+        query_per_kvhead=4,
+        n_routed_experts=128, n_activated_experts=8,
+        dim=128, moe_inter_dim=48),
+}
 
 
 def _rms_norm(x, eps=1e-6):
@@ -40,42 +58,26 @@ def _rotate_half(x):
 
 
 def _model_config(model_name, is_small):
-    if model_name == "mixtral":
-        return SmallerMixtral8x7B() if is_small else Mixtral8x7B()
-    if model_name == "qwen":
-        return SmallerQwen30B() if is_small else Qwen30B()
-    assert False, f"Unknown model_name: {model_name!r}"
+    key = (model_name, is_small)
+    assert key in _MODEL_CONFIGS, (
+        f"Unknown model_name/is_small combination: {key!r}. "
+        f"Known: {list(_MODEL_CONFIGS.keys())}"
+    )
+    return _MODEL_CONFIGS[key]
 
 
-def get_inputs(dims):
-    """All randomly-generated tensors, in canonical RNG order.
-
-    The order locked here is also the order used by precompute.py, so the
-    bit-exactness check in stepdb-add-benchmark step 4 compares element-
-    for-element against precompute_tensors.
-    """
+def compute_gold(dims, tensors):
     seq_len = dims["seq_len"]
     is_small = dims.get("is_small", False)
     mc = _model_config(dims["model_name"], is_small)
 
-    torch.manual_seed(SEED)
-
-    input_tensor = torch.randn(seq_len, mc.hidden_dim)
-    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
-    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
-    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
-    cos = torch.randn(seq_len, 1, mc.head_dim)
-    sin = torch.randn(seq_len, 1, mc.head_dim)
-    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
-    return [input_tensor, q_proj, k_proj, v_proj, cos, sin, o_proj_weight]
-
-
-def compute_gold(dims):
-    seq_len = dims["seq_len"]
-    is_small = dims.get("is_small", False)
-    mc = _model_config(dims["model_name"], is_small)
-
-    (input_tensor, q_proj, k_proj, v_proj, cos, sin, o_proj_weight) = get_inputs(dims)
+    input_tensor = tensors["input_tensor"]
+    q_proj = tensors["q_proj"]
+    k_proj = tensors["k_proj"]
+    v_proj = tensors["v_proj"]
+    cos = tensors["cos"]
+    sin = tensors["sin"]
+    o_proj_weight = tensors["o_proj_weight"]
 
     with torch.no_grad():
         # [1] Pre-attention RMSNorm
@@ -97,27 +99,29 @@ def compute_gold(dims):
         # [5] GQA full-sequence attention.  Group queries by kv head:
         #   Q [S, num_heads, D] -> [Hkv, qpkv, S, D]
         #   K, V [S, num_kv_heads, D] -> [Hkv, 1, S, D]
-        # exp-normalize softmax in float64 mirrors end_to_end (no max sub,
-        # no 1/sqrt(d); float64 keeps exp from overflowing for any seq_len).
+        # Numerically-stable softmax (no 1/sqrt(d) scaling) in fp32, matching
+        # the STeP streaming-softmax kernel which subtracts the per-row max
+        # before exp. exp(-row_max) cancels in num/denom, so this is exactly
+        # equivalent to the no-max formulation but stable in fp32.
         Qh = (
             Q.view(seq_len, mc.num_kv_heads, mc.query_per_kvhead, mc.head_dim)
              .permute(1, 2, 0, 3)
-             .double()
         )                                                               # [Hkv, qpkv, S, D]
-        Kh = K.permute(1, 0, 2).unsqueeze(1).double()                   # [Hkv, 1, S, D]
-        Vh = V.permute(1, 0, 2).unsqueeze(1).double()                   # [Hkv, 1, S, D]
+        Kh = K.permute(1, 0, 2).unsqueeze(1)                            # [Hkv, 1, S, D]
+        Vh = V.permute(1, 0, 2).unsqueeze(1)                            # [Hkv, 1, S, D]
         scores = Qh @ Kh.transpose(-1, -2)                              # [Hkv, qpkv, S, S]
-        e = torch.exp(scores)
-        num = e @ Vh                                                    # [Hkv, qpkv, S, D]
+        row_max = scores.amax(dim=-1, keepdim=True)
+        e = torch.exp(scores - row_max)
+        num = e @ Vh
         denom = e.sum(dim=-1, keepdim=True)
-        attn = (num / denom).float()
+        attn = num / denom
         attn = attn.permute(2, 0, 1, 3).reshape(
             seq_len, mc.num_heads, mc.head_dim
-        )                                                               # [S, num_heads, D]
+        )
 
         # [6] O-projection + residual add
         attn_flat = attn.reshape(seq_len, mc.num_heads * mc.head_dim)
-        o_proj_out = attn_flat @ o_proj_weight                          # [S, HID]
-        output = o_proj_out + input_tensor                              # [S, HID]
+        o_proj_out = attn_flat @ o_proj_weight
+        output = o_proj_out + input_tensor
 
     return output

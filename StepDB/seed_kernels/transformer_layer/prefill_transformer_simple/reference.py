@@ -10,29 +10,49 @@ Mixtral / Qwen3-30B-A3B model configs:
 Differences vs end_to_end:
   * No batching: leading dim is seq_len, not batch
   * No KV cache: K and V come entirely from the current sequence
-  * No external routing/trace files: top-k routing is computed in-place
-    from the post-attention activations (router_w @ normed)
+  * No external routing/trace files: top-k routing is computed in
+    precompute.py from float64 attention (avoids fp32 boundary flips)
 
-Attention uses exp-normalize softmax (no max subtraction, no 1/sqrt(d)
-scaling) in float64, mirroring end_to_end and the STeP streaming-softmax
-kernel.
+Attention uses numerically-stable softmax (max-subtraction, no 1/sqrt(d)
+scaling) in float32, matching the STeP streaming-softmax kernel. Max-sub
+is mathematically equivalent to the no-max formulation since exp(-row_max)
+cancels in num/denom, but it keeps exp() from overflowing in fp32.
+
+Inputs and routing tensors come from StepDB/precompute.py via the `tensors`
+arg. Routing uses `expert_onehot` to recover (token, top-k slot) pairs per
+expert without re-running the float-precision-sensitive top-k.
 """
-import sys
-from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
-import step_py as _sp
-_STEP_TL_ROOT = str(Path(_sp.__file__).resolve().parent.parent.parent)
-if _STEP_TL_ROOT not in sys.path:
-    sys.path.insert(0, _STEP_TL_ROOT)
 
-from end_to_end.model_configs import (
-    Mixtral8x7B, SmallerMixtral8x7B, Qwen30B, SmallerQwen30B,
-)
-
-SEED = 42
+# Inlined model configs. Mirrors end_to_end.model_configs in step_tl, but
+# kept here as concrete literals so the LLM reading this reference sees
+# every value `mc.<attr>` resolves to without external imports.
+_MODEL_CONFIGS = {
+    ("mixtral", False): SimpleNamespace(
+        hidden_dim=4096, head_dim=128, num_heads=32, num_kv_heads=8,
+        query_per_kvhead=4,
+        n_routed_experts=8, n_activated_experts=2,
+        dim=4096, moe_inter_dim=14336),
+    ("mixtral", True): SimpleNamespace(
+        hidden_dim=512, head_dim=32, num_heads=16, num_kv_heads=4,
+        query_per_kvhead=4,
+        n_routed_experts=8, n_activated_experts=2,
+        dim=512, moe_inter_dim=1792),
+    ("qwen", False): SimpleNamespace(
+        hidden_dim=2048, head_dim=64, num_heads=32, num_kv_heads=4,
+        query_per_kvhead=8,
+        n_routed_experts=128, n_activated_experts=8,
+        dim=2048, moe_inter_dim=768),
+    ("qwen", True): SimpleNamespace(
+        hidden_dim=128, head_dim=16, num_heads=8, num_kv_heads=2,
+        query_per_kvhead=4,
+        n_routed_experts=128, n_activated_experts=8,
+        dim=128, moe_inter_dim=48),
+}
 
 
 def _rms_norm(x, eps=1e-6):
@@ -45,62 +65,31 @@ def _rotate_half(x):
 
 
 def _model_config(model_name, is_small):
-    if model_name == "mixtral":
-        return SmallerMixtral8x7B() if is_small else Mixtral8x7B()
-    if model_name == "qwen":
-        return SmallerQwen30B() if is_small else Qwen30B()
-    assert False, f"Unknown model_name: {model_name!r}"
+    key = (model_name, is_small)
+    assert key in _MODEL_CONFIGS, (
+        f"Unknown model_name/is_small combination: {key!r}. "
+        f"Known: {list(_MODEL_CONFIGS.keys())}"
+    )
+    return _MODEL_CONFIGS[key]
 
 
-def get_inputs(dims):
-    """All randomly-generated tensors, in canonical RNG order.
-
-    The order locked here is also the order used by precompute.py, so the
-    bit-exactness check in stepdb-add-benchmark step 4 compares element-
-    for-element against precompute_tensors.
-    """
+def compute_gold(dims, tensors):
     seq_len = dims["seq_len"]
     is_small = dims.get("is_small", False)
     mc = _model_config(dims["model_name"], is_small)
 
-    torch.manual_seed(SEED)
-
-    input_tensor = torch.randn(seq_len, mc.hidden_dim)
-    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
-    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
-    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
-    cos = torch.randn(seq_len, 1, mc.head_dim)
-    sin = torch.randn(seq_len, 1, mc.head_dim)
-    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
-    w_gate_list = [
-        torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
-        .weight.T.detach().clone().contiguous()
-        for _ in range(mc.n_routed_experts)
-    ]
-    w_up_list = [
-        torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
-        .weight.T.detach().clone().contiguous()
-        for _ in range(mc.n_routed_experts)
-    ]
-    w_down_list = [
-        torch.nn.Linear(mc.moe_inter_dim, mc.dim, bias=False)
-        .weight.T.detach().clone().contiguous()
-        for _ in range(mc.n_routed_experts)
-    ]
-    router_w = torch.randn(mc.dim, mc.n_routed_experts)
-    return [
-        input_tensor, q_proj, k_proj, v_proj, cos, sin, o_proj_weight,
-        w_gate_list, w_up_list, w_down_list, router_w,
-    ]
-
-
-def compute_gold(dims):
-    seq_len = dims["seq_len"]
-    is_small = dims.get("is_small", False)
-    mc = _model_config(dims["model_name"], is_small)
-
-    (input_tensor, q_proj, k_proj, v_proj, cos, sin, o_proj_weight,
-     w_gate_list, w_up_list, w_down_list, router_w) = get_inputs(dims)
+    input_tensor = tensors["input_tensor"]
+    q_proj = tensors["q_proj"]
+    k_proj = tensors["k_proj"]
+    v_proj = tensors["v_proj"]
+    cos = tensors["cos"]
+    sin = tensors["sin"]
+    o_proj_weight = tensors["o_proj_weight"]
+    w_gate_list = tensors["w_gate_list"]
+    w_up_list = tensors["w_up_list"]
+    w_down_list = tensors["w_down_list"]
+    expert_weights = tensors["expert_weights"]
+    expert_onehot = tensors["expert_onehot"]
 
     with torch.no_grad():
         # [1] Pre-attention RMSNorm
@@ -119,51 +108,38 @@ def compute_gold(dims):
         Q = Q * cos + _rotate_half(Q) * sin
         K = K * cos + _rotate_half(K) * sin
 
-        # [5] GQA full-sequence attention.  Group queries by kv head:
-        #   Q [S, num_heads, D] -> [Hkv, qpkv, S, D]
-        #   K, V [S, num_kv_heads, D] -> [Hkv, S, D]
-        # exp-normalize softmax in float64 mirrors end_to_end (no max sub,
-        # no 1/sqrt(d); float64 keeps exp from overflowing for any seq_len).
+        # [5] GQA full-sequence attention with max-sub softmax in fp32.
         Qh = (
             Q.view(seq_len, mc.num_kv_heads, mc.query_per_kvhead, mc.head_dim)
              .permute(1, 2, 0, 3)
-             .double()
         )                                                               # [Hkv, qpkv, S, D]
-        # Insert qpkv broadcast axis on K/V so matmul aligns batch dims
-        # [Hkv, qpkv] vs [Hkv, 1] regardless of how Hkv compares to qpkv.
-        Kh = K.permute(1, 0, 2).unsqueeze(1).double()                   # [Hkv, 1, S, D]
-        Vh = V.permute(1, 0, 2).unsqueeze(1).double()                   # [Hkv, 1, S, D]
-        scores = Qh @ Kh.transpose(-1, -2)                              # [Hkv, qpkv, S, S]
-        e = torch.exp(scores)
-        num = e @ Vh                                                    # [Hkv, qpkv, S, D]
+        Kh = K.permute(1, 0, 2).unsqueeze(1)                            # [Hkv, 1, S, D]
+        Vh = V.permute(1, 0, 2).unsqueeze(1)                            # [Hkv, 1, S, D]
+        scores = Qh @ Kh.transpose(-1, -2)
+        row_max = scores.amax(dim=-1, keepdim=True)
+        e = torch.exp(scores - row_max)
+        num = e @ Vh
         denom = e.sum(dim=-1, keepdim=True)
-        attn = (num / denom).float()
+        attn = num / denom
         attn = attn.permute(2, 0, 1, 3).reshape(
             seq_len, mc.num_heads, mc.head_dim
-        )                                                               # [S, num_heads, D]
+        )
 
         # [6] O-projection + first residual add
         attn_flat = attn.reshape(seq_len, mc.num_heads * mc.head_dim)
-        o_proj_out = attn_flat @ o_proj_weight                          # [S, HID]
-        res_add_0 = o_proj_out + input_tensor                           # [S, HID]
+        o_proj_out = attn_flat @ o_proj_weight
+        res_add_0 = o_proj_out + input_tensor
 
         # [7] Post-attention RMSNorm
-        normed_2 = _rms_norm(res_add_0)                                 # [S, HID]
+        normed_2 = _rms_norm(res_add_0)
 
-        # [8] Top-k expert routing (computed in-place; no external file)
-        router_logits = normed_2 @ router_w                             # [S, n_experts]
-        _, expert_indices = torch.topk(
-            router_logits, mc.n_activated_experts, dim=-1
-        )
-        expert_weights_raw, _ = torch.topk(
-            router_logits, mc.n_activated_experts, dim=-1
-        )
-        expert_weights = torch.softmax(expert_weights_raw, dim=-1)      # [S, n_active]
-
-        # [9] MoE: y[t] = sum_j w[t,j] * down(silu(gate(x))*up(x)) for j in top-k
+        # [8] MoE: y[t] = sum_j w[t,j] * down(silu(gate(x))*up(x)) for j in top-k.
+        # expert_onehot[s, k, e] == 1 iff token s assigns its slot k to expert e,
+        # so torch.where on the per-expert slice gives the (token, slot) pairs
+        # that step_impl routes to expert `e_idx`.
         moe_output = torch.zeros(seq_len, mc.dim)
         for e_idx in range(mc.n_routed_experts):
-            tok, top_pos = torch.where(expert_indices == e_idx)
+            tok, top_pos = torch.where(expert_onehot[:, :, e_idx] == 1)
             if len(tok) == 0:
                 continue
             gate_out = normed_2[tok] @ w_gate_list[e_idx]
@@ -172,7 +148,7 @@ def compute_gold(dims):
             down_out = hidden @ w_down_list[e_idx]
             moe_output[tok] += down_out * expert_weights[tok, top_pos, None]
 
-        # [10] Final residual add
+        # [9] Final residual add
         output = moe_output + res_add_0
 
     return output

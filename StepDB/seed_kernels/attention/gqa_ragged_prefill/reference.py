@@ -4,9 +4,7 @@ Ported verbatim from the flashinfer_trace definition
 `gqa_ragged_prefill_causal_h32_kv16_d128.json` (Gemma 3 27B, TP=1).
 
 The `run` function below is the definition's reference implementation unchanged.
-This module wraps it with the StepDB `get_inputs` / `compute_gold` API:
-uniform-length batches are constructed (every sequence has `q_len` queries
-and `kv_len` keys) so that the ragged indptrs are deterministic.
+Inputs come from StepDB/precompute.py via the `tensors` arg.
 
 Source JSON:
   flashinfer-bench/flashinfer_trace/definitions/gqa_ragged/
@@ -15,13 +13,6 @@ Source JSON:
 import math
 
 import torch
-import torch.nn as nn
-
-SEED = 42
-
-NUM_QO_HEADS = 32
-NUM_KV_HEADS = 16
-HEAD_DIM = 128
 
 
 @torch.no_grad()
@@ -92,38 +83,9 @@ def run(q, k, v, qo_indptr, kv_indptr, sm_scale):
     return output, lse
 
 
-class Model(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, q, k, v, qo_indptr, kv_indptr, sm_scale):
-        output, _lse = run(q, k, v, qo_indptr, kv_indptr, sm_scale)
-        return output
-
-
-def get_inputs(dims):
-    torch.manual_seed(SEED)
-    batch_size = dims["batch_size"]
-    q_len = dims["q_len"]
-    kv_len = dims["kv_len"]
-    assert kv_len >= q_len, "kv_len must be >= q_len for the causal mask"
-
-    total_q = batch_size * q_len
-    total_kv = batch_size * kv_len
-    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
-
-    q = torch.randn(total_q, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16)
-    k = torch.randn(total_kv, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16)
-    v = torch.randn(total_kv, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16)
-    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * q_len
-    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
-    return q, k, v, qo_indptr, kv_indptr, sm_scale
-
-
-def get_init_inputs(dims):
-    return []
-
-
-def compute_gold(dims):
-    model = Model()
-    return model(*get_inputs(dims))
+def compute_gold(dims, tensors):
+    output, _lse = run(
+        tensors["q"], tensors["k"], tensors["v"],
+        tensors["qo_indptr"], tensors["kv_indptr"], tensors["sm_scale"],
+    )
+    return output

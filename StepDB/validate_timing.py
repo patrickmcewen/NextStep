@@ -34,6 +34,7 @@ sys.path.insert(0, STEP_TL_PROTO)
 sys.path.insert(0, STEPDB_DIR)
 
 from precompute import precompute_tensors
+from timing_and_emulator.timing import DEFAULT_HW_CONFIG
 
 # Standard imports prepended to step_impl code
 IMPORT_SCAFFOLD = """\
@@ -109,6 +110,73 @@ def _strip_imports(code):
             continue
         result.append(line)
     return "\n".join(result)
+
+
+def _sym_to_int(expr):
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        expr = expr.xreplace({s: 1 for s in expr.free_symbols})
+    return int(sympy.N(expr))
+
+
+def _fmt_bytes(n):
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f}KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f}MB"
+    return f"{n / 1024 ** 3:.1f}GB"
+
+
+def compute_memory_totals(result, pmu_buffer_bytes):
+    """Sum on-chip / off-chip memory across nodes.
+
+    Mirrors `_compute_memory_totals` in StepGenFlow9/src/autotune.py so the
+    numbers reported here match what the autotuner surfaces in its status,
+    progress, and result JSONs.
+    """
+    info = result["per_node"]
+    sym_subs = result.get("sym_subs", {}) or {}
+
+    def _sub(expr):
+        if sym_subs and hasattr(expr, "free_symbols") and expr.free_symbols:
+            return expr.xreplace(sym_subs)
+        return expr
+
+    total_on_chip = 0
+    total_off_chip = 0
+    for _nid, i in info.items():
+        n = i["node"]
+        total_on_chip += _sym_to_int(_sub(n.on_chip_requirement(count_fifos=False)))
+        total_off_chip += _sym_to_int(_sub(n.off_chip_traffic()))
+
+    pmu_pct = (100.0 * total_on_chip / pmu_buffer_bytes) if pmu_buffer_bytes else None
+    return {
+        "on_chip_bytes": total_on_chip,
+        "off_chip_bytes": total_off_chip,
+        "pmu_buffer_bytes": pmu_buffer_bytes,
+        "pmu_utilization_pct": pmu_pct,
+    }
+
+
+def normalize_compute_bw(graph, max_total_compute_bw):
+    """Rescale every compute op's `compute_bw` so their sum equals the budget.
+
+    Mirrors `_normalize_compute_bw` in StepGenFlow9/src/autotune.py so the
+    analytical timing here matches what the autotuner reports. Mutates the
+    graph in place; returns (sum_before, sum_after) for logging.
+    """
+    assert max_total_compute_bw >= 1, f"max_total_compute_bw must be >= 1, got {max_total_compute_bw}"
+    compute_nodes = [n for n in graph.nodes if hasattr(n, "compute_bw")]
+    assert compute_nodes, "Graph has no compute ops exposing compute_bw"
+    old_sum = sum(n.compute_bw for n in compute_nodes)
+    assert old_sum >= 1, "Sum of compute_bw across compute ops is zero — invalid graph"
+    scale = max_total_compute_bw / old_sum
+    new_sum = 0
+    for n in compute_nodes:
+        n.compute_bw = max(1, int(round(n.compute_bw * scale)))
+        new_sum += n.compute_bw
+    return old_sum, new_sum
 
 
 def build_graph_from_impl(kernel_name, dims, config):
@@ -246,14 +314,25 @@ def run_simulator(graph, output_op, work_dir):
     return cycles
 
 
-def validate_kernel(kernel_name, preset, config, verbose=False):
+def validate_kernel(kernel_name, preset, config, verbose=False, max_compute_bw=None, show_memory=False):
     """Validate one kernel+preset. Returns (kernel, preset, predicted, actual, error_pct, detail)."""
     dims = dict(config[kernel_name]["presets"][preset])
     graph, output_op = build_graph_from_impl(kernel_name, dims, config)
 
+    if max_compute_bw is not None:
+        old_sum, new_sum = normalize_compute_bw(graph, max_compute_bw)
+        print(f"Rescaled compute_bw: sum {old_sum} -> {new_sum} (target={max_compute_bw})")
+
     predicted, detail = run_analytical_model(graph)
 
     print(f"Predicted: {predicted}")
+
+    if show_memory:
+        mem = compute_memory_totals(detail, DEFAULT_HW_CONFIG["pmu_buffer_bytes"])
+        detail["memory"] = mem
+        pmu_str = f" ({mem['pmu_utilization_pct']:.1f}% of PMU={mem['pmu_buffer_bytes']} B)" if mem["pmu_utilization_pct"] is not None else ""
+        print(f"  on-chip:  {mem['on_chip_bytes']} B{pmu_str}")
+        print(f"  off-chip: {mem['off_chip_bytes']} B")
 
     work_dir = os.path.join(STEPDB_DIR, "seed_kernels", kernel_name, f"_work_timing_{preset}")
     actual = run_simulator(graph, output_op, work_dir)
@@ -275,6 +354,11 @@ def print_kernel_result(kernel_name, preset, config, predicted, actual, error_pc
             print(f"    {str(node):50s}  st={ninfo['st']}  end={ninfo['end']}  OCI={ninfo['OCI']}  OTI={ninfo['OTI']}")
     print(f"  Cycle-accurate sim: {actual} cycles")
     print(f"  Error: {error_pct:.1f}%")
+    if "memory" in detail:
+        mem = detail["memory"]
+        pmu_str = f" ({mem['pmu_utilization_pct']:.1f}% of PMU={mem['pmu_buffer_bytes']} B)" if mem["pmu_utilization_pct"] is not None else ""
+        print(f"  On-chip:  {mem['on_chip_bytes']} B{pmu_str}")
+        print(f"  Off-chip: {mem['off_chip_bytes']} B")
 
 
 def _build_job_list(config, args):
@@ -295,13 +379,13 @@ def _build_job_list(config, args):
         return [(k, list(config[k]["presets"].keys())[0]) for k in seed_kernels]
 
 
-def _run_serial(jobs, config, verbose):
+def _run_serial(jobs, config, verbose, max_compute_bw=None, show_memory=False):
     """Run jobs sequentially with full output."""
     results = []
     skipped = []
     for kernel, preset in jobs:
         try:
-            r = validate_kernel(kernel, preset, config, verbose)
+            r = validate_kernel(kernel, preset, config, verbose, max_compute_bw=max_compute_bw, show_memory=show_memory)
             kernel, preset, predicted, actual, error_pct, detail = r
             print_kernel_result(kernel, preset, config, predicted, actual, error_pct, detail, verbose)
             results.append((kernel, preset, predicted, actual, error_pct))
@@ -311,7 +395,7 @@ def _run_serial(jobs, config, verbose):
     return results, skipped
 
 
-def _run_parallel(jobs, config, verbose, max_workers):
+def _run_parallel(jobs, config, verbose, max_workers, max_compute_bw=None, show_memory=False):
     """Run jobs in parallel, logging each as it completes."""
     results = []
     skipped = []
@@ -320,7 +404,7 @@ def _run_parallel(jobs, config, verbose, max_workers):
     done_count = [0]  # mutable counter for closure
 
     def _worker(kernel, preset):
-        return validate_kernel(kernel, preset, config, verbose)
+        return validate_kernel(kernel, preset, config, verbose, max_compute_bw=max_compute_bw, show_memory=show_memory)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_to_job = {
@@ -334,8 +418,13 @@ def _run_parallel(jobs, config, verbose, max_workers):
             try:
                 kernel, preset, predicted, actual, error_pct, detail = future.result()
                 results.append((kernel, preset, predicted, actual, error_pct))
+                mem_str = ""
+                if "memory" in detail:
+                    m = detail["memory"]
+                    pct = f"({m['pmu_utilization_pct']:.1f}% PMU)" if m["pmu_utilization_pct"] is not None else ""
+                    mem_str = f"  on_chip={_fmt_bytes(m['on_chip_bytes'])}{pct} off_chip={_fmt_bytes(m['off_chip_bytes'])}"
                 with print_lock:
-                    print(f"  [{idx}/{total}] {kernel:30s} {preset:15s}  pred={predicted:>8d}  actual={actual:>8d}  err={error_pct:.1f}%")
+                    print(f"  [{idx}/{total}] {kernel:30s} {preset:15s}  pred={predicted:>8d}  actual={actual:>8d}  err={error_pct:.1f}%{mem_str}")
                     if verbose:
                         for nid, ninfo in detail["per_node"].items():
                             node = ninfo["node"]
@@ -356,6 +445,16 @@ def main():
     parser.add_argument("--all", action="store_true", help="All seed kernels, every preset")
     parser.add_argument("-j", "--jobs", type=int, default=1, help="Parallel workers (default: 1 = serial)")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--max-compute-bw", type=int, default=None,
+        help="Rescale every compute op's compute_bw so the sum equals this budget "
+             "(matches the autotuner's _normalize_compute_bw). Default: no rescaling.",
+    )
+    parser.add_argument(
+        "--show-memory", action="store_true",
+        help="Compute and report on-chip / off-chip memory totals (matches the "
+             "autotuner's _compute_memory_totals).",
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -363,9 +462,15 @@ def main():
     print(f"Running {len(jobs)} benchmark(s) with {args.jobs} worker(s)\n")
 
     if args.jobs > 1:
-        results, skipped = _run_parallel(jobs, config, args.verbose, args.jobs)
+        results, skipped = _run_parallel(
+            jobs, config, args.verbose, args.jobs,
+            max_compute_bw=args.max_compute_bw, show_memory=args.show_memory,
+        )
     else:
-        results, skipped = _run_serial(jobs, config, args.verbose)
+        results, skipped = _run_serial(
+            jobs, config, args.verbose,
+            max_compute_bw=args.max_compute_bw, show_memory=args.show_memory,
+        )
 
     # Summary sorted by kernel name then preset
     results.sort(key=lambda r: (r[0], r[1]))

@@ -153,7 +153,11 @@ def run_reference(kernel_name, dims, config):
     namespace = {}
     exec(ref_code, namespace)
     assert "compute_gold" in namespace, f"compute_gold not found in {ref_path}"
-    return namespace["compute_gold"](dims)
+    compute_gold = namespace["compute_gold"]
+    if "tensors" in inspect.signature(compute_gold).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        return compute_gold(dims, tensors)
+    return compute_gold(dims)
 
 
 def run_functional_sim(graph, output_op):

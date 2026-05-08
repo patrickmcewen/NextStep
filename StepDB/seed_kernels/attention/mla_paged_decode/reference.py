@@ -5,10 +5,7 @@ Ported verbatim from the flashinfer_trace definition
   num_qo_heads=128/8=16, head_dim_ckv=512, head_dim_kpe=64).
 
 The `run` function below is the definition's reference implementation unchanged.
-This module wraps it with the StepDB `get_inputs` / `compute_gold` API:
-each batch element owns a contiguous, non-overlapping range of `kv_len` pages,
-giving `num_pages = batch_size * kv_len` and deterministic `kv_indptr`/
-`kv_indices` arrays.
+Inputs come from StepDB/precompute.py via the `tensors` arg.
 
 Source JSON:
   flashinfer-bench/flashinfer_trace/definitions/mla_paged/
@@ -17,14 +14,6 @@ Source JSON:
 import math
 
 import torch
-import torch.nn as nn
-
-SEED = 42
-
-NUM_QO_HEADS = 16
-HEAD_DIM_CKV = 512
-HEAD_DIM_KPE = 64
-PAGE_SIZE = 1
 
 
 @torch.no_grad()
@@ -93,39 +82,10 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
     return output, lse
 
 
-class Model(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
-        output, _lse = run(
-            q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale
-        )
-        return output
-
-
-def get_inputs(dims):
-    torch.manual_seed(SEED)
-    batch_size = dims["batch_size"]
-    kv_len = dims["kv_len"]
-
-    num_pages = batch_size * kv_len
-    # Per the JSON: sm_scale = 1/sqrt(128 + 64) = 1/sqrt(192), from pre-absorption head dims
-    sm_scale = 1.0 / math.sqrt(128 + HEAD_DIM_KPE)
-
-    q_nope = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM_CKV, dtype=torch.bfloat16)
-    q_pe = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM_KPE, dtype=torch.bfloat16)
-    ckv_cache = torch.randn(num_pages, PAGE_SIZE, HEAD_DIM_CKV, dtype=torch.bfloat16)
-    kpe_cache = torch.randn(num_pages, PAGE_SIZE, HEAD_DIM_KPE, dtype=torch.bfloat16)
-    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
-    kv_indices = torch.arange(num_pages, dtype=torch.int32)
-    return q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale
-
-
-def get_init_inputs(dims):
-    return []
-
-
-def compute_gold(dims):
-    model = Model()
-    return model(*get_inputs(dims))
+def compute_gold(dims, tensors):
+    output, _lse = run(
+        tensors["q_nope"], tensors["q_pe"],
+        tensors["ckv_cache"], tensors["kpe_cache"],
+        tensors["kv_indptr"], tensors["kv_indices"], tensors["sm_scale"],
+    )
+    return output

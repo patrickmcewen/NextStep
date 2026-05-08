@@ -665,29 +665,29 @@ def _precompute_prefill_transformer_simple(dims):
 
     torch.manual_seed(SEED)
 
-    input_tensor = torch.randn(seq_len, mc.hidden_dim)
-    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
-    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
-    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
-    cos = torch.randn(seq_len, 1, mc.head_dim)
-    sin = torch.randn(seq_len, 1, mc.head_dim)
-    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
+    input_tensor = torch.randn(seq_len, mc.hidden_dim).double()
+    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim).double()
+    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim).double()
+    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim).double()
+    cos = torch.randn(seq_len, 1, mc.head_dim).double()
+    sin = torch.randn(seq_len, 1, mc.head_dim).double()
+    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim).double()
     w_gate_list = [
         torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
-        .weight.T.detach().clone().contiguous()
+        .weight.T.detach().clone().contiguous().double()
         for _ in range(mc.n_routed_experts)
     ]
     w_up_list = [
         torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
-        .weight.T.detach().clone().contiguous()
+        .weight.T.detach().clone().contiguous().double()
         for _ in range(mc.n_routed_experts)
     ]
     w_down_list = [
         torch.nn.Linear(mc.moe_inter_dim, mc.dim, bias=False)
-        .weight.T.detach().clone().contiguous()
+        .weight.T.detach().clone().contiguous().double()
         for _ in range(mc.n_routed_experts)
     ]
-    router_w = torch.randn(mc.dim, mc.n_routed_experts)
+    router_w = torch.randn(mc.dim, mc.n_routed_experts).double()
 
     # ---- Top-k routing tensors (need float64 attention to match reference) ----
     def _rms_norm_t(x, eps=1e-6):
@@ -717,7 +717,7 @@ def _precompute_prefill_transformer_simple(dims):
         Vh = V_post_rope.permute(1, 0, 2).unsqueeze(1).double()
         scores = Qh @ Kh.transpose(-1, -2)
         e = torch.exp(scores)
-        attn = (e @ Vh / e.sum(dim=-1, keepdim=True)).float()
+        attn = (e @ Vh / e.sum(dim=-1, keepdim=True)).double()
         attn = attn.permute(2, 0, 1, 3).reshape(
             seq_len, mc.num_heads, mc.head_dim
         )

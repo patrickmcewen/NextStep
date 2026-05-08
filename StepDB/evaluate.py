@@ -249,7 +249,10 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
         sim_output = np.load(f"{store_path}.npy")
 
     sim_tensor = torch.from_numpy(sim_output).float()
-    gold = ref_mod.compute_gold(dims).float()
+    if "tensors" in inspect.signature(ref_mod.compute_gold).parameters:
+        gold = ref_mod.compute_gold(dims, precompute_tensors(kernel_name, dims)).float()
+    else:
+        gold = ref_mod.compute_gold(dims).float()
 
     assert sim_tensor.numel() == gold.numel(), (
         f"Element count mismatch: sim={sim_tensor.numel()} gold={gold.numel()}"
