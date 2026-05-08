@@ -308,7 +308,8 @@ def _load_stepdb_config() -> dict:
 # Correctness checkers for each executor type
 # ---------------------------------------------------------------------------
 
-def _compare_against_gold(result, kernel_name, dims, label="result"):
+def _compare_against_gold(result, kernel_name, dims, label="result", *,
+                           is_root: bool = True):
     """Compare a tensor (or tuple/list of tensors) result against gold.
 
     Tuple/list outputs are supported because the planner can decompose a
@@ -317,6 +318,11 @@ def _compare_against_gold(result, kernel_name, dims, label="result"):
     inherits the original kernel's single-tensor signature, so root-level
     comparisons stay single-tensor; tuple comparisons only kick in for
     intermediate per-node refactor passes.
+
+    ``is_root=False`` relaxes shape strictness: shapes do not need to match
+    exactly — both tensors are flattened and compared element-wise (numel
+    must still match). The root output is the kernel's externally-observable
+    signature, so we keep its shape check strict.
     """
     import torch
 
@@ -336,7 +342,8 @@ def _compare_against_gold(result, kernel_name, dims, label="result"):
                 f"{label} has {len(result)}\nmatch=False"
             )
         per_out = [
-            _compare_one_tensor(g, r, kernel_name, dims, f"{label}[{i}]")
+            _compare_one_tensor(g, r, kernel_name, dims, f"{label}[{i}]",
+                                is_root=is_root)
             for i, (g, r) in enumerate(zip(gold, result))
         ]
         all_match = all(p["match"] for p in per_out)
@@ -344,11 +351,18 @@ def _compare_against_gold(result, kernel_name, dims, label="result"):
         for i, p in enumerate(per_out):
             out += f"\n--- output[{i}] ---\n{p['report']}"
         return out
-    return _compare_one_tensor(gold, result, kernel_name, dims, label)["report"]
+    return _compare_one_tensor(gold, result, kernel_name, dims, label,
+                               is_root=is_root)["report"]
 
 
-def _compare_one_tensor(gold, result, kernel_name, dims, label):
-    """Single-tensor comparison helper. Returns ``{"match": bool, "report": str}``."""
+def _compare_one_tensor(gold, result, kernel_name, dims, label, *,
+                         is_root: bool = True):
+    """Single-tensor comparison helper. Returns ``{"match": bool, "report": str}``.
+
+    For non-root nodes (``is_root=False``) shapes need not match exactly —
+    both tensors are flattened before the element-wise comparison. The numel
+    must still match.
+    """
     import torch
 
     if not hasattr(result, "shape"):
@@ -357,33 +371,56 @@ def _compare_one_tensor(gold, result, kernel_name, dims, label):
             f"{type(result).__name__}\nmatch=False"
         )
         return {"match": False, "report": report}
-    if gold.shape != result.shape:
-        report = (
-            f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs "
-            f"{label} {tuple(result.shape)}\nmatch=False"
-        )
-        return {"match": False, "report": report}
 
-    max_err = (gold - result).abs().max().item()
-    rel_err = max_err / (gold.abs().max().item() + 1e-12)
+    if gold.shape != result.shape:
+        if is_root:
+            report = (
+                f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs "
+                f"{label} {tuple(result.shape)}\nmatch=False"
+            )
+            return {"match": False, "report": report}
+        if gold.numel() != result.numel():
+            report = (
+                f"NUMEL MISMATCH (non-root, flatten compare): "
+                f"gold {tuple(gold.shape)} (numel={gold.numel()}) vs "
+                f"{label} {tuple(result.shape)} (numel={result.numel()})\n"
+                f"match=False"
+            )
+            return {"match": False, "report": report}
+        gold_cmp = gold.reshape(-1)
+        result_cmp = result.reshape(-1)
+    else:
+        gold_cmp = gold
+        result_cmp = result
+
+    max_err = (gold_cmp - result_cmp).abs().max().item()
+    rel_err = max_err / (gold_cmp.abs().max().item() + 1e-12)
     match = rel_err < 1e-5
 
+    shape_note = (
+        f"output_shape={tuple(result.shape)}"
+        if gold.shape == result.shape
+        else (f"output_shape={tuple(result.shape)} "
+              f"(flattened to {tuple(result_cmp.shape)} for non-root compare; "
+              f"gold shape {tuple(gold.shape)})")
+    )
     report = (
         f"match={match}\nmax_abs_err={max_err:.2e}\nrel_err={rel_err:.2e}\n"
-        f"output_shape={tuple(result.shape)}"
+        f"{shape_note}"
     )
     if not match:
-        diff = (gold - result).abs()
+        diff = (gold_cmp - result_cmp).abs()
         worst_multi = torch.unravel_index(diff.argmax(), diff.shape)
         report += (
             f"\nworst_error_index={tuple(i.item() for i in worst_multi)}"
-            f"\ngold_value={gold[worst_multi].item():.6e}"
-            f"\n{label}_value={result[worst_multi].item():.6e}"
+            f"\ngold_value={gold_cmp[worst_multi].item():.6e}"
+            f"\n{label}_value={result_cmp[worst_multi].item():.6e}"
         )
     return {"match": match, "report": report}
 
 
-def _run_dsl_correctness(code, kernel_name, dims, tensors):
+def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
+                          is_root: bool = True):
     """Run a refactor-pass candidate against gold via the DSL executor.
 
     The DSL surface is directly runnable (the standalone ``step_dsl`` module
@@ -391,10 +428,12 @@ def _run_dsl_correctness(code, kernel_name, dims, tensors):
     ``tiled_reference(dims, tensors)`` and compare its output to gold.
     """
     result = _exec_dsl_ref(code, dims, tensors)
-    return _compare_against_gold(result, kernel_name, dims, "dsl")
+    return _compare_against_gold(result, kernel_name, dims, "dsl",
+                                 is_root=is_root)
 
 
-def _run_graph_correctness(code, kernel_name, dims, tensors):
+def _run_graph_correctness(code, kernel_name, dims, tensors, *,
+                            is_root: bool = True):
     """Run a translate-pass candidate against gold via the simulator.
 
     The candidate is exec'd as ``build_graph(dims, tensors)`` and the
@@ -411,7 +450,8 @@ def _run_graph_correctness(code, kernel_name, dims, tensors):
         stripped = code.replace("import ", "# import ")  # strip imports for line matching
         enhanced = enhance_emulator_error(exc, stripped)
         raise type(exc)(enhanced) from exc
-    return _compare_against_gold(sim, kernel_name, dims, "sim")
+    return _compare_against_gold(sim, kernel_name, dims, "sim",
+                                 is_root=is_root)
 
 
 # Map executor type to correctness checker. ``dsl`` gates phase-1 refactor
@@ -561,7 +601,8 @@ class _GateResult(NamedTuple):
     tokens: int = 0
 
 
-def _check_banned_ops(code: str, pass_name: str) -> list[str]:
+def _check_banned_ops(code: str, pass_name: str, *,
+                       is_root: bool = True) -> list[str]:
     """Check whether ``code`` complies with this pass's output constraints.
 
     Returns a list of violation messages; empty means compliant. Each pass's
@@ -569,6 +610,11 @@ def _check_banned_ops(code: str, pass_name: str) -> list[str]:
     passes, only the ``build_graph`` body is checked so scaffold code (DSL
     functions, functional.py) may use torch.* internally without false
     positives.
+
+    ``is_root=False`` drops sink ops (``offchip_store`` / ``OffChipStore``)
+    from the required-ops set: only the root node writes results off-chip;
+    intermediate nodes hand their tensors back to a parent rather than
+    storing them.
     """
     rules = _PASS_RULES.get(pass_name)
     if rules is None:
@@ -599,7 +645,10 @@ def _check_banned_ops(code: str, pass_name: str) -> list[str]:
         if re.search(r'\b' + re.escape(pattern), code):
             violations.append(f"- `{pattern}` still present — {fix}")
 
+    sink_ops = {"offchip_store", "OffChipStore", "random_offchip_store"}
     for required in rules["required_ops"]:
+        if not is_root and required in sink_ops:
+            continue
         if required not in code:
             violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
 
@@ -607,12 +656,17 @@ def _check_banned_ops(code: str, pass_name: str) -> list[str]:
     return list(dict.fromkeys(violations))
 
 
-def _check_bundle_compliance(code: str, compliance: dict) -> list[str]:
+def _check_bundle_compliance(code: str, compliance: dict, *,
+                              is_root: bool = True) -> list[str]:
     """Bundle-mode compliance checker driven by the bundle's manifest config.
 
     Mirrors ``_check_banned_ops`` but pulls allowed/banned/required from the
     bundle's compliance dict rather than the hard-coded step_dsl tables.
     Empty allowlist = allowlist disabled.
+
+    ``is_root=False`` drops sink ops (anything in
+    ``compliance.get("sink_ops")`` or matching ``*offchip_store*`` /
+    ``*OffChipStore*``) from the required-ops set.
     """
     code = _strip_annotations(code)
     code = _extract_func_body(code)
@@ -648,7 +702,14 @@ def _check_bundle_compliance(code: str, compliance: dict) -> list[str]:
         if re.search(r'\b' + re.escape(pattern), code):
             violations.append(f"- `{pattern}` still present — {entry['fix']}")
 
+    declared_sinks = set(compliance.get("sink_ops") or [])
     for name in required:
+        if not is_root and (
+            name in declared_sinks
+            or "offchip_store" in name
+            or "OffChipStore" in name
+        ):
+            continue
         if name not in code:
             violations.append(
                 f"- `{name}` missing — this bundle requires a call to {name}"
@@ -700,7 +761,8 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
 
 def _make_translation_post_validator(kernel_name: str, dims: dict,
                                      tensors: dict, log,
-                                     translate_fn=None):
+                                     translate_fn=None,
+                                     *, is_root: bool = True):
     """Build a refactor_final post-validator that runs deterministic translation.
 
     The validator returns ``None`` when the DSL code translates cleanly into a
@@ -741,7 +803,8 @@ def _make_translation_post_validator(kernel_name: str, dims: dict,
 
         log(f"      [translate-check] verifying STeP graph correctness...")
         try:
-            result = _run_graph_correctness(step_code, kernel_name, dims, tensors)
+            result = _run_graph_correctness(step_code, kernel_name, dims, tensors,
+                                            is_root=is_root)
         except Exception:
             err = traceback.format_exc()
             _write(check_dir / "graph_error.txt", err)
@@ -806,7 +869,8 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
 
 
 async def _gate_correctness(code, kernel_name, dims, tensors, executor,
-                            turn_dir: Path, log) -> tuple[_GateResult, str]:
+                            turn_dir: Path, log, *,
+                            is_root: bool = True) -> tuple[_GateResult, str]:
     """Run check_correctness with stdout captured for shape trace.
 
     Returns (gate_result, shape_trace). The shape trace is captured even on
@@ -817,7 +881,8 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
     _trace_buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(_trace_buf):
-            result = check_correctness(code, kernel_name, dims, tensors)
+            result = check_correctness(code, kernel_name, dims, tensors,
+                                       is_root=is_root)
         shape_trace = _trace_buf.getvalue()
         if shape_trace:
             _write(turn_dir / "shape_trace.txt", shape_trace)
@@ -874,7 +939,8 @@ def _build_judge_context(tensors, *, correctness_verified: bool) -> str:
 
 async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
                            tensors, turn_dir: Path, log,
-                           *, correctness_verified: bool) -> _GateResult:
+                           *, correctness_verified: bool,
+                           is_root: bool = True) -> _GateResult:
     """Regex compliance check.
 
     On failure, on `pass_name == "refactor_final"` with a non-None judge_agent,
@@ -882,9 +948,10 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
     pre-refactor inline carve-out).
     """
     if compliance_override is not None:
-        violations = _check_bundle_compliance(code, compliance_override)
+        violations = _check_bundle_compliance(code, compliance_override,
+                                              is_root=is_root)
     else:
-        violations = _check_banned_ops(code, pass_name)
+        violations = _check_banned_ops(code, pass_name, is_root=is_root)
 
     if not violations:
         return _GateResult(None, "PASS", 0)
@@ -981,7 +1048,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          post_validator=None,
                          compliance_override: dict | None = None,
                          check_order: str,
-                         prebuilt_user_prompt: str | None = None):
+                         prebuilt_user_prompt: str | None = None,
+                         is_root: bool = True):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1072,13 +1140,14 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 if gate_name == "correctness":
                     res, shape_trace = await _gate_correctness(
                         code, kernel_name, dims, tensors, executor,
-                        turn_dir, log)
+                        turn_dir, log, is_root=is_root)
                     correctness_verified = (res.feedback is None)
                 elif gate_name == "compliance":
                     res = await _gate_compliance(
                         code, pass_name, compliance_override, judge_agent,
                         tensors, turn_dir, log,
-                        correctness_verified=correctness_verified)
+                        correctness_verified=correctness_verified,
+                        is_root=is_root)
                 elif gate_name == "judge":
                     res = await _gate_judge(
                         judge_agent, code, tensors, turn_dir, log,
@@ -1263,6 +1332,40 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
         few_shot_block = "\n\n## Verified sub-task DSLs (reference material)\n"
         for child_path, dsl in children_dsls:
             few_shot_block += f"\n### {child_path}\n```python\n{dsl.rstrip()}\n```\n"
+        few_shot_block += (
+            "\n### How to compose these sub-routines\n"
+            "Each verified sub-routine above was written as a self-contained DSL "
+            "program: it loads its own inputs from `tensors[...]` via "
+            "`offchip_load` / `offchip_load_ref` / `dyn_offchip_load` / "
+            "`random_offchip_load` and (if it was the root of its subproblem) "
+            "writes results via `offchip_store`.\n\n"
+            "When you inline / compose these sub-routines into THIS node, those "
+            "source-op calls may end up operating on values that are NOT raw "
+            "input tensors anymore — they may be intermediate stream tensors "
+            "produced by your own DSL ops (the new compute this node introduces "
+            "on top of its children). That is illegal: `offchip_load*` must "
+            "ONLY be applied to a raw `tensors['<name>']` value, never to the "
+            "output of a previous DSL/STeP op. Re-loading already-streamed "
+            "values would imply round-tripping through off-chip memory mid-"
+            "program, which is not allowed.\n\n"
+            "When you encounter this in a sub-routine you are inlining, you "
+            "MUST either:\n"
+            "1. Remove the offending `offchip_load*` call entirely and feed the "
+            "upstream stream tensor directly into whatever consumed the load's "
+            "output, OR\n"
+            "2. Replace it with the appropriate stream-shape DSL ops "
+            "(`promote`, `promote_outer`, `flatten`, `reshape_stream`, "
+            "`reshape_pad_stream`, `expand_ref`, `repeat_ref`, `repeat_static`, "
+            "`streamify`, `dyn_streamify`, `bufferize`, `retile_streamify`, "
+            "`accum_retile_row`, `accum_retile_col`) so that the downstream "
+            "computation sees the same stream/tile shape it would have seen "
+            "had the load happened on a raw tensor.\n\n"
+            "Symmetrically, sub-routines that ended in `offchip_store` should "
+            "have that store dropped when their output is consumed by further "
+            "DSL ops in this node — only the ROOT program writes results "
+            "off-chip; intermediate stages hand stream tensors to their "
+            "parent.\n"
+        )
         user_prompt = user_prompt + few_shot_block
 
     node_dir = ckpt_root / "refactor" / node.path
@@ -1270,10 +1373,13 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
     agent = agent_factory(children_dsls)
     refactor_judge_agent = getattr(agent_factory, "__refactor_judge_agent__", None)
 
+    is_root = (node.path == "root")
+
     post_validator = None
     if translate_fn is not None:
         post_validator = _make_translation_post_validator(
             synth_name, dims, tensors, log, translate_fn=translate_fn,
+            is_root=is_root,
         )
 
     async def _one_attempt(attempt_idx: int) -> dict:
@@ -1290,9 +1396,9 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
             prebuilt_user_prompt=user_prompt,
             judge_agent=refactor_judge_agent,
             post_validator=post_validator,
+            is_root=is_root,
         )
 
-    is_root = (node.path == "root")
     run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
 
     if node_attempts == 1:

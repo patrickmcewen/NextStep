@@ -50,7 +50,7 @@ class Buffered:
 
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], f"offchip_load: underlying dtype must be float16-64, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     R, C = underlying.shape[-2], underlying.shape[-1]
 
     # ---- Tiling invariant: must actually stream, not load as one giant tile ----
@@ -93,8 +93,8 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
 
 def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_dispatch=1):
     assert par_dispatch >= 1, f"dyn_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], (
-        f"dyn_offchip_load: underlying dtype must be float16-64, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16], (
+        f"dyn_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     )
     R, C = underlying.shape[-2], underlying.shape[-1]
     assert R % tile_row == 0 and C % tile_col == 0, (
@@ -107,7 +107,7 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
 
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], f"offchip_load_ref: underlying dtype must be float16-64, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed)
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
@@ -127,7 +127,12 @@ def select_gen(underlying, is_multihot, n):
         f"select_gen: control's last dim must equal n={n}, "
         f"got shape {tuple(underlying.shape)}"
     )
-    return underlying
+    # Prepend a leading singleton so the DSL stream rank matches STeP's
+    # SelectGen, which produces stream=(1,)+tensor.shape[:-1]. Without this,
+    # downstream ops (notably expert_addr_gen) end up one rank shorter in DSL
+    # than in the translated STeP graph, hiding rank-sensitive shape bugs
+    # until the build_graph stage.
+    return underlying.unsqueeze(0)
 
 def metadata_gen(tensor):
     return tensor.float().reshape(1, *tensor.shape, 1, 1)
@@ -183,8 +188,8 @@ def filter_last_tile(seq_len):
 
 def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"random_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], (
-        f"random_offchip_load: underlying dtype must be float16-64, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16], (
+        f"random_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     )
     assert raddr.shape[-2:] == (1, 1), (
         f"random_offchip_load: raddr tile shape must be (1,1), got {tuple(raddr.shape[-2:])}"
@@ -222,8 +227,8 @@ def _assert_stream_match(a, b, op_name):
 
 
 def _assert_float(x, op_name):
-    assert x.dtype in (torch.float32, torch.float16, torch.float64), (
-        f"{op_name}: input dtype must be float16-64, got {x.dtype}."
+    assert x.dtype in (torch.float32, torch.float16), (
+        f"{op_name}: input dtype must be float16 or float32, got {x.dtype}."
     )
 
 def _assert_int(x, op_name):
@@ -583,6 +588,17 @@ def promote(x, rank=1):
 
 
 def promote_outer(x):
+    # STeP's PromoteOuter only operates on streams with rank >= 1, so the input
+    # must be at least 3D (>=1 stream dim + 2 tile dims). Allowing a rank-0
+    # stream here lets the DSL accept a "tile-only" tensor that the translator
+    # cannot represent in STeP, surfacing only as a build_graph crash later.
+    assert x.ndim >= 3, (
+        f"promote_outer: input must have >=1 stream dim (>=3D total), "
+        f"got shape {tuple(x.shape)}. If this is the output of a fully-"
+        f"collapsing accum (e.g. accum_retile_row(rank=stream_rank)), keep "
+        f"a stream dim — drop one rank from the accum or skip an upstream "
+        f"flatten that consumed the leading singleton."
+    )
     return x.unsqueeze(0)
 
 
@@ -803,8 +819,8 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
 
 def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0, *, par_dispatch=1):
     assert par_dispatch >= 1, f"random_offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], (
-        f"random_offchip_store: underlying dtype must be float16-64, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16], (
+        f"random_offchip_store: underlying dtype must be float16 or float32, got {underlying.dtype}"
     )
     assert waddr.shape[-2:] == (1, 1), (
         f"random_offchip_store: waddr tile shape must be (1,1), got {tuple(waddr.shape[-2:])}"

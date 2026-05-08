@@ -46,10 +46,25 @@ def precompute_tensors(kernel_name: str, dims: dict) -> dict:
 @register("broadcast_diamond")
 @register("bufferize_roundtrip")
 @register("bufferize_chain")
+@register("tile_grid_transpose_2d")
 def _precompute_single_input(dims):
     torch.manual_seed(SEED)
     M, K = dims["M"], dims["K"]
     return {"input": torch.randn(M, K)}
+
+
+@register("head_split_permute")
+def _precompute_head_split_permute(dims):
+    torch.manual_seed(SEED)
+    S, H, D = dims["S"], dims["H"], dims["D"]
+    return {"input": torch.randn(S, H * D)}
+
+
+@register("attn_layout_permute_4d")
+def _precompute_attn_layout_permute_4d(dims):
+    torch.manual_seed(SEED)
+    B, H, S, D = dims["B"], dims["H"], dims["S"], dims["D"]
+    return {"input": torch.randn(B, H, S, D)}
 
 
 @register("rms_norm")
@@ -665,31 +680,32 @@ def _precompute_prefill_transformer_simple(dims):
 
     torch.manual_seed(SEED)
 
-    input_tensor = torch.randn(seq_len, mc.hidden_dim).double()
-    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim).double()
-    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim).double()
-    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim).double()
-    cos = torch.randn(seq_len, 1, mc.head_dim).double()
-    sin = torch.randn(seq_len, 1, mc.head_dim).double()
-    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim).double()
+    input_tensor = torch.randn(seq_len, mc.hidden_dim)
+    q_proj = torch.randn(mc.hidden_dim, mc.num_heads * mc.head_dim)
+    k_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    v_proj = torch.randn(mc.hidden_dim, mc.num_kv_heads * mc.head_dim)
+    cos = torch.randn(seq_len, 1, mc.head_dim)
+    sin = torch.randn(seq_len, 1, mc.head_dim)
+    o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
     w_gate_list = [
         torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
-        .weight.T.detach().clone().contiguous().double()
+        .weight.T.detach().clone().contiguous()
         for _ in range(mc.n_routed_experts)
     ]
     w_up_list = [
         torch.nn.Linear(mc.dim, mc.moe_inter_dim, bias=False)
-        .weight.T.detach().clone().contiguous().double()
+        .weight.T.detach().clone().contiguous()
         for _ in range(mc.n_routed_experts)
     ]
     w_down_list = [
         torch.nn.Linear(mc.moe_inter_dim, mc.dim, bias=False)
-        .weight.T.detach().clone().contiguous().double()
+        .weight.T.detach().clone().contiguous()
         for _ in range(mc.n_routed_experts)
     ]
-    router_w = torch.randn(mc.dim, mc.n_routed_experts).double()
+    router_w = torch.randn(mc.dim, mc.n_routed_experts)
 
-    # ---- Top-k routing tensors (need float64 attention to match reference) ----
+    # ---- Top-k routing tensors. Runs in fp32 with max-subtraction softmax so
+    # routing decisions match the reference's fp32 attention exactly. ----
     def _rms_norm_t(x, eps=1e-6):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
 
@@ -711,13 +727,13 @@ def _precompute_prefill_transformer_simple(dims):
             Q_post_rope
             .view(seq_len, mc.num_kv_heads, mc.query_per_kvhead, mc.head_dim)
             .permute(1, 2, 0, 3)
-            .double()
         )
-        Kh = K_post_rope.permute(1, 0, 2).unsqueeze(1).double()
-        Vh = V_post_rope.permute(1, 0, 2).unsqueeze(1).double()
+        Kh = K_post_rope.permute(1, 0, 2).unsqueeze(1)
+        Vh = V_post_rope.permute(1, 0, 2).unsqueeze(1)
         scores = Qh @ Kh.transpose(-1, -2)
-        e = torch.exp(scores)
-        attn = (e @ Vh / e.sum(dim=-1, keepdim=True)).double()
+        row_max = scores.amax(dim=-1, keepdim=True)
+        e = torch.exp(scores - row_max)
+        attn = e @ Vh / e.sum(dim=-1, keepdim=True)
         attn = attn.permute(2, 0, 1, 3).reshape(
             seq_len, mc.num_heads, mc.head_dim
         )
@@ -823,3 +839,18 @@ def _precompute_sdpa_kv_read(dims):
     batch_size = dims["batch_size"]
     batch_idx = dims["batch_idx"]
     return {"x": torch.randn(1, hidden_dim), "W_q": torch.randn(hidden_dim, num_heads * head_dim), "W_k": torch.randn(hidden_dim, num_kv_heads * head_dim), "W_v": torch.randn(hidden_dim, num_kv_heads * head_dim), "K_cache": torch.randn(batch_size, seq_len+1, num_kv_heads, head_dim), "V_cache": torch.randn(batch_size, seq_len+1, num_kv_heads, head_dim), "batch_idx": batch_idx, "seq_len": seq_len}
+
+
+@register("qk_reshape_score")
+def _precompute_qk_reshape_score(dims):
+    torch.manual_seed(SEED)
+    seq_len = dims["seq_len"]
+    hidden_size = dims["hidden_size"]
+    num_heads = dims["num_heads"]
+    num_kv_heads = dims["num_kv_heads"]
+    head_dim = dims["head_dim"]
+    return {
+        "x": torch.randn(seq_len, hidden_size),
+        "w": torch.randn(hidden_size, num_heads * head_dim),
+        "k": torch.randn(seq_len, num_kv_heads, head_dim),
+    }

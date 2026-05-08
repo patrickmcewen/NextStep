@@ -2075,3 +2075,101 @@ parallelize_observe:
       tile_k: 16
       par_factor: 4
   origin: seed
+
+qk_reshape_score:
+  problem: seed_kernels/qk_reshape_score/reference.py
+  step_impl: null
+  params:
+  - seq_len
+  - hidden_size
+  - num_heads
+  - num_kv_heads
+  - head_dim
+  presets:
+    tiny:
+      seq_len: 8
+      hidden_size: 16
+      num_heads: 4
+      num_kv_heads: 2
+      head_dim: 8
+    small:
+      seq_len: 128
+      hidden_size: 512
+      num_heads: 8
+      num_kv_heads: 4
+      head_dim: 64
+    medium:
+      seq_len: 512
+      hidden_size: 2048
+      num_heads: 16
+      num_kv_heads: 4
+      head_dim: 128
+    large:
+      seq_len: 1024
+      hidden_size: 4096
+      num_heads: 32
+      num_kv_heads: 8
+      head_dim: 128
+  origin: seed
+tile_grid_transpose_2d:
+  problem: seed_kernels/language_primitives/tile_grid_transpose_2d/reference.py
+  step_impl: seed_kernels/language_primitives/tile_grid_transpose_2d/step_impl.py
+  params:
+  - M
+  - K
+  - tile_m
+  - tile_k
+  presets:
+    small:
+      M: 32
+      K: 32
+      tile_m: 16
+      tile_k: 16
+    rect:
+      M: 64
+      K: 64
+      tile_m: 16
+      tile_k: 8
+    square:
+      M: 64
+      K: 64
+      tile_m: 16
+      tile_k: 16
+  origin: seed
+head_split_permute:
+  problem: seed_kernels/language_primitives/head_split_permute/reference.py
+  step_impl: seed_kernels/language_primitives/head_split_permute/step_impl.py
+  params:
+  - S
+  - H
+  - D
+  presets:
+    small:
+      S: 8
+      H: 4
+      D: 16
+    medium:
+      S: 16
+      H: 8
+      D: 32
+  origin: seed
+attn_layout_permute_4d:
+  problem: seed_kernels/language_primitives/attn_layout_permute_4d/reference.py
+  step_impl: seed_kernels/language_primitives/attn_layout_permute_4d/step_impl.py
+  params:
+  - B
+  - H
+  - S
+  - D
+  presets:
+    small:
+      B: 2
+      H: 4
+      S: 8
+      D: 16
+    medium:
+      B: 4
+      H: 8
+      S: 16
+      D: 32
+  origin: seed

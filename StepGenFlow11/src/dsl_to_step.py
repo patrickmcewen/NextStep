@@ -428,6 +428,11 @@ class _State:
     def __init__(self):
         self.counter = 0
         self.select_gen_vars: set = set()
+        # Variables bound from `offchip_store(...)` so `_rewrite_return` can
+        # tell `return result` (where `result = offchip_store(...)`) apart
+        # from `return result` (where `result` is some intermediate node) and
+        # avoid double-wrapping the former.
+        self.offchip_store_vars: set = set()
         self.fn_depth = 0  # 0 == top-level tiled_reference; >0 == nested def
 
     def fresh(self, prefix: str) -> str:
@@ -469,6 +474,18 @@ class _State:
         return [stmt]
 
     def _rewrite_assign(self, stmt):
+        # Desugar `xs = [dsl_fn(elt, ...) for elt in iterable]` into an
+        # explicit for-loop so the inner DSL call goes through the normal
+        # per-element rewrite path. The bare list-comp form would otherwise
+        # pass through verbatim and crash at exec time with a NameError on
+        # the DSL alias (the namespace only has STeP class names).
+        if (len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.ListComp)):
+            desugared = self._desugar_dsl_listcomp(stmt.targets[0], stmt.value)
+            if desugared is not None:
+                return desugared
+
         if not (len(stmt.targets) == 1
                 and isinstance(stmt.value, ast.Call)
                 and isinstance(stmt.value.func, ast.Name)):
@@ -486,6 +503,38 @@ class _State:
             f"a non-Name target: {ast.dump(target)}"
         )
         return _DISPATCH[fname](self, target.id, stmt.value)
+
+    def _desugar_dsl_listcomp(self, target, comp):
+        """Handle `target = [dsl_fn(elt, ...) for elt in iterable]`.
+
+        Returns a list of statements (already recursively rewritten) or
+        ``None`` if the comprehension doesn't match the supported shape.
+        """
+        if len(comp.generators) != 1:
+            return None
+        gen = comp.generators[0]
+        if gen.ifs or gen.is_async:
+            return None
+        if not isinstance(gen.target, ast.Name):
+            return None
+        if not (isinstance(comp.elt, ast.Call)
+                and isinstance(comp.elt.func, ast.Name)
+                and comp.elt.func.id in _DSL_NAMES):
+            return None
+        fname = comp.elt.func.id
+        assert fname not in _MULTI_OUTPUT, (
+            f"DSL multi-output op {fname!r} inside a list comprehension is "
+            f"not supported; bind each branch at top level instead."
+        )
+
+        elt_target = self.fresh(fname)
+        src = (
+            f"{target.id} = []\n"
+            f"for {gen.target.id} in {ast.unparse(gen.iter)}:\n"
+            f"    {elt_target} = {ast.unparse(comp.elt)}\n"
+            f"    {target.id}.append({elt_target})\n"
+        )
+        return self.rewrite_block(_block(src))
 
     def _rewrite_multi(self, target, call, fname):
         node_var = self.fresh(fname)
@@ -556,6 +605,10 @@ class _State:
         # Two supported forms at the end of tiled_reference:
         #   return offchip_store(x)               (with optional par_dispatch=N kwarg)
         #   return out                            (out was assigned earlier)
+        # Non-root sub-kernels are allowed to skip offchip_store at the DSL
+        # surface, but the simulator's `_untile_store` requires the output op
+        # to be an OffChipStore. So when `out` isn't already from an
+        # offchip_store(...) call, wrap it.
         if (isinstance(stmt.value, ast.Call)
                 and isinstance(stmt.value.func, ast.Name)
                 and stmt.value.func.id == "offchip_store"):
@@ -569,10 +622,18 @@ class _State:
                 f"return graph, {store_var}\n"
             )
         out = _src(stmt.value)
+        if isinstance(stmt.value, ast.Name) and stmt.value.id in self.offchip_store_vars:
+            return _block(
+                f"_seal_unused_branches(graph)\n"
+                f"graph = infer_broadcast(graph)\n"
+                f"return graph, {out}\n"
+            )
+        store_var = self.fresh("store")
         return _block(
+            f"{store_var} = OffChipStore(graph, {out}, par_dispatch=1)\n"
             f"_seal_unused_branches(graph)\n"
             f"graph = infer_broadcast(graph)\n"
-            f"return graph, {out}\n"
+            f"return graph, {store_var}\n"
         )
 
 
@@ -953,6 +1014,7 @@ def _h_flat_reassemble(state, target, call):
 def _h_offchip_store(state, target, call):
     x = _src(_arg(call, 0, "x"))
     par_dispatch = _arg_or_default(call, 1, "par_dispatch", "1")
+    state.offchip_store_vars.add(target)
     return _block(f"{target} = OffChipStore(graph, {x}, par_dispatch={par_dispatch})\n")
 
 

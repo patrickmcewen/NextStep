@@ -26,7 +26,7 @@ def _make_log_capture():
 
 def test_gate_correctness_pass(tmp_path, monkeypatch):
     """match=True returns _GateResult(None, 'PASS', 0) and writes correctness_result.txt."""
-    def fake_check(code, kernel, dims, tensors):
+    def fake_check(code, kernel, dims, tensors, **_kw):
         return "match=True\nmax_diff=0.0"
 
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl", fake_check)
@@ -45,7 +45,7 @@ def test_gate_correctness_pass(tmp_path, monkeypatch):
 
 
 def test_gate_correctness_mismatch(tmp_path, monkeypatch):
-    def fake_check(code, kernel, dims, tensors):
+    def fake_check(code, kernel, dims, tensors, **_kw):
         return "match=False\nmax_diff=0.5"
 
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl", fake_check)
@@ -61,7 +61,7 @@ def test_gate_correctness_mismatch(tmp_path, monkeypatch):
 
 
 def test_gate_correctness_exception(tmp_path, monkeypatch):
-    def fake_check(code, kernel, dims, tensors):
+    def fake_check(code, kernel, dims, tensors, **_kw):
         raise ValueError("kaboom")
 
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl", fake_check)
@@ -83,7 +83,10 @@ _CLEAN_CODE = "def f():\n    return 0\n"
 
 
 def _stub_check_banned_ops(monkeypatch, violations):
-    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn: list(violations))
+    monkeypatch.setattr(
+        orch_mod, "_check_banned_ops",
+        lambda code, pn, **_kw: list(violations),
+    )
 
 
 def test_gate_compliance_pass(tmp_path, monkeypatch):
@@ -319,8 +322,8 @@ def _stub_pass_loop_infra(monkeypatch):
 def test_run_pass_loop_correctness_first_clean_pass(tmp_path, monkeypatch):
     """Smoke test: _run_pass_loop under correctness-first; one turn, all gates pass."""
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl",
-                        lambda c, k, d, t: "match=True\nmax_diff=0.0")
-    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn: [])
+                        lambda c, k, d, t, **_kw: "match=True\nmax_diff=0.0")
+    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn, **_kw: [])
     _stub_pass_loop_infra(monkeypatch)
     _stub_runner_run(monkeypatch, ["```python\ndef tiled_reference(d, t): return 0\n```"])
 
@@ -341,10 +344,10 @@ def test_run_pass_loop_correctness_first_clean_pass(tmp_path, monkeypatch):
 def test_run_pass_loop_correctness_first_compliance_fail_then_pass(tmp_path, monkeypatch):
     """Compliance fails on turn 0, agent fixes it on turn 1."""
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl",
-                        lambda c, k, d, t: "match=True\nmax_diff=0.0")
+                        lambda c, k, d, t, **_kw: "match=True\nmax_diff=0.0")
     state = {"violations": ["torch.matmul: line 1"]}
     monkeypatch.setattr(orch_mod, "_check_banned_ops",
-                        lambda code, pn: state["violations"])
+                        lambda code, pn, **_kw: state["violations"])
     _stub_pass_loop_infra(monkeypatch)
 
     def runner_responses():
@@ -372,14 +375,14 @@ def test_run_pass_loop_correctness_first_compliance_fail_then_pass(tmp_path, mon
 def test_run_pass_loop_compliance_first_compliance_short_circuits_correctness(tmp_path, monkeypatch):
     """Under compliance-first, a banned-op turn is rejected before correctness runs."""
     correctness_calls = []
-    def boom(code, kernel, dims, tensors):
+    def boom(code, kernel, dims, tensors, **_kw):
         correctness_calls.append(1)
         return "match=True"
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl", boom)
 
     state = {"violations": ["torch.matmul: line 1"]}
     monkeypatch.setattr(orch_mod, "_check_banned_ops",
-                        lambda code, pn: state["violations"])
+                        lambda code, pn, **_kw: state["violations"])
 
     _stub_pass_loop_infra(monkeypatch)
 
@@ -413,8 +416,8 @@ def test_run_pass_loop_compliance_first_compliance_short_circuits_correctness(tm
 
 def test_run_pass_loop_compliance_first_judge_runs_with_not_yet_verified_ctx(tmp_path, monkeypatch):
     monkeypatch.setitem(orch_mod._CORRECTNESS_CHECKERS, "dsl",
-                        lambda c, k, d, t: "match=True")
-    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn: [])
+                        lambda c, k, d, t, **_kw: "match=True")
+    monkeypatch.setattr(orch_mod, "_check_banned_ops", lambda code, pn, **_kw: [])
 
     captured = {}
     async def fake_run_judge(judge_agent, code, turn_dir, log, *, context):

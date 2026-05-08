@@ -137,7 +137,7 @@ def compute_gold(dims, tensors):
         # expert_onehot[s, k, e] == 1 iff token s assigns its slot k to expert e,
         # so torch.where on the per-expert slice gives the (token, slot) pairs
         # that step_impl routes to expert `e_idx`.
-        moe_output = torch.zeros(seq_len, mc.dim)
+        moe_output = torch.zeros(seq_len, mc.dim, dtype=torch.float32)
         for e_idx in range(mc.n_routed_experts):
             tok, top_pos = torch.where(expert_onehot[:, :, e_idx] == 1)
             if len(tok) == 0:

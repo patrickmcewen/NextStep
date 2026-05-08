@@ -43,7 +43,6 @@ DSL_FUNCTIONS = {
 - `tensors["key"]` — accessing tensors to pass to `offchip_load` or `select_gen`
 - Python scalars and control flow: `B // tile_n`, `range()`, `for`, `if`, `len()`
 - List operations: `[].append()`, `parts[i]` indexing
-- `return offchip_store(result)`
 
 ## What is NOT allowed
 
@@ -85,6 +84,7 @@ x_sel = x[idx]
 
 ## Other Rules
 1. Pytorch tensors can ONLY be passed into source operators from the DSL_FUNCTIONS. They cannot be used directly in functions like repeat_ref, but must first go through a source node; the output of the source node can be passed into anything.
+2. Off-chip-load operators (`offchip_load`, `offchip_load_ref`, `dyn_offchip_load`, `random_offchip_load`) MUST be applied directly to a raw input tensor read from `tensors[...]` (or, for `dyn_offchip_load`, the literal `tensors['<name>']` expression). They MUST NOT be applied to the output of a previous DSL/STeP operation. If you see an `offchip_load*` call whose underlying argument is the result of any prior DSL call (e.g. an op output, a binary/unary/accum result), flag it. Re-loading already-streamed values is meaningless — it would imply round-tripping through off-chip memory mid-program, which is not allowed.
 
 ## Output Format
 

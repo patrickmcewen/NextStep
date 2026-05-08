@@ -24,6 +24,13 @@ The code MUST contain at least one call to each of the following operators
 
 {required_ops_block}
 
+Exception: sink / off-chip-store operators (anything whose name contains
+`offchip_store` or `OffChipStore`) are only required at the program root —
+the function whose output is the kernel's externally-observable result.
+When judging an intermediate / non-root sub-function, do NOT flag it for
+missing a sink operator. Intermediate nodes may legally `return` plain
+stream tensors to a parent; only the root writes results off-chip.
+
 ## What IS allowed on the host
 
 - `dims["key"]` — reading scalar dimension values.
@@ -46,6 +53,16 @@ The code MUST contain at least one call to each of the following operators
 - The `@` operator.
 - "Laundering": computing a result with host-side arithmetic on tensor
   values, then passing the result into a source operator.
+- Off-chip-load on intermediate results: any source operator whose name
+  contains `offchip_load` (e.g. `offchip_load`, `offchip_load_ref`,
+  `dyn_offchip_load`, `random_offchip_load`, `LinearOffChipLoad`,
+  `DynLinearOffChipLoad`) MUST be applied directly to a raw input tensor
+  read from `tensors[...]` (or its literal `tensors['<name>']` form for
+  the dynamic variant). It MUST NOT be applied to the output of a
+  previous DSL/STeP operation. Re-loading values that are already
+  streaming through the program is meaningless — it would imply
+  round-tripping through off-chip memory mid-program, which is not
+  allowed.
 
 ## Output Format
 
