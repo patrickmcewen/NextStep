@@ -243,25 +243,59 @@ def _build_dsl_scaffold() -> str:
     return _DSL_IMPORTS + src_path.read_text() + "\n"
 
 
-def _exec_dsl_ref(code: str, dims: dict, tensors: dict) -> torch.Tensor:
-    """Execute user code with DSL functions available. Returns the output tensor.
+def _exec_dsl_ref(code: str, dims: dict, tensors: dict):
+    """Execute user code with DSL functions available. Returns the DSL output.
 
     The DSL scaffold injects the active step_dsl source — the standalone
     ``src/step_dsl.py`` in normal runs, or the bundle's ``abstraction.py``
     when bundle mode has registered it as ``sys.modules["step_dsl"]`` —
     into the execution namespace so the refactored code can call DSL ops
     directly without writing imports.
+
+    Returns either a single ``torch.Tensor`` or a tuple/list of tensors.
+    Intermediate planner nodes whose ``Model.forward`` returns a tuple
+    (e.g. ``return Q, K, V``) produce tuple-returning DSL refs;
+    ``_compare_against_gold`` walks tuples element-wise to compare against
+    the matching tuple gold.
+
+    Sandbox: snapshot ``builtins.isinstance`` and ``torch.Tensor`` before
+    exec and restore them after, even if user code raises. LLM-emitted DSL
+    refs have been observed monkey-patching these to fool framework checks
+    (``builtins.isinstance = _patched_isinstance``, ``torch.Tensor = tuple``).
+    Since ``builtins`` is process-global, patches accumulate across turns —
+    each retry captures the already-patched callable as its "original" and
+    chains another layer in front, eventually triggering RecursionError
+    once the chain exceeds Python's recursion limit.
     """
+    import builtins as _builtins
     scaffold = _build_dsl_scaffold()
     scaffold_lines = scaffold.count("\n") + 1
     namespace = {}
-    exec(scaffold + "\n" + code, namespace)
-    assert "tiled_reference" in namespace, "Code must define a tiled_reference function"
+    _saved_isinstance = _builtins.isinstance
+    _saved_torch_tensor = torch.Tensor
     try:
-        result = namespace["tiled_reference"](dims, tensors)
-    except Exception as exc:
-        raise _enhance_user_code_error(exc, code, scaffold_lines) from exc
-    assert isinstance(result, torch.Tensor), f"tiled_reference must return a torch.Tensor, got {type(result)}"
+        exec(scaffold + "\n" + code, namespace)
+        assert "tiled_reference" in namespace, (
+            "Code must define a tiled_reference function"
+        )
+        try:
+            result = namespace["tiled_reference"](dims, tensors)
+        except Exception as exc:
+            raise _enhance_user_code_error(exc, code, scaffold_lines) from exc
+    finally:
+        _builtins.isinstance = _saved_isinstance
+        torch.Tensor = _saved_torch_tensor
+    if isinstance(result, (tuple, list)):
+        for i, t in enumerate(result):
+            assert isinstance(t, torch.Tensor), (
+                f"tiled_reference returned a {type(result).__name__}; element "
+                f"[{i}] must be a torch.Tensor, got {type(t).__name__}"
+            )
+    else:
+        assert isinstance(result, torch.Tensor), (
+            f"tiled_reference must return a torch.Tensor (or tuple/list of "
+            f"tensors for tuple-returning planner nodes), got {type(result).__name__}"
+        )
     return result
 
 

@@ -26,7 +26,11 @@ def test_build_run_py_command_minimal():
         autotune_max_turns=None,
         autotune_agent=None,
     )
-    assert cmd == [sys.executable, "run.py", "gemm", "small", "--model", "gpt-oss-120b"]
+    assert cmd == [
+        sys.executable, "run.py", "gemm", "small",
+        "--model", "gpt-oss-120b",
+        "--non-root-sequential",
+    ]
 
 
 def test_build_run_py_command_full_passthrough():
@@ -56,6 +60,7 @@ def test_build_run_py_command_full_passthrough():
         "--pipeline", "direct",
         "--translator", "llm",
         "--checkpoint-dir", "/tmp/ckpt",
+        "--non-root-sequential",
     ]
 
 
@@ -84,6 +89,7 @@ def test_build_run_py_command_with_autotune_flags():
         "--autotune-config", "my_at.json",
         "--autotune-max-turns", "4",
         "--autotune-agent", "parallel",
+        "--non-root-sequential",
     ]
 
 

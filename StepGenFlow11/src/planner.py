@@ -9,8 +9,10 @@ to produce a ``Tree`` that Phase 1's per-node refactor walker consumes.
 import ast
 import asyncio
 import re
+import textwrap
 from dataclasses import dataclass
-from typing import Iterator
+from pathlib import Path
+from typing import Callable, Iterator
 
 import torch
 
@@ -109,14 +111,65 @@ class ParsedSplit:
 
 
 _DECISION_RE = re.compile(r"^\s*DECISION:\s*(leaf|split)\s*$", re.MULTILINE)
-_CHILD_HEADER_RE = re.compile(r"^#\s*child:\s*(\w+)\s*$", re.MULTILINE)
-_PARENT_HEADER_RE = re.compile(r"^#\s*refactored parent\s*$", re.MULTILINE)
+_CHILD_HEADER_RE = re.compile(r"^[ \t]*#\s*child:\s*(\w+)\s*$", re.MULTILINE)
+_PARENT_HEADER_RE = re.compile(r"^[ \t]*#\s*refactored parent\s*$", re.MULTILINE)
 _CODE_FENCE_RE = re.compile(r"^```(?:python|py)?\s*$", re.MULTILINE)
+_FENCED_BLOCK_RE = re.compile(
+    r"^```(?:python|py)?\s*\n(.*?)^```\s*$",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def _strip_code_fences(body: str) -> str:
-    """Remove markdown ``` fences that LLMs sometimes wrap around block bodies."""
-    return _CODE_FENCE_RE.sub("", body).strip()
+    """Extract code from a body that may be wrapped in ``` fences.
+
+    If at least one fenced block ``` ```python ... ``` ``` is present, returns
+    only the concatenated contents of those blocks — discarding any prose
+    before, between, or after them. (LLMs sometimes append a trailing
+    "explanation" paragraph after the closing fence; that prose then ends up
+    in ast.parse and crashes downstream guards.)
+
+    If no fenced block is present, returns the body unchanged (modulo strip).
+    """
+    blocks = _FENCED_BLOCK_RE.findall(body)
+    if blocks:
+        return "\n\n".join(b.rstrip() for b in blocks).strip()
+    # No fences: the LLM may have indented the whole block (e.g. as a sub-bullet
+    # of the DECISION line). Dedent before stripping so common leading
+    # whitespace is removed *per line* rather than only off the first line.
+    return textwrap.dedent(body.strip("\n")).strip()
+
+
+def _snake_to_camel(snake: str) -> str:
+    return "".join(p.capitalize() for p in snake.split("_"))
+
+
+def _normalize_child_model_class(body: str, child_name: str) -> str:
+    """Allow children to be declared as ``class <CamelCase>Model`` instead of the
+    literal ``class Model``. The system prompt's parent block uses
+    ``<ChildName>Model`` for the references, which makes the per-child
+    ``class Model`` rule easy to misread; LLMs often pick the more readable
+    convention. When detected, rename the class to ``Model`` so downstream
+    synth + compose keep a uniform contract.
+    """
+    if re.search(r"^class\s+Model\b", body, flags=re.MULTILINE):
+        return body
+    expected = _snake_to_camel(child_name) + "Model"
+    pattern = re.compile(rf"^class\s+{re.escape(expected)}\b", flags=re.MULTILINE)
+    if pattern.search(body):
+        return pattern.sub("class Model", body, count=1)
+    # Fallback: snake→Camel doesn't capture acronym preservation (rms_norm →
+    # RMSNormModel, not RmsNormModel). If exactly one top-level
+    # ``class <Identifier>Model(nn.Module)`` exists in the body, treat it as
+    # the child Model and rename it. Multiple matches are ambiguous and left
+    # alone so the missing-Model guard fires loudly.
+    fallback = re.compile(
+        r"^class\s+(\w+)Model\s*\(\s*nn\.Module\s*\)", flags=re.MULTILINE
+    )
+    matches = fallback.findall(body)
+    if len(matches) == 1:
+        return fallback.sub("class Model(nn.Module)", body, count=1)
+    return body
 
 
 def parse_planner_response(text: str):
@@ -150,12 +203,16 @@ def parse_planner_response(text: str):
     seen_names: set[str] = set()
     for i, (kind, name, _, header_end) in enumerate(markers):
         next_start = markers[i + 1][2] if i + 1 < len(markers) else len(after_decision)
-        body = _strip_code_fences(after_decision[header_end:next_start].strip())
+        # Pass the raw inter-marker slice (no outer .strip): _strip_code_fences
+        # uses textwrap.dedent on the no-fence path, which only works when the
+        # common leading indent is preserved across all lines.
+        body = _strip_code_fences(after_decision[header_end:next_start])
         if kind == "child":
             assert name is not None
             if name in seen_names:
                 raise MalformedSplit(f"duplicate child name: {name!r}")
             seen_names.add(name)
+            body = _normalize_child_model_class(body, name)
             if "class Model" not in body:
                 raise MalformedSplit(
                     f"child {name!r}: missing 'class Model' in body"
@@ -168,9 +225,9 @@ def parse_planner_response(text: str):
         else:
             refactored_parent_code = body
 
-    if len(children) < 2:
+    if len(children) < 1:
         raise MalformedSplit(
-            f"split response must contain at least 2 children, got {len(children)}"
+            f"split response must contain at least 1 child, got {len(children)}"
         )
     assert refactored_parent_code is not None
 
@@ -190,10 +247,15 @@ def synthesize_reference_module(body: str) -> str:
     """
     out = body.lstrip("\n")
 
-    if "import torch" not in out:
-        out = "import torch\nimport torch.nn as nn\n\n" + out
-    elif "import torch.nn as nn" not in out:
-        out = "import torch.nn as nn\n" + out
+    has_torch = re.search(r"^import\s+torch\s*$", out, flags=re.MULTILINE) is not None
+    has_torch_nn = re.search(r"^import\s+torch\.nn\s+as\s+nn\s*$", out, flags=re.MULTILINE) is not None
+    prepend = ""
+    if not has_torch:
+        prepend += "import torch\n"
+    if not has_torch_nn:
+        prepend += "import torch.nn as nn\n"
+    if prepend:
+        out = prepend + "\n" + out
 
     if "def get_init_inputs(dims):" not in out:
         out = out.rstrip() + "\n\n\ndef get_init_inputs(dims):\n    return []\n"
@@ -226,6 +288,28 @@ def _extract_model_forward(code: str) -> ast.FunctionDef:
     raise AssertionError("could not find class Model with forward() method in code")
 
 
+def has_class_model(code: str) -> bool:
+    """True iff ``code`` defines a top-level ``class Model`` with a ``forward`` method.
+
+    A handful of StepDB references (e.g., transformer_layer/prefill_transformer_simple,
+    mlp/moe_routed) ship as function-based modules with only ``compute_gold`` —
+    no Model class. The planner needs a different code path for those at the root.
+    """
+    try:
+        _extract_model_forward(code)
+    except AssertionError:
+        return False
+    return True
+
+
+def _extract_compute_gold_body(code: str) -> ast.FunctionDef:
+    tree = ast.parse(code)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "compute_gold":
+            return node
+    raise AssertionError("could not find def compute_gold in code")
+
+
 def _forward_body_op_count(forward_node: ast.FunctionDef) -> int:
     count = 0
     for node in ast.walk(forward_node):
@@ -251,16 +335,24 @@ def _ast_node_count(node: ast.AST) -> int:
 
 
 def check_anti_monolith(original_parent_code: str, refactored_parent_code: str) -> None:
-    """Refactored parent's forward() must be strictly smaller than original's."""
-    orig_forward = _extract_model_forward(original_parent_code)
+    """Refactored parent's forward() must be strictly smaller than original's.
+
+    For function-based originals (no class Model — e.g. prefill_transformer_simple),
+    we use ``compute_gold``'s body as the size baseline since that's where the
+    actual work lives.
+    """
+    if has_class_model(original_parent_code):
+        orig_baseline = _extract_model_forward(original_parent_code)
+    else:
+        orig_baseline = _extract_compute_gold_body(original_parent_code)
     new_forward = _extract_model_forward(refactored_parent_code)
-    orig_size = _ast_node_count(orig_forward)
+    orig_size = _ast_node_count(orig_baseline)
     new_size = _ast_node_count(new_forward)
     if new_size >= orig_size:
         raise GuardFailure(
             f"refactored parent's forward() is not smaller than the original's "
             f"(refactored AST nodes: {new_size}, original: {orig_size}). The split "
-            f"didn't actually move work into children."
+            f"didn't actually move work into children. You can also consider declaring as a LEAF if you don't want to split up the problem."
         )
 
 
@@ -268,30 +360,129 @@ def _camel_case(snake: str) -> str:
     return "".join(part.capitalize() for part in snake.split("_"))
 
 
+def check_no_dead_children(refactored_parent_code: str, children: list) -> None:
+    """Each child must be invoked at least once from the refactored parent's
+    ``forward``. A child that is bound in ``__init__`` but never called is a
+    dead child — usually a sign the LLM is padding the response to satisfy a
+    quota rather than actually decomposing.
+    """
+    forward = _extract_model_forward(refactored_parent_code)
+    called_attrs: set[str] = set()
+    for node in ast.walk(forward):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            value = node.func.value
+            if isinstance(value, ast.Name) and value.id == "self":
+                called_attrs.add(node.func.attr)
+    for child in children:
+        if child.name not in called_attrs:
+            raise GuardFailure(
+                f"child {child.name!r} is dead: not invoked anywhere in the "
+                f"refactored parent's forward(). Either remove the child or "
+                f"wire it into the parent's computation."
+            )
+
+
+def check_children_runnable(children: list, dims: dict) -> None:
+    """Ensure each child's reference module is actually runnable on ``dims``.
+
+    The compose check only execs child *modules* (defining their classes); it
+    never calls the children's ``get_inputs`` or ``Model()``. When a child block
+    has a typo in its ``_model_config`` dispatch (or omits a helper entirely),
+    the bug only surfaces at the *next* recursion level — where ``plan()`` uses
+    the buggy child as the new "original" and ``check_compose`` calls the
+    broken ``get_inputs(dims)``. That AssertionError/NameError is not a
+    GuardFailure and crashes the whole outer iteration.
+
+    Catching it here converts the failure into a retryable GuardFailure at the
+    level where the LLM actually emitted the broken child, so the retry has the
+    relevant context.
+    """
+    for child in children:
+        ns: dict = {}
+        try:
+            exec(child.reference_code, ns)
+        except Exception as exc:
+            raise GuardFailure(
+                f"child {child.name!r}: module-level exec failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if "get_inputs" not in ns:
+            raise GuardFailure(
+                f"child {child.name!r} reference is missing get_inputs(dims). "
+                f"Every child block must define get_inputs(dims) at module scope."
+            )
+        if "Model" not in ns:
+            raise GuardFailure(
+                f"child {child.name!r} reference is missing class Model. "
+                f"Every child block must define a class Model(nn.Module) at module scope."
+            )
+        try:
+            inputs = ns["get_inputs"](dims)
+        except Exception as exc:
+            raise GuardFailure(
+                f"child {child.name!r}: get_inputs(dims) crashed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if isinstance(inputs, list):
+            inputs = tuple(inputs)
+        elif not isinstance(inputs, tuple):
+            inputs = (inputs,)
+        try:
+            with torch.no_grad():
+                ns["Model"]()(*inputs)
+        except Exception as exc:
+            raise GuardFailure(
+                f"child {child.name!r}: Model()(*get_inputs(dims)) crashed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+
 def check_compose(original_reference_code: str,
                   refactored_parent_code: str,
                   children: list,
-                  dims: dict) -> None:
+                  dims: dict,
+                  tensors: dict | None = None) -> None:
     """Numerical compose check.
 
     Run the refactored parent (which uses children's Model classes via
     ``<ChildName>Model``) against the original parent on the original parent's
     inputs. Outputs must agree within ``rel_err < 1e-5``.
+
+    For function-based originals (``compute_gold(dims, tensors)`` with no
+    ``get_inputs`` / ``class Model``), the caller supplies the precomputed
+    ``tensors`` dict; we synthesize ``inputs = (dims, tensors)`` to match the
+    LLM-emitted ``forward(self, dims, tensors)`` convention for refactored
+    parents and children of such originals.
     """
     orig_ns: dict = {}
     exec(original_reference_code, orig_ns)
-    assert "Model" in orig_ns and "get_inputs" in orig_ns, (
-        "original reference must define Model and get_inputs"
-    )
 
-    inputs = orig_ns["get_inputs"](dims)
-    if isinstance(inputs, list):
-        inputs = tuple(inputs)
-    elif not isinstance(inputs, tuple):
-        inputs = (inputs,)
+    if "get_inputs" in orig_ns:
+        inputs = orig_ns["get_inputs"](dims)
+        if isinstance(inputs, list):
+            inputs = tuple(inputs)
+        elif not isinstance(inputs, tuple):
+            inputs = (inputs,)
+    else:
+        assert "compute_gold" in orig_ns, (
+            "original reference must define either get_inputs+Model or "
+            "compute_gold(dims, tensors)"
+        )
+        assert tensors is not None, (
+            "function-based original (compute_gold) requires the caller to "
+            "supply precomputed tensors via plan(tensors=...)"
+        )
+        inputs = (dims, tensors)
 
     with torch.no_grad():
-        original_out = orig_ns["Model"]()(*inputs)
+        if "Model" in orig_ns:
+            original_out = orig_ns["Model"]()(*inputs)
+        else:
+            assert "compute_gold" in orig_ns
+            if tensors is not None:
+                original_out = orig_ns["compute_gold"](dims, tensors)
+            else:
+                original_out = orig_ns["compute_gold"](dims)
 
     new_ns: dict = {}
     for child in children:
@@ -302,11 +493,24 @@ def check_compose(original_reference_code: str,
         )
         new_ns[f"{_camel_case(child.name)}Model"] = child_ns["Model"]
 
-    exec(refactored_parent_code, new_ns)
+    try:
+        exec(refactored_parent_code, new_ns)
+    except Exception as exc:
+        raise GuardFailure(
+            f"compose check failed: refactored parent code did not exec cleanly: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     assert "Model" in new_ns, "refactored parent code must define class Model"
 
-    with torch.no_grad():
-        refactored_out = new_ns["Model"]()(*inputs)
+    try:
+        with torch.no_grad():
+            refactored_out = new_ns["Model"]()(*inputs)
+    except Exception as exc:
+        raise GuardFailure(
+            f"compose check failed: refactored parent's forward() crashed when "
+            f"run on the original inputs: {type(exc).__name__}: {exc}. The "
+            f"children's input/output contracts do not compose with the parent."
+        ) from exc
 
     pairs = (
         list(zip(original_out, refactored_out))
@@ -353,35 +557,82 @@ def build_node_tensors(reference_code: str, dims: dict) -> dict:
     return dict(zip(arg_names, inputs))
 
 
-class PlannerExhausted(RuntimeError):
-    """Raised when a planner call exhausts its retry budget without a valid response."""
-
-    def __init__(self, node_path: str, last_message: str):
-        self.node_path = node_path
-        self.last_message = last_message
-        super().__init__(
-            f"planner exhausted retry budget at node {node_path!r}: {last_message}"
-        )
-
-
 def _path_tail(path: str) -> str:
     return path.rsplit("/", 1)[-1]
 
 
+def _node_turn_dir(turn_root: Path | None, path: str, attempt: int) -> Path | None:
+    if turn_root is None:
+        return None
+    safe = path.replace("/", "_")
+    d = turn_root / safe / f"turn_{attempt}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _extract_reasoning(run_result) -> str:
+    """Concatenate reasoning summaries from a RunResult, or "" if absent.
+
+    Mirrors orchestrator._reasoning_text but is duplicated here to keep the
+    planner module free of orchestrator imports. Tolerant of fake results
+    used in tests (which have no ``new_items`` attribute).
+    """
+    items = getattr(run_result, "new_items", None)
+    if not items:
+        return ""
+    from agents import ReasoningItem
+    chunks: list[str] = []
+    for item in items:
+        if isinstance(item, ReasoningItem):
+            for summary in item.raw_item.summary:
+                chunks.append(summary.text)
+    return "\n\n".join(chunks)
+
+
 async def plan(*, reference_code: str, dims: dict, agent, path: str,
-               runner_fn, retry_budget: int = 3,
-               replan_context: dict | None = None) -> "PlanNode":
+               runner_fn, retry_budget: int = 8,
+               replan_context: dict | None = None,
+               log: Callable[[str], None] = print,
+               turn_root: Path | None = None,
+               max_depth: int | None = None,
+               precompute_source: str | None = None,
+               tensors: dict | None = None) -> "PlanNode":
     """Recursively decompose a node.
 
     ``runner_fn(agent, conversation)`` is called per LLM turn (the default real
     implementation passes ``Runner.run`` from agents-SDK; tests pass a fake).
     ``replan_context`` (when set) renders a re-plan user prompt instead of the
-    initial one.
+    initial one. ``log`` receives one line per decision point for visibility.
+    ``turn_root`` (when set) is the directory under which per-node turn artifacts
+    are written: ``turn_root/<node_path>/turn_<N>/{user_prompt,response,status}.txt``.
+    ``max_depth`` (when set) caps tree depth: any node at depth >= max_depth is
+    forced to LEAF without consulting the LLM. Depth is derived from ``path``
+    (root=0, root/foo=1, root/foo/bar=2). ``None`` means no limit.
     """
     from src.prompts import build_planner_user_prompt, build_replan_user_prompt
 
+    depth = path.count("/")
+    if max_depth is not None and depth >= max_depth:
+        log(f"[planner] node={path!r} at depth={depth} (max_depth={max_depth}) — forcing LEAF without LLM call")
+        if turn_root is not None:
+            forced_dir = turn_root / path.replace("/", "_")
+            forced_dir.mkdir(parents=True, exist_ok=True)
+            (forced_dir / "MAX_DEPTH_FORCED_LEAF.txt").write_text(
+                f"depth={depth} reached max_depth={max_depth}; declaring LEAF without LLM call.\n"
+            )
+        return PlanNode(name=_path_tail(path), path=path,
+                        reference_code=reference_code,
+                        refactored_code=None,
+                        is_leaf=True, children=())
+
+    mode = "replan" if replan_context else "initial"
+    log(f"[planner] node={path!r} ({mode}) — calling LLM, retry_budget={retry_budget}")
+
     if replan_context is None:
-        user = build_planner_user_prompt(reference_code=reference_code, dims=dims)
+        user = build_planner_user_prompt(
+            reference_code=reference_code, dims=dims,
+            precompute_source=precompute_source,
+        )
     else:
         user = build_replan_user_prompt(
             reference_code=reference_code, dims=dims,
@@ -390,19 +641,48 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             failing_node=replan_context["failing_node"],
             last_turn_messages=replan_context["last_turn_messages"],
             sibling_results=replan_context["sibling_results"],
+            precompute_source=precompute_source,
         )
 
     conversation = [{"role": "user", "content": user}]
     last_message = "no LLM call made"
 
     for attempt in range(retry_budget):
-        result = await runner_fn(agent, conversation)
+        log(f"[planner] node={path!r} attempt {attempt + 1}/{retry_budget}: awaiting LLM response")
+        turn_dir = _node_turn_dir(turn_root, path, attempt)
+        if turn_dir is not None:
+            last_user_msg = conversation[-1]["content"] if conversation[-1]["role"] == "user" else ""
+            (turn_dir / "user_prompt.txt").write_text(last_user_msg)
+            instructions = getattr(agent, "instructions", None)
+            if isinstance(instructions, str):
+                (turn_dir / "system_prompt.txt").write_text(instructions)
+
+        from openai import BadRequestError as _BadRequestError
+        try:
+            result = await runner_fn(agent, conversation)
+        except _BadRequestError as exc:
+            log(f"[planner] node={path!r} attempt {attempt + 1}: LLM rejected request ({exc}) — falling through to leaf fallback")
+            if turn_dir is not None:
+                (turn_dir / "status.txt").write_text(f"LLM_BAD_REQUEST: {exc}")
+            last_message = f"<LLM rejected: {exc}>"
+            break
         text = result.final_output
         last_message = text
+        if turn_dir is not None:
+            (turn_dir / "response.txt").write_text(text or "")
+            reasoning = _extract_reasoning(result)
+            if reasoning:
+                (turn_dir / "reasoning.txt").write_text(reasoning)
+
+        def _set_status(status: str) -> None:
+            if turn_dir is not None:
+                (turn_dir / "status.txt").write_text(status)
 
         try:
             parsed = parse_planner_response(text)
         except NotADecision as exc:
+            log(f"[planner] node={path!r} attempt {attempt + 1}: NO DECISION marker — retrying")
+            _set_status(f"NO_DECISION: {exc}")
             conversation.append({"role": "assistant", "content": text})
             conversation.append({"role": "user", "content": (
                 f"Your previous response had no DECISION: marker ({exc}). "
@@ -410,6 +690,8 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             )})
             continue
         except MalformedSplit as exc:
+            log(f"[planner] node={path!r} attempt {attempt + 1}: MALFORMED split ({exc}) — retrying")
+            _set_status(f"MALFORMED_SPLIT: {exc}")
             conversation.append({"role": "assistant", "content": text})
             conversation.append({"role": "user", "content": (
                 f"Your split response was malformed: {exc}. Fix and retry."
@@ -417,10 +699,15 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             continue
 
         if parsed == "leaf":
+            log(f"[planner] node={path!r} attempt {attempt + 1}: decided LEAF — returning")
+            _set_status("LEAF")
             return PlanNode(name=_path_tail(path), path=path,
                             reference_code=reference_code,
                             refactored_code=None,
                             is_leaf=True, children=())
+
+        child_names = [c.name for c in parsed.children]
+        log(f"[planner] node={path!r} attempt {attempt + 1}: decided SPLIT into {child_names} — running guards")
 
         children_full = tuple(
             ParsedChild(name=child.name,
@@ -432,22 +719,31 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
         try:
             check_anti_passthrough(list(children_full))
             check_anti_monolith(reference_code, refactored_full)
+            check_no_dead_children(refactored_full, list(children_full))
+            check_children_runnable(list(children_full), dims)
             check_compose(reference_code, refactored_full,
-                          list(children_full), dims)
+                          list(children_full), dims,
+                          tensors=tensors if not has_class_model(reference_code) else None)
         except GuardFailure as exc:
+            log(f"[planner] node={path!r} attempt {attempt + 1}: GUARD FAILED ({exc}) — retrying")
+            _set_status(f"GUARD_FAILED: {exc}")
             conversation.append({"role": "assistant", "content": text})
             conversation.append({"role": "user", "content": (
                 f"Mechanical guard rejected your split: {exc}. Fix and retry."
             )})
             continue
 
+        _set_status(f"SPLIT_OK: children={child_names}")
+        log(f"[planner] node={path!r} guards PASSED — recursing into {len(children_full)} children")
         child_tasks = [
             plan(reference_code=child.reference_code, dims=dims, agent=agent,
                  path=f"{path}/{child.name}", runner_fn=runner_fn,
-                 retry_budget=retry_budget)
+                 retry_budget=retry_budget, log=log, turn_root=turn_root,
+                 max_depth=max_depth, precompute_source=precompute_source)
             for child in children_full
         ]
         child_subtrees = await asyncio.gather(*child_tasks)
+        log(f"[planner] node={path!r} subtree complete (children={child_names})")
 
         return PlanNode(name=_path_tail(path), path=path,
                         reference_code=reference_code,
@@ -455,4 +751,24 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
                         is_leaf=False,
                         children=tuple(child_subtrees))
 
-    raise PlannerExhausted(path, last_message)
+    # Exhaustion fallback: declare this node a leaf instead of failing the
+    # whole subtree. Every retryable failure mode (anti-monolith, compose,
+    # children-runnable, malformed-split, no-decision, etc.) is safely
+    # recoverable as a leaf — the leaf path bypasses children entirely and
+    # just runs the node's own reference_code through the refactor pass.
+    # If the node has a real bug it will resurface there with better context.
+    log(
+        f"[planner] node={path!r} EXHAUSTED retry budget after {retry_budget} "
+        f"attempts — falling back to LEAF"
+    )
+    if turn_root is not None:
+        exhausted_dir = turn_root / path.replace("/", "_")
+        exhausted_dir.mkdir(parents=True, exist_ok=True)
+        (exhausted_dir / "EXHAUSTED_FALLBACK_TO_LEAF.txt").write_text(
+            f"Retry budget {retry_budget} exhausted; declaring this node a leaf.\n"
+            f"Last LLM message:\n\n{last_message}"
+        )
+    return PlanNode(name=_path_tail(path), path=path,
+                    reference_code=reference_code,
+                    refactored_code=None,
+                    is_leaf=True, children=())

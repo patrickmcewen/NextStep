@@ -50,7 +50,7 @@ class Buffered:
 
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], f"offchip_load: underlying dtype must be float16-64, got {underlying.dtype}"
     R, C = underlying.shape[-2], underlying.shape[-1]
 
     # ---- Tiling invariant: must actually stream, not load as one giant tile ----
@@ -93,8 +93,8 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
 
 def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_dispatch=1):
     assert par_dispatch >= 1, f"dyn_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16], (
-        f"dyn_offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], (
+        f"dyn_offchip_load: underlying dtype must be float16-64, got {underlying.dtype}"
     )
     R, C = underlying.shape[-2], underlying.shape[-1]
     assert R % tile_row == 0 and C % tile_col == 0, (
@@ -107,7 +107,7 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
 
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], f"offchip_load_ref: underlying dtype must be float16-64, got {underlying.dtype}"
     loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed)
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
@@ -183,8 +183,8 @@ def filter_last_tile(seq_len):
 
 def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"random_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16], (
-        f"random_offchip_load: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], (
+        f"random_offchip_load: underlying dtype must be float16-64, got {underlying.dtype}"
     )
     assert raddr.shape[-2:] == (1, 1), (
         f"random_offchip_load: raddr tile shape must be (1,1), got {tuple(raddr.shape[-2:])}"
@@ -222,8 +222,8 @@ def _assert_stream_match(a, b, op_name):
 
 
 def _assert_float(x, op_name):
-    assert x.dtype in (torch.float32, torch.float16), (
-        f"{op_name}: input dtype must be float32 or float16, got {x.dtype}."
+    assert x.dtype in (torch.float32, torch.float16, torch.float64), (
+        f"{op_name}: input dtype must be float16-64, got {x.dtype}."
     )
 
 def _assert_int(x, op_name):
@@ -803,8 +803,8 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
 
 def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0, *, par_dispatch=1):
     assert par_dispatch >= 1, f"random_offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
-    assert underlying.dtype in [torch.float32, torch.float16], (
-        f"random_offchip_store: underlying dtype must be float32 or float16, got {underlying.dtype}"
+    assert underlying.dtype in [torch.float32, torch.float16, torch.float64], (
+        f"random_offchip_store: underlying dtype must be float16-64, got {underlying.dtype}"
     )
     assert waddr.shape[-2:] == (1, 1), (
         f"random_offchip_store: waddr tile shape must be (1,1), got {tuple(waddr.shape[-2:])}"

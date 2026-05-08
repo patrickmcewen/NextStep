@@ -41,7 +41,6 @@ DSL_FUNCTIONS = {
 
 - `dims["key"]` — reading scalar dimension values
 - `tensors["key"]` — accessing tensors to pass to `offchip_load` or `select_gen`
-- `tensors["key"].reshape(...)` or `.to(...)` — preparing metadata for `select_gen` or `offchip_load`
 - Python scalars and control flow: `B // tile_n`, `range()`, `for`, `if`, `len()`
 - List operations: `[].append()`, `parts[i]` indexing
 - `return offchip_store(result)`

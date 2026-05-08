@@ -606,10 +606,11 @@ def build_planner_system_prompt() -> str:
     return template_path.read_text()
 
 
-def build_planner_user_prompt(*, reference_code: str, dims: dict) -> str:
-    """Initial planner-call user prompt: just reference + dims."""
+def build_planner_user_prompt(*, reference_code: str, dims: dict,
+                               precompute_source: str | None = None) -> str:
+    """Initial planner-call user prompt: reference + dims (+ precompute when known)."""
     dims_json = json.dumps(dims, indent=2)
-    return (
+    parts = [
         "## Reference code (the node you are deciding on)\n\n"
         "```python\n"
         f"{reference_code.rstrip()}\n"
@@ -617,10 +618,20 @@ def build_planner_user_prompt(*, reference_code: str, dims: dict) -> str:
         "## Dimensions\n\n"
         "```json\n"
         f"{dims_json}\n"
-        "```\n\n"
-        "Decide whether to leaf this kernel or split it. "
+        "```\n",
+    ]
+    if precompute_source is not None:
+        parts.append(
+            "\n## Precompute source (defines the `tensors` dict the reference receives)\n\n"
+            "```python\n"
+            f"{precompute_source.rstrip()}\n"
+            "```\n"
+        )
+    parts.append(
+        "\nDecide whether to leaf this kernel or split it. "
         "Use the response format described in your system prompt."
     )
+    return "".join(parts)
 
 
 def build_replan_user_prompt(*, reference_code: str, dims: dict,
@@ -628,7 +639,8 @@ def build_replan_user_prompt(*, reference_code: str, dims: dict,
                               node_path: str,
                               failing_node: str,
                               last_turn_messages: list[str],
-                              sibling_results: list[tuple[str, str]]) -> str:
+                              sibling_results: list[tuple[str, str]],
+                              precompute_source: str | None = None) -> str:
     """Re-plan user prompt with failure context."""
     dims_json = json.dumps(dims, indent=2)
     last_turns = "\n".join(
@@ -643,6 +655,15 @@ def build_replan_user_prompt(*, reference_code: str, dims: dict,
         )
     else:
         siblings_block = "  (no successful siblings)"
+
+    precompute_block = ""
+    if precompute_source is not None:
+        precompute_block = (
+            "\n## Precompute source (defines the `tensors` dict the reference receives)\n\n"
+            "```python\n"
+            f"{precompute_source.rstrip()}\n"
+            "```\n"
+        )
 
     return (
         "RE-PLAN CONTEXT\n"
@@ -666,6 +687,7 @@ def build_replan_user_prompt(*, reference_code: str, dims: dict,
         "## Dimensions\n\n"
         "```json\n"
         f"{dims_json}\n"
-        "```\n\n"
-        "Re-plan this subtree. Use the response format from your system prompt."
+        "```\n"
+        f"{precompute_block}"
+        "\nRe-plan this subtree. Use the response format from your system prompt."
     )

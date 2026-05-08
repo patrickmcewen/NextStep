@@ -79,6 +79,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--max-replans", type=int, default=None,
         help="Forward --max-replans N to each subprocess invocation.",
     )
+    p.add_argument(
+        "--node-attempts", type=int, default=None,
+        help="Forward --node-attempts N to each subprocess invocation.",
+    )
+    p.add_argument(
+        "--max-plan-depth", type=int, default=None,
+        help="Forward --max-plan-depth N to each subprocess invocation.",
+    )
+    p.add_argument(
+        "--non-root-sequential", action=argparse.BooleanOptionalAction, default=True,
+        help="Forward --non-root-sequential / --no-non-root-sequential to each "
+             "subprocess invocation. Default True (sequential attempts for "
+             "non-root nodes when --node-attempts > 1).",
+    )
     return p.parse_args(argv)
 
 
@@ -174,6 +188,9 @@ async def _amain(args: argparse.Namespace) -> int:
             check_order=args.check_order,
             no_plan=args.no_plan,
             max_replans=args.max_replans,
+            node_attempts=args.node_attempts,
+            non_root_sequential=args.non_root_sequential,
+            max_plan_depth=args.max_plan_depth,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)

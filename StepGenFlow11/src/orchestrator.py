@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -308,28 +309,78 @@ def _load_stepdb_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def _compare_against_gold(result, kernel_name, dims, label="result"):
-    """Compare a tensor result against gold reference. Returns formatted string."""
+    """Compare a tensor (or tuple/list of tensors) result against gold.
+
+    Tuple/list outputs are supported because the planner can decompose a
+    kernel into intermediate (non-root) sub-Models whose forward returns
+    multiple tensors (e.g. ``return Q, K, V``). The root tree node always
+    inherits the original kernel's single-tensor signature, so root-level
+    comparisons stay single-tensor; tuple comparisons only kick in for
+    intermediate per-node refactor passes.
+    """
     import torch
 
     gold = _get_gold(kernel_name, dims)
 
+    gold_is_seq = isinstance(gold, (tuple, list))
+    result_is_seq = isinstance(result, (tuple, list))
+    if gold_is_seq != result_is_seq:
+        return (
+            f"STRUCTURE MISMATCH: gold is {type(gold).__name__}, "
+            f"{label} is {type(result).__name__}\nmatch=False"
+        )
+    if gold_is_seq:
+        if len(gold) != len(result):
+            return (
+                f"LENGTH MISMATCH: gold has {len(gold)} outputs, "
+                f"{label} has {len(result)}\nmatch=False"
+            )
+        per_out = [
+            _compare_one_tensor(g, r, kernel_name, dims, f"{label}[{i}]")
+            for i, (g, r) in enumerate(zip(gold, result))
+        ]
+        all_match = all(p["match"] for p in per_out)
+        out = f"match={all_match}"
+        for i, p in enumerate(per_out):
+            out += f"\n--- output[{i}] ---\n{p['report']}"
+        return out
+    return _compare_one_tensor(gold, result, kernel_name, dims, label)["report"]
+
+
+def _compare_one_tensor(gold, result, kernel_name, dims, label):
+    """Single-tensor comparison helper. Returns ``{"match": bool, "report": str}``."""
+    import torch
+
+    if not hasattr(result, "shape"):
+        report = (
+            f"TYPE MISMATCH: gold is torch.Tensor, {label} is "
+            f"{type(result).__name__}\nmatch=False"
+        )
+        return {"match": False, "report": report}
     if gold.shape != result.shape:
-        return f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs {label} {tuple(result.shape)}\nmatch=False"
+        report = (
+            f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs "
+            f"{label} {tuple(result.shape)}\nmatch=False"
+        )
+        return {"match": False, "report": report}
 
     max_err = (gold - result).abs().max().item()
     rel_err = max_err / (gold.abs().max().item() + 1e-12)
     match = rel_err < 1e-5
 
-    out = f"match={match}\nmax_abs_err={max_err:.2e}\nrel_err={rel_err:.2e}\noutput_shape={tuple(result.shape)}"
+    report = (
+        f"match={match}\nmax_abs_err={max_err:.2e}\nrel_err={rel_err:.2e}\n"
+        f"output_shape={tuple(result.shape)}"
+    )
     if not match:
         diff = (gold - result).abs()
         worst_multi = torch.unravel_index(diff.argmax(), diff.shape)
-        out += (
+        report += (
             f"\nworst_error_index={tuple(i.item() for i in worst_multi)}"
             f"\ngold_value={gold[worst_multi].item():.6e}"
             f"\n{label}_value={result[worst_multi].item():.6e}"
         )
-    return out
+    return {"match": match, "report": report}
 
 
 def _run_dsl_correctness(code, kernel_name, dims, tensors):
@@ -966,7 +1017,15 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         last_user_msg = conversation[-1]["content"] if conversation[-1]["role"] == "user" else ""
         _write(turn_dir / "user_prompt.txt", last_user_msg)
 
-        run_result = await Runner.run(agent, conversation)
+        from openai import BadRequestError as _BadRequestError
+        try:
+            run_result = await Runner.run(agent, conversation)
+        except _BadRequestError as exc:
+            log(f"      LLM rejected request ({exc}); aborting this {pass_name} attempt.")
+            _write(turn_dir / "status.txt", f"LLM_BAD_REQUEST: {exc}")
+            return {"success": False, "code": last_code, "total_tokens": total_tokens,
+                    "last_messages": [{"role": "user", "content": last_user_msg},
+                                       {"role": "assistant", "content": f"<LLM rejected: {exc}>"}]}
         if run_result.context_wrapper.usage is not None:
             total_tokens += run_result.context_wrapper.usage.total_tokens
         assistant_text = run_result.final_output or ""
@@ -1136,14 +1195,26 @@ class _NodeFailure(Exception):
 
 async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
                               agent_factory, max_turns, log,
-                              children_dsls):
+                              children_dsls, node_attempts: int = 1,
+                              non_root_sequential: bool = True,
+                              translate_fn=None):
     """Refactor a single tree node. Returns the same dict shape as ``_run_pass_loop``.
 
     Gold is always computed from ``node.reference_code`` (the original Model,
     no child dependencies). The refactor agent sees ``node.refactored_code``
     when it exists, since that is the form decomposed into children.
+
+    When ``node_attempts > 1``, spawns N parallel ``_run_pass_loop`` instances
+    under ``<node_dir>/attempt_<i>/refactor_final/``; first success wins and
+    the rest are cancelled. With ``node_attempts == 1`` the legacy single-
+    attempt layout is used (artifacts go directly under ``<node_dir>``).
+
+    If ``non_root_sequential`` is True and the node is non-root, the N attempts
+    run one-at-a-time with early-exit on success, so attempts that aren't
+    needed don't burn LLM tokens. Root nodes always run in parallel.
     """
-    from src.planner import build_node_tensors
+    from src.planner import build_node_tensors, has_class_model
+    from src.prompts import _get_precompute_source
 
     synth_name = _synth_kernel_name(root_kernel, node.path)
 
@@ -1154,17 +1225,34 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
         f"For LLM-synthesized children this is added by synthesize_reference_module; "
         f"for StepDB roots it ships with the seed kernel."
     )
+
+    if has_class_model(node.reference_code):
+        tensors = build_node_tensors(node.reference_code, dims)
+        precompute_src = _extract_get_inputs_source(node.reference_code)
+    else:
+        assert node.path == "root", (
+            f"only the root may be a function-based reference; node {node.path!r} "
+            f"has no class Model but is not the root. LLM-emitted children always "
+            f"go through synthesize_reference_module which produces a Model class."
+        )
+        tensors = precompute_tensors(root_kernel, dims)
+        precompute_src = _get_precompute_source(root_kernel)
+
+    import inspect as _inspect
+    gold_arity = len(_inspect.signature(ref_ns["compute_gold"]).parameters)
+    assert gold_arity in (1, 2), (
+        f"node {node.path!r}: compute_gold must take (dims) or (dims, tensors); "
+        f"got signature with {gold_arity} parameters"
+    )
     with torch.no_grad():
-        gold = ref_ns["compute_gold"](dims)
+        gold = (ref_ns["compute_gold"](dims) if gold_arity == 1
+                else ref_ns["compute_gold"](dims, tensors))
     _inject_gold(synth_name, dims, gold)
 
     agent_facing_code = (
         node.refactored_code if node.refactored_code is not None
         else node.reference_code
     )
-
-    tensors = build_node_tensors(node.reference_code, dims)
-    precompute_src = _extract_get_inputs_source(node.reference_code)
     user_prompt = build_pass_user_prompt(
         "refactor_final", synth_name, dims,
         tensors=tensors,
@@ -1180,14 +1268,66 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
     node_dir = ckpt_root / "refactor" / node.path
     node_dir.mkdir(parents=True, exist_ok=True)
     agent = agent_factory(children_dsls)
+    refactor_judge_agent = getattr(agent_factory, "__refactor_judge_agent__", None)
 
-    result = await _run_pass_loop(
-        agent, "refactor_final",
-        kernel_name=synth_name, dims=dims, max_turns=max_turns,
-        ckpt_dir=node_dir, executor="dsl", tensors=tensors, log=log,
-        check_order="correctness-first",
-        prebuilt_user_prompt=user_prompt,
-    )
+    post_validator = None
+    if translate_fn is not None:
+        post_validator = _make_translation_post_validator(
+            synth_name, dims, tensors, log, translate_fn=translate_fn,
+        )
+
+    async def _one_attempt(attempt_idx: int) -> dict:
+        attempt_dir = (
+            node_dir if node_attempts == 1
+            else node_dir / f"attempt_{attempt_idx}"
+        )
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        return await _run_pass_loop(
+            agent, "refactor_final",
+            kernel_name=synth_name, dims=dims, max_turns=max_turns,
+            ckpt_dir=attempt_dir, executor="dsl", tensors=tensors, log=log,
+            check_order="correctness-first",
+            prebuilt_user_prompt=user_prompt,
+            judge_agent=refactor_judge_agent,
+            post_validator=post_validator,
+        )
+
+    is_root = (node.path == "root")
+    run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
+
+    if node_attempts == 1:
+        result = await _one_attempt(0)
+    elif run_sequential:
+        log(f"[planner] node {node.path!r}: running up to {node_attempts} sequential refactor attempts (non-root)")
+        result = {"success": False}
+        for i in range(node_attempts):
+            r = await _one_attempt(i)
+            if r.get("success"):
+                log(f"[planner] node {node.path!r}: attempt {i} succeeded — skipping remaining {node_attempts - i - 1}")
+                result = r
+                break
+            result = r
+    else:
+        log(f"[planner] node {node.path!r}: spawning {node_attempts} parallel refactor attempts")
+        pending = {asyncio.create_task(_one_attempt(i)) for i in range(node_attempts)}
+        last_failure: dict | None = None
+        result = None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                r = d.result()
+                if r.get("success"):
+                    log(f"[planner] node {node.path!r}: attempt succeeded — cancelling {len(pending)} pending")
+                    for t in pending:
+                        t.cancel()
+                    result = r
+                    pending = set()
+                    break
+                last_failure = r
+        if result is None:
+            result = last_failure or {"success": False}
+
     if not result.get("success"):
         result.setdefault("failing_node", _synth_kernel_name(root_kernel, node.path))
         result.setdefault("last_messages", [])
@@ -1195,14 +1335,32 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
 
 
 async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
-                        agent_factory, max_turns, log) -> dict:
+                        agent_factory, max_turns, log,
+                        node_attempts: int = 1,
+                        non_root_sequential: bool = True,
+                        verified_cache: dict[str, str] | None = None,
+                        translate_fn=None) -> dict:
     """Walk tree leaves->root, refactor each node, sibling-parallel.
+
+    ``verified_cache`` (when provided) maps ``node.path`` to a previously-
+    verified DSL string. Nodes present in the cache are skipped — no LLM call,
+    no gold computation — and their cached DSL is used directly when assembling
+    parents. Used by ``--resume-planner`` to pick up where a crashed outer
+    iteration left off.
+
+    ``translate_fn`` (when provided) is forwarded to each per-node refactor
+    pass as a translation post-validator: every refactor turn must not only be
+    numerically correct but also lower cleanly into STeP IR via this callable.
+    Surfaces translator-side constraints (e.g. ``dyn_offchip_load`` literal
+    requirements) as feedback to the refactor agent immediately, instead of
+    letting them fail later at the final translate step.
 
     Returns:
         {"success": True, "root_dsl": <str>}  on success
         {"success": False, "failing_node": <path>, "last_messages": [...]} on failure
     """
     verified: dict[str, str] = {}
+    cache = verified_cache or {}
 
     async def _run_subtree(node) -> dict:
         if node.children:
@@ -1218,14 +1376,27 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
                 if not r["success"]:
                     raise _NodeFailure(r)
 
+        if node.path in cache:
+            log(f"[planner] refactor: node {node.path!r} CACHED (resumed) — skipping LLM")
+            verified[node.path] = cache[node.path]
+            return {"success": True, "code": cache[node.path]}
+
         children_dsls = [(c.path, verified[c.path]) for c in node.children]
+        kind = "leaf" if node.is_leaf else f"parent of {[c.name for c in node.children]}"
+        log(f"[planner] refactor: starting node {node.path!r} ({kind})")
         result = await _refactor_one_node(
             node=node, dims=dims, root_kernel=root_kernel,
             ckpt_root=ckpt_root, agent_factory=agent_factory,
             max_turns=max_turns, log=log, children_dsls=children_dsls,
+            node_attempts=node_attempts,
+            non_root_sequential=non_root_sequential,
+            translate_fn=translate_fn,
         )
         if result["success"]:
             verified[node.path] = result["code"]
+            log(f"[planner] refactor: node {node.path!r} VERIFIED")
+        else:
+            log(f"[planner] refactor: node {node.path!r} FAILED")
         return result
 
     try:
@@ -1243,22 +1414,36 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
     return {"success": True, "root_dsl": verified[tree.root.path]}
 
 
-async def _initial_plan(*, root_reference, dims, agent, log) -> "PlanNode":
+async def _initial_plan(*, root_reference, dims, agent, log,
+                         turn_root: Path | None = None,
+                         max_depth: int | None = None,
+                         precompute_source: str | None = None,
+                         tensors: dict | None = None) -> "PlanNode":
     """Thin wrapper around src.planner.plan for monkeypatching in tests."""
     from src.planner import plan
     return await plan(reference_code=root_reference, dims=dims,
                        agent=agent, path="root",
-                       runner_fn=Runner.run, retry_budget=3)
+                       runner_fn=Runner.run, retry_budget=8, log=log,
+                       turn_root=turn_root, max_depth=max_depth,
+                       precompute_source=precompute_source,
+                       tensors=tensors)
 
 
 async def _replan(*, subtree_reference, dims, agent, node_path,
                   failing_node, last_messages, sibling_results,
-                  replan_iteration, log) -> "PlanNode":
+                  replan_iteration, log,
+                  turn_root: Path | None = None,
+                  max_depth: int | None = None,
+                  precompute_source: str | None = None,
+                  tensors: dict | None = None) -> "PlanNode":
     """Re-invoke the planner on a failing subtree."""
     from src.planner import plan
     return await plan(
         reference_code=subtree_reference, dims=dims, agent=agent,
-        path=node_path, runner_fn=Runner.run, retry_budget=3,
+        path=node_path, runner_fn=Runner.run, retry_budget=8, log=log,
+        turn_root=turn_root, max_depth=max_depth,
+        precompute_source=precompute_source,
+        tensors=tensors,
         replan_context={
             "replan_iteration": replan_iteration,
             "node_path": node_path,
@@ -1270,8 +1455,21 @@ async def _replan(*, subtree_reference, dims, agent, node_path,
 
 
 async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
-                             agent_factory, max_turns, log, max_replans):
+                             agent_factory, max_turns, log, max_replans,
+                             node_attempts: int = 1,
+                             non_root_sequential: bool = True,
+                             max_plan_depth: int | None = None,
+                             precompute_source: str | None = None,
+                             tensors: dict | None = None,
+                             resumed_tree=None,
+                             verified_cache: dict[str, str] | None = None,
+                             translate_fn=None):
     """Top-level Phase 0+1 loop with re-plan on failure.
+
+    When ``resumed_tree`` is provided, the Phase 0 plan call is skipped and the
+    given tree is used as iteration_0. ``verified_cache`` (when provided) is
+    forwarded to ``refactor_tree`` so previously-verified per-node DSLs are
+    reused without re-running the LLM.
 
     Returns: {"success": True, "root_dsl": str} or
              {"success": False, "failing_node": str, "last_messages": [...]}.
@@ -1280,13 +1478,29 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
 
     planner_agent = getattr(agent_factory, "__planner_agent__", None)
 
+    log(f"[planner] === Phase 0 starting for kernel {root_kernel!r} (max_replans={max_replans}) ===")
+
     plan_iter = 0
-    root_node = await _initial_plan(
-        root_reference=root_reference, dims=dims,
-        agent=planner_agent, log=log,
-    )
-    tree = Tree(root=root_node)
-    _persist_tree(tree, ckpt_root / "plan" / f"iteration_{plan_iter}")
+    iter_dir = ckpt_root / "plan" / f"iteration_{plan_iter}"
+    if resumed_tree is not None:
+        tree = resumed_tree
+        log(f"[planner] iteration {plan_iter}: RESUMED tree from disk — skipping Phase 0 LLM plan")
+    else:
+        root_node = await _initial_plan(
+            root_reference=root_reference, dims=dims,
+            agent=planner_agent, log=log,
+            turn_root=iter_dir / "turns",
+            max_depth=max_plan_depth,
+            precompute_source=precompute_source,
+            tensors=tensors,
+        )
+        tree = Tree(root=root_node)
+    _persist_tree(tree, iter_dir)
+    n_nodes = sum(1 for _ in tree.iter_topological())
+    cached_n = sum(1 for n in tree.iter_topological()
+                   if (verified_cache or {}).get(n.path) is not None)
+    log(f"[planner] iteration {plan_iter}: tree built ({n_nodes} node(s); {cached_n} cached) "
+        f"— starting Phase 1 refactor walk")
 
     replans_used = 0
     while True:
@@ -1294,16 +1508,26 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             tree=tree, dims=dims, root_kernel=root_kernel,
             ckpt_root=ckpt_root, agent_factory=agent_factory,
             max_turns=max_turns, log=log,
+            node_attempts=node_attempts,
+            non_root_sequential=non_root_sequential,
+            verified_cache=verified_cache,
+            translate_fn=translate_fn,
         )
         if result["success"]:
+            log(f"[planner] === Phase 0+1 SUCCEEDED (used {replans_used} replan(s)) ===")
             return result
 
+        log(f"[planner] iteration {plan_iter}: refactor walk FAILED at node "
+            f"{result.get('failing_node')!r}; replans_used={replans_used}/{max_replans}")
         if replans_used >= max_replans:
+            log(f"[planner] === Phase 0+1 EXHAUSTED replan budget ({max_replans}) ===")
             return result
 
         failing = result["failing_node"]
         owner = tree.find_owner(failing) or tree.root
         sibling_results: list = []
+        log(f"[planner] replanning subtree at {owner.path!r} (failing leaf: {failing!r})")
+        next_iter_dir = ckpt_root / "plan" / f"iteration_{plan_iter + 1}"
         new_subtree = await _replan(
             subtree_reference=owner.reference_code, dims=dims,
             agent=planner_agent, node_path=owner.path,
@@ -1311,17 +1535,88 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             last_messages=result.get("last_messages", []),
             sibling_results=sibling_results,
             replan_iteration=replans_used + 1, log=log,
+            turn_root=next_iter_dir / "turns",
+            max_depth=max_plan_depth,
+            precompute_source=precompute_source,
+            tensors=tensors,
         )
         tree = _replace_subtree(tree, owner.path, new_subtree)
         replans_used += 1
         plan_iter += 1
-        _persist_tree(tree, ckpt_root / "plan" / f"iteration_{plan_iter}")
+        _persist_tree(tree, next_iter_dir)
+        n_nodes = sum(1 for _ in tree.iter_topological())
+        log(f"[planner] iteration {plan_iter}: replanned tree built ({n_nodes} node(s)) — retrying refactor walk")
 
 
 def _persist_tree(tree, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "tree.json").write_text(json.dumps(_tree_to_dict(tree.root), indent=2))
     _persist_node_files(tree.root, dest)
+
+
+def _load_tree_from_dir(outer_dir: Path):
+    """Inverse of ``_persist_tree``: reconstruct the latest planner tree saved
+    under ``<outer_dir>/plan/iteration_*/``.
+
+    Picks the highest iteration index (i.e. the tree state at the time the
+    outer crashed, after any replans). Each node's reference.py / refactored.py
+    is read back from disk. Used by ``--resume-planner``.
+    """
+    from src.planner import PlanNode, Tree
+    plan_dir = outer_dir / "plan"
+    iters = sorted(plan_dir.glob("iteration_*"))
+    assert iters, f"no plan iterations found under {plan_dir}"
+    latest = iters[-1]
+    tree_dict = json.loads((latest / "tree.json").read_text())
+
+    def _load_node(d: dict) -> PlanNode:
+        node_dir = latest / d["path"].replace("/", "_")
+        reference_code = (node_dir / "reference.py").read_text()
+        refactored_code = None
+        if d["has_refactored"]:
+            refactored_code = (node_dir / "refactored.py").read_text()
+        children = tuple(_load_node(c) for c in d["children"])
+        return PlanNode(
+            name=d["name"], path=d["path"],
+            reference_code=reference_code,
+            refactored_code=refactored_code,
+            is_leaf=d["is_leaf"],
+            children=children,
+        )
+
+    return Tree(root=_load_node(tree_dict))
+
+
+def _load_verified_dsls(outer_dir: Path) -> dict[str, str]:
+    """Scan ``<outer_dir>/refactor/`` for nodes with a successful refactor turn.
+
+    A node is verified iff it has a ``status.txt`` containing exactly ``PASS``
+    under either ``refactor_final/turn_*/`` (single-attempt layout) or
+    ``attempt_*/refactor_final/turn_*/`` (multi-attempt layout). Returns a
+    ``{node_path: verified_dsl_code}`` mapping consumable by ``refactor_tree``.
+    """
+    refactor_root = outer_dir / "refactor"
+    if not refactor_root.is_dir():
+        return {}
+    cache: dict[str, str] = {}
+    for status_path in refactor_root.rglob("status.txt"):
+        if status_path.read_text().strip() != "PASS":
+            continue
+        if status_path.parent.parent.name != "refactor_final":
+            continue
+        code_path = status_path.parent / "extracted_code.py"
+        if not code_path.exists():
+            continue
+        # Path layout (under refactor_root):
+        #   <node_path>/refactor_final/turn_N/                  → 3 trailing parts
+        #   <node_path>/attempt_K/refactor_final/turn_N/        → 4 trailing parts
+        rel = status_path.parent.parent.parent.relative_to(refactor_root)
+        if rel.name.startswith("attempt_"):
+            rel = rel.parent
+        node_path = str(rel).replace("\\", "/")
+        # First PASS wins; subsequent attempts/turns for the same node ignored.
+        cache.setdefault(node_path, code_path.read_text())
+    return cache
 
 
 def _tree_to_dict(node) -> dict:
@@ -1429,6 +1724,10 @@ async def run_kernel(
     check_order: str = "correctness-first",
     plan_enabled: bool = True,
     max_replans: int = 3,
+    node_attempts: int = 1,
+    non_root_sequential: bool = True,
+    max_plan_depth: int | None = 3,
+    resume_planner: str | None = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -1569,9 +1868,11 @@ async def run_kernel(
         judge_agents = {name: make_judge_agent(llm_config, name) for name in _JUDGE_TEMPLATES}
 
     # Set up checkpoint directory
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
     if checkpoint_dir is None:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         checkpoint_dir = str(Path("checkpoints") / ts)
+    else:
+        checkpoint_dir = str(Path(checkpoint_dir) / ts)
     ckpt_root = Path(checkpoint_dir) / kernel_name
     ckpt_root.mkdir(parents=True, exist_ok=True)
 
@@ -1589,43 +1890,30 @@ async def run_kernel(
         "few_shot_paths": list(few_shot_paths) if few_shot_paths else [],
     }, indent=2))
 
-    plan_resume_dsl = None
+    planner_agent = None
+    root_reference = None
     if plan_enabled:
         ref_path = _STEPDB_DIR / config[kernel_name]["problem"]
         root_reference = ref_path.read_text()
-
         from src.agents import make_planner_agent
         planner_agent = make_planner_agent(llm_config)
 
-        def _agent_factory(_few_shot):
-            return pass_agents["refactor_final"]
-        _agent_factory.__planner_agent__ = planner_agent
+    resumed_tree = None
+    verified_cache: dict[str, str] = {}
+    if resume_planner is not None:
+        assert plan_enabled, "--resume-planner requires plan_enabled (no --no-plan)"
+        resume_dir = Path(resume_planner)
+        assert resume_dir.is_dir(), f"--resume-planner: not a directory: {resume_dir}"
+        resumed_tree = _load_tree_from_dir(resume_dir)
+        verified_cache = _load_verified_dsls(resume_dir)
+        print(f"  Resumed planner state from {resume_dir} "
+              f"({sum(1 for _ in resumed_tree.iter_topological())} nodes, "
+              f"{len(verified_cache)} cached DSLs)")
 
-        plan_result = await _run_planner_phase(
-            root_reference=root_reference, dims=dims,
-            root_kernel=kernel_name, ckpt_root=ckpt_root,
-            agent_factory=_agent_factory, max_turns=max_turns,
-            log=print, max_replans=max_replans,
-        )
-        if not plan_result["success"]:
-            failure = {
-                "success": False,
-                "outer_iteration": -1,
-                "outer_iterations": max_outer,
-                "total_tool_calls": 0,
-                "total_tokens": 0,
-                "cycle_count": None,
-                "final_diagnosis": (
-                    f"Planner phase failed at {plan_result['failing_node']}: "
-                    f"{plan_result.get('last_messages', [])}"
-                ),
-                "per_outer": [],
-            }
-            _write(ckpt_root / "result.json", json.dumps(failure, indent=2, default=str))
-            return failure
-        plan_resume_dsl = plan_result["root_dsl"]
-
-    # Run all outer iterations in parallel — they are independent attempts
+    # Run all outer iterations in parallel — they are independent attempts.
+    # Each outer that has plan_enabled runs its own planner phase + refactor walk
+    # (so we get max_outer parallel attempts at the lowering stage, restoring
+    # the legacy non-planner behaviour at the right granularity).
     tasks = []
     for i in range(max_outer):
         outer_dir = ckpt_root / f"outer_{i}"
@@ -1635,13 +1923,23 @@ async def run_kernel(
             max_turns, ckpt_root, preset, experience_dir,
             lowering_passes=lowering_passes,
             translator_passes=translator_passes,
-            resume_dsl_code=(plan_resume_dsl if plan_resume_dsl is not None else resume_dsl_code),
+            resume_dsl_code=resume_dsl_code,
             translator=translator,
             translate_fn=translate_fn,
             compliance_override=bundle_compliance,
             llm_config=llm_config,
             autotune_options=autotune_options,
             check_order=check_order,
+            plan_enabled=plan_enabled,
+            planner_agent=planner_agent,
+            root_reference=root_reference,
+            max_replans=max_replans,
+            node_attempts=node_attempts,
+            non_root_sequential=non_root_sequential,
+            max_plan_depth=max_plan_depth,
+            resumed_tree=resumed_tree,
+            verified_cache=verified_cache,
+            resume_planner_dir=Path(resume_planner) if resume_planner else None,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1693,6 +1991,16 @@ async def _run_outer_iteration(
     compliance_override: dict | None = None,
     autotune_options: dict = None,
     check_order: str = "correctness-first",
+    plan_enabled: bool = False,
+    planner_agent=None,
+    root_reference: str | None = None,
+    max_replans: int = 3,
+    node_attempts: int = 1,
+    non_root_sequential: bool = True,
+    max_plan_depth: int | None = 3,
+    resumed_tree=None,
+    verified_cache: dict[str, str] | None = None,
+    resume_planner_dir: Path | None = None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -1737,6 +2045,59 @@ async def _run_outer_iteration(
         _write(outer_dir / "dsl_code.py", dsl_code)
         log(f"  Resumed from checkpoint — using saved dsl_code ({len(dsl_code)} chars)")
         print(f"{tag} Resumed — skipping lowering")
+    elif plan_enabled and lowering_passes:
+        assert planner_agent is not None and root_reference is not None, (
+            "plan_enabled requires planner_agent and root_reference"
+        )
+
+        if resume_planner_dir is not None:
+            for sub in ("plan", "refactor"):
+                src = resume_planner_dir / sub
+                if src.is_dir():
+                    shutil.copytree(src, outer_dir / sub, dirs_exist_ok=True)
+            log(f"  Copied resumed planner artifacts from {resume_planner_dir}")
+
+        def _agent_factory(_few_shot):
+            return pass_agents["refactor_final"]
+        _agent_factory.__planner_agent__ = planner_agent
+        _agent_factory.__refactor_judge_agent__ = judge_agents.get("refactor_final")
+
+        log(f"  Planner phase (plan + per-node refactor)")
+        print(f"{tag} Planner phase starting")
+        from src.prompts import _get_precompute_source
+        plan_result = await _run_planner_phase(
+            root_reference=root_reference, dims=dims,
+            root_kernel=kernel_name, ckpt_root=outer_dir,
+            agent_factory=_agent_factory, max_turns=max_turns,
+            log=log, max_replans=max_replans,
+            node_attempts=node_attempts,
+            non_root_sequential=non_root_sequential,
+            max_plan_depth=max_plan_depth,
+            precompute_source=_get_precompute_source(kernel_name),
+            tensors=precompute_tensors(kernel_name, dims),
+            resumed_tree=resumed_tree,
+            verified_cache=verified_cache,
+            translate_fn=(translate_fn if translator == "auto" else None),
+        )
+        if not plan_result["success"]:
+            log(f"  -> Planner phase FAILED at {plan_result.get('failing_node')}")
+            print(f"{tag} Planner phase FAILED")
+            log_file.close()
+            return {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "total_tokens": outer_total_tokens,
+                "cycle_count": None,
+                "final_diagnosis": (
+                    f"Planner phase failed at {plan_result.get('failing_node')}"
+                ),
+            }
+        dsl_code = plan_result["root_dsl"]
+        _write(outer_dir / "dsl_code.py", dsl_code)
+        log(f"  -> Planner phase OK")
+        print(f"{tag} Planner phase OK")
     elif lowering_passes:
         assert len(lowering_passes) == 1 and lowering_passes[0]["name"] == "refactor_final", (
             f"phase 1 expects exactly one refactor_final pass, got {[p['name'] for p in lowering_passes]}"

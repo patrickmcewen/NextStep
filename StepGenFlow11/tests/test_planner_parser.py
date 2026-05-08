@@ -78,22 +78,43 @@ def test_parse_no_decision_raises_NotADecision():
         parse_planner_response("just some text without DECISION:")
 
 
-def test_parse_split_with_one_child_raises_MalformedSplit():
-    bad = """
+def test_parse_split_with_one_child_is_accepted():
+    """The carve-out pattern (1 child, parent does the rest) is a valid
+    decomposition. The parser must not require ≥2 children — that artificial
+    quota leads LLMs to invent dead siblings just to satisfy it."""
+    response = """
 DECISION: split
 
-# child: only_one
+# child: rotate_half
 class Model(nn.Module):
     def forward(self, x):
-        return x
+        half = x.shape[-1] // 2
+        return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 def get_inputs(dims):
-    return (torch.randn(4),)
+    return (torch.randn(dims["M"]),)
+
+# refactored parent
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rotate_half = RotateHalfModel()
+    def forward(self, x, cos, sin):
+        return x * cos + self.rotate_half(x) * sin
+"""
+    result = parse_planner_response(response)
+    assert isinstance(result, ParsedSplit)
+    assert [c.name for c in result.children] == ["rotate_half"]
+
+
+def test_parse_split_with_zero_children_raises_MalformedSplit():
+    bad = """
+DECISION: split
 
 # refactored parent
 class Model(nn.Module):
     pass
 """
-    with pytest.raises(MalformedSplit, match="at least 2 children"):
+    with pytest.raises(MalformedSplit, match="at least 1 child"):
         parse_planner_response(bad)
 
 
@@ -166,6 +187,168 @@ class Model(nn.Module):
 """
     with pytest.raises(MalformedSplit, match="missing 'class Model'"):
         parse_planner_response(bad)
+
+
+def test_parse_split_accepts_child_class_named_after_camelcase_child():
+    """LLMs sometimes name a child's class ``<CamelCase>Model`` instead of the
+    literal ``class Model``. The parser normalizes it so downstream guards and
+    synth see a uniform ``class Model`` per child."""
+    response = """
+DECISION: split
+
+# child: pre_attention
+```python
+class PreAttentionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return x * 2
+
+def get_inputs(dims):
+    return (torch.randn(4),)
+```
+
+# child: post_norm
+```python
+class PostNormModel(nn.Module):
+    def forward(self, x):
+        return x + 1
+
+def get_inputs(dims):
+    return (torch.randn(4),)
+```
+
+# refactored parent
+```python
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pre_attention = PreAttentionModel()
+        self.post_norm = PostNormModel()
+    def forward(self, x):
+        return self.post_norm(self.pre_attention(x))
+```
+"""
+    result = parse_planner_response(response)
+    assert isinstance(result, ParsedSplit)
+    assert [c.name for c in result.children] == ["pre_attention", "post_norm"]
+    for child in result.children:
+        assert "class Model(nn.Module):" in child.reference_code
+        assert "class PreAttentionModel" not in child.reference_code
+        assert "class PostNormModel" not in child.reference_code
+
+
+def test_parse_split_normalizes_acronym_class_name_to_Model():
+    """LLMs preserve acronym capitalization (rms_norm → RMSNormModel, not
+    RmsNormModel). When snake→Camel exact-match misses, the parser falls
+    back to renaming the unique top-level ``class <Identifier>Model(nn.Module)``
+    to ``class Model``."""
+    response = """
+DECISION: split
+
+# child: rms_norm
+```python
+import torch
+import torch.nn as nn
+
+class RMSNormModel(nn.Module):
+    def forward(self, x):
+        return x * 2
+
+def get_inputs(dims):
+    return (torch.randn(4),)
+```
+
+# refactored parent
+```python
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rms_norm = RMSNormModel()
+    def forward(self, x):
+        return self.rms_norm(x)
+```
+"""
+    result = parse_planner_response(response)
+    assert isinstance(result, ParsedSplit)
+    assert "class Model(nn.Module):" in result.children[0].reference_code
+    assert "class RMSNormModel" not in result.children[0].reference_code
+
+
+def test_parse_split_accepts_indented_markers_and_dedents_bodies():
+    """Models sometimes emit the entire DECISION: split block indented (e.g.
+    as a sub-bullet). Markers ``# child:`` / ``# refactored parent`` and the
+    code bodies must still parse — and bodies must be dedented so downstream
+    ast.parse / exec succeed."""
+    response = """
+DECISION: split
+
+  # child: doubler
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def forward(self, x):
+            return x * 2
+
+    def get_inputs(dims):
+        return (torch.randn(4),)
+
+  # refactored parent
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.doubler = DoublerModel()
+        def forward(self, x):
+            return self.doubler(x)
+"""
+    result = parse_planner_response(response)
+    assert isinstance(result, ParsedSplit)
+    assert [c.name for c in result.children] == ["doubler"]
+    # Bodies must be dedented so they're valid module-level Python.
+    import ast
+    ast.parse(result.children[0].reference_code)
+    ast.parse(result.refactored_parent_code)
+
+
+def test_parse_split_discards_trailing_prose_after_closing_fence():
+    """LLMs sometimes append an "explanation" paragraph after the closing
+    fence of the refactored parent block. That prose must be discarded —
+    leaving it in lets unicode characters (e.g. non-breaking hyphen) crash
+    ast.parse() downstream."""
+    response = """
+DECISION: split
+
+# child: doubler
+```python
+class Model(nn.Module):
+    def forward(self, x):
+        return x * 2
+def get_inputs(dims):
+    return (torch.randn(4),)
+```
+
+# refactored parent
+```python
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.doubler = DoublerModel()
+    def forward(self, x):
+        return self.doubler(x)
+```
+
+The parent now delegates to DoublerModel — note the non‑breaking hyphen here.
+"""
+    result = parse_planner_response(response)
+    assert isinstance(result, ParsedSplit)
+    # The refactored parent body must contain ONLY the fenced code, no prose.
+    assert "non" not in result.refactored_parent_code
+    assert "delegates" not in result.refactored_parent_code
+    assert "class Model(nn.Module):" in result.refactored_parent_code
 
 
 def test_parse_split_strips_markdown_code_fences_in_bodies():
@@ -260,6 +443,28 @@ def get_inputs(dims):
     inputs = namespace["get_inputs"]({"M": 4})
     expected = namespace["Model"]()(*inputs)
     assert torch.equal(out, expected)
+
+
+def test_synthesize_adds_import_torch_when_only_import_torch_nn_present():
+    """Regression: 'import torch' substring check used to match
+    'import torch.nn as nn' and skip adding 'import torch', leaving the
+    refactored module unable to reference ``torch.X``."""
+    body = """\
+import torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, x):
+        return torch.cat([x, x], dim=-1)
+
+def get_inputs(dims):
+    return (torch.randn(4),)
+"""
+    full = synthesize_reference_module(body)
+    namespace = {}
+    exec(full, namespace)
+    assert "torch" in namespace
+    out = namespace["Model"]()(namespace["torch"].zeros(2, 3))
+    assert out.shape == (2, 6)
 
 
 def test_synthesize_idempotent_when_compute_gold_already_present():
