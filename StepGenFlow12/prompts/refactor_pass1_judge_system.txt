@@ -9,16 +9,16 @@ You will receive a function produced by the Pass-1 refactor agent. Your job: ver
 The function must be defined with exactly the required name and signature. For non-root nodes the signature must be:
 
 ```python
-def <node_name>(*intermediate_args, *, out_shape, out_perm=None):
+def <node_name>(*intermediate_args, *, out_shapes, out_perms=None):
 ```
 
-where `<node_name>` matches the planner node name specified above. For the root node the signature must be:
+where `<node_name>` matches the planner node name specified above. The keyword args are always plural — even single-output nodes must use ``out_shapes`` and ``out_perms`` (the parent will pass a 1-tuple). For the root node the signature must be:
 
 ```python
-def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
+def tiled_reference(dims, tensors):
 ```
 
-Flag any deviation: wrong function name, extra positional parameters, missing `out_shape` or `out_perm` keyword parameters.
+Flag any deviation: wrong function name, extra positional parameters, singular `out_shape`/`out_perm` instead of plural `out_shapes`/`out_perms`, or missing keyword parameters.
 
 ## Requirement 2: Child blackbox calls
 
@@ -38,7 +38,7 @@ Flag any of the following applied to a tensor between its source and a blackbox 
 - Arithmetic operators (`*`, `+`, `-`, `/`, `@`)
 - `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()` (single-argument form that changes layout)
 
-Output permutation must be expressed via the `out_perm` keyword argument, not by transforming the input before the call.
+Output permutations must be expressed via the `out_perms` keyword argument (a tuple parallel to ``out_shapes``, ``None`` entries = identity), not by transforming the input before the call. For multi-output children, the call site must destructure the returned tuple (e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).
 
 ## Output Format
 

@@ -22,6 +22,7 @@ Checkpoint structure:
   checkpoints/<timestamp>/<kernel>/result.json
 """
 
+import ast
 import asyncio
 import contextlib
 import io
@@ -563,6 +564,58 @@ _PASS_RULES: dict[str, dict] = {
 
 _TRANSLATION_PASSES = {"translate", "translate_full", "translate_full_no_functional"}
 
+# DSL alphabet — mirrors prompts/refactor_final_judge_system.txt's DSL_FUNCTIONS.
+# Producers create on-chip streams from raw input or generate metadata streams;
+# their inputs may be raw ``tensors[...]`` reads. Consumers operate on existing
+# on-chip streams and require their tensor inputs to come from a producer,
+# another consumer, a blackbox-child return, or a positional intermediate arg.
+_DSL_PRODUCERS: frozenset[str] = frozenset({
+    "offchip_load", "offchip_load_ref", "dyn_offchip_load",
+    "random_offchip_load",
+    "select_gen", "metadata_gen", "expert_addr_gen",
+    "cache_read_addr_gen", "filter_last_tile",
+})
+
+_DSL_CONSUMERS: frozenset[str] = frozenset({
+    # Binary
+    "binary_matmul", "binary_mul", "binary_add", "binary_div", "binary_is_equal",
+    "binary_set_offset", "binary_row_wise_append", "binary_cache_write_addr_gen",
+    "binary_map_accum",
+    # Unary
+    "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
+    "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
+    "unary_mask_row", "unary_select_to_scalar", "unary_to_const_int",
+    # Accumulation
+    "accum_add", "accum_mul", "accum_max",
+    "accum_retile_row", "accum_retile_col", "accum_signal_req_all_read",
+    # Stream shape
+    "promote", "promote_outer", "flatten",
+    "reshape_stream", "reshape_pad_stream",
+    "expand_ref", "repeat_ref", "repeat_static",
+    "streamify", "dyn_streamify", "bufferize", "retile_streamify",
+    # Multi-output
+    "broadcast", "parallelize", "static_reassemble",
+    # Routing
+    "eager_merge", "flat_partition", "flat_reassemble",
+    # Flatmap
+    "flatmap_filter_row_streamify", "flatmap_counter",
+    # Sink
+    "offchip_store", "random_offchip_store",
+})
+
+# Source classifications for a Name's binding, used by the dataflow walk.
+_SRC_PRODUCER = "producer"
+_SRC_CONSUMER = "consumer"
+_SRC_BLACKBOX = "blackbox"
+_SRC_INTERMEDIATE_ARG = "intermediate_arg"
+_SRC_RAW_TENSORS = "raw_tensors_subscript"
+_SRC_NON_TENSOR = "non_tensor"
+_SRC_UNKNOWN = "unknown"
+
+_ONCHIP_SOURCES = frozenset({
+    _SRC_PRODUCER, _SRC_CONSUMER, _SRC_BLACKBOX, _SRC_INTERMEDIATE_ARG,
+})
+
 # Regex to find torch.XXX( and F.XXX( calls
 _TORCH_CALL_RE = re.compile(r'\btorch\.(\w+)\s*\(')
 _F_CALL_RE = re.compile(r'\bF\.(\w+)\s*\(')
@@ -601,6 +654,195 @@ class _GateResult(NamedTuple):
     feedback: str | None
     status: str
     tokens: int = 0
+
+
+def _call_name(call: ast.Call) -> str | None:
+    """Return the bare callable name for ``foo(...)`` or ``x.foo(...)``."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _walk_no_nested_def(func: ast.FunctionDef):
+    """Walk ``func``'s body without descending into nested ``FunctionDef`` bodies.
+
+    Each top-level function is checked in its own frame so a Name that's a
+    parameter of an inner helper isn't confused with one in the outer scope.
+    """
+    def _w(node):
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef):
+                continue
+            yield from _w(child)
+    for stmt in func.body:
+        yield from _w(stmt)
+
+
+def _classify_value(value: ast.AST,
+                    name_to_source: dict[str, str],
+                    blackbox_set: frozenset[str]) -> str:
+    """Classify the data-flow source of an RHS expression."""
+    if isinstance(value, ast.Call):
+        name = _call_name(value)
+        if name in _DSL_PRODUCERS:
+            return _SRC_PRODUCER
+        if name in _DSL_CONSUMERS:
+            return _SRC_CONSUMER
+        if name in blackbox_set:
+            return _SRC_BLACKBOX
+        # Method calls like ``x.reshape(...)`` propagate the receiver's source
+        # so a forgotten load on a host-side reshape of ``tensors["x"]`` is
+        # still flagged when consumed by a DSL op.
+        if isinstance(value.func, ast.Attribute):
+            return _classify_value(value.func.value, name_to_source, blackbox_set)
+        return _SRC_NON_TENSOR
+    if isinstance(value, ast.Subscript):
+        if isinstance(value.value, ast.Name) and value.value.id == "tensors":
+            return _SRC_RAW_TENSORS
+        return _SRC_NON_TENSOR
+    if isinstance(value, ast.Name):
+        return name_to_source.get(value.id, _SRC_UNKNOWN)
+    if isinstance(value, ast.Attribute):
+        return _SRC_NON_TENSOR
+    if isinstance(value, (ast.Constant, ast.BinOp, ast.UnaryOp,
+                          ast.BoolOp, ast.Compare, ast.IfExp,
+                          ast.Tuple, ast.List, ast.Set, ast.Dict)):
+        return _SRC_NON_TENSOR
+    return _SRC_UNKNOWN
+
+
+def _bind_target(target: ast.AST, src: str,
+                 name_to_source: dict[str, str]) -> None:
+    """Bind LHS target(s) to a source classification.
+
+    Tuple unpack ``(a, b, c) = call(...)``: each element gets the producer's
+    source (an over-approximation — we don't slice tuple returns per element
+    but the worst case is ``_SRC_NON_TENSOR`` which we accept silently).
+    """
+    if isinstance(target, ast.Name):
+        name_to_source[target.id] = src
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _bind_target(elt, src, name_to_source)
+
+
+def _subscript_key_repr(sub: ast.Subscript) -> str:
+    s = sub.slice
+    if isinstance(s, ast.Constant):
+        return repr(s.value)
+    return "..."
+
+
+def _check_consumer_arg(arg: ast.AST,
+                         name_to_source: dict[str, str],
+                         blackbox_set: frozenset[str],
+                         *, op: str) -> str | None:
+    """Return a violation message if ``arg`` is clearly an off-chip raw read
+    being fed into a DSL consumer; ``None`` otherwise.
+
+    Conservative: only flags ``tensors["X"]`` (direct or via a Name that was
+    bound to one). Unknown / non-tensor sources are accepted silently to
+    avoid false positives on scalars and host-side helpers.
+    """
+    if isinstance(arg, ast.Subscript):
+        if isinstance(arg.value, ast.Name) and arg.value.id == "tensors":
+            key = _subscript_key_repr(arg)
+            return (f"- `{op}` consumes a raw `tensors[{key}]` read; wrap it "
+                    f"in `offchip_load(tensors[{key}], ...)` (or another "
+                    f"source op) before passing to a DSL consumer")
+        return None
+    if isinstance(arg, ast.Name):
+        src = name_to_source.get(arg.id, _SRC_UNKNOWN)
+        if src in _ONCHIP_SOURCES:
+            return None
+        if src == _SRC_RAW_TENSORS:
+            return (f"- `{op}` consumes `{arg.id}` which holds a raw "
+                    f"`tensors[...]` read; load it via `offchip_load` (or "
+                    f"another source op) before passing to a DSL consumer")
+        return None
+    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
+        # Method-chain like ``tensors["x"].reshape(...)`` — recurse on the receiver.
+        return _check_consumer_arg(arg.func.value, name_to_source, blackbox_set, op=op)
+    return None
+
+
+def _check_func_dataflow(func: ast.FunctionDef,
+                          blackbox_set: frozenset[str]) -> list[str]:
+    """Per-function dataflow check; see ``_check_dataflow_invariant``."""
+    name_to_source: dict[str, str] = {}
+    # Positional args other than dims/tensors are intermediate (on-chip per
+    # parent contract). Keyword-only args (out_shapes, out_perms) are scalars.
+    for arg in func.args.args:
+        if arg.arg in {"dims", "tensors", "self"}:
+            continue
+        name_to_source[arg.arg] = _SRC_INTERMEDIATE_ARG
+    for arg in func.args.kwonlyargs:
+        name_to_source[arg.arg] = _SRC_NON_TENSOR
+
+    # First pass: bind every assignment target to the source of its RHS.
+    for node in _walk_no_nested_def(func):
+        if isinstance(node, ast.Assign):
+            src = _classify_value(node.value, name_to_source, blackbox_set)
+            for tgt in node.targets:
+                _bind_target(tgt, src, name_to_source)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            src = _classify_value(node.value, name_to_source, blackbox_set)
+            _bind_target(node.target, src, name_to_source)
+
+    # Second pass: every DSL-consumer call's tensor arg must be on-chip.
+    violations: list[str] = []
+    for node in _walk_no_nested_def(func):
+        if not isinstance(node, ast.Call):
+            continue
+        call_name = _call_name(node)
+        if call_name not in _DSL_CONSUMERS:
+            continue
+        for arg in node.args:
+            v = _check_consumer_arg(arg, name_to_source, blackbox_set, op=call_name)
+            if v is not None:
+                violations.append(v)
+        for kw in node.keywords:
+            if kw.arg is None:  # **kwargs unpacking — skip
+                continue
+            v = _check_consumer_arg(kw.value, name_to_source, blackbox_set, op=call_name)
+            if v is not None:
+                violations.append(v)
+    return violations
+
+
+def _check_dataflow_invariant(code: str, *,
+                               blackbox_names: tuple[str, ...] = ()) -> list[str]:
+    """AST-level dataflow check for ``refactor_final`` output.
+
+    For every DSL consumer call (``binary_*``, ``unary_*``, ``offchip_store``,
+    …), each tensor-typed positional or keyword argument must trace back to a
+    valid on-chip source: a DSL producer (``offchip_load*``, ``select_gen``,
+    …), another consumer, a blackbox-child return, or a positional
+    intermediate function arg (one that isn't ``dims``/``tensors``/``self``).
+
+    Raw ``tensors["X"]`` reads being fed into a DSL consumer are flagged.
+    Blackbox-child call sites are exempt because their stubs accept either
+    raw or tiled inputs and reshape internally.
+
+    Subsumes the previous textual ``offchip_load`` requirement: a function
+    that consumes only intermediate args or blackbox returns generates no
+    violations even though it never calls ``offchip_load`` itself.
+    """
+    blackbox_set = frozenset(blackbox_names)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []  # exec'd elsewhere; don't double-flag here.
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            violations.extend(_check_func_dataflow(node, blackbox_set))
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(violations))
 
 
 def _check_banned_ops(code: str, pass_name: str, *,
@@ -650,11 +892,26 @@ def _check_banned_ops(code: str, pass_name: str, *,
 
     sink_ops = {"offchip_store", "OffChipStore", "random_offchip_store"}
     required_ops = list(rules["required_ops"]) + list(extra_required_ops)
+    if pass_name == "refactor_final":
+        # The AST dataflow walk subsumes the textual ``offchip_load`` check —
+        # a node consuming only intermediate args / blackbox returns never
+        # needs to call ``offchip_load`` itself. Sink-op orchestrators (root
+        # nodes whose body is purely blackbox calls) likewise terminate via
+        # their children's stores, so drop ``offchip_store`` when blackbox
+        # children are present.
+        required_ops = [op for op in required_ops if op != "offchip_load"]
+        if extra_required_ops:
+            required_ops = [op for op in required_ops if op != "offchip_store"]
     for required in required_ops:
         if not is_root and required in sink_ops:
             continue
         if required not in code:
             violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
+
+    if pass_name == "refactor_final":
+        violations.extend(_check_dataflow_invariant(
+            code, blackbox_names=tuple(extra_required_ops),
+        ))
 
     # Deduplicate while preserving order
     return list(dict.fromkeys(violations))
@@ -1548,9 +1805,14 @@ def _build_node_index(tree, tensors: dict):
             arg_names = tuple(tensor_only.keys())
             arg_shapes = tuple(tuple(tensor_only[n].shape) for n in arg_names)
             from src.node_signature import NodeSignature as _NS
+            # Function-based-root NodeSignature is a placeholder: it is created
+            # solely so the dict has an entry for ``node.path``. The root's own
+            # signature is never consumed downstream — only its CHILDREN's
+            # signatures matter, and the function-based-root-with-children case
+            # is already rejected at refactor_tree entry.
             signatures[node.path] = _NS(
                 arg_names=arg_names, arg_shapes=arg_shapes,
-                out_shape=(), weight_names=(),
+                out_shapes=(), weight_names=(), out_is_tuple=False,
             )
             canonical_inputs = dict(tensors)
         else:
@@ -1672,9 +1934,22 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
     """
     from src.agents import make_pass1_agent, make_pass1_judge_agent
     from src.prompts import build_pass1_user_prompt
+    from src.planner import build_node_tensors, has_class_model
 
     is_root = (node.path == "root")
     synth_name = _synth_kernel_name(root_kernel, node.path)
+
+    # For non-root nodes the caller-supplied ``tensors`` is the root precompute,
+    # which has no relation to the seed used by the planner-emitted child's own
+    # ``get_inputs(dims)`` (the source ``compute_gold`` consults). Running gold
+    # on one input universe and the DSL on another guarantees match=False even
+    # for a structurally-correct refactor. Rebuild per-node tensors from the
+    # node's own ``get_inputs`` so both sides see byte-identical inputs.
+    # Root keeps its caller-supplied precompute (StepDB-canonical inputs).
+    if not is_root and has_class_model(node.reference_code):
+        node_tensors = build_node_tensors(node.reference_code, dims)
+    else:
+        node_tensors = tensors
 
     # Build gold from reference_code (same as _refactor_one_node)
     ref_ns: dict = {}
@@ -1689,7 +1964,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         f"got signature with {gold_arity} parameters")
     with torch.no_grad():
         gold = (ref_ns["compute_gold"](dims) if gold_arity == 1
-                else ref_ns["compute_gold"](dims, tensors))
+                else ref_ns["compute_gold"](dims, node_tensors))
     _inject_gold(synth_name, dims, gold)
 
     # Build function signature string the LLM must produce
@@ -1700,7 +1975,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         assert parent_contract is not None, (
             f"non-root node {node.path!r} must have a parent_contract")
         sig_args = ", ".join(parent_contract.arg_names)
-        function_signature = f"def {node.name}({sig_args}, *, out_shape, out_perm=None):"
+        function_signature = f"def {node.name}({sig_args}, *, out_shapes, out_perms=None):"
 
     # Build child_blackbox_block and contract_block strings for the agent factory
     child_blackbox_block = ""
@@ -1709,9 +1984,19 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         for child_path, child_sig in children_signatures:
             child_name = child_path.rsplit("/", 1)[-1]
             sig_args = ", ".join(child_sig.arg_names)
-            lines.append(f"`{child_name}({sig_args}, *, out_shape, out_perm=None)`")
+            lines.append(f"`{child_name}({sig_args}, *, out_shapes, out_perms=None)`")
             for aname, ashape in zip(child_sig.arg_names, child_sig.arg_shapes):
                 lines.append(f"  - `{aname}` vanilla shape: {ashape}")
+            if child_sig.out_is_tuple:
+                lines.append(
+                    f"  returns a tuple of {len(child_sig.out_shapes)} tensors "
+                    f"(per-output vanilla shapes: {list(child_sig.out_shapes)}); "
+                    f"call site must destructure: ``a_0, a_1, ... = {child_name}(...)``"
+                )
+            else:
+                lines.append(
+                    f"  returns a single tensor (vanilla shape {child_sig.out_shapes[0]})"
+                )
         child_blackbox_block = "\n".join(lines)
 
     contract_block = ""
@@ -1725,22 +2010,39 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
             lines.append(
                 f"`{aname}`: vanilla shape {vshape}, tiled shape {tshape}"
             )
-        lines.append(f"Required output shape: `{parent_contract.out_shape}`")
-        lines.append(f"Output permutation: `{parent_contract.out_perm}`")
+        lines.append(
+            f"Required output shapes (one per produced tensor): "
+            f"`{list(parent_contract.out_shapes)}`"
+        )
+        lines.append(
+            f"Output permutations (parallel to shapes; ``None`` = identity): "
+            f"`{list(parent_contract.out_perms)}`"
+        )
         contract_block = "\n".join(lines)
 
     # Build the user prompt
-    # children_signatures expected as list of (child_name, arg_names, vanilla_shapes)
+    # children_signatures expected as list of (child_name, arg_names,
+    # vanilla_shapes, out_shapes, out_is_tuple)
     children_sig_triples = [
-        (child_path.rsplit("/", 1)[-1], child_sig.arg_names, child_sig.arg_shapes)
+        (child_path.rsplit("/", 1)[-1], child_sig.arg_names,
+         child_sig.arg_shapes, child_sig.out_shapes, child_sig.out_is_tuple)
         for child_path, child_sig in children_signatures
     ]
+    # For internal nodes the planner already produced a decomposed parent
+    # (``refactored_code``) whose ``forward`` calls each child by name; that
+    # is the structural template the LLM should follow, not the original
+    # monolithic reference. Leaves keep their own reference_code.
+    agent_facing_reference = (
+        node.refactored_code
+        if node.refactored_code is not None
+        else node.reference_code
+    )
     user_prompt = build_pass1_user_prompt(
         node_name=node.name,
         is_root=is_root,
-        reference_code=node.reference_code,
+        reference_code=agent_facing_reference,
         dims=dims,
-        tensors=tensors,
+        tensors=node_tensors,
         contract=parent_contract,
         children_signatures=children_sig_triples,
         function_signature=function_signature,
@@ -1778,7 +2080,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         return await _run_pass_loop(
             agent, "refactor_final",
             kernel_name=synth_name, dims=dims, max_turns=max_turns,
-            ckpt_dir=attempt_dir, executor="dsl", tensors=tensors, log=log,
+            ckpt_dir=attempt_dir, executor="dsl", tensors=node_tensors, log=log,
             check_order="correctness-first",
             prebuilt_user_prompt=user_prompt,
             judge_agent=judge_agent,
@@ -1999,6 +2301,22 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
     assert tensors is not None, (
         "tensors dict is now required by refactor_tree (used to instantiate "
         "Modules for signature extraction and to drive Pass-1 stubs)")
+
+    # v1 limitation: dict-style modules (forward(self, dims, tensors)) — produced
+    # by the planner when the original kernel is a function-based StepDB reference
+    # (compute_gold(dims, tensors) with no class Model) — do not fit the per-arg
+    # blackbox-stub contract, which assumes positional tensor args. Fail fast with
+    # an actionable message rather than crashing later in _build_node_index.
+    from src.planner import has_class_model
+    if not has_class_model(tree.root.reference_code) and tree.root.children:
+        raise AssertionError(
+            "Two-pass refactor v1 does not support function-based StepDB kernels "
+            "(forward(self, dims, tensors)) with non-leaf decompositions. "
+            f"Root {tree.root.path!r} is function-based and has "
+            f"{len(tree.root.children)} children. Workarounds: "
+            "(a) reduce --max-plan-depth so the planner returns a leaf-only tree, "
+            "(b) use a class-based kernel reference, or "
+            "(c) extend the contract design to dict-style modules.")
 
     # Precompute per-node signatures and instantiate Modules once.
     signatures, ref_modules = _build_node_index(tree, tensors)

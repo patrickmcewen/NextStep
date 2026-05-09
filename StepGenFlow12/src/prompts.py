@@ -604,7 +604,13 @@ def build_pass1_user_prompt(
     dims: dict,
     tensors: dict,
     contract,            # src.contract.Contract for non-root, None for root
-    children_signatures: list[tuple[str, tuple[str, ...], tuple[tuple[int, ...], ...]]],
+    children_signatures: list[tuple[
+        str,                                # child_name
+        tuple[str, ...],                    # arg_names
+        tuple[tuple[int, ...], ...],        # arg_shapes (vanilla)
+        tuple[tuple[int, ...], ...],        # out_shapes (one entry per output)
+        bool,                               # out_is_tuple
+    ]],
     function_signature: str,
 ) -> str:
     """Build the Pass-1 user prompt for a single planner node.
@@ -627,29 +633,48 @@ def build_pass1_user_prompt(
     contract:
         ``Contract`` for non-root nodes, ``None`` for root.
     children_signatures:
-        List of ``(child_name, arg_names, vanilla_shapes)`` tuples, one per
-        declared child.  Empty for leaf nodes.
+        List of ``(child_name, arg_names, vanilla_shapes, out_shapes,
+        out_is_tuple)`` 5-tuples, one per declared child. Empty for
+        leaf nodes.
     function_signature:
         The exact signature string the LLM must produce (e.g.
-        ``"def attention(Q, *, out_shape, out_perm=None):"``).
+        ``"def attention(Q, *, out_shapes, out_perms=None):"``).
     """
     dims_json = json.dumps(dims, indent=2)
 
+    has_children = bool(children_signatures)
+    if has_children:
+        ref_header = "### PyTorch Reference (planner-decomposed parent)"
+        ref_note = (
+            "This is the planner's already-validated decomposition of this node. "
+            "The child sub-models it calls (held as `self.<child_name>` "
+            "attributes) correspond 1:1 to the blackboxes listed below — "
+            "your job is to replace each `self.<child_name>(args)` call with "
+            "`<child_name>(args, out_shapes=..., out_perms=...)`. Do not "
+            "re-derive the split; preserve the call structure."
+        )
+    else:
+        ref_header = "### PyTorch Reference"
+        ref_note = None
     lines = [
         f"## Node: {node_name}",
         "",
-        "### PyTorch Reference",
+        ref_header,
         "",
         "```python",
         reference_code.rstrip(),
         "```",
+    ]
+    if ref_note is not None:
+        lines.extend(["", ref_note])
+    lines.extend([
         "",
         "### Dimensions",
         "",
         "```json",
         dims_json,
         "```",
-    ]
+    ])
 
     # Tensors dict — only shown when non-empty (root always has tensors; non-root may not)
     if tensors:
@@ -682,8 +707,12 @@ def build_pass1_user_prompt(
             )
         lines.extend([
             "",
-            f"  Required output shape: `{contract.out_shape}`",
-            f"  Output permutation: `{contract.out_perm}`",
+            f"  Required output shapes (one per produced tensor): "
+            f"`{list(contract.out_shapes)}`",
+            f"  Output permutations (parallel; ``None`` = identity): "
+            f"`{list(contract.out_perms)}`",
+            f"  Number of outputs: {len(contract.out_shapes)} "
+            f"({'tuple' if len(contract.out_shapes) > 1 else 'single tensor'})",
         ])
 
     # Child blackboxes — non-leaf only
@@ -696,17 +725,35 @@ def build_pass1_user_prompt(
             "implements the semantics of its corresponding PyTorch reference.",
             "You MUST call each one exactly once, straight-line (no loops or conditionals).",
             "",
+            "Each blackbox is invoked with plural keyword args ``out_shapes`` "
+            "(tuple of per-output shapes) and optional ``out_perms`` (tuple of "
+            "per-output permutations, parallel to ``out_shapes``). Single-output "
+            "children still take 1-tuples (e.g. ``out_shapes=((H, W),)``). "
+            "Multi-output children must be destructured at the call site "
+            "(e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).",
+            "",
         ])
-        for child_name, arg_names, vanilla_shapes in children_signatures:
+        for entry in children_signatures:
+            child_name, arg_names, vanilla_shapes, out_shapes, out_is_tuple = entry
             sig_args = ", ".join(arg_names)
-            lines.append(f"  `{child_name}({sig_args}, *, out_shape, out_perm=None)`")
+            lines.append(f"  `{child_name}({sig_args}, *, out_shapes, out_perms=None)`")
             for arg_name, vshape in zip(arg_names, vanilla_shapes):
                 lines.append(f"    - `{arg_name}` vanilla shape: {vshape}")
+            if out_is_tuple:
+                lines.append(
+                    f"    - returns a tuple of {len(out_shapes)} tensors; "
+                    f"per-output vanilla shapes: {list(out_shapes)}"
+                )
+            else:
+                lines.append(
+                    f"    - returns a single tensor (vanilla shape {out_shapes[0]})"
+                )
         lines.extend([
             "",
             "**Reshape rule:** between any tensor source and a blackbox call site,",
             "only `.reshape(...)` is permitted. No `.permute()`, `.transpose()`,",
-            "indexing, or arithmetic. Output permutation goes in `out_perm`.",
+            "indexing, or arithmetic. Output permutations go in `out_perms` "
+            "(one entry per output, ``None`` = identity).",
         ])
 
     # Required function signature

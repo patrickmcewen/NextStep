@@ -108,7 +108,7 @@ def main():
              "where the refactor pass is flaky.",
     )
     parser.add_argument(
-        "--max-plan-depth", type=int, default=4,
+        "--max-plan-depth", type=int, default=2,
         help="Maximum recursion depth of the planner tree. Depth 0 is the root, "
              "depth 1 is its direct children, etc. Any node at depth >= "
              "--max-plan-depth is forced to LEAF without consulting the LLM. "

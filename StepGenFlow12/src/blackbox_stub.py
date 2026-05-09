@@ -10,9 +10,13 @@ slice, or otherwise non-bijectively transform a tensor before passing
 it to a stub. The stub's input recovery is ``flatten().reshape(vanilla)``,
 which is correct only for invertible reshape.
 
-Outputs are template-driven: the parent calls the stub with
-``out_shape=...`` (and optionally ``out_perm=...``); the stub applies
-permute (if any) then reshape, returning the parent-declared shape.
+Outputs are template-driven and always plural: the parent calls the stub
+with ``out_shapes=(<shape_0>, <shape_1>, ...)`` (and optionally
+``out_perms=(<perm_0>, <perm_1>, ...)`` where each entry may be ``None``).
+For each output the stub applies permute (if any) then reshape. If the
+underlying reference returns a single Tensor (``len(out_shapes) == 1``)
+the stub returns a Tensor; if it returns a tuple, the stub returns a
+tuple of the same length.
 
 The first call to a given stub records a ``Contract`` on the supplied
 ``ContractRecorder``; subsequent calls are pure passthrough. This means
@@ -42,31 +46,53 @@ def make_stub(*, ref_module: nn.Module,
         f"arg_names ({len(arg_names)}) and vanilla_shapes "
         f"({len(vanilla_shapes)}) length mismatch")
 
-    def stub(*tiled_args, out_shape, out_perm=None):
+    def stub(*tiled_args, out_shapes, out_perms=None):
         assert len(tiled_args) == len(arg_names), (
             f"stub expected {len(arg_names)} positional args "
             f"({arg_names}), got {len(tiled_args)}")
+        assert isinstance(out_shapes, tuple) and len(out_shapes) >= 1 and all(
+            isinstance(s, tuple) for s in out_shapes), (
+            f"out_shapes must be a non-empty tuple of shape tuples, "
+            f"got {out_shapes!r}")
+        if out_perms is None:
+            out_perms = (None,) * len(out_shapes)
+        assert isinstance(out_perms, tuple) and len(out_perms) == len(out_shapes), (
+            f"out_perms must be a tuple of length {len(out_shapes)} "
+            f"(or None for all-None), got {out_perms!r}")
+
         vanilla_args = []
         for t, vshape, name in zip(tiled_args, vanilla_shapes, arg_names):
             assert isinstance(t, torch.Tensor), (
                 f"stub arg {name!r} must be a Tensor, got {type(t).__name__}")
-            v = t.reshape(-1).reshape(vshape)
-            vanilla_args.append(v)
+            vanilla_args.append(t.reshape(-1).reshape(vshape))
+
         with torch.no_grad():
-            out = ref_module(*vanilla_args)
-        if out_perm is not None:
-            out = out.permute(*out_perm)
-        out = out.reshape(out_shape)
+            raw = ref_module(*vanilla_args)
+        raw_outputs = raw if isinstance(raw, tuple) else (raw,)
+        assert len(raw_outputs) == len(out_shapes), (
+            f"output count mismatch: ref_module returned {len(raw_outputs)} "
+            f"tensor(s), but parent requested {len(out_shapes)} via out_shapes")
+
+        results = []
+        for raw_out, out_shape, out_perm in zip(raw_outputs, out_shapes, out_perms):
+            if out_perm is not None:
+                raw_out = raw_out.permute(*out_perm)
+            results.append(raw_out.reshape(out_shape))
+
         if recorder.contract is None:
             recorder.contract = Contract(
                 arg_names=arg_names,
                 vanilla_shapes=vanilla_shapes,
                 tiled_shapes=tuple(tuple(t.shape) for t in tiled_args),
                 tiled_values=tuple(t.detach().clone() for t in tiled_args),
-                out_shape=tuple(out_shape),
-                out_perm=None if out_perm is None else tuple(out_perm),
+                out_shapes=tuple(tuple(s) for s in out_shapes),
+                out_perms=tuple(
+                    None if p is None else tuple(p) for p in out_perms),
             )
-        return out
+
+        if isinstance(raw, tuple):
+            return tuple(results)
+        return results[0]
 
     stub.__name__ = "blackbox_stub"
     return stub

@@ -86,6 +86,31 @@ each internal node's `refactored_code` via `node_signature.extract_signature`.
 These shapes are used to auto-generate the child blackbox stubs that
 Pass 1 presents to the parent LLM.
 
+**Multi-output children.** The contract is plural in both directions:
+`Contract.out_shapes` and `Contract.out_perms` are tuples — length 1 for
+single-output nodes, length N for nodes whose `forward` returns an
+N-tuple (e.g. `return Q, K, V`). `NodeSignature.out_is_tuple` records
+the underlying return type so the prompt can teach the LLM whether to
+destructure the call site (`q, k, v = preprocess_heads(...)`) or assign
+directly (`r = attention(...)`). Stubs return a Tensor when the
+underlying ref module returns a Tensor and a tuple when it returns a
+tuple — matching the LLM's natural call-site syntax. Pass-1
+function signatures use plural keyword args universally:
+`def <node_name>(*intermediate_args, *, out_shapes, out_perms=None):`.
+
+**v1 limitation (function-based StepDB kernels).** The contract design
+assumes children take positional tensor args (`forward(self, *tensors)`).
+For function-based StepDB references — those defining only
+`compute_gold(dims, tensors)` with no `class Model` — the planner emits
+children with `forward(self, dims, tensors)` (a `dims` dict and a
+`tensors` dict), per the planner system prompt. This dict-style call
+shape does not fit the per-arg `Contract.arg_names` / `vanilla_shapes`
+representation. `refactor_tree` rejects this combination at entry with
+an `AssertionError` if the root reference has no `class Model` and the
+planner produced any non-leaf children. Workarounds: lower
+`--max-plan-depth` so the planner returns a leaf-only tree, use a
+class-based reference, or extend the contract to dict-style modules.
+
 `--node-attempts N` controls fan-out *per node*: each node spawns up to
 N parallel refactor-loop attempts (each a full `_run_pass_loop` with
 its own `--max-turns` budget) and the first success wins. Nodes that
@@ -111,7 +136,17 @@ same post-validator. The differences are:
 - **Reference code**: gold is computed from the node's own
   `reference_code` (the original module), not from any composed-parent
   form. This is what makes the children-first walk safe — each child
-  is verified against its own ground truth.
+  is verified against its own ground truth. **DSL inputs are rebuilt
+  from the same `reference_code`'s `get_inputs(dims)`** (via
+  `build_node_tensors`), not the root precompute — gold and DSL must
+  consume byte-identical tensors. The planner-emitted children use
+  their own `torch.manual_seed(...)` inside `get_inputs`, so feeding
+  the root's seed-42 precompute would compare gold-on-seed-N against
+  DSL-on-seed-42 and never match. Only the root keeps its caller-
+  supplied StepDB precompute (canonical kernel inputs); non-root
+  nodes rebuild. Pass 2's composition step re-runs the full root DSL
+  against the canonical precompute, catching any silent shape
+  divergence introduced by the per-node input substitution.
 - **`is_root` flag** flows through every gate. When `is_root=False`:
   - DSL output may be a tuple/list of tensors (children with
     multi-tensor `forward`s);
@@ -121,11 +156,34 @@ same post-validator. The differences are:
     since non-root DSLs don't terminate at off-chip;
   - the deterministic-translate post-validator runs but doesn't enforce
     the kernel-level output contract.
+- **Dataflow compliance** replaces the textual `offchip_load`/`offchip_store`
+  requirement for `refactor_final`. An AST walk
+  (`_check_dataflow_invariant` in `orchestrator.py`) confirms that every
+  DSL-consumer call (`binary_*`, `unary_*`, `accum_*`, sinks, …) takes
+  tensor inputs sourced from a DSL producer (`offchip_load*`,
+  `select_gen`, …), another consumer, a blackbox-child return, or a
+  positional intermediate arg (parent contract). Raw `tensors[...]`
+  reads flowing into a consumer are flagged. Blackbox call sites are
+  exempt — their stubs accept either vanilla raw tensors or tiled
+  streams. Consequence: a pure orchestrator parent (only blackbox
+  calls + threading) emits no compliance violations even though it
+  never calls `offchip_load`/`offchip_store` itself; the textual
+  `offchip_store` requirement is dropped whenever blackbox children
+  are present, since the children carry the sink internally.
 - **Pass-1 prompt additions**: the node's user prompt carries the
   parent-declared contract block (input shapes + values + output
   shape/permutation) and, for non-leaf nodes, the blackbox signatures
   for each child. The LLM picks the call-site contract; children
   refactor under it. See [pass_loop.md](pass_loop.md) for details.
+- **Reference shown to the LLM**: for non-leaf nodes the prompt shows the
+  planner's `refactored_code` (parent rewritten to call its children as
+  `self.<child_name>(args)`) rather than the original `reference_code`.
+  The structural decomposition is already validated by `compose-equivalent`,
+  so the LLM's job is to translate `self.<child_name>(args)` call sites
+  into `<child_name>(args, out_shapes=..., out_perms=...)` blackbox calls,
+  not to re-derive the split. Leaves still see their original
+  `reference_code`. Gold is always computed from `reference_code` — the
+  refactored form is a prompt-side aid only.
 
 ## Replanning
 

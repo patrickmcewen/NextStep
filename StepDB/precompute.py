@@ -766,9 +766,11 @@ def _precompute_prefill_transformer_simple(dims):
         "cos": cos,
         "sin": sin,
         "o_proj_weight": o_proj_weight,
-        "w_gate_list": w_gate_list,
-        "w_up_list": w_up_list,
-        "w_down_list": w_down_list,
+        # Stacked expert weights: [n_routed_experts, ...]. ``w[i]`` returns a
+        # contiguous view equivalent to the old ``w_*_list[i]``.
+        "w_gate": torch.stack(w_gate_list, dim=0),
+        "w_up": torch.stack(w_up_list, dim=0),
+        "w_down": torch.stack(w_down_list, dim=0),
         "router_w": router_w,
         "expert_weights": expert_weights,
         "expert_multihot": expert_multihot,

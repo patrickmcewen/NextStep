@@ -26,10 +26,11 @@ These functions are pre-imported and available at runtime. Here are their exact 
 
 When passing a tensor to a child blackbox, the **only** permitted transform between the tensor source and the blackbox call site is `tensor.reshape(...)`. Specifically:
 
-- **Allowed:** `child_name(x.reshape(new_shape), ..., out_shape=(...), out_perm=None)`
+- **Allowed (single-output child):** `result = child_name(x.reshape(new_shape), ..., out_shapes=((H, W),), out_perms=(None,))`
+- **Allowed (multi-output child):** `q, k, v = child_name(x.reshape(new_shape), ..., out_shapes=(s_q, s_k, s_v), out_perms=(p_q, p_k, p_v))`
 - **Forbidden:** `permute`, `transpose`, any index expression `[...]`, arithmetic (`*`, `+`, etc.), `squeeze`, `unsqueeze`, `expand`, `flatten` (with explicit dims)
 
-Output permutation is communicated via the `out_perm` keyword argument, not by permuting the input. If you need a specific memory layout on the output, pass the appropriate `out_perm` tuple.
+Both ``out_shapes`` and ``out_perms`` are **always tuples of per-output entries**. Even single-output children take a 1-tuple (``out_shapes=((H, W),)``). Output permutations go in ``out_perms`` (one entry per output, ``None`` = identity); never apply ``permute``/``transpose`` to the input.
 
 This rule is enforced by the judge. Any non-reshape transform between a tensor and a blackbox call site will result in `VERDICT: REJECT`.
 
@@ -53,8 +54,10 @@ def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
 
 For every non-root node (must match the stub signature exactly):
 ```python
-def <node_name>(*intermediate_args, *, out_shape, out_perm=None):
+def <node_name>(*intermediate_args, *, out_shapes, out_perms=None):
 ```
+
+If your node's PyTorch reference returns a single tensor, your function returns a single tensor. If it returns a tuple of N tensors (e.g. ``return Q, K, V``), your function must return a tuple of the same length. ``out_shapes`` always has length N (the parent will pass a 1-tuple for single-output children). ``out_perms`` is parallel to ``out_shapes``; ``None`` entries mean the matching output keeps its native layout.
 
 The judge will reject any function whose name or signature deviates from what is specified in the prompt.
 {few_shot_examples}

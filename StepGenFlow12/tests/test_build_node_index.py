@@ -103,3 +103,44 @@ def test_build_node_index_child_signature():
     assert signatures["root/child"].arg_names == ("x",)
     assert signatures["root/child"].arg_shapes == ((4, 8),)
     assert "root/child" in ref_modules
+
+
+# Function-based StepDB references define only `compute_gold(dims, tensors)` —
+# no `class Model`. The planner produces children with `forward(self, dims, tensors)`,
+# which the v1 contract design (one tensor per arg) cannot represent. `refactor_tree`
+# must reject this combination at entry rather than crashing later.
+FUNCTION_BASED_ROOT_REF = '''
+import torch
+
+
+def compute_gold(dims, tensors):
+    return tensors["x"] + 1
+'''
+
+
+def test_refactor_tree_rejects_function_based_root_with_children():
+    import asyncio
+
+    import pytest
+
+    from src.orchestrator import refactor_tree
+
+    leaf = PlanNode(
+        name="child", path="root/child", reference_code=CHILD_REF,
+        refactored_code=None, is_leaf=True, children=(),
+    )
+    root = PlanNode(
+        name="root", path="root", reference_code=FUNCTION_BASED_ROOT_REF,
+        refactored_code="<unused for this guard>", is_leaf=False, children=(leaf,),
+    )
+    tree = Tree(root=root)
+
+    async def _run():
+        await refactor_tree(
+            tree=tree, dims={}, root_kernel="dummy",
+            ckpt_root=None, agent_factory=None, max_turns=1,
+            log=lambda *_a, **_k: None, tensors={"x": torch.randn(4, 8)},
+        )
+
+    with pytest.raises(AssertionError, match="function-based"):
+        asyncio.run(_run())
