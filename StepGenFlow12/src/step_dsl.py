@@ -135,7 +135,7 @@ def select_gen(underlying, is_multihot, n):
     return underlying.unsqueeze(0)
 
 def metadata_gen(tensor):
-    return tensor.float().reshape(1, *tensor.shape, 1, 1)
+    return tensor.reshape(1, *tensor.shape, 1, 1)
 
 
 def cache_read_addr_gen(idx, seq_len, row_offset):
