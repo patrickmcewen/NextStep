@@ -1,0 +1,60 @@
+You are an expert at converting PyTorch into DSL function calls. This is Pass 1 of a two-pass refactor: you write the function for this planner node first, treating each child as an opaque blackbox callable.
+
+Your task: Replace or refactor operations into DSL function calls. PyTorch operations may not convert exactly one-to-one into DSL operations; sometimes you will need to find the right mix of DSL operations to replicate PyTorch functionality.
+
+After this pass, every tensor operation must be a DSL call OR a child blackbox call. **The only remaining Python should be scalar math, control flow, list operations, and blackbox calls.** No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`.
+
+You cannot use python indexing to access parts of data tensors.
+
+You also may not create any new pytorch tensors besides the ones provided to you in the function. No torch.zeros or similar.
+
+If the code is already fully in DSL form, output it unchanged.
+
+{child_blackbox_block}
+
+{contract_block}
+
+## DSL Functions for This Pass
+
+These functions are pre-imported and available at runtime. Here are their exact implementations:
+
+```python
+{dsl_code}
+```
+
+## Reshape Rule
+
+When passing a tensor to a child blackbox, the **only** permitted transform between the tensor source and the blackbox call site is `tensor.reshape(...)`. Specifically:
+
+- **Allowed:** `child_name(x.reshape(new_shape), ..., out_shape=(...), out_perm=None)`
+- **Forbidden:** `permute`, `transpose`, any index expression `[...]`, arithmetic (`*`, `+`, etc.), `squeeze`, `unsqueeze`, `expand`, `flatten` (with explicit dims)
+
+Output permutation is communicated via the `out_perm` keyword argument, not by permuting the input. If you need a specific memory layout on the output, pass the appropriate `out_perm` tuple.
+
+This rule is enforced by the judge. Any non-reshape transform between a tensor and a blackbox call site will result in `VERDICT: REJECT`.
+
+## NOTE ABOUT LOADS
+
+## Stride Convention
+
+`stride` and `out_shape_tiled` define how tile indices map to positions in the underlying tensor's tile grid.
+
+- **Advancing dim**: `stride[i] = grid_cols_per_step` — tiles advance through the grid
+- **Broadcast dim**: `stride[i] = 0` — same tile replicated along this dimension
+
+## HINT: Arbitrary permutation of tensor can be expressed through a Bufferize + Streamify pair with proper strides.
+
+## Function Signature
+
+For the root node:
+```python
+def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
+```
+
+For every non-root node (must match the stub signature exactly):
+```python
+def <node_name>(*intermediate_args, *, out_shape, out_perm=None):
+```
+
+The judge will reject any function whose name or signature deviates from what is specified in the prompt.
+{few_shot_examples}

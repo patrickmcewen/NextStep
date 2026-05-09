@@ -57,8 +57,8 @@ The first turn's prompt carries the kernel context the model needs:
   exactly how each tensor was built,
 - the previous pass's verified output, when present (refactor passes
   receive PyTorch; translate passes receive the DSL form),
-- for planner non-root nodes, a "Verified sub-task DSLs" block listing
-  each child's verified DSL form,
+- for planner non-root nodes, the parent-declared contract block and
+  child blackbox signatures (Pass-1 prompt extensions — see below),
 - the function signature the pass must produce (`tiled_reference` for
   refactor, `build_graph` for translate),
 - a hard prohibition on creating new torch tensors (no `torch.randn`,
@@ -77,6 +77,63 @@ prompt-cache prefix stays stable across turns and per-turn context is
 capped at O(1). This is a refactor-pass-only mode; translate passes
 keep growing their conversation regardless. Off by default —
 accumulating chat history is the existing behavior.
+
+## Pass-1 prompt extensions
+
+When the orchestrator runs Pass 1 (pre-order refactor with blackbox children),
+the per-node user prompt carries two additions beyond the baseline assembly
+described above:
+
+**Contract block.** For every non-root node, the prompt includes the
+parent-declared contract: the actual tiled input tensor shapes and values
+that the parent passed at the child's call site, and the `out_shape` /
+`out_perm` the parent requested back. This is the concrete tiled interface
+the child must satisfy — not abstract planner-level shapes.
+
+**Child-blackbox signature block.** For every non-leaf node, the prompt
+lists the auto-generated blackbox stubs available to call, one entry per
+planner child:
+
+```
+<child_name>(*intermediate_args, *, out_shape, out_perm=None) -> Tensor
+```
+
+The model is told these names resolve to callable subroutines whose
+semantics match the corresponding PyTorch reference; it chooses the
+input tiling and the requested output shape per call site.
+
+**Reshape-only rule.** Any tensor flowing into a blackbox call must be
+transformed by pure reshape only (no `permute`, `transpose`, or slicing
+before the call). Compliance enforces this lexically as an extension of
+the existing `banned_patterns` mechanism; the `required_ops` list is
+computed per-node from the planner tree's child names rather than from a
+hard-coded table.
+
+## Pass-2 deterministic gate
+
+Pass 2 runs once after all Pass-1 nodes are verified. It is post-order,
+deterministic, and invokes no LLM.
+
+**Name rebinding.** For each non-leaf node (deepest first, then root),
+the orchestrator builds a namespace where each blackbox name is bound to
+the verified child DSL function instead of the auto-generated stub.
+Because the verified child DSL has exactly the same signature as the stub
+(`(*intermediate_args, *, out_shape, out_perm=None)`), call sites resolve
+without any AST modification to the parent's source.
+
+**Re-execution against gold.** The parent's frozen Pass-1 source is
+exec'd with the rebound namespace against kernel-level gold
+(`rel_err < 1e-5`). No candidate code is generated; the parent's source
+is never rewritten.
+
+**Scope in v1.** Only the root is verified at Pass 2. The root's
+re-execution subsumes all intermediate compositions; per-level
+verification is a future refinement.
+
+**Failure.** If the root's Pass-2 executor fails (typically due to
+numerical drift from DSL-level precision differences between the stub
+and the real child DSL), the entire outer attempt fails and escalates to
+the existing replan loop. There is no LLM repair at Pass 2.
 
 ## Executors
 

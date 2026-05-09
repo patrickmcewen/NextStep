@@ -26,7 +26,11 @@ directory is the durable record of the run.
         │       ├── <node_path>/{reference.py, refactored.py}
         │       └── turns/<node_path>/turn_<N>/{system_prompt.txt, user_prompt.txt, response.txt, reasoning.txt, status.txt}
         ├── refactor/               # only when Phase 0 ran — per-node refactor artifacts
-        │   └── <node_path>/[attempt_<i>/]refactor_final/turn_<N>/...
+        │   └── pass1/              # Pass-1 artifacts, one subdir per node
+        │       └── <node_path>/[attempt_<i>/]refactor_final/turn_<N>/...
+        │                           # attempt_<i>/ layer only present when --node-attempts > 1
+        ├── pass2_composed.py       # Pass-2 output: the composed root DSL after name rebinding
+        │                           # (only present when Pass 2 ran and succeeded)
         ├── dsl_code.py             # phase-1 verified DSL output (when refactor_final succeeded)
         ├── autotune/               # only present when --autotune was set and this outer succeeded
         │   └── pass_<idx>_<agent>/
@@ -71,6 +75,12 @@ The `plan/` and `refactor/` subtrees only appear when Phase 0 (the
 decomposition planner) ran for that outer. In the legacy single-shot
 path (`--no-plan`), the refactor pass writes directly to a top-level
 `<pass>/turn_<m>/...` subdirectory under `outer_<i>/` instead.
+
+Under the planner path, Pass-1 artifacts are laid out with the pass
+level above the node: `refactor/pass1/<node_path>/[attempt_<i>/]refactor_final/turn_<N>/...`.
+The `attempt_<i>/` layer is inserted only when `--node-attempts > 1`.
+There is no per-node `pass2/` directory — Pass 2 runs once at the root
+and writes a single `pass2_composed.py` artifact directly under `outer_<i>/`.
 
 `status.txt` is the most useful single file for triage — its values
 are a fixed vocabulary:
@@ -227,7 +237,8 @@ disk.
 | Deterministic translator kept failing | `turn_<m>/translate_check/error.txt` or `graph_error.txt` |
 | Planner refused to split a node | `outer_<i>/plan/iteration_*/turns/<node_path>/turn_*/status.txt` (look for `MALFORMED_SPLIT` / `GUARD_FAILED`) |
 | Planner gave up on a node | look for `EXHAUSTED_FALLBACK_TO_LEAF.txt` or `MAX_DEPTH_FORCED_LEAF.txt` under `plan/iteration_*/<node_path>/` |
-| Per-node refactor failure under planner | `outer_<i>/refactor/<node_path>/.../turn_*/status.txt` |
+| Per-node refactor failure under planner | `outer_<i>/refactor/pass1/<node_path>/.../turn_*/status.txt` |
+| Pass 2 composition failed | `outer_<i>/log.txt` (last lines) — Pass 2 writes no per-turn artifacts; failure escalates to replan |
 | Regression-suite kernel never started | `<results-root>/<stamp>/jobs/<kernel>__<preset>.log` |
 | Autotuner regressed correctness | `<...>/turn_<n>/dsl_correctness_result.txt` or `graph_correctness_result.txt` (the loop ignores it; baseline is preserved as `baseline_dsl.py`) |
 | Per-outer autotune crashed | `<checkpoint-dir>/<kernel>/outer_<i>/autotune/pass_<idx>_<agent>/<kernel>/progress.json` for last-known best; outer's `result.json` `autotune.passes[idx].status` will be `error` with the exception message |

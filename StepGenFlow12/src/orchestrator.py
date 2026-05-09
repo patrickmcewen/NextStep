@@ -420,20 +420,22 @@ def _compare_one_tensor(gold, result, kernel_name, dims, label, *,
 
 
 def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
-                          is_root: bool = True):
+                          is_root: bool = True,
+                          extra_globals: dict | None = None):
     """Run a refactor-pass candidate against gold via the DSL executor.
 
     The DSL surface is directly runnable (the standalone ``step_dsl`` module
     or the bundle's mounted abstraction), so we exec the candidate as
     ``tiled_reference(dims, tensors)`` and compare its output to gold.
     """
-    result = _exec_dsl_ref(code, dims, tensors)
+    result = _exec_dsl_ref(code, dims, tensors, extra_globals=extra_globals)
     return _compare_against_gold(result, kernel_name, dims, "dsl",
                                  is_root=is_root)
 
 
 def _run_graph_correctness(code, kernel_name, dims, tensors, *,
-                            is_root: bool = True):
+                            is_root: bool = True,
+                            extra_globals: dict | None = None):
     """Run a translate-pass candidate against gold via the simulator.
 
     The candidate is exec'd as ``build_graph(dims, tensors)`` and the
@@ -602,7 +604,8 @@ class _GateResult(NamedTuple):
 
 
 def _check_banned_ops(code: str, pass_name: str, *,
-                       is_root: bool = True) -> list[str]:
+                       is_root: bool = True,
+                       extra_required_ops: tuple[str, ...] = ()) -> list[str]:
     """Check whether ``code`` complies with this pass's output constraints.
 
     Returns a list of violation messages; empty means compliant. Each pass's
@@ -646,7 +649,8 @@ def _check_banned_ops(code: str, pass_name: str, *,
             violations.append(f"- `{pattern}` still present — {fix}")
 
     sink_ops = {"offchip_store", "OffChipStore", "random_offchip_store"}
-    for required in rules["required_ops"]:
+    required_ops = list(rules["required_ops"]) + list(extra_required_ops)
+    for required in required_ops:
         if not is_root and required in sink_ops:
             continue
         if required not in code:
@@ -870,7 +874,8 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
 
 async def _gate_correctness(code, kernel_name, dims, tensors, executor,
                             turn_dir: Path, log, *,
-                            is_root: bool = True) -> tuple[_GateResult, str]:
+                            is_root: bool = True,
+                            extra_globals: dict | None = None) -> tuple[_GateResult, str]:
     """Run check_correctness with stdout captured for shape trace.
 
     Returns (gate_result, shape_trace). The shape trace is captured even on
@@ -882,7 +887,8 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
     try:
         with contextlib.redirect_stdout(_trace_buf):
             result = check_correctness(code, kernel_name, dims, tensors,
-                                       is_root=is_root)
+                                       is_root=is_root,
+                                       extra_globals=extra_globals)
         shape_trace = _trace_buf.getvalue()
         if shape_trace:
             _write(turn_dir / "shape_trace.txt", shape_trace)
@@ -940,7 +946,8 @@ def _build_judge_context(tensors, *, correctness_verified: bool) -> str:
 async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
                            tensors, turn_dir: Path, log,
                            *, correctness_verified: bool,
-                           is_root: bool = True) -> _GateResult:
+                           is_root: bool = True,
+                           extra_required_ops: tuple[str, ...] = ()) -> _GateResult:
     """Regex compliance check.
 
     On failure, on `pass_name == "refactor_final"` with a non-None judge_agent,
@@ -951,7 +958,8 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
         violations = _check_bundle_compliance(code, compliance_override,
                                               is_root=is_root)
     else:
-        violations = _check_banned_ops(code, pass_name, is_root=is_root)
+        violations = _check_banned_ops(code, pass_name, is_root=is_root,
+                                       extra_required_ops=extra_required_ops)
 
     if not violations:
         return _GateResult(None, "PASS", 0)
@@ -1075,7 +1083,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          check_order: str,
                          prebuilt_user_prompt: str | None = None,
                          is_root: bool = True,
-                         stateless: bool = False):
+                         stateless: bool = False,
+                         extra_required_ops: tuple[str, ...] = (),
+                         extra_globals: dict | None = None):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1186,14 +1196,16 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 if gate_name == "correctness":
                     res, shape_trace = await _gate_correctness(
                         code, kernel_name, dims, tensors, executor,
-                        turn_dir, log, is_root=is_root)
+                        turn_dir, log, is_root=is_root,
+                        extra_globals=extra_globals)
                     correctness_verified = (res.feedback is None)
                 elif gate_name == "compliance":
                     res = await _gate_compliance(
                         code, pass_name, compliance_override, judge_agent,
                         tensors, turn_dir, log,
                         correctness_verified=correctness_verified,
-                        is_root=is_root)
+                        is_root=is_root,
+                        extra_required_ops=extra_required_ops)
                 elif gate_name == "judge":
                     res = await _gate_judge(
                         judge_agent, code, tensors, turn_dir, log,
@@ -1490,86 +1502,541 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
     return result
 
 
+# ---------------------------------------------------------------------------
+# Pass-1 plumbing (Task 8) — pre-order walk with blackbox stubs
+# ---------------------------------------------------------------------------
+
+def _build_node_index(tree, tensors: dict):
+    """Walk the tree once, instantiate each node's Module, extract per-node
+    NodeSignature.
+
+    Returns a tuple ``(signatures, ref_modules)`` where:
+    - ``signatures``: dict[node.path -> NodeSignature]
+    - ``ref_modules``: dict[node.path -> nn.Module instance]
+
+    For the root node, canonical inputs are derived from ``tensors`` matched
+    against ``Model.forward``'s parameter names.  For non-root nodes, the
+    parent's ``refactored_code`` is exec'd with each child's ``Model`` class
+    injected as ``{CamelCase(child.name)}Model``; a ``register_forward_pre_hook``
+    on each child instance captures the exact tiled args the parent passes.
+    """
+    import inspect as _inspect
+
+    from src.node_signature import NodeSignature, extract_signature
+    from src.planner import _camel_case
+
+    signatures: dict = {}
+    ref_modules: dict = {}
+
+    from src.planner import has_class_model
+
+    def _process_node(node, parent_canonical_inputs: dict | None):
+        """Recursively process one node, then recurse into its children.
+
+        ``parent_canonical_inputs`` is the already-resolved canonical input dict
+        for THIS node (None only for the very first call, indicating root).
+        """
+        is_root = parent_canonical_inputs is None
+        root_is_function_based = is_root and not has_class_model(node.reference_code)
+
+        if root_is_function_based:
+            # StepDB function-based root (compute_gold(dims, tensors), no Model class).
+            # The root's signature is derived directly from `tensors`; no Module to
+            # instantiate. Filter to actual tensors — `tensors` may also carry
+            # scalar params (e.g. eps) that don't have a .shape.
+            tensor_only = {n: t for n, t in tensors.items() if isinstance(t, torch.Tensor)}
+            arg_names = tuple(tensor_only.keys())
+            arg_shapes = tuple(tuple(tensor_only[n].shape) for n in arg_names)
+            from src.node_signature import NodeSignature as _NS
+            signatures[node.path] = _NS(
+                arg_names=arg_names, arg_shapes=arg_shapes,
+                out_shape=(), weight_names=(),
+            )
+            canonical_inputs = dict(tensors)
+        else:
+            # Standard path: instantiate Model and extract signature.
+            ns: dict = {}
+            exec(node.reference_code, ns)
+            assert "Model" in ns, (
+                f"node {node.path!r}: reference_code must define class Model(nn.Module)")
+            model_instance = ns["Model"]()
+            ref_modules[node.path] = model_instance
+
+            if parent_canonical_inputs is None:
+                forward_sig = _inspect.signature(model_instance.forward)
+                arg_names = tuple(p for p in forward_sig.parameters if p != "self")
+                canonical_inputs = {}
+                for name in arg_names:
+                    assert name in tensors, (
+                        f"root forward param {name!r} not found in tensors "
+                        f"(available: {sorted(tensors)})")
+                    canonical_inputs[name] = tensors[name]
+            else:
+                canonical_inputs = parent_canonical_inputs
+
+            sig = extract_signature(node.reference_code, canonical_inputs)
+            signatures[node.path] = sig
+
+        if not node.children:
+            return
+
+        # --- for non-leaf: capture child inputs by running parent's refactored forward ---
+        assert node.refactored_code is not None, (
+            f"non-leaf node {node.path!r} must have refactored_code to resolve child shapes")
+
+        # Build namespace with each child's Model class under its camel-case name
+        parent_ns: dict = {}
+        child_instances: dict = {}  # child.path -> nn.Module instance
+        for child in node.children:
+            child_ns: dict = {}
+            exec(child.reference_code, child_ns)
+            assert "Model" in child_ns, (
+                f"child {child.path!r}: reference_code must define class Model(nn.Module)")
+            child_model_class = child_ns["Model"]
+            # The parent's refactored_code references children as {CamelCase(name)}Model
+            parent_ns[f"{_camel_case(child.name)}Model"] = child_model_class
+
+        exec(node.refactored_code, parent_ns)
+        assert "Model" in parent_ns, (
+            f"node {node.path!r}: refactored_code must define class Model(nn.Module)")
+        parent_model = parent_ns["Model"]()
+
+        # Map child attribute name -> child path for hook dispatch
+        child_by_name = {c.name: c for c in node.children}
+
+        # Register pre-hooks on each child sub-module found as a direct attribute
+        captured_inputs: dict = {}  # child.name -> tuple of args
+        hooks = []
+        for attr_name, submodule in parent_model.named_children():
+            if attr_name in child_by_name:
+                child_path = child_by_name[attr_name].path
+
+                def make_hook(cpath):
+                    def hook(module, args):
+                        if cpath not in captured_inputs:
+                            captured_inputs[cpath] = args
+                    return hook
+
+                h = submodule.register_forward_pre_hook(make_hook(child_path))
+                hooks.append(h)
+                child_instances[child_path] = submodule
+
+        # Run parent's forward once on this node's canonical inputs
+        arg_names = tuple(p for p in _inspect.signature(parent_model.forward).parameters
+                          if p != "self")
+        forward_args = tuple(canonical_inputs[n] for n in arg_names)
+        with torch.no_grad():
+            parent_model(*forward_args)
+
+        for h in hooks:
+            h.remove()
+
+        # Verify all children were reached
+        for child in node.children:
+            assert child.path in captured_inputs, (
+                f"child {child.name!r} (path {child.path!r}) was never called "
+                f"during parent {node.path!r} forward — check refactored_code "
+                f"assigns each child as a self.{child.name} attribute")
+
+        # Recurse into children using their captured inputs
+        for child in node.children:
+            raw_args = captured_inputs[child.path]
+            child_forward_sig = _inspect.signature(child_instances[child.path].forward)
+            child_arg_names = tuple(p for p in child_forward_sig.parameters if p != "self")
+            assert len(child_arg_names) == len(raw_args), (
+                f"child {child.path!r}: forward declares {len(child_arg_names)} params "
+                f"but hook captured {len(raw_args)} args")
+            child_canonical = dict(zip(child_arg_names, raw_args))
+            _process_node(child, child_canonical)
+
+    _process_node(tree.root, None)
+    return signatures, ref_modules
+
+
+async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures,
+                                    extras, dims, root_kernel, ckpt_root,
+                                    agent_factory, max_turns, log,
+                                    node_attempts: int = 1,
+                                    non_root_sequential: bool = True,
+                                    stateless: bool = False,
+                                    tensors: dict):
+    """Refactor a single tree node in Pass-1 (pre-order, blackbox-stub style).
+
+    Structurally mirrors ``_refactor_one_node`` but uses Pass-1 prompt/agent
+    builders and threads ``extra_globals`` (the blackbox stubs) + ``extra_required_ops``
+    (the child names) into ``_run_pass_loop``.
+
+    ``parent_contract`` is the Contract recorded by the grandparent's stub call, or
+    None for the root node.  ``children_signatures`` is a list of
+    ``(child_path, NodeSignature)`` pairs.  ``extras`` maps child name → stub callable.
+    """
+    from src.agents import make_pass1_agent, make_pass1_judge_agent
+    from src.prompts import build_pass1_user_prompt
+
+    is_root = (node.path == "root")
+    synth_name = _synth_kernel_name(root_kernel, node.path)
+
+    # Build gold from reference_code (same as _refactor_one_node)
+    ref_ns: dict = {}
+    exec(node.reference_code, ref_ns)
+    assert "compute_gold" in ref_ns, (
+        f"node {node.path!r}: reference_code must define compute_gold(dims)")
+
+    import inspect as _inspect
+    gold_arity = len(_inspect.signature(ref_ns["compute_gold"]).parameters)
+    assert gold_arity in (1, 2), (
+        f"node {node.path!r}: compute_gold must take (dims) or (dims, tensors); "
+        f"got signature with {gold_arity} parameters")
+    with torch.no_grad():
+        gold = (ref_ns["compute_gold"](dims) if gold_arity == 1
+                else ref_ns["compute_gold"](dims, tensors))
+    _inject_gold(synth_name, dims, gold)
+
+    # Build function signature string the LLM must produce
+    if is_root:
+        function_signature = "def tiled_reference(dims, tensors):"
+    else:
+        # Non-root: positional args are the tiled intermediate args from the contract
+        assert parent_contract is not None, (
+            f"non-root node {node.path!r} must have a parent_contract")
+        sig_args = ", ".join(parent_contract.arg_names)
+        function_signature = f"def {node.name}({sig_args}, *, out_shape, out_perm=None):"
+
+    # Build child_blackbox_block and contract_block strings for the agent factory
+    child_blackbox_block = ""
+    if children_signatures:
+        lines = []
+        for child_path, child_sig in children_signatures:
+            child_name = child_path.rsplit("/", 1)[-1]
+            sig_args = ", ".join(child_sig.arg_names)
+            lines.append(f"`{child_name}({sig_args}, *, out_shape, out_perm=None)`")
+            for aname, ashape in zip(child_sig.arg_names, child_sig.arg_shapes):
+                lines.append(f"  - `{aname}` vanilla shape: {ashape}")
+        child_blackbox_block = "\n".join(lines)
+
+    contract_block = ""
+    if not is_root and parent_contract is not None:
+        lines = []
+        for aname, vshape, tshape in zip(
+            parent_contract.arg_names,
+            parent_contract.vanilla_shapes,
+            parent_contract.tiled_shapes,
+        ):
+            lines.append(
+                f"`{aname}`: vanilla shape {vshape}, tiled shape {tshape}"
+            )
+        lines.append(f"Required output shape: `{parent_contract.out_shape}`")
+        lines.append(f"Output permutation: `{parent_contract.out_perm}`")
+        contract_block = "\n".join(lines)
+
+    # Build the user prompt
+    # children_signatures expected as list of (child_name, arg_names, vanilla_shapes)
+    children_sig_triples = [
+        (child_path.rsplit("/", 1)[-1], child_sig.arg_names, child_sig.arg_shapes)
+        for child_path, child_sig in children_signatures
+    ]
+    user_prompt = build_pass1_user_prompt(
+        node_name=node.name,
+        is_root=is_root,
+        reference_code=node.reference_code,
+        dims=dims,
+        tensors=tensors,
+        contract=parent_contract,
+        children_signatures=children_sig_triples,
+        function_signature=function_signature,
+    )
+
+    node_dir = ckpt_root / "pass1" / node.path
+    node_dir.mkdir(parents=True, exist_ok=True)
+
+    llm_config = getattr(agent_factory, "__llm_config__", None)
+    assert llm_config is not None, (
+        "agent_factory must expose __llm_config__ for make_pass1_agent; "
+        "wrap your factory so it sets agent_factory.__llm_config__ = llm_config")
+    agent = make_pass1_agent(
+        llm_config,
+        child_blackbox_block=child_blackbox_block,
+        contract_block=contract_block,
+    )
+    judge_agent = make_pass1_judge_agent(
+        llm_config,
+        child_blackbox_block=child_blackbox_block,
+        contract_block=contract_block,
+    )
+
+    # extra_required_ops = child names (each stub must appear textually in the code)
+    extra_required_ops = tuple(
+        child_path.rsplit("/", 1)[-1] for child_path, _ in children_signatures
+    )
+
+    async def _one_attempt(attempt_idx: int) -> dict:
+        attempt_dir = (
+            node_dir if node_attempts == 1
+            else node_dir / f"attempt_{attempt_idx}"
+        )
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        return await _run_pass_loop(
+            agent, "refactor_final",
+            kernel_name=synth_name, dims=dims, max_turns=max_turns,
+            ckpt_dir=attempt_dir, executor="dsl", tensors=tensors, log=log,
+            check_order="correctness-first",
+            prebuilt_user_prompt=user_prompt,
+            judge_agent=judge_agent,
+            is_root=is_root,
+            stateless=stateless,
+            extra_globals=extras,
+            extra_required_ops=extra_required_ops,
+        )
+
+    run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
+
+    if node_attempts == 1:
+        result = await _one_attempt(0)
+    elif run_sequential:
+        log(f"[pass1] node {node.path!r}: running up to {node_attempts} sequential attempts (non-root)")
+        result = {"success": False}
+        for i in range(node_attempts):
+            r = await _one_attempt(i)
+            if r.get("success"):
+                log(f"[pass1] node {node.path!r}: attempt {i} succeeded — skipping remaining {node_attempts - i - 1}")
+                result = r
+                break
+            result = r
+    else:
+        log(f"[pass1] node {node.path!r}: spawning {node_attempts} parallel attempts")
+        pending = {asyncio.create_task(_one_attempt(i)) for i in range(node_attempts)}
+        last_failure: dict | None = None
+        result = None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                r = d.result()
+                if r.get("success"):
+                    log(f"[pass1] node {node.path!r}: attempt succeeded — cancelling {len(pending)} pending")
+                    for t in pending:
+                        t.cancel()
+                    result = r
+                    pending = set()
+                    break
+                last_failure = r
+        if result is None:
+            result = last_failure or {"success": False}
+
+    if not result.get("success"):
+        result.setdefault("failing_node", synth_name)
+        result.setdefault("last_messages", [])
+    return result
+
+
+async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
+                       dims, root_kernel, ckpt_root, agent_factory,
+                       max_turns, log, node_attempts, non_root_sequential,
+                       stateless, tensors):
+    """Pre-order Pass-1 walk.
+
+    Refactors ``node`` first (using ``parent_contract`` as the call-site spec),
+    then harvests each child's recorded contract from the stub calls the parent
+    made during its correctness gate, and recurses into children in parallel.
+
+    Returns a dict mapping node.path -> result dict.  Each result dict has at
+    least ``{"success": bool}``.  On success, ``result["dsl"]`` holds the
+    verified DSL string.
+    """
+    from src.blackbox_stub import ContractRecorder, make_stub
+
+    # Build one blackbox stub per child, each backed by a ContractRecorder
+    child_recorders = {c.path: ContractRecorder() for c in node.children}
+    extras: dict = {}
+    for child in node.children:
+        sig = signatures[child.path]
+        extras[child.name] = make_stub(
+            ref_module=ref_modules[child.path],
+            arg_names=sig.arg_names,
+            vanilla_shapes=sig.arg_shapes,
+            recorder=child_recorders[child.path],
+        )
+
+    children_signatures = [(c.path, signatures[c.path]) for c in node.children]
+
+    result = await _refactor_one_node_pass1(
+        node=node,
+        parent_contract=parent_contract,
+        children_signatures=children_signatures,
+        extras=extras,
+        dims=dims,
+        root_kernel=root_kernel,
+        ckpt_root=ckpt_root,
+        agent_factory=agent_factory,
+        max_turns=max_turns,
+        log=log,
+        node_attempts=node_attempts,
+        non_root_sequential=non_root_sequential,
+        stateless=stateless,
+        tensors=tensors,
+    )
+
+    if not result["success"]:
+        return {node.path: result}
+
+    # Harvest per-child contracts from the stubs the parent called
+    child_contracts: dict = {}
+    for child in node.children:
+        c = child_recorders[child.path].contract
+        assert c is not None, (
+            f"Parent {node.path!r} succeeded Pass 1 without calling child "
+            f"blackbox {child.name!r} — compliance gate is broken")
+        child_contracts[child.path] = c
+
+    out: dict = {node.path: {"dsl": result["code"], "success": True}}
+
+    if node.children:
+        sub_results = await asyncio.gather(*[
+            _pass1_walk(
+                node=child,
+                parent_contract=child_contracts[child.path],
+                signatures=signatures,
+                ref_modules=ref_modules,
+                dims=dims,
+                root_kernel=root_kernel,
+                ckpt_root=ckpt_root,
+                agent_factory=agent_factory,
+                max_turns=max_turns,
+                log=log,
+                node_attempts=node_attempts,
+                non_root_sequential=non_root_sequential,
+                stateless=stateless,
+                tensors=tensors,
+            )
+            for child in node.children
+        ])
+        for sr in sub_results:
+            out.update(sr)
+
+    return out
+
+
+def _pass2_compose_namespace(*, parent_dsl: str,
+                              child_name_to_dsl: dict[str, str]) -> dict:
+    """Build an exec namespace where each child name resolves to its verified DSL function.
+
+    The grandchild-and-deeper case is handled by exec'ing each child's DSL
+    in the same shared namespace as the parent. Python's late binding means
+    a function defined here can call another function defined here, even if
+    the calling order at exec-time predates the callee — resolution happens
+    at call time, by which point all functions are bound.
+    """
+    from src.tools import _build_dsl_scaffold
+    scaffold = _build_dsl_scaffold()
+    ns: dict = {}
+    exec(scaffold, ns)
+    for child_name, child_dsl in child_name_to_dsl.items():
+        exec(child_dsl, ns)
+    exec(parent_dsl, ns)
+    return ns
+
+
+def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
+                    dims: dict, tensors: dict, root_kernel: str,
+                    ckpt_root, log) -> dict:
+    """Run deterministic Pass 2 at the root level.
+
+    Builds a shared namespace containing every descendant's Pass-1 DSL function,
+    then runs ``tiled_reference(dims, tensors)`` and compares to gold.
+
+    Returns:
+        {"success": True, "root_dsl": <composed string>}  on success
+        {"success": False, "failing_node": <root path>, "exec_log": <str>} on failure
+    """
+    from src.tools import _exec_dsl_ref
+
+    # Flat dict of all non-root descendant node names -> their Pass-1 DSL.
+    descendants: dict[str, str] = {}
+    for node in tree.iter_topological():   # post-order (children before parent)
+        if node.path == tree.root.path:
+            continue
+        descendants[node.name] = pass1_dsls[node.path]
+
+    root_dsl = pass1_dsls[tree.root.path]
+    log("[pass2] composing root with all descendants name-rebound")
+
+    # Build namespace including descendants, then extract the verified
+    # callables and re-execute the root through the standard executor with
+    # those bindings as extra_globals (injected before scaffold exec).
+    composed_ns = _pass2_compose_namespace(
+        parent_dsl=root_dsl, child_name_to_dsl=descendants)
+    extras = {name: composed_ns[name] for name in descendants}
+
+    result = _exec_dsl_ref(root_dsl, dims, tensors, extra_globals=extras)
+
+    report = _compare_against_gold(result, root_kernel, dims, is_root=True)
+    if "match=True" in report:
+        composed_source = "\n\n".join(list(descendants.values()) + [root_dsl])
+        return {"success": True, "root_dsl": composed_source}
+    log(f"[pass2] root mismatch: {report[:200]}")
+    return {"success": False, "failing_node": tree.root.path,
+            "exec_log": report}
+
+
 async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
                         agent_factory, max_turns, log,
                         node_attempts: int = 1,
                         non_root_sequential: bool = True,
                         verified_cache: dict[str, str] | None = None,
                         translate_fn=None,
-                        stateless: bool = False) -> dict:
-    """Walk tree leaves->root, refactor each node, sibling-parallel.
+                        stateless: bool = False,
+                        tensors: dict | None = None) -> dict:
+    """Two-pass walk: pre-order Pass 1, then post-order Pass 2 at root.
 
-    ``verified_cache`` (when provided) maps ``node.path`` to a previously-
-    verified DSL string. Nodes present in the cache are skipped — no LLM call,
-    no gold computation — and their cached DSL is used directly when assembling
-    parents. Used by ``--resume-planner`` to pick up where a crashed outer
-    iteration left off.
-
-    ``translate_fn`` (when provided) is forwarded to each per-node refactor
-    pass as a translation post-validator: every refactor turn must not only be
-    numerically correct but also lower cleanly into STeP IR via this callable.
-    Surfaces translator-side constraints (e.g. ``dyn_offchip_load`` literal
-    requirements) as feedback to the refactor agent immediately, instead of
-    letting them fail later at the final translate step.
+    ``verified_cache`` and ``translate_fn`` are accepted for backward
+    compatibility but are not wired through in v1 of the two-pass flow.
 
     Returns:
         {"success": True, "root_dsl": <str>}  on success
-        {"success": False, "failing_node": <path>, "last_messages": [...]} on failure
+        {"success": False, "failing_node": <path>, "last_messages": [...],
+         "phase": "pass1"|"pass2", "exec_log": <str>}  on failure
     """
-    verified: dict[str, str] = {}
-    cache = verified_cache or {}
+    assert tensors is not None, (
+        "tensors dict is now required by refactor_tree (used to instantiate "
+        "Modules for signature extraction and to drive Pass-1 stubs)")
 
-    async def _run_subtree(node) -> dict:
-        if node.children:
-            tasks = [asyncio.create_task(_run_subtree(c)) for c in node.children]
-            try:
-                results = await asyncio.gather(*tasks)
-            except _NodeFailure:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                raise
-            for r in results:
-                if not r["success"]:
-                    raise _NodeFailure(r)
+    # Precompute per-node signatures and instantiate Modules once.
+    signatures, ref_modules = _build_node_index(tree, tensors)
 
-        if node.path in cache:
-            log(f"[planner] refactor: node {node.path!r} CACHED (resumed) — skipping LLM")
-            verified[node.path] = cache[node.path]
-            return {"success": True, "code": cache[node.path]}
-
-        children_dsls = [(c.path, verified[c.path]) for c in node.children]
-        kind = "leaf" if node.is_leaf else f"parent of {[c.name for c in node.children]}"
-        log(f"[planner] refactor: starting node {node.path!r} ({kind})")
-        result = await _refactor_one_node(
-            node=node, dims=dims, root_kernel=root_kernel,
-            ckpt_root=ckpt_root, agent_factory=agent_factory,
-            max_turns=max_turns, log=log, children_dsls=children_dsls,
-            node_attempts=node_attempts,
-            non_root_sequential=non_root_sequential,
-            translate_fn=translate_fn,
-            stateless=stateless,
-        )
-        if result["success"]:
-            verified[node.path] = result["code"]
-            log(f"[planner] refactor: node {node.path!r} VERIFIED")
-        else:
-            log(f"[planner] refactor: node {node.path!r} FAILED")
-        return result
-
-    try:
-        root_result = await _run_subtree(tree.root)
-    except _NodeFailure as exc:
+    # Pass 1: pre-order walk.
+    pass1 = await _pass1_walk(
+        node=tree.root, parent_contract=None,
+        signatures=signatures, ref_modules=ref_modules,
+        dims=dims, root_kernel=root_kernel, ckpt_root=ckpt_root,
+        agent_factory=agent_factory, max_turns=max_turns, log=log,
+        node_attempts=node_attempts,
+        non_root_sequential=non_root_sequential,
+        stateless=stateless, tensors=tensors,
+    )
+    failing = [(p, r) for p, r in pass1.items() if not r["success"]]
+    if failing:
+        path, r = failing[0]
         return {"success": False,
-                "failing_node": exc.result.get("failing_node", tree.root.path),
-                "last_messages": exc.result.get("last_messages", [])}
+                "failing_node": path,
+                "last_messages": r.get("last_messages", []),
+                "phase": "pass1"}
 
-    if not root_result["success"]:
+    pass1_dsls = {p: r["dsl"] for p, r in pass1.items()}
+
+    # Pass 2: deterministic composition + verification at root.
+    pass2 = _pass2_compose(
+        tree=tree, pass1_dsls=pass1_dsls,
+        dims=dims, tensors=tensors,
+        root_kernel=root_kernel, ckpt_root=ckpt_root, log=log,
+    )
+    if not pass2["success"]:
         return {"success": False,
-                "failing_node": tree.root.path,
-                "last_messages": root_result.get("last_messages", [])}
+                "failing_node": pass2["failing_node"],
+                "last_messages": [],
+                "phase": "pass2",
+                "exec_log": pass2.get("exec_log", "")}
 
-    return {"success": True, "root_dsl": verified[tree.root.path]}
+    return {"success": True, "root_dsl": pass2["root_dsl"]}
 
 
 async def _initial_plan(*, root_reference, dims, agent, log,
@@ -1672,6 +2139,7 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             verified_cache=verified_cache,
             translate_fn=translate_fn,
             stateless=stateless_refactor,
+            tensors=tensors,
         )
         if result["success"]:
             log(f"[planner] === Phase 0+1 SUCCEEDED (used {replans_used} replan(s)) ===")
@@ -2224,6 +2692,7 @@ async def _run_outer_iteration(
             return pass_agents["refactor_final"]
         _agent_factory.__planner_agent__ = planner_agent
         _agent_factory.__refactor_judge_agent__ = judge_agents.get("refactor_final")
+        _agent_factory.__llm_config__ = llm_config
 
         log(f"  Planner phase (plan + per-node refactor)")
         print(f"{tag} Planner phase starting")

@@ -83,17 +83,35 @@ For pipelines that have a lowering phase, the flow runs **phase 0 → phase
    `anti-passthrough`, etc.) and the tree walk are documented in
    [planner.md](planner.md). With `--no-plan`, this phase collapses to a
    single-leaf tree equivalent to the legacy single-shot path.
-2. **Phase 1 — lowering.** For each tree node in post-order, the LLM is
-   given the node's PyTorch reference, the dims, the precomputed tensor
-   descriptions, any verified child DSLs as few-shot context, and a
-   system prompt that describes the DSL surface. It must emit a
-   `tiled_reference(dims, tensors)` (or, for non-root nodes, the node's
-   own `Model.forward` lifted to DSL — possibly tuple-returning) that
-   calls only DSL operators. Each turn is gated on **tiled-DSL
-   correctness** — the candidate code is exec'd against the precomputed
-   tensors and its output compared to gold (see [pass_loop.md](pass_loop.md)
-   for the executors). On success the verified DSL source is persisted;
-   the root node's DSL is the run's `dsl_code.py`.
+2. **Phase 1 — lowering.** Split into two sub-passes:
+
+   ```
+   Phase 1: Pass 1 (pre-order, LLM)  →  Pass 2 (post-order, deterministic, no LLM)
+   ```
+
+   **Pass 1** walks root → leaves. Each non-leaf node refactors with its
+   children represented as auto-generated blackbox stubs; the parent
+   declares the call-site contract (input shapes, output shape/permutation)
+   that each child must satisfy. The LLM is given the node's PyTorch
+   reference, a parent-declared contract block, and the blackbox signatures
+   for its children. Each turn is gated on tiled-DSL correctness — the
+   candidate code is exec'd with the stubs providing child outputs. On
+   success the verified DSL and the captured child contracts are persisted.
+   Sibling subtrees fan out in parallel once their parent's Pass 1 succeeds.
+
+   **Pass 2** walks leaves → root deterministically. For each non-leaf
+   node, each blackbox name is rebound to the verified child DSL function;
+   the parent's frozen Pass-1 source is re-executed against kernel-level
+   gold. No LLM is invoked. In v1 only the root is verified at Pass 2
+   (the root subsumes intermediate compositions); per-level verification
+   is a future refinement. Failure escalates to the existing replan loop.
+
+   `--no-plan` collapses Phase 1 to a single root refactor with no children
+   (degenerate Pass 1, no Pass 2), behaving identically to the legacy
+   single-shot path. Bundle mode is pinned to `--no-plan` and is unaffected
+   by the two-pass structure.
+
+   On success the verified root DSL is persisted as the run's `dsl_code.py`.
 3. **Phase 2 — translation.** Under `--translator=auto` the DSL source
    is fed through a deterministic AST translator that emits a
    `build_graph(dims, tensors)` returning `(graph, output_op)`; the graph
@@ -144,8 +162,10 @@ Two resume modes serve different recovery scenarios:
   checkpoint root, in which case the flow searches for
   `<kernel_name>/outer_*/dsl_code.py`.
 - **`--resume-planner`** loads a crashed outer's saved tree plus any
-  per-node DSLs that were verified before the crash, and re-runs only the
-  non-verified nodes. Use this when an outer crashed mid-Phase-1 and the
+  per-node DSLs verified before the crash, and re-runs only the
+  non-verified nodes. A resume can land in mid-Pass-1 (some nodes
+  complete, some not), at the boundary "Pass 1 done, Pass 2 not started",
+  or mid-Pass-2. Use this when an outer crashed during Phase 1 and the
   invested per-node refactor work is worth recovering. See
   [planner.md](planner.md) for the resume contract and on-disk layout.
 
@@ -169,9 +189,9 @@ to seed another's). Resolution rules are the same as `--resume`: a
 name is recovered from the resolved checkpoint's `config.json` so the
 matching PyTorch reference can be loaded from StepDB.
 
-Few-shot examples are distinct from the planner's own
-"verified sub-task DSLs" block, which is rendered automatically into a
-parent node's user prompt from its just-verified children.
+Few-shot examples are distinct from the Pass-1 prompt's contract block
+and child-blackbox signatures, which are generated per-node from the
+planner tree and injected automatically.
 
 ## Run-time invariants
 

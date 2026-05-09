@@ -24,6 +24,45 @@ from src.prompts import (build_pass_system_prompt, build_judge_system_prompt,
                          build_autotune_system_prompt,
                          build_planner_system_prompt)
 
+_PASS1_SYSTEM_TEMPLATE = "refactor_pass1_system.txt"
+_PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
+_PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
+
+
+def _load_pass1_system_prompt(
+    *,
+    child_blackbox_block: str,
+    contract_block: str,
+    dsl_code: str,
+    few_shot_examples=None,
+) -> str:
+    """Render the Pass-1 system prompt template with caller-supplied blocks."""
+    from src.prompts import _format_few_shot_examples, _STEP_DSL_PY
+    template_path = _PROMPTS_DIR_AGENTS / _PASS1_SYSTEM_TEMPLATE
+    assert template_path.exists(), f"Pass-1 system template not found: {template_path}"
+    template = template_path.read_text()
+    return template.format(
+        child_blackbox_block=child_blackbox_block,
+        contract_block=contract_block,
+        dsl_code=dsl_code,
+        few_shot_examples=_format_few_shot_examples(few_shot_examples or []),
+    )
+
+
+def _load_pass1_judge_prompt(
+    *,
+    child_blackbox_block: str,
+    contract_block: str,
+) -> str:
+    """Render the Pass-1 judge system prompt template with caller-supplied blocks."""
+    template_path = _PROMPTS_DIR_AGENTS / _PASS1_JUDGE_TEMPLATE
+    assert template_path.exists(), f"Pass-1 judge template not found: {template_path}"
+    template = template_path.read_text()
+    return template.format(
+        child_blackbox_block=child_blackbox_block,
+        contract_block=contract_block,
+    )
+
 
 _VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
@@ -173,6 +212,67 @@ def make_bundle_judge_agent(llm_config: dict, compliance: dict) -> Agent:
 
     return Agent(
         name="StepJudge_bundle",
+        instructions=system_prompt,
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_pass1_agent(
+    llm_config: dict,
+    *,
+    child_blackbox_block: str,
+    contract_block: str,
+    few_shot_examples=None,
+) -> Agent:
+    """Create a Pass-1 refactor agent for a single planner node.
+
+    ``child_blackbox_block`` is the rendered markdown block describing each
+    child's callable signature (empty string for leaf nodes).
+    ``contract_block`` is the rendered markdown block describing the parent's
+    declared input shapes and required output shape/permutation (empty string
+    for the root node).
+    ``few_shot_examples`` is an optional list of resolved example dicts (see
+    ``resolve_few_shot_examples``).
+    """
+    from src.prompts import _STEP_DSL_PY
+    assert _STEP_DSL_PY.exists(), f"step_dsl.py not found: {_STEP_DSL_PY}"
+    dsl_code = _STEP_DSL_PY.read_text()
+
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    system_prompt = _load_pass1_system_prompt(
+        child_blackbox_block=child_blackbox_block,
+        contract_block=contract_block,
+        dsl_code=dsl_code,
+        few_shot_examples=few_shot_examples,
+    )
+    return Agent(
+        name="StepPass_pass1",
+        instructions=system_prompt,
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_pass1_judge_agent(
+    llm_config: dict,
+    *,
+    child_blackbox_block: str,
+    contract_block: str,
+) -> Agent:
+    """Create a Pass-1 judge agent for a single planner node.
+
+    Same block parameters as ``make_pass1_agent``.
+    """
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    system_prompt = _load_pass1_judge_prompt(
+        child_blackbox_block=child_blackbox_block,
+        contract_block=contract_block,
+    )
+    return Agent(
+        name="StepJudge_pass1",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),

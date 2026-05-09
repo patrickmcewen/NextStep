@@ -243,7 +243,8 @@ def _build_dsl_scaffold() -> str:
     return _DSL_IMPORTS + src_path.read_text() + "\n"
 
 
-def _exec_dsl_ref(code: str, dims: dict, tensors: dict):
+def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
+                  extra_globals: dict | None = None):
     """Execute user code with DSL functions available. Returns the DSL output.
 
     The DSL scaffold injects the active step_dsl source — the standalone
@@ -251,6 +252,10 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict):
     when bundle mode has registered it as ``sys.modules["step_dsl"]`` —
     into the execution namespace so the refactored code can call DSL ops
     directly without writing imports.
+
+    extra_globals: Optional dict of names to inject into the execution namespace.
+    Intended for Pass-1 blackbox stubs or Pass-2 verified child DSL functions.
+    Injected before exec so user code can call these as if they were imports.
 
     Returns either a single ``torch.Tensor`` or a tuple/list of tensors.
     Intermediate planner nodes whose ``Model.forward`` returns a tuple
@@ -271,6 +276,8 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict):
     scaffold = _build_dsl_scaffold()
     scaffold_lines = scaffold.count("\n") + 1
     namespace = {}
+    if extra_globals:
+        namespace.update(extra_globals)
     _saved_isinstance = _builtins.isinstance
     _saved_torch_tensor = torch.Tensor
     try:

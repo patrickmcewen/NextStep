@@ -561,13 +561,18 @@ def _path_tail(path: str) -> str:
     return path.rsplit("/", 1)[-1]
 
 
-def _node_turn_dir(turn_root: Path | None, path: str, attempt: int) -> Path | None:
+def _node_turn_dir(turn_root: Path | None, path: str, attempt: int | None,
+                    *, pass_name: str | None = None) -> Path | None:
     if turn_root is None:
         return None
     safe = path.replace("/", "_")
-    d = turn_root / safe / f"turn_{attempt}"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    base = Path(turn_root) / safe
+    if pass_name is not None:
+        base = base / pass_name
+    if attempt is not None:
+        base = base / f"turn_{attempt}"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def _extract_reasoning(run_result) -> str:

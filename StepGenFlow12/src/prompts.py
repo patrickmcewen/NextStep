@@ -596,6 +596,136 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
     return "\n".join(lines)
 
 
+def build_pass1_user_prompt(
+    *,
+    node_name: str,
+    is_root: bool,
+    reference_code: str,
+    dims: dict,
+    tensors: dict,
+    contract,            # src.contract.Contract for non-root, None for root
+    children_signatures: list[tuple[str, tuple[str, ...], tuple[tuple[int, ...], ...]]],
+    function_signature: str,
+) -> str:
+    """Build the Pass-1 user prompt for a single planner node.
+
+    Parameters
+    ----------
+    node_name:
+        The planner node's name (e.g. "attention"). Used as the function name
+        for non-root nodes.
+    is_root:
+        True if this is the root node (function signature is
+        ``tiled_reference(dims, tensors)``).
+    reference_code:
+        The PyTorch reference for this node (the planner node's sub-Model
+        forward or the full reference for root).
+    dims:
+        Dimension dict (scalar ints, e.g. ``{"B": 2, "H": 8}``).
+    tensors:
+        Tensors dict available at the node level (may be empty for non-root).
+    contract:
+        ``Contract`` for non-root nodes, ``None`` for root.
+    children_signatures:
+        List of ``(child_name, arg_names, vanilla_shapes)`` tuples, one per
+        declared child.  Empty for leaf nodes.
+    function_signature:
+        The exact signature string the LLM must produce (e.g.
+        ``"def attention(Q, *, out_shape, out_perm=None):"``).
+    """
+    dims_json = json.dumps(dims, indent=2)
+
+    lines = [
+        f"## Node: {node_name}",
+        "",
+        "### PyTorch Reference",
+        "",
+        "```python",
+        reference_code.rstrip(),
+        "```",
+        "",
+        "### Dimensions",
+        "",
+        "```json",
+        dims_json,
+        "```",
+    ]
+
+    # Tensors dict — only shown when non-empty (root always has tensors; non-root may not)
+    if tensors:
+        lines.extend([
+            "",
+            "### Available Tensors",
+            "",
+            "```",
+            _format_tensors_description(tensors),
+            "```",
+        ])
+
+    # Contract block — non-root only
+    if not is_root:
+        assert contract is not None, "Non-root node must have a Contract"
+        lines.extend([
+            "",
+            "### Contract (declared by parent)",
+            "",
+            "Your parent has called your stub with these inputs. You must handle",
+            "exactly this call site — do not change the function signature.",
+            "",
+        ])
+        for arg_name, vanilla_shape, tiled_shape in zip(
+            contract.arg_names, contract.vanilla_shapes, contract.tiled_shapes
+        ):
+            lines.append(
+                f"  `{arg_name}`: vanilla shape {vanilla_shape}, "
+                f"tiled shape declared by parent {tiled_shape}"
+            )
+        lines.extend([
+            "",
+            f"  Required output shape: `{contract.out_shape}`",
+            f"  Output permutation: `{contract.out_perm}`",
+        ])
+
+    # Child blackboxes — non-leaf only
+    if children_signatures:
+        lines.extend([
+            "",
+            "### Child Blackboxes Available",
+            "",
+            "The following child callables are pre-imported and available. Each",
+            "implements the semantics of its corresponding PyTorch reference.",
+            "You MUST call each one exactly once, straight-line (no loops or conditionals).",
+            "",
+        ])
+        for child_name, arg_names, vanilla_shapes in children_signatures:
+            sig_args = ", ".join(arg_names)
+            lines.append(f"  `{child_name}({sig_args}, *, out_shape, out_perm=None)`")
+            for arg_name, vshape in zip(arg_names, vanilla_shapes):
+                lines.append(f"    - `{arg_name}` vanilla shape: {vshape}")
+        lines.extend([
+            "",
+            "**Reshape rule:** between any tensor source and a blackbox call site,",
+            "only `.reshape(...)` is permitted. No `.permute()`, `.transpose()`,",
+            "indexing, or arithmetic. Output permutation goes in `out_perm`.",
+        ])
+
+    # Required function signature
+    lines.extend([
+        "",
+        "### Required Function Signature",
+        "",
+        "```python",
+        function_signature,
+        "```",
+        "",
+        "Output a single Python function with this exact signature. "
+        "No imports. No new torch tensors. "
+        "Above the function definition, include a comment with your implementation reasoning.",
+    ])
+
+    return "\n".join(lines)
+
+
 def build_planner_system_prompt() -> str:
     """Load the planner agent's system prompt.
 

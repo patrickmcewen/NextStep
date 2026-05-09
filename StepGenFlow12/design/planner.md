@@ -1,18 +1,16 @@
 # Decomposition planner
 
-Phase 0 of the implementer pipeline. Before the refactor pass runs, the
-planner decomposes a kernel into a tree of sub-Models, refactors each
-sub-Model independently, and uses children's verified DSLs as
-few-shot context when refactoring their parent. The planner is on by
-default; `--no-plan` falls back to the single-shot legacy behavior of
-running one `refactor_final` pass on the whole kernel.
+Phase 0 of the implementer pipeline. Before Phase 1 runs, the
+planner decomposes a kernel into a tree of sub-Models that Phase 1's
+two-pass refactor then processes. The planner is on by default;
+`--no-plan` falls back to the single-shot legacy behavior of running
+one `refactor_final` pass on the whole kernel.
 
 The planner exists because the refactor pass scales badly on large
 kernels — by the time a transformer-block-sized kernel is rewritten in
 DSL, the model has burned its turn budget on local syntactic fixups
 without ever reaching the structural rewrite. Decomposing first lets
-the refactor pass work at a granularity the LLM can keep in its head,
-and stitches the result back together one level at a time.
+the refactor pass work at a granularity the LLM can keep in its head.
 
 ## What the planner produces
 
@@ -73,13 +71,20 @@ split them. LLM-emitted children are always class-based.
 
 ## Tree walk
 
-Once the tree is fixed, refactoring walks the tree **post-order**
-(children first, then parents). Sibling subtrees fan out under
-`asyncio.gather`, so independent siblings refactor in parallel. A
-parent's refactor pass receives its children's verified DSLs as a
-"verified sub-task DSLs" block in its user prompt, so the LLM doesn't
-have to re-derive the child's lowering — it composes against an
-already-good child surface.
+Once the tree is fixed, Phase 1 runs in two passes (see
+[pipeline.md](pipeline.md)). **Pass 1** walks root → leaves (pre-order):
+the parent refactors first using auto-generated blackbox stubs for its
+children, then each child refactors under the contract the parent's
+stub captured. Sibling subtrees fan out under `asyncio.gather` once
+their parent's Pass 1 completes. **Pass 2** walks leaves → root
+(post-order, deterministic): each blackbox name is rebound to the
+verified child DSL and the parent is re-executed against gold.
+
+At planner-output time the orchestrator extracts per-node
+intermediate-input shapes by running a hook-based forward dry-run on
+each internal node's `refactored_code` via `node_signature.extract_signature`.
+These shapes are used to auto-generate the child blackbox stubs that
+Pass 1 presents to the parent LLM.
 
 `--node-attempts N` controls fan-out *per node*: each node spawns up to
 N parallel refactor-loop attempts (each a full `_run_pass_loop` with
@@ -91,10 +96,10 @@ attempts one at a time with early exit, while the root always
 parallelizes since its failure is the most expensive failure to
 retry. `--no-non-root-sequential` forces all nodes to fan out.
 
-The result of the post-order walk is a single root DSL string — the
-verified `tiled_reference(dims, tensors)` for the whole kernel — which
-is persisted as the outer's `dsl_code.py`. From phase 2's perspective
-this is indistinguishable from the no-plan output. Per-node DSLs are
+The result of Phase 1 is a single root DSL string — the verified
+`tiled_reference(dims, tensors)` for the whole kernel — persisted as
+the outer's `dsl_code.py`. From phase 2's perspective this is
+indistinguishable from the no-plan output. Per-node DSLs are
 intermediate scaffolding; only the root is handed off to translation.
 
 ## Per-node refactor
@@ -116,16 +121,18 @@ same post-validator. The differences are:
     since non-root DSLs don't terminate at off-chip;
   - the deterministic-translate post-validator runs but doesn't enforce
     the kernel-level output contract.
-- **Few-shot block**: the parent node's user prompt prepends a
-  "Verified sub-task DSLs" block listing each child's verified DSL.
-  The LLM is expected to compose against these, not re-derive them.
+- **Pass-1 prompt additions**: the node's user prompt carries the
+  parent-declared contract block (input shapes + values + output
+  shape/permutation) and, for non-leaf nodes, the blackbox signatures
+  for each child. The LLM picks the call-site contract; children
+  refactor under it. See [pass_loop.md](pass_loop.md) for details.
 
 ## Replanning
 
-If the post-order walk fails — i.e., some node's refactor pass burns
-its budget without reaching PASS — the planner phase locates the
-failing node's parent (its tree owner) and re-invokes the planner LLM
-on the parent's `reference_code` with a populated **replan context**:
+If Phase 1 fails — i.e., some node's Pass-1 refactor burns its budget,
+or Pass 2 fails on composition — the planner phase locates the failing
+node's parent (its tree owner) and re-invokes the planner LLM on the
+parent's `reference_code` with a populated **replan context**:
 the failing path, the last few turns of the failing refactor
 conversation, and any successfully-verified sibling DSLs. The new
 subtree is spliced in place of the old one, the walk retries, and
