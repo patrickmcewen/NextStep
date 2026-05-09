@@ -244,7 +244,10 @@ def _build_dsl_scaffold() -> str:
 
 
 def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
-                  extra_globals: dict | None = None):
+                  extra_globals: dict | None = None,
+                  entry_point: str = "tiled_reference",
+                  call_args: tuple | None = None,
+                  call_kwargs: dict | None = None):
     """Execute user code with DSL functions available. Returns the DSL output.
 
     The DSL scaffold injects the active step_dsl source — the standalone
@@ -256,6 +259,15 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     extra_globals: Optional dict of names to inject into the execution namespace.
     Intended for Pass-1 blackbox stubs or Pass-2 verified child DSL functions.
     Injected before exec so user code can call these as if they were imports.
+
+    entry_point/call_args/call_kwargs: select which top-level function to
+    invoke after exec'ing ``code``. Defaults invoke ``tiled_reference(dims,
+    tensors)`` — the root-node convention. For non-root planner nodes the
+    LLM emits ``def <node_name>(<arg_1>, ..., *, out_shapes,
+    out_perms=None)`` (positional names from ``Contract.arg_names``);
+    callers pass ``entry_point=node_name``,
+    ``call_args=parent_contract.tiled_values``, and ``call_kwargs={
+    "out_shapes": ..., "out_perms": ...}`` to invoke that signature.
 
     Returns either a single ``torch.Tensor`` or a tuple/list of tensors.
     Intermediate planner nodes whose ``Model.forward`` returns a tuple
@@ -273,6 +285,10 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     once the chain exceeds Python's recursion limit.
     """
     import builtins as _builtins
+    if call_args is None:
+        call_args = (dims, tensors)
+    if call_kwargs is None:
+        call_kwargs = {}
     scaffold = _build_dsl_scaffold()
     scaffold_lines = scaffold.count("\n") + 1
     namespace = {}
@@ -282,11 +298,11 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     _saved_torch_tensor = torch.Tensor
     try:
         exec(scaffold + "\n" + code, namespace)
-        assert "tiled_reference" in namespace, (
-            "Code must define a tiled_reference function"
+        assert entry_point in namespace, (
+            f"Code must define a {entry_point} function"
         )
         try:
-            result = namespace["tiled_reference"](dims, tensors)
+            result = namespace[entry_point](*call_args, **call_kwargs)
         except Exception as exc:
             raise _enhance_user_code_error(exc, code, scaffold_lines) from exc
     finally:
@@ -295,12 +311,12 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     if isinstance(result, (tuple, list)):
         for i, t in enumerate(result):
             assert isinstance(t, torch.Tensor), (
-                f"tiled_reference returned a {type(result).__name__}; element "
+                f"{entry_point} returned a {type(result).__name__}; element "
                 f"[{i}] must be a torch.Tensor, got {type(t).__name__}"
             )
     else:
         assert isinstance(result, torch.Tensor), (
-            f"tiled_reference must return a torch.Tensor (or tuple/list of "
+            f"{entry_point} must return a torch.Tensor (or tuple/list of "
             f"tensors for tuple-returning planner nodes), got {type(result).__name__}"
         )
     return result

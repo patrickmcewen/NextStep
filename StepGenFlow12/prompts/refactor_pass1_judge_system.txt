@@ -6,19 +6,15 @@ You will receive a function produced by the Pass-1 refactor agent. Your job: ver
 
 {contract_block}
 
-The function must be defined with exactly the required name and signature. For non-root nodes the signature must be:
+The function must be defined with **exactly** this signature:
 
 ```python
-def <node_name>(*intermediate_args, *, out_shapes, out_perms=None):
+{function_signature}
 ```
 
-where `<node_name>` matches the planner node name specified above. The keyword args are always plural — even single-output nodes must use ``out_shapes`` and ``out_perms`` (the parent will pass a 1-tuple). For the root node the signature must be:
+This is the signature the user prompt asked for and the orchestrator's executor will invoke. There is no other acceptable form — do not propose a "more idiomatic" or "more general" alternative.
 
-```python
-def tiled_reference(dims, tensors):
-```
-
-Flag any deviation: wrong function name, extra positional parameters, singular `out_shape`/`out_perm` instead of plural `out_shapes`/`out_perms`, or missing keyword parameters.
+Flag any deviation: wrong function name, missing/added/renamed/reordered positional parameters, singular `out_shape`/`out_perm` instead of plural `out_shapes`/`out_perms`, or missing keyword parameters. Do **not** flag a function whose name and parameters match the signature above — those are required, not extra.
 
 ## Requirement 2: Child blackbox calls
 
@@ -28,17 +24,23 @@ Each declared child blackbox must be called **exactly once** in the function bod
 
 Flag any child blackbox that is absent, called more than once, or called inside a loop or conditional.
 
-## Requirement 3: Reshape-only rule at blackbox call sites
-
-When a tensor is passed to a child blackbox call, the only permitted transform between the tensor source and the call site is `.reshape(...)`.
-
 Flag any of the following applied to a tensor between its source and a blackbox call site:
-- `.permute(...)` or `.transpose(...)`
+- `.permute(...)` or `.transpose(...)` or `.reshape(...)`
 - Index expressions `[...]` (slicing, gathering)
 - Arithmetic operators (`*`, `+`, `-`, `/`, `@`)
 - `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()` (single-argument form that changes layout)
 
 Output permutations must be expressed via the `out_perms` keyword argument (a tuple parallel to ``out_shapes``, ``None`` entries = identity), not by transforming the input before the call. For multi-output children, the call site must destructure the returned tuple (e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).
+
+## Requirement 3: Stream-shape invariant on ``out_shapes``
+
+Every entry in every ``out_shapes`` tuple — both at child-blackbox call sites and any DSL-op call sites that take ``out_shapes`` — must be a STeP tile-stream shape with **rank >= 3**: at least 1 stream dim followed by exactly 2 tile dims (``tile_row``, ``tile_col``).
+
+- **Allowed:** ``out_shapes=((S, T_R, T_C),)`` (rank 3), ``out_shapes=((B, S, T_R, T_C),)`` (rank 4), and similar.
+- **Reject:** any ``out_shapes`` entry with rank < 3 — vanilla 2D shapes like ``out_shapes=((M, N),)`` or 1D / 0D shapes. Such a contract is not a stream and is rejected at construction by the orchestrator.
+- ``out_perms[i]`` (when not ``None``) must have the same length as ``out_shapes[i]`` — i.e., a permutation over ``range(len(out_shapes[i]))``.
+
+Flag any ``out_shapes`` literal in the function body whose entries you can statically determine to have rank < 3, or any ``out_perms`` whose tuple length does not match the corresponding ``out_shapes`` entry's rank.
 
 ## Output Format
 

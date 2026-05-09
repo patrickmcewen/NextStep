@@ -88,6 +88,8 @@ def make_stub(*, ref_module: nn.Module,
                 out_shapes=tuple(tuple(s) for s in out_shapes),
                 out_perms=tuple(
                     None if p is None else tuple(p) for p in out_perms),
+                tiled_outputs=tuple(r.detach().clone() for r in results),
+                out_is_tuple=isinstance(raw, tuple),
             )
 
         if isinstance(raw, tuple):

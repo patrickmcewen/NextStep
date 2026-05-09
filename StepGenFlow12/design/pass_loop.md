@@ -95,7 +95,7 @@ lists the auto-generated blackbox stubs available to call, one entry per
 planner child:
 
 ```
-<child_name>(*intermediate_args, *, out_shape, out_perm=None) -> Tensor
+<child_name>(*tiled_args, out_shapes, out_perms=None) -> Tensor | tuple
 ```
 
 The model is told these names resolve to callable subroutines whose
@@ -117,9 +117,9 @@ deterministic, and invokes no LLM.
 **Name rebinding.** For each non-leaf node (deepest first, then root),
 the orchestrator builds a namespace where each blackbox name is bound to
 the verified child DSL function instead of the auto-generated stub.
-Because the verified child DSL has exactly the same signature as the stub
-(`(*intermediate_args, *, out_shape, out_perm=None)`), call sites resolve
-without any AST modification to the parent's source.
+Because the verified child DSL has exactly the same call shape as the stub
+(positional tiled args followed by keyword-only `out_shapes`/`out_perms=None`),
+call sites resolve without any AST modification to the parent's source.
 
 **Re-execution against gold.** The parent's frozen Pass-1 source is
 exec'd with the rebound namespace against kernel-level gold

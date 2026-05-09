@@ -25,8 +25,8 @@ directory is the durable record of the run.
         │       ├── tree.json
         │       ├── <node_path>/{reference.py, refactored.py}
         │       └── turns/<node_path>/turn_<N>/{system_prompt.txt, user_prompt.txt, response.txt, reasoning.txt, status.txt}
-        ├── refactor/               # only when Phase 0 ran — per-node refactor artifacts
-        │   └── pass1/              # Pass-1 artifacts, one subdir per node
+        ├── pass1/                  # only when Phase 0 ran — per-node Pass-1 artifacts
+        │   └── iteration_<k>/      # one per replan iteration (matches plan/iteration_<k>/)
         │       └── <node_path>/[attempt_<i>/]refactor_final/turn_<N>/...
         │                           # attempt_<i>/ layer only present when --node-attempts > 1
         ├── pass2_composed.py       # Pass-2 output: the composed root DSL after name rebinding
@@ -43,7 +43,7 @@ directory is the durable record of the run.
         │           ├── best.py / best_translated.py
         │           ├── best_timing.txt / best_verbose_timing.txt
         │           └── result.json     # only present on a clean autotune completion
-        └── <pass>/                 # one per LLM pass that ran (no-plan path; under Phase 0, see refactor/<node_path>/)
+        └── <pass>/                 # one per LLM pass that ran (no-plan path; under Phase 0, see pass1/iteration_<k>/<node_path>/)
             ├── system_prompt.txt   # the rendered system prompt this pass actually used
             └── turn_<m>/
                 ├── user_prompt.txt        # the next-turn input the model saw
@@ -71,16 +71,20 @@ resuming from the previous pass's `best.py`. See
 invocation *and* that particular outer's functional pipeline reached
 the verified-DSL step.
 
-The `plan/` and `refactor/` subtrees only appear when Phase 0 (the
+The `plan/` and `pass1/` subtrees only appear when Phase 0 (the
 decomposition planner) ran for that outer. In the legacy single-shot
 path (`--no-plan`), the refactor pass writes directly to a top-level
 `<pass>/turn_<m>/...` subdirectory under `outer_<i>/` instead.
 
-Under the planner path, Pass-1 artifacts are laid out with the pass
-level above the node: `refactor/pass1/<node_path>/[attempt_<i>/]refactor_final/turn_<N>/...`.
-The `attempt_<i>/` layer is inserted only when `--node-attempts > 1`.
-There is no per-node `pass2/` directory — Pass 2 runs once at the root
-and writes a single `pass2_composed.py` artifact directly under `outer_<i>/`.
+Under the planner path, Pass-1 artifacts are laid out with the iteration
+level above the node:
+`pass1/iteration_<k>/<node_path>/[attempt_<i>/]refactor_final/turn_<N>/...`.
+The `iteration_<k>/` layer is what keeps each replan iteration's
+per-node refactor work isolated on disk; without it, replanning would
+overwrite earlier iterations' attempts at the same node path. The
+`attempt_<i>/` layer is inserted only when `--node-attempts > 1`. There
+is no per-node `pass2/` directory — Pass 2 runs once at the root and
+writes a single `pass2_composed.py` artifact directly under `outer_<i>/`.
 
 `status.txt` is the most useful single file for triage — its values
 are a fixed vocabulary:
@@ -237,7 +241,7 @@ disk.
 | Deterministic translator kept failing | `turn_<m>/translate_check/error.txt` or `graph_error.txt` |
 | Planner refused to split a node | `outer_<i>/plan/iteration_*/turns/<node_path>/turn_*/status.txt` (look for `MALFORMED_SPLIT` / `GUARD_FAILED`) |
 | Planner gave up on a node | look for `EXHAUSTED_FALLBACK_TO_LEAF.txt` or `MAX_DEPTH_FORCED_LEAF.txt` under `plan/iteration_*/<node_path>/` |
-| Per-node refactor failure under planner | `outer_<i>/refactor/pass1/<node_path>/.../turn_*/status.txt` |
+| Per-node refactor failure under planner | `outer_<i>/pass1/iteration_<k>/<node_path>/.../turn_*/status.txt` (the highest-numbered iteration is the one that ran last) |
 | Pass 2 composition failed | `outer_<i>/log.txt` (last lines) — Pass 2 writes no per-turn artifacts; failure escalates to replan |
 | Regression-suite kernel never started | `<results-root>/<stamp>/jobs/<kernel>__<preset>.log` |
 | Autotuner regressed correctness | `<...>/turn_<n>/dsl_correctness_result.txt` or `graph_correctness_result.txt` (the loop ignores it; baseline is preserved as `baseline_dsl.py`) |

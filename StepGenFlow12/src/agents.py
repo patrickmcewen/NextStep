@@ -53,14 +53,23 @@ def _load_pass1_judge_prompt(
     *,
     child_blackbox_block: str,
     contract_block: str,
+    function_signature: str,
 ) -> str:
-    """Render the Pass-1 judge system prompt template with caller-supplied blocks."""
+    """Render the Pass-1 judge system prompt template with caller-supplied blocks.
+
+    ``function_signature`` is the *exact* signature line the orchestrator
+    will invoke (e.g. ``def tiled_reference(dims, tensors):`` for the root
+    or ``def <node>(<arg_1>, ..., *, out_shapes, out_perms=None):`` for a
+    non-root node). The judge enforces a literal match against it, which
+    obviates a root/non-root branch in the template.
+    """
     template_path = _PROMPTS_DIR_AGENTS / _PASS1_JUDGE_TEMPLATE
     assert template_path.exists(), f"Pass-1 judge template not found: {template_path}"
     template = template_path.read_text()
     return template.format(
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
+        function_signature=function_signature,
     )
 
 
@@ -260,16 +269,21 @@ def make_pass1_judge_agent(
     *,
     child_blackbox_block: str,
     contract_block: str,
+    function_signature: str,
 ) -> Agent:
     """Create a Pass-1 judge agent for a single planner node.
 
-    Same block parameters as ``make_pass1_agent``.
+    Same block parameters as ``make_pass1_agent``, plus ``function_signature``:
+    the exact signature line the candidate function must match (root nodes get
+    ``def tiled_reference(dims, tensors):``; non-root nodes get the
+    contract-derived ``def <node>(<arg_1>, ..., *, out_shapes, out_perms=None):``).
     """
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
     system_prompt = _load_pass1_judge_prompt(
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
+        function_signature=function_signature,
     )
     return Agent(
         name="StepJudge_pass1",

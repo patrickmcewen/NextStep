@@ -422,14 +422,25 @@ def _compare_one_tensor(gold, result, kernel_name, dims, label, *,
 
 def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
                           is_root: bool = True,
-                          extra_globals: dict | None = None):
+                          extra_globals: dict | None = None,
+                          entry_point: str = "tiled_reference",
+                          call_args: tuple | None = None,
+                          call_kwargs: dict | None = None):
     """Run a refactor-pass candidate against gold via the DSL executor.
 
     The DSL surface is directly runnable (the standalone ``step_dsl`` module
-    or the bundle's mounted abstraction), so we exec the candidate as
-    ``tiled_reference(dims, tensors)`` and compare its output to gold.
+    or the bundle's mounted abstraction), so we exec the candidate and
+    invoke the configured entry point. By default this is
+    ``tiled_reference(dims, tensors)`` (root nodes); non-root nodes pass
+    ``entry_point=<node_name>`` plus the contract-derived ``call_args`` and
+    ``call_kwargs`` so the LLM-emitted
+    ``<node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)`` is
+    exercised against parent-recorded inputs.
     """
-    result = _exec_dsl_ref(code, dims, tensors, extra_globals=extra_globals)
+    result = _exec_dsl_ref(code, dims, tensors, extra_globals=extra_globals,
+                           entry_point=entry_point,
+                           call_args=call_args,
+                           call_kwargs=call_kwargs)
     return _compare_against_gold(result, kernel_name, dims, "dsl",
                                  is_root=is_root)
 
@@ -489,12 +500,13 @@ _PASS_RULES: dict[str, dict] = {
             (".expand(",    "use expand_ref(x, ref) or repeat_static(x, factor)"),
             (".sum(",       "use accum_add(x, rank=1) or unary_rowwise_sum(x)"),
             (".prod(",      "use accum_mul(x, rank=1)"),
+            (".reshape(",   "use shape-modifying DSL calls"),
             ("torch.matmul", "use binary_matmul(a, b)"),
             ("torch.exp",    "use unary_exp(x)"),
             ("torch.rsqrt",  "use unary_rsqrt(x)"),
             ("F.silu",       "use unary_silu(x)"),
-            ("out_shape_tiled=(1,)",
-             "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
+            #("out_shape_tiled=(1,)",
+            # "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
         ],
         "required_ops": ["offchip_load", "offchip_store"],
     },
@@ -1132,20 +1144,35 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
 async def _gate_correctness(code, kernel_name, dims, tensors, executor,
                             turn_dir: Path, log, *,
                             is_root: bool = True,
-                            extra_globals: dict | None = None) -> tuple[_GateResult, str]:
+                            extra_globals: dict | None = None,
+                            entry_point: str = "tiled_reference",
+                            call_args: tuple | None = None,
+                            call_kwargs: dict | None = None) -> tuple[_GateResult, str]:
     """Run check_correctness with stdout captured for shape trace.
 
     Returns (gate_result, shape_trace). The shape trace is captured even on
     failure so the caller can append it to feedback for the LLM.
+
+    ``entry_point``/``call_args``/``call_kwargs`` are only meaningful for the
+    DSL executor (non-root pass1 invokes
+    ``<node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)``); the graph
+    executor ignores them and stays on the canonical
+    ``build_graph(dims, tensors)`` entry point.
     """
     check_correctness = _CORRECTNESS_CHECKERS[executor]
     log(f"      Running correctness check ({executor})...")
+    extra_kwargs: dict = {}
+    if executor == "dsl":
+        extra_kwargs["entry_point"] = entry_point
+        extra_kwargs["call_args"] = call_args
+        extra_kwargs["call_kwargs"] = call_kwargs
     _trace_buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(_trace_buf):
             result = check_correctness(code, kernel_name, dims, tensors,
                                        is_root=is_root,
-                                       extra_globals=extra_globals)
+                                       extra_globals=extra_globals,
+                                       **extra_kwargs)
         shape_trace = _trace_buf.getvalue()
         if shape_trace:
             _write(turn_dir / "shape_trace.txt", shape_trace)
@@ -1342,7 +1369,10 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          is_root: bool = True,
                          stateless: bool = False,
                          extra_required_ops: tuple[str, ...] = (),
-                         extra_globals: dict | None = None):
+                         extra_globals: dict | None = None,
+                         entry_point: str = "tiled_reference",
+                         call_args: tuple | None = None,
+                         call_kwargs: dict | None = None):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1454,7 +1484,10 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                     res, shape_trace = await _gate_correctness(
                         code, kernel_name, dims, tensors, executor,
                         turn_dir, log, is_root=is_root,
-                        extra_globals=extra_globals)
+                        extra_globals=extra_globals,
+                        entry_point=entry_point,
+                        call_args=call_args,
+                        call_kwargs=call_kwargs)
                     correctness_verified = (res.feedback is None)
                 elif gate_name == "compliance":
                     res = await _gate_compliance(
@@ -1921,7 +1954,8 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
                                     node_attempts: int = 1,
                                     non_root_sequential: bool = True,
                                     stateless: bool = False,
-                                    tensors: dict):
+                                    tensors: dict,
+                                    plan_iter: int = 0):
     """Refactor a single tree node in Pass-1 (pre-order, blackbox-stub style).
 
     Structurally mirrors ``_refactor_one_node`` but uses Pass-1 prompt/agent
@@ -1939,32 +1973,49 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
     is_root = (node.path == "root")
     synth_name = _synth_kernel_name(root_kernel, node.path)
 
-    # For non-root nodes the caller-supplied ``tensors`` is the root precompute,
-    # which has no relation to the seed used by the planner-emitted child's own
-    # ``get_inputs(dims)`` (the source ``compute_gold`` consults). Running gold
-    # on one input universe and the DSL on another guarantees match=False even
-    # for a structurally-correct refactor. Rebuild per-node tensors from the
-    # node's own ``get_inputs`` so both sides see byte-identical inputs.
-    # Root keeps its caller-supplied precompute (StepDB-canonical inputs).
-    if not is_root and has_class_model(node.reference_code):
-        node_tensors = build_node_tensors(node.reference_code, dims)
-    else:
+    # For non-root nodes, the LLM emits
+    # ``def <node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)`` — its
+    # inputs are the parent's recorded ``tiled_values`` (positional, in
+    # ``Contract.arg_names`` order) and its expected outputs are the parent's recorded
+    # ``tiled_outputs`` (both captured by ``make_stub`` during the parent's
+    # Pass-1 verification). Pulling gold straight from the contract ties the
+    # child's check to exactly the call site the parent committed to, with
+    # no second input-universe to keep in sync. Root nodes keep the
+    # ``tiled_reference(dims, tensors)`` convention against ``compute_gold``.
+    if is_root:
         node_tensors = tensors
+        ref_ns: dict = {}
+        exec(node.reference_code, ref_ns)
+        assert "compute_gold" in ref_ns, (
+            f"node {node.path!r}: reference_code must define compute_gold(dims)")
 
-    # Build gold from reference_code (same as _refactor_one_node)
-    ref_ns: dict = {}
-    exec(node.reference_code, ref_ns)
-    assert "compute_gold" in ref_ns, (
-        f"node {node.path!r}: reference_code must define compute_gold(dims)")
-
-    import inspect as _inspect
-    gold_arity = len(_inspect.signature(ref_ns["compute_gold"]).parameters)
-    assert gold_arity in (1, 2), (
-        f"node {node.path!r}: compute_gold must take (dims) or (dims, tensors); "
-        f"got signature with {gold_arity} parameters")
-    with torch.no_grad():
-        gold = (ref_ns["compute_gold"](dims) if gold_arity == 1
-                else ref_ns["compute_gold"](dims, node_tensors))
+        import inspect as _inspect
+        gold_arity = len(_inspect.signature(ref_ns["compute_gold"]).parameters)
+        assert gold_arity in (1, 2), (
+            f"node {node.path!r}: compute_gold must take (dims) or (dims, tensors); "
+            f"got signature with {gold_arity} parameters")
+        with torch.no_grad():
+            gold = (ref_ns["compute_gold"](dims) if gold_arity == 1
+                    else ref_ns["compute_gold"](dims, node_tensors))
+    else:
+        # Non-root: ``parent_contract.tiled_outputs`` is the gold the LLM
+        # function must reproduce; we still surface vanilla ``node_tensors``
+        # (when the planner emitted a ``Model``) for the prompt's tensor
+        # description, which the agent uses for shape orientation only.
+        assert parent_contract is not None, (
+            f"non-root node {node.path!r} must have a parent_contract")
+        if has_class_model(node.reference_code):
+            node_tensors = build_node_tensors(node.reference_code, dims)
+        else:
+            node_tensors = tensors
+        if parent_contract.out_is_tuple:
+            gold = parent_contract.tiled_outputs
+        else:
+            assert len(parent_contract.tiled_outputs) == 1, (
+                f"non-root node {node.path!r}: parent_contract reports "
+                f"out_is_tuple=False but tiled_outputs has "
+                f"{len(parent_contract.tiled_outputs)} entries")
+            gold = parent_contract.tiled_outputs[0]
     _inject_gold(synth_name, dims, gold)
 
     # Build function signature string the LLM must produce
@@ -1972,8 +2023,6 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         function_signature = "def tiled_reference(dims, tensors):"
     else:
         # Non-root: positional args are the tiled intermediate args from the contract
-        assert parent_contract is not None, (
-            f"non-root node {node.path!r} must have a parent_contract")
         sig_args = ", ".join(parent_contract.arg_names)
         function_signature = f"def {node.name}({sig_args}, *, out_shapes, out_perms=None):"
 
@@ -2048,7 +2097,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         function_signature=function_signature,
     )
 
-    node_dir = ckpt_root / "pass1" / node.path
+    node_dir = ckpt_root / "pass1" / f"iteration_{plan_iter}" / node.path
     node_dir.mkdir(parents=True, exist_ok=True)
 
     llm_config = getattr(agent_factory, "__llm_config__", None)
@@ -2064,12 +2113,29 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         llm_config,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
+        function_signature=function_signature,
     )
 
     # extra_required_ops = child names (each stub must appear textually in the code)
     extra_required_ops = tuple(
         child_path.rsplit("/", 1)[-1] for child_path, _ in children_signatures
     )
+
+    # Entry-point dispatch: root keeps the canonical
+    # ``tiled_reference(dims, tensors)`` convention; non-root invokes the
+    # node's own function with the parent-recorded tiled inputs and the
+    # parent-declared out_shapes/out_perms.
+    if is_root:
+        entry_point = "tiled_reference"
+        call_args: tuple | None = None
+        call_kwargs: dict | None = None
+    else:
+        entry_point = node.name
+        call_args = tuple(parent_contract.tiled_values)
+        call_kwargs = {
+            "out_shapes": parent_contract.out_shapes,
+            "out_perms": parent_contract.out_perms,
+        }
 
     async def _one_attempt(attempt_idx: int) -> dict:
         attempt_dir = (
@@ -2088,6 +2154,9 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
             stateless=stateless,
             extra_globals=extras,
             extra_required_ops=extra_required_ops,
+            entry_point=entry_point,
+            call_args=call_args,
+            call_kwargs=call_kwargs,
         )
 
     run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
@@ -2134,7 +2203,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
 async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
                        dims, root_kernel, ckpt_root, agent_factory,
                        max_turns, log, node_attempts, non_root_sequential,
-                       stateless, tensors):
+                       stateless, tensors, plan_iter: int = 0):
     """Pre-order Pass-1 walk.
 
     Refactors ``node`` first (using ``parent_contract`` as the call-site spec),
@@ -2176,6 +2245,7 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
         non_root_sequential=non_root_sequential,
         stateless=stateless,
         tensors=tensors,
+        plan_iter=plan_iter,
     )
 
     if not result["success"]:
@@ -2209,6 +2279,7 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
                 non_root_sequential=non_root_sequential,
                 stateless=stateless,
                 tensors=tensors,
+                plan_iter=plan_iter,
             )
             for child in node.children
         ])
@@ -2287,7 +2358,8 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
                         verified_cache: dict[str, str] | None = None,
                         translate_fn=None,
                         stateless: bool = False,
-                        tensors: dict | None = None) -> dict:
+                        tensors: dict | None = None,
+                        plan_iter: int = 0) -> dict:
     """Two-pass walk: pre-order Pass 1, then post-order Pass 2 at root.
 
     ``verified_cache`` and ``translate_fn`` are accepted for backward
@@ -2330,6 +2402,7 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
         node_attempts=node_attempts,
         non_root_sequential=non_root_sequential,
         stateless=stateless, tensors=tensors,
+        plan_iter=plan_iter,
     )
     failing = [(p, r) for p, r in pass1.items() if not r["success"]]
     if failing:
@@ -2458,6 +2531,7 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             translate_fn=translate_fn,
             stateless=stateless_refactor,
             tensors=tensors,
+            plan_iter=plan_iter,
         )
         if result["success"]:
             log(f"[planner] === Phase 0+1 SUCCEEDED (used {replans_used} replan(s)) ===")
@@ -2534,34 +2608,46 @@ def _load_tree_from_dir(outer_dir: Path):
 
 
 def _load_verified_dsls(outer_dir: Path) -> dict[str, str]:
-    """Scan ``<outer_dir>/refactor/`` for nodes with a successful refactor turn.
+    """Scan ``<outer_dir>/pass1/iteration_*/`` for nodes with a successful refactor turn.
 
     A node is verified iff it has a ``status.txt`` containing exactly ``PASS``
     under either ``refactor_final/turn_*/`` (single-attempt layout) or
     ``attempt_*/refactor_final/turn_*/`` (multi-attempt layout). Returns a
     ``{node_path: verified_dsl_code}`` mapping consumable by ``refactor_tree``.
+
+    When the same node has a PASS in multiple plan iterations (because a
+    later replan re-ran it under a new contract), the latest iteration's
+    DSL wins — its parent contract matches the live tree.
     """
-    refactor_root = outer_dir / "refactor"
-    if not refactor_root.is_dir():
+    pass1_root = outer_dir / "pass1"
+    if not pass1_root.is_dir():
         return {}
+    iteration_dirs = sorted(
+        (d for d in pass1_root.iterdir()
+         if d.is_dir() and d.name.startswith("iteration_")),
+        key=lambda d: int(d.name.split("_", 1)[1]),
+        reverse=True,
+    )
     cache: dict[str, str] = {}
-    for status_path in refactor_root.rglob("status.txt"):
-        if status_path.read_text().strip() != "PASS":
-            continue
-        if status_path.parent.parent.name != "refactor_final":
-            continue
-        code_path = status_path.parent / "extracted_code.py"
-        if not code_path.exists():
-            continue
-        # Path layout (under refactor_root):
-        #   <node_path>/refactor_final/turn_N/                  → 3 trailing parts
-        #   <node_path>/attempt_K/refactor_final/turn_N/        → 4 trailing parts
-        rel = status_path.parent.parent.parent.relative_to(refactor_root)
-        if rel.name.startswith("attempt_"):
-            rel = rel.parent
-        node_path = str(rel).replace("\\", "/")
-        # First PASS wins; subsequent attempts/turns for the same node ignored.
-        cache.setdefault(node_path, code_path.read_text())
+    for iter_dir in iteration_dirs:
+        for status_path in iter_dir.rglob("status.txt"):
+            if status_path.read_text().strip() != "PASS":
+                continue
+            if status_path.parent.parent.name != "refactor_final":
+                continue
+            code_path = status_path.parent / "extracted_code.py"
+            if not code_path.exists():
+                continue
+            # Path layout (under iter_dir):
+            #   <node_path>/refactor_final/turn_N/                  → 3 trailing parts
+            #   <node_path>/attempt_K/refactor_final/turn_N/        → 4 trailing parts
+            rel = status_path.parent.parent.parent.relative_to(iter_dir)
+            if rel.name.startswith("attempt_"):
+                rel = rel.parent
+            node_path = str(rel).replace("\\", "/")
+            # Latest iteration wins (iteration_dirs is sorted desc); within
+            # an iteration, first PASS wins.
+            cache.setdefault(node_path, code_path.read_text())
     return cache
 
 
@@ -3000,7 +3086,7 @@ async def _run_outer_iteration(
         )
 
         if resume_planner_dir is not None:
-            for sub in ("plan", "refactor"):
+            for sub in ("plan", "pass1"):
                 src = resume_planner_dir / sub
                 if src.is_dir():
                     shutil.copytree(src, outer_dir / sub, dirs_exist_ok=True)

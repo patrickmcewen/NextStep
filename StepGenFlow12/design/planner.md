@@ -94,9 +94,14 @@ the underlying return type so the prompt can teach the LLM whether to
 destructure the call site (`q, k, v = preprocess_heads(...)`) or assign
 directly (`r = attention(...)`). Stubs return a Tensor when the
 underlying ref module returns a Tensor and a tuple when it returns a
-tuple — matching the LLM's natural call-site syntax. Pass-1
-function signatures use plural keyword args universally:
-`def <node_name>(*intermediate_args, *, out_shapes, out_perms=None):`.
+tuple — matching the LLM's natural call-site syntax. Non-root Pass-1
+function signatures use the parent contract's named positional args
+followed by a keyword-only tail with plural keyword args:
+`def <node_name>(<arg_1>, <arg_2>, ..., *, out_shapes, out_perms=None):`,
+where the positional names come from `Contract.arg_names`. Collapsing
+the positionals into `*intermediate_args` together with the `*, ...`
+tail is a Python syntax error (`* argument may appear only once`) —
+the orchestrator's user-prompt builder always emits the named form.
 
 **v1 limitation (function-based StepDB kernels).** The contract design
 assumes children take positional tensor args (`forward(self, *tensors)`).
@@ -211,9 +216,11 @@ planner a chance to subdivide differently.
   `<OUTER_DIR>/plan/iteration_*/tree.json` (replanning iterations are
   numbered 0, 1, … and the last one is the live tree),
 - per-node verified DSLs are recovered by scanning
-  `<OUTER_DIR>/refactor/**/status.txt` for files whose status is
-  `PASS` and reading the matching `extracted_code.py`. The result is
-  a `{node_path: dsl_code}` cache.
+  `<OUTER_DIR>/pass1/iteration_*/**/status.txt` for files whose status
+  is `PASS` and reading the matching `extracted_code.py`. When the same
+  node has a PASS in multiple iterations (replan re-ran it under a new
+  contract), the latest iteration wins. The result is a
+  `{node_path: dsl_code}` cache.
 
 The walk re-runs only the non-verified nodes; verified siblings are
 fed in as few-shot context immediately. Files are also copied forward
@@ -242,7 +249,7 @@ plan/
         ├── response.txt
         ├── reasoning.txt
         └── status.txt
-refactor/<node_path>/[attempt_<i>/]refactor_final/turn_<N>/...
+pass1/iteration_<k>/<node_path>/[attempt_<i>/]refactor_final/turn_<N>/...
 dsl_code.py                              # the verified root DSL handed off to phase 2
 ```
 
@@ -254,10 +261,13 @@ Forced-leaf and exhausted-budget nodes drop a marker file
 distinction between "the planner chose leaf" and "the planner gave up"
 is recoverable from the on-disk record.
 
-The `refactor/<node_path>/` subtree mirrors the legacy
-`refactor_final/turn_<N>/...` layout from the no-plan path. With
-`--node-attempts > 1`, an `attempt_<i>/` layer is inserted so each
-parallel attempt's turns stay separate.
+The `pass1/iteration_<k>/<node_path>/` subtree mirrors the legacy
+`refactor_final/turn_<N>/...` layout from the no-plan path. The
+`iteration_<k>/` layer keeps each replan iteration's per-node refactor
+attempts on disk independently — without it, a later iteration's
+attempts would partially clobber an earlier iteration's at the same
+node path. With `--node-attempts > 1`, an `attempt_<i>/` layer is
+inserted so each parallel attempt's turns stay separate.
 
 ## Invariants
 

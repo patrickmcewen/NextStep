@@ -51,10 +51,37 @@ def test_contract_with_multiple_outputs():
 def test_contract_is_frozen():
     import dataclasses
     c = Contract(arg_names=(), vanilla_shapes=(), tiled_shapes=(),
-                 tiled_values=(), out_shapes=((1,),), out_perms=(None,))
+                 tiled_values=(), out_shapes=((1, 1, 1),), out_perms=(None,))
     try:
-        c.out_shapes = ((2,),)   # type: ignore[misc]
+        c.out_shapes = ((1, 2, 1),)   # type: ignore[misc]
         raised = False
     except dataclasses.FrozenInstanceError:
         raised = True
+    assert raised
+
+
+def test_contract_rejects_sub_stream_rank_out_shapes():
+    """STeP invariant: every out_shape must be at least rank 3
+    (>= 1 stream dim + 2 tile dims)."""
+    raised = False
+    try:
+        Contract(arg_names=(), vanilla_shapes=(), tiled_shapes=(),
+                 tiled_values=(), out_shapes=((4, 8),), out_perms=(None,))
+    except AssertionError as e:
+        raised = True
+        assert "rank >= 3" in str(e), str(e)
+    assert raised, "Contract should reject 2D out_shapes"
+
+
+def test_contract_rejects_sub_stream_rank_in_multi_output():
+    """The invariant is per-entry: one bad shape in a multi-output contract fails."""
+    raised = False
+    try:
+        Contract(arg_names=(), vanilla_shapes=(), tiled_shapes=(),
+                 tiled_values=(),
+                 out_shapes=((4, 8, 2), (4, 8)),   # second is 2D
+                 out_perms=(None, None))
+    except AssertionError as e:
+        raised = True
+        assert "out_shapes[1]" in str(e), str(e)
     assert raised

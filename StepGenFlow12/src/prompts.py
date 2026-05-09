@@ -727,8 +727,11 @@ def build_pass1_user_prompt(
             "",
             "Each blackbox is invoked with plural keyword args ``out_shapes`` "
             "(tuple of per-output shapes) and optional ``out_perms`` (tuple of "
-            "per-output permutations, parallel to ``out_shapes``). Single-output "
-            "children still take 1-tuples (e.g. ``out_shapes=((H, W),)``). "
+            "per-output permutations, parallel to ``out_shapes``). Every "
+            "``out_shapes`` entry must be a tile-stream shape with rank >= 3 "
+            "(at least 1 stream dim + 2 tile dims) — vanilla 2D shapes like "
+            "``(M, N)`` are not valid stream shapes. Single-output children "
+            "still take 1-tuples (e.g. ``out_shapes=((S, T_R, T_C),)``). "
             "Multi-output children must be destructured at the call site "
             "(e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).",
             "",
@@ -750,10 +753,13 @@ def build_pass1_user_prompt(
                 )
         lines.extend([
             "",
-            "**Reshape rule:** between any tensor source and a blackbox call site,",
-            "only `.reshape(...)` is permitted. No `.permute()`, `.transpose()`,",
-            "indexing, or arithmetic. Output permutations go in `out_perms` "
-            "(one entry per output, ``None`` = identity).",
+            "**Call-site rule:** no tensor-method transform may appear between a tensor",
+            "source and a blackbox call site — the stub recovers vanilla shape internally.",
+            "Forbidden: `.reshape(...)`, `.permute(...)`, `.transpose(...)`, indexing,",
+            "arithmetic, `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()`. Output",
+            "permutations go in `out_perms` (one entry per output, ``None`` = identity).",
+            "If a stream's shape needs to change, use a DSL op (`reshape_stream`,",
+            "`reshape_pad_stream`, `streamify`, `flatten`, etc.), never `tensor.reshape(...)`.",
         ])
 
     # Required function signature
