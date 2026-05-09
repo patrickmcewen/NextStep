@@ -148,18 +148,22 @@ or a structured failure description:
 
 Each executor compares the result against gold:
 
-- For root nodes (and all standalone-mode passes), shapes must match
-  exactly and `rel_err < 1e-5` against gold.
-- For planner non-root nodes (`is_root=False`), the executor accepts a
-  tuple/list result alongside a tuple/list gold (per-output comparison),
-  and shape strictness is relaxed for single-tensor outputs — both
-  tensors are flattened before the element-wise comparison; numel must
-  still match. The kernel-level output contract is preserved at the
-  root.
+- Comparison is **always shape-relaxed**: both tensors are flattened in
+  row-major order and compared element-wise with `rel_err < 1e-5`,
+  requiring only that `numel` matches. Layout-changing bugs (transposes,
+  scrambles) still fail because they place different element values at
+  the same flat positions; unit-dim differences (e.g., vanilla 2D gold
+  vs the equivalent stream-shaped output) pass since they share flat
+  memory order. This is the natural correctness check for a flow whose
+  outputs are tile-streams of rank ≥ 3 even when the reference's vanilla
+  output is lower rank.
+- The executor accepts a tuple/list result alongside a tuple/list gold
+  (per-output comparison) for planner non-root nodes whose forward
+  returns multiple tensors.
 
-On mismatch, the worst-error index is reported alongside the gold and
-candidate values at that index. Gold is memoized per `(kernel, dims)` for
-the process lifetime.
+On mismatch, the worst-error flat index is reported alongside the gold
+and candidate values at that index. Gold is memoized per `(kernel, dims)`
+for the process lifetime.
 
 The `dsl` executor prepends a small import scaffold to the user code
 (`torch`, `torch.nn.functional`, the DSL module, etc.) so the model never
@@ -203,7 +207,10 @@ contain `torch.*` calls and shouldn't be flagged.
 
 For planner non-root refactor passes (`is_root=False`), the rules
 relax: sink-op requirements (`offchip_store`) drop, since non-root
-DSLs don't terminate at off-chip.
+DSLs don't terminate at off-chip — they hand a stream up to their
+parent. The root, in contrast, must always include `offchip_store`
+even when its body is a pure blackbox-orchestrator: the kernel's
+external output is written off-chip exactly once, at the root.
 
 When the check finds violations on otherwise-correct code, the next-turn
 feedback explicitly says "your output is correct, but you used these

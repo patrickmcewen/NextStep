@@ -15,7 +15,7 @@ def double(x, *, out_shapes, out_perms=None):
 '''
     ns = _pass2_compose_namespace(
         parent_dsl=parent_dsl,
-        child_name_to_dsl={"double": child_dsl},
+        child_dsls_in_order=[child_dsl],
     )
     x = torch.arange(8, dtype=torch.float32)
     out = ns["tiled_reference"]({}, {"x": x})
@@ -35,16 +35,49 @@ def outer(x, *, out_shapes, out_perms=None):
 def inner(x, *, out_shapes, out_perms=None):
     return (x * 10).reshape(out_shapes[0])
 '''
+    # Post-order: leaf (inner) before parent (outer).
     ns = _pass2_compose_namespace(
         parent_dsl=parent_dsl,
-        child_name_to_dsl={
-            "outer": middle_dsl,
-            "inner": leaf_dsl,
-        },
+        child_dsls_in_order=[leaf_dsl, middle_dsl],
     )
     x = torch.arange(4, dtype=torch.float32)
     out = ns["tiled_reference"]({}, {"x": x})
     assert torch.equal(out, x * 10 + 1)
+
+
+def test_compose_handles_same_name_parent_and_leaf():
+    """Regression: planner can produce nested nodes that share a function
+    name (e.g., a parent ``moe_dispatch`` whose child is also a leaf
+    ``moe_dispatch``). Pass-1 may emit a parent that captures the leaf via
+    ``_<name>_child = <name>`` before redefining the function. This works
+    iff the leaf's DSL has been exec'd in the namespace before the
+    parent's. Keying descendants by ``node.name`` (the old behaviour)
+    silently dropped the leaf and produced ``NameError`` at parent-exec
+    time."""
+    leaf_dsl = '''
+def moe_dispatch(x, *, out_shapes, out_perms=None):
+    return (x * 100).reshape(out_shapes[0])
+'''
+    # Parent shares the leaf's name and uses the capture-then-shadow trick.
+    parent_dsl = '''
+_moe_dispatch_child = moe_dispatch
+def moe_dispatch(x, *, out_shapes, out_perms=None):
+    return _moe_dispatch_child(x, out_shapes=out_shapes) + 1
+'''
+    root_dsl = '''
+def tiled_reference(dims, tensors):
+    return moe_dispatch(tensors["x"],
+                         out_shapes=(tuple(tensors["x"].shape),))
+'''
+    # Post-order: leaf first, then parent.
+    ns = _pass2_compose_namespace(
+        parent_dsl=root_dsl,
+        child_dsls_in_order=[leaf_dsl, parent_dsl],
+    )
+    x = torch.arange(4, dtype=torch.float32)
+    out = ns["tiled_reference"]({}, {"x": x})
+    # Parent calls leaf (* 100), then adds 1 → 100x + 1
+    assert torch.equal(out, x * 100 + 1)
 
 
 def test_compose_handles_multi_output_child():
@@ -62,7 +95,7 @@ def split3(x, *, out_shapes, out_perms=None):
 '''
     ns = _pass2_compose_namespace(
         parent_dsl=parent_dsl,
-        child_name_to_dsl={"split3": child_dsl},
+        child_dsls_in_order=[child_dsl],
     )
     x = torch.arange(4, dtype=torch.float32)
     out = ns["tiled_reference"]({}, {"x": x})

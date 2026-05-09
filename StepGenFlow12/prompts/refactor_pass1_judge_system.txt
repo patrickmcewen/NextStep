@@ -16,17 +16,18 @@ This is the signature the user prompt asked for and the orchestrator's executor 
 
 Flag any deviation: wrong function name, missing/added/renamed/reordered positional parameters, singular `out_shape`/`out_perm` instead of plural `out_shapes`/`out_perms`, or missing keyword parameters. Do **not** flag a function whose name and parameters match the signature above — those are required, not extra.
 
-## Requirement 2: Child blackbox calls
+## Requirement 2: Child blackbox call sites
 
 {child_blackbox_block}
 
-Each declared child blackbox must be called **exactly once** in the function body. Straight-line calls only — no blackbox calls inside loops or conditionals.
+Calling these blackboxes is **optional** — they are tools the implementer may invoke. Do **not** flag any of the following:
+- A child blackbox that is never called in the function body.
+- A child blackbox called multiple times.
+- Calls placed inside loops or conditionals.
 
-Flag any child blackbox that is absent, called more than once, or called inside a loop or conditional.
-
-Flag any of the following applied to a tensor between its source and a blackbox call site:
+The only thing to flag is what the implementer does to a tensor *between its source and the call*. When a blackbox IS called, flag any of the following applied to a tensor flowing into that call site:
 - `.permute(...)` or `.transpose(...)` or `.reshape(...)`
-- Index expressions `[...]` (slicing, gathering)
+- Index expressions `[...]` on a tensor flowing into the call (slicing or gathering — NOT a `for i, x in enumerate(...)` loop iterating over a static container, which is permitted)
 - Arithmetic operators (`*`, `+`, `-`, `/`, `@`)
 - `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()` (single-argument form that changes layout)
 

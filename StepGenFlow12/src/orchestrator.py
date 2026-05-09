@@ -309,8 +309,21 @@ def _load_stepdb_config() -> dict:
 # Correctness checkers for each executor type
 # ---------------------------------------------------------------------------
 
-def _compare_against_gold(result, kernel_name, dims, label="result", *,
-                           is_root: bool = True):
+def _overall_match(report: str) -> bool:
+    """Read the overall verdict from a ``_compare_against_gold`` report.
+
+    The first line of every report is unambiguously ``match=True`` or
+    ``match=False``; per-output detail blocks below it use ``tensor=PASS``
+    / ``tensor=FAIL`` so a partial per-output match never leaks the
+    substring ``match=True`` into a tuple report whose overall verdict is
+    False. Always use this helper at gate sites — never substring-match.
+    """
+    if not report:
+        return False
+    return report.splitlines()[0].strip() == "match=True"
+
+
+def _compare_against_gold(result, kernel_name, dims, label="result"):
     """Compare a tensor (or tuple/list of tensors) result against gold.
 
     Tuple/list outputs are supported because the planner can decompose a
@@ -320,10 +333,19 @@ def _compare_against_gold(result, kernel_name, dims, label="result", *,
     comparisons stay single-tensor; tuple comparisons only kick in for
     intermediate per-node refactor passes.
 
-    ``is_root=False`` relaxes shape strictness: shapes do not need to match
-    exactly — both tensors are flattened and compared element-wise (numel
-    must still match). The root output is the kernel's externally-observable
-    signature, so we keep its shape check strict.
+    Shape strictness is uniformly relaxed: every comparison flattens both
+    tensors and checks element-wise equality with matching ``numel()``.
+    The kernel's externally-observable output is a STeP tile-stream
+    (rank >= 3), so a vanilla 2D gold against an equivalent stream-shaped
+    DSL/sim output shares row-major flat memory and matches element-wise.
+    Layout-changing bugs (transposes, scrambles) still fail because they
+    produce different elements at the same flat positions.
+
+    Return-format invariant: the first line is always ``match=True`` or
+    ``match=False`` (the overall verdict). Detail follows on subsequent
+    lines and uses ``tensor=PASS``/``tensor=FAIL`` for per-output blocks
+    so callers reading the verdict via ``_overall_match`` cannot be
+    fooled by a partial match.
     """
     import torch
 
@@ -333,66 +355,64 @@ def _compare_against_gold(result, kernel_name, dims, label="result", *,
     result_is_seq = isinstance(result, (tuple, list))
     if gold_is_seq != result_is_seq:
         return (
+            f"match=False\n"
             f"STRUCTURE MISMATCH: gold is {type(gold).__name__}, "
-            f"{label} is {type(result).__name__}\nmatch=False"
+            f"{label} is {type(result).__name__}"
         )
     if gold_is_seq:
         if len(gold) != len(result):
             return (
+                f"match=False\n"
                 f"LENGTH MISMATCH: gold has {len(gold)} outputs, "
-                f"{label} has {len(result)}\nmatch=False"
+                f"{label} has {len(result)}"
             )
         per_out = [
-            _compare_one_tensor(g, r, kernel_name, dims, f"{label}[{i}]",
-                                is_root=is_root)
+            _compare_one_tensor(g, r, kernel_name, dims, f"{label}[{i}]")
             for i, (g, r) in enumerate(zip(gold, result))
         ]
         all_match = all(p["match"] for p in per_out)
         out = f"match={all_match}"
         for i, p in enumerate(per_out):
-            out += f"\n--- output[{i}] ---\n{p['report']}"
+            tag = "PASS" if p["match"] else "FAIL"
+            out += f"\n--- output[{i}] (tensor={tag}) ---\n{p['report']}"
         return out
-    return _compare_one_tensor(gold, result, kernel_name, dims, label,
-                               is_root=is_root)["report"]
+    res = _compare_one_tensor(gold, result, kernel_name, dims, label)
+    return f"match={res['match']}\n{res['report']}"
 
 
-def _compare_one_tensor(gold, result, kernel_name, dims, label, *,
-                         is_root: bool = True):
+def _compare_one_tensor(gold, result, kernel_name, dims, label):
     """Single-tensor comparison helper. Returns ``{"match": bool, "report": str}``.
 
-    For non-root nodes (``is_root=False``) shapes need not match exactly —
-    both tensors are flattened before the element-wise comparison. The numel
-    must still match.
+    Shape strictness is uniformly relaxed across the flow: both tensors are
+    flattened in row-major order before the element-wise compare, requiring
+    only that ``numel`` matches. See ``_compare_against_gold`` for the
+    rationale.
+
+    The ``report`` body intentionally contains no ``match=True``/
+    ``match=False`` substring — the per-tensor verdict is carried in the
+    structured ``match`` field, and the overall verdict line is emitted
+    once by ``_compare_against_gold``. This prevents a partial per-output
+    PASS from greenlighting a substring-based gate check on a tuple
+    report whose overall verdict is FAIL.
     """
     import torch
 
     if not hasattr(result, "shape"):
         report = (
             f"TYPE MISMATCH: gold is torch.Tensor, {label} is "
-            f"{type(result).__name__}\nmatch=False"
+            f"{type(result).__name__}"
         )
         return {"match": False, "report": report}
 
-    if gold.shape != result.shape:
-        if is_root:
-            report = (
-                f"SHAPE MISMATCH: gold {tuple(gold.shape)} vs "
-                f"{label} {tuple(result.shape)}\nmatch=False"
-            )
-            return {"match": False, "report": report}
-        if gold.numel() != result.numel():
-            report = (
-                f"NUMEL MISMATCH (non-root, flatten compare): "
-                f"gold {tuple(gold.shape)} (numel={gold.numel()}) vs "
-                f"{label} {tuple(result.shape)} (numel={result.numel()})\n"
-                f"match=False"
-            )
-            return {"match": False, "report": report}
-        gold_cmp = gold.reshape(-1)
-        result_cmp = result.reshape(-1)
-    else:
-        gold_cmp = gold
-        result_cmp = result
+    if gold.numel() != result.numel():
+        report = (
+            f"NUMEL MISMATCH: gold {tuple(gold.shape)} (numel={gold.numel()}) "
+            f"vs {label} {tuple(result.shape)} (numel={result.numel()})"
+        )
+        return {"match": False, "report": report}
+
+    gold_cmp = gold.reshape(-1)
+    result_cmp = result.reshape(-1)
 
     max_err = (gold_cmp - result_cmp).abs().max().item()
     rel_err = max_err / (gold_cmp.abs().max().item() + 1e-12)
@@ -402,11 +422,10 @@ def _compare_one_tensor(gold, result, kernel_name, dims, label, *,
         f"output_shape={tuple(result.shape)}"
         if gold.shape == result.shape
         else (f"output_shape={tuple(result.shape)} "
-              f"(flattened to {tuple(result_cmp.shape)} for non-root compare; "
-              f"gold shape {tuple(gold.shape)})")
+              f"(flattened for compare; gold shape {tuple(gold.shape)})")
     )
     report = (
-        f"match={match}\nmax_abs_err={max_err:.2e}\nrel_err={rel_err:.2e}\n"
+        f"max_abs_err={max_err:.2e}\nrel_err={rel_err:.2e}\n"
         f"{shape_note}"
     )
     if not match:
@@ -421,7 +440,6 @@ def _compare_one_tensor(gold, result, kernel_name, dims, label, *,
 
 
 def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
-                          is_root: bool = True,
                           extra_globals: dict | None = None,
                           entry_point: str = "tiled_reference",
                           call_args: tuple | None = None,
@@ -441,12 +459,10 @@ def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
                            entry_point=entry_point,
                            call_args=call_args,
                            call_kwargs=call_kwargs)
-    return _compare_against_gold(result, kernel_name, dims, "dsl",
-                                 is_root=is_root)
+    return _compare_against_gold(result, kernel_name, dims, "dsl")
 
 
 def _run_graph_correctness(code, kernel_name, dims, tensors, *,
-                            is_root: bool = True,
                             extra_globals: dict | None = None):
     """Run a translate-pass candidate against gold via the simulator.
 
@@ -464,8 +480,7 @@ def _run_graph_correctness(code, kernel_name, dims, tensors, *,
         stripped = code.replace("import ", "# import ")  # strip imports for line matching
         enhanced = enhance_emulator_error(exc, stripped)
         raise type(exc)(enhanced) from exc
-    return _compare_against_gold(sim, kernel_name, dims, "sim",
-                                 is_root=is_root)
+    return _compare_against_gold(sim, kernel_name, dims, "sim")
 
 
 # Map executor type to correctness checker. ``dsl`` gates phase-1 refactor
@@ -500,7 +515,11 @@ _PASS_RULES: dict[str, dict] = {
             (".expand(",    "use expand_ref(x, ref) or repeat_static(x, factor)"),
             (".sum(",       "use accum_add(x, rank=1) or unary_rowwise_sum(x)"),
             (".prod(",      "use accum_mul(x, rank=1)"),
-            (".reshape(",   "use shape-modifying DSL calls"),
+            (".reshape(",   "use shape-modifying DSL calls (reshape_stream, flatten, bufferize+streamify)"),
+            (".view(",      "use shape-modifying DSL calls (reshape_stream, flatten, bufferize+streamify)"),
+            (".permute(",   "can express permutations using shape-modifying DSL calls like bufferize+streamify"),
+            (".transpose(", "can express transposes using shape-modifying DSL calls like bufferize+streamify or via the transposed argument in binary ops"),
+            (".flatten(",   "use the DSL `flatten(...)` standalone op, not the tensor method"),
             ("torch.matmul", "use binary_matmul(a, b)"),
             ("torch.exp",    "use unary_exp(x)"),
             ("torch.rsqrt",  "use unary_rsqrt(x)"),
@@ -898,22 +917,33 @@ def _check_banned_ops(code: str, pass_name: str, *,
             violations.append(f"- `{call}()` is not allowed — decompose into primitives")
 
     # Word-boundary anchor avoids false positives like "broadcast(" matching "infer_broadcast(".
+    # Only prepend ``\b`` for patterns whose first character is a word char —
+    # for dot-prefixed patterns (``.permute(``, ``.unsqueeze(``, ...) ``\b``
+    # is the boundary between the previous char and ``.``, which silently
+    # fails when the previous char is also non-word (e.g. ``).unsqueeze(``
+    # — both ``)`` and ``.`` are non-word, so ``\b`` is False and the call
+    # slips past the check). The leading literal ``.`` already prevents
+    # partial-word matches, so the boundary is unnecessary in that case.
     for pattern, fix in rules["banned_patterns"]:
-        if re.search(r'\b' + re.escape(pattern), code):
+        prefix = r'\b' if pattern[:1].isalnum() or pattern[:1] == '_' else ''
+        if re.search(prefix + re.escape(pattern), code):
             violations.append(f"- `{pattern}` still present — {fix}")
 
     sink_ops = {"offchip_store", "OffChipStore", "random_offchip_store"}
-    required_ops = list(rules["required_ops"]) + list(extra_required_ops)
+    # ``extra_required_ops`` (the planner's child blackbox names) is intentionally
+    # NOT required to appear textually: blackbox calls are tools the implementer
+    # may use, not a quota. They still flow into the dataflow walk below as
+    # ``blackbox_names`` so call sites are exempt from the consumer-source rule.
+    required_ops = list(rules["required_ops"])
     if pass_name == "refactor_final":
         # The AST dataflow walk subsumes the textual ``offchip_load`` check —
         # a node consuming only intermediate args / blackbox returns never
-        # needs to call ``offchip_load`` itself. Sink-op orchestrators (root
-        # nodes whose body is purely blackbox calls) likewise terminate via
-        # their children's stores, so drop ``offchip_store`` when blackbox
-        # children are present.
+        # needs to call ``offchip_load`` itself. ``offchip_store`` is NOT
+        # dropped here: the kernel's externally-observable output goes
+        # off-chip via a single sink at the root, regardless of whether
+        # the root is a leaf or a blackbox-only orchestrator. Children are
+        # exempt (handled by the ``not is_root`` rule below).
         required_ops = [op for op in required_ops if op != "offchip_load"]
-        if extra_required_ops:
-            required_ops = [op for op in required_ops if op != "offchip_store"]
     for required in required_ops:
         if not is_root and required in sink_ops:
             continue
@@ -1034,8 +1064,7 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
 
 def _make_translation_post_validator(kernel_name: str, dims: dict,
                                      tensors: dict, log,
-                                     translate_fn=None,
-                                     *, is_root: bool = True):
+                                     translate_fn=None):
     """Build a refactor_final post-validator that runs deterministic translation.
 
     The validator returns ``None`` when the DSL code translates cleanly into a
@@ -1076,8 +1105,7 @@ def _make_translation_post_validator(kernel_name: str, dims: dict,
 
         log(f"      [translate-check] verifying STeP graph correctness...")
         try:
-            result = _run_graph_correctness(step_code, kernel_name, dims, tensors,
-                                            is_root=is_root)
+            result = _run_graph_correctness(step_code, kernel_name, dims, tensors)
         except Exception:
             err = traceback.format_exc()
             _write(check_dir / "graph_error.txt", err)
@@ -1091,7 +1119,7 @@ def _make_translation_post_validator(kernel_name: str, dims: dict,
             )
         _write(check_dir / "graph_correctness.txt", result)
 
-        if "match=True" not in result:
+        if not _overall_match(result):
             log(f"      [translate-check] graph mismatch")
             return (
                 "## Correctness: PASS at DSL level, but STeP graph is numerically wrong\n\n"
@@ -1135,7 +1163,7 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
     result = _run_graph_correctness(step_code, kernel_name, dims, tensors)
     _write(turn_dir / "correctness_result.txt", result)
 
-    success = "match=True" in result
+    success = _overall_match(result)
     _write(turn_dir / "status.txt", "PASS" if success else "MISMATCH")
     log(f"  -> deterministic translate {'OK' if success else 'FAILED'}")
     return {"success": success, "code": step_code}
@@ -1143,7 +1171,6 @@ def _run_deterministic_translate(dsl_code: str, kernel_name: str,
 
 async def _gate_correctness(code, kernel_name, dims, tensors, executor,
                             turn_dir: Path, log, *,
-                            is_root: bool = True,
                             extra_globals: dict | None = None,
                             entry_point: str = "tiled_reference",
                             call_args: tuple | None = None,
@@ -1170,7 +1197,6 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
     try:
         with contextlib.redirect_stdout(_trace_buf):
             result = check_correctness(code, kernel_name, dims, tensors,
-                                       is_root=is_root,
                                        extra_globals=extra_globals,
                                        **extra_kwargs)
         shape_trace = _trace_buf.getvalue()
@@ -1178,7 +1204,7 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
             _write(turn_dir / "shape_trace.txt", shape_trace)
         _write(turn_dir / "correctness_result.txt", result)
 
-        if "match=True" in result:
+        if _overall_match(result):
             return _GateResult(None, "PASS", 0), shape_trace
 
         first_line = result.splitlines()[0] if result else "(empty)"
@@ -1358,6 +1384,28 @@ def _build_stateless_user_prompt(original_user_prompt: str,
     return "".join(parts)
 
 
+def _make_attempt_log(base_log, node_path: str, attempt_idx: int,
+                      total_attempts: int):
+    """Wrap ``log`` so every inner line carries its node-path + attempt tag.
+
+    Pass1 and the planner spawn parallel ``_run_pass_loop`` instances per
+    node and per attempt; without this their `[refactor_final] Turn N/M`,
+    `Extracted code: …`, gate-result lines all interleave anonymously and
+    you can't tell which checkpoint dir a given line came from.
+    """
+    if total_attempts <= 1:
+        prefix = f"[{node_path}]"
+    else:
+        prefix = f"[{node_path} attempt_{attempt_idx}]"
+
+    def wrapped(msg: str) -> None:
+        stripped = msg.lstrip(" ")
+        leading = msg[: len(msg) - len(stripped)]
+        base_log(f"{leading}{prefix} {stripped}")
+
+    return wrapped
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, *, executor: str, tensors: dict,
                          prev_code=None, log=print,
@@ -1483,7 +1531,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                 if gate_name == "correctness":
                     res, shape_trace = await _gate_correctness(
                         code, kernel_name, dims, tensors, executor,
-                        turn_dir, log, is_root=is_root,
+                        turn_dir, log,
                         extra_globals=extra_globals,
                         entry_point=entry_point,
                         call_args=call_args,
@@ -1730,7 +1778,6 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
     if translate_fn is not None:
         post_validator = _make_translation_post_validator(
             synth_name, dims, tensors, log, translate_fn=translate_fn,
-            is_root=is_root,
         )
 
     async def _one_attempt(attempt_idx: int) -> dict:
@@ -1739,10 +1786,13 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
             else node_dir / f"attempt_{attempt_idx}"
         )
         attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_log = _make_attempt_log(
+            log, node.path, attempt_idx, node_attempts)
         return await _run_pass_loop(
             agent, "refactor_final",
             kernel_name=synth_name, dims=dims, max_turns=max_turns,
-            ckpt_dir=attempt_dir, executor="dsl", tensors=tensors, log=log,
+            ckpt_dir=attempt_dir, executor="dsl", tensors=tensors,
+            log=attempt_log,
             check_order="correctness-first",
             prebuilt_user_prompt=user_prompt,
             judge_agent=refactor_judge_agent,
@@ -2143,10 +2193,13 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
             else node_dir / f"attempt_{attempt_idx}"
         )
         attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_log = _make_attempt_log(
+            log, node.path, attempt_idx, node_attempts)
         return await _run_pass_loop(
             agent, "refactor_final",
             kernel_name=synth_name, dims=dims, max_turns=max_turns,
-            ckpt_dir=attempt_dir, executor="dsl", tensors=node_tensors, log=log,
+            ckpt_dir=attempt_dir, executor="dsl", tensors=node_tensors,
+            log=attempt_log,
             check_order="correctness-first",
             prebuilt_user_prompt=user_prompt,
             judge_agent=judge_agent,
@@ -2290,20 +2343,24 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
 
 
 def _pass2_compose_namespace(*, parent_dsl: str,
-                              child_name_to_dsl: dict[str, str]) -> dict:
+                              child_dsls_in_order: list[str]) -> dict:
     """Build an exec namespace where each child name resolves to its verified DSL function.
 
-    The grandchild-and-deeper case is handled by exec'ing each child's DSL
-    in the same shared namespace as the parent. Python's late binding means
-    a function defined here can call another function defined here, even if
-    the calling order at exec-time predates the callee — resolution happens
-    at call time, by which point all functions are bound.
+    ``child_dsls_in_order`` MUST be in post-order (children before
+    parents). The Pass-1 LLM is allowed to capture a same-named child via
+    ``_<name>_child = <name>`` at module level *before* redefining the
+    function — that capture reads ``<name>`` at exec time, so the child's
+    ``def`` must already have run. Two same-name ``def``s shadow each
+    other in ``ns``; the post-order contract preserves the parent's
+    captured alias before its own redef overwrites the child binding.
+    For function-call references (the common case), Python's late binding
+    makes the order irrelevant — all functions are bound by call time.
     """
     from src.tools import _build_dsl_scaffold
     scaffold = _build_dsl_scaffold()
     ns: dict = {}
     exec(scaffold, ns)
-    for child_name, child_dsl in child_name_to_dsl.items():
+    for child_dsl in child_dsls_in_order:
         exec(child_dsl, ns)
     exec(parent_dsl, ns)
     return ns
@@ -2323,27 +2380,42 @@ def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
     """
     from src.tools import _exec_dsl_ref
 
-    # Flat dict of all non-root descendant node names -> their Pass-1 DSL.
-    descendants: dict[str, str] = {}
+    # Collect descendant DSLs in post-order. We keep a list (not a
+    # name-keyed dict) because the planner can produce nested same-named
+    # nodes — e.g. a parent ``moe_dispatch`` whose child is also named
+    # ``moe_dispatch``. Keying by ``node.name`` would silently drop the
+    # leaf when the parent overwrites it, so the parent's
+    # ``_<name>_child = <name>`` capture would resolve against a namespace
+    # where the child was never exec'd → NameError. Indexing by path also
+    # has no functional role here (we never look entries up by key); the
+    # only thing that matters is iteration order, which iter_topological
+    # already guarantees is children-before-parents.
+    descendants_in_order: list[str] = []
     for node in tree.iter_topological():   # post-order (children before parent)
         if node.path == tree.root.path:
             continue
-        descendants[node.name] = pass1_dsls[node.path]
+        descendants_in_order.append(pass1_dsls[node.path])
 
     root_dsl = pass1_dsls[tree.root.path]
     log("[pass2] composing root with all descendants name-rebound")
 
-    # Build namespace including descendants, then extract the verified
-    # callables and re-execute the root through the standard executor with
-    # those bindings as extra_globals (injected before scaffold exec).
+    # Build a namespace containing scaffold + all descendants + root, then
+    # re-execute the root through the standard executor with the composed
+    # bindings as ``extra_globals``. We extract the extras by walking
+    # ``composed_ns`` itself (all callables except the root entry point)
+    # rather than indexing by descendant key — this is robust to the
+    # same-name shadowing case: the parent's ``def`` overwrote the leaf in
+    # ``composed_ns``, but the leaf survives via the parent's captured
+    # ``_<name>_child`` alias, which is *also* a callable in ``composed_ns``.
     composed_ns = _pass2_compose_namespace(
-        parent_dsl=root_dsl, child_name_to_dsl=descendants)
-    extras = {name: composed_ns[name] for name in descendants}
+        parent_dsl=root_dsl, child_dsls_in_order=descendants_in_order)
+    extras = {k: v for k, v in composed_ns.items()
+              if callable(v) and k != "tiled_reference"}
 
     result = _exec_dsl_ref(root_dsl, dims, tensors, extra_globals=extras)
 
-    report = _compare_against_gold(result, root_kernel, dims, is_root=True)
-    if "match=True" in report:
+    report = _compare_against_gold(result, root_kernel, dims)
+    if _overall_match(report):
         composed_source = "\n\n".join(list(descendants.values()) + [root_dsl])
         return {"success": True, "root_dsl": composed_source}
     log(f"[pass2] root mismatch: {report[:200]}")
@@ -3018,6 +3090,51 @@ async def _run_outer_iteration(
     max_turns: int,
     ckpt_root: Path, preset: str, experience_dir: str,
     llm_config: dict,
+    **kwargs,
+) -> dict:
+    """Run one outer iteration; surface crashes immediately, never raise.
+
+    Wraps ``_run_outer_iteration_body`` so an unhandled exception in any
+    phase is logged to ``outer_dir/log.txt`` and printed as ``[outer_N]
+    CRASHED — <last line>`` *as soon as it happens*, instead of being
+    silently held by ``asyncio.gather(return_exceptions=True)`` until all
+    siblings finish. Sibling outers are unaffected (we still return a
+    failure-shaped dict rather than raising).
+    """
+    try:
+        return await _run_outer_iteration_body(
+            i, max_outer, outer_dir,
+            kernel_name, dims, tensors,
+            pass_agents, judge_agents, max_turns,
+            ckpt_root, preset, experience_dir, llm_config,
+            **kwargs,
+        )
+    except Exception:
+        err = traceback.format_exc()
+        outer_dir.mkdir(parents=True, exist_ok=True)
+        # Append (not overwrite) — body may have already written progress.
+        with open(outer_dir / "log.txt", "a") as f:
+            f.write(f"\n--- CRASHED ---\n{err}\n")
+        last_line = err.strip().splitlines()[-1] if err.strip() else "<unknown>"
+        print(f"[outer_{i}] CRASHED — {last_line}", flush=True)
+        return {
+            "success": False,
+            "outer_iteration": i,
+            "outer_iterations": max_outer,
+            "total_tool_calls": 0,
+            "total_tokens": 0,
+            "cycle_count": None,
+            "final_diagnosis": last_line,
+        }
+
+
+async def _run_outer_iteration_body(
+    i: int, max_outer: int, outer_dir: Path,
+    kernel_name: str, dims: dict, tensors: dict,
+    pass_agents: dict, judge_agents: dict,
+    max_turns: int,
+    ckpt_root: Path, preset: str, experience_dir: str,
+    llm_config: dict,
     lowering_passes: list = None, translator_passes: list = None,
     resume_dsl_code: str = None,
     translator: str = "llm",
@@ -3257,7 +3374,7 @@ async def _run_outer_iteration(
             translation_ok = False
             graph_result = None
 
-        if graph_result is not None and "match=True" in graph_result:
+        if graph_result is not None and _overall_match(graph_result):
             log(f"-> PASS (graph verified)")
             print(f"{tag} SUCCESS")
             result = _build_success_result(i, 0,

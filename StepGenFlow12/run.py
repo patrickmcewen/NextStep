@@ -101,21 +101,21 @@ def main():
         help="Global re-plan budget on Phase 1 failure. Default 3.",
     )
     parser.add_argument(
-        "--node-attempts", type=int, default=5,
+        "--node-attempts", type=int, default=3,
         help="Per-tree-node parallel refactor attempts. Default 1 (single "
              "attempt). Set higher to spawn N parallel refactor_final passes "
              "per node and use the first successful one — useful for nodes "
              "where the refactor pass is flaky.",
     )
     parser.add_argument(
-        "--max-plan-depth", type=int, default=2,
+        "--max-plan-depth", type=int, default=3,
         help="Maximum recursion depth of the planner tree. Depth 0 is the root, "
              "depth 1 is its direct children, etc. Any node at depth >= "
              "--max-plan-depth is forced to LEAF without consulting the LLM. "
              "Default 3 (root → mid → leaves).",
     )
     parser.add_argument(
-        "--non-root-sequential", action=argparse.BooleanOptionalAction, default=True,
+        "--non-root-sequential", action=argparse.BooleanOptionalAction, default=False,
         help="When --node-attempts > 1, run the N attempts sequentially (with "
              "early-exit on success) for non-root nodes. Root nodes always run "
              "attempts in parallel. Default True — saves LLM tokens on easy "

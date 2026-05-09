@@ -723,7 +723,11 @@ def build_pass1_user_prompt(
             "",
             "The following child callables are pre-imported and available. Each",
             "implements the semantics of its corresponding PyTorch reference.",
-            "You MUST call each one exactly once, straight-line (no loops or conditionals).",
+            "Calling them is optional — these are tools available to you.",
+            "Loops and conditionals around blackbox calls are permitted; calling a",
+            "child zero, one, or multiple times is all fine. If you can produce a",
+            "correct DSL implementation without invoking a particular child, that's",
+            "acceptable.",
             "",
             "Each blackbox is invoked with plural keyword args ``out_shapes`` "
             "(tuple of per-output shapes) and optional ``out_perms`` (tuple of "

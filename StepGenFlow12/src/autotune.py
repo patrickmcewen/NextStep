@@ -53,6 +53,7 @@ from timing_and_emulator.timing import analyze_timing  # noqa: E402
 from src.orchestrator import (  # noqa: E402
     _run_dsl_correctness,
     _run_graph_correctness,
+    _overall_match,
     _write,
     _extract_code,
     _reasoning_text,
@@ -635,7 +636,7 @@ def _evaluate_dsl_correctness(
         dsl_text = "ERROR:\n" + traceback.format_exc()
     out["dsl_correctness_text"] = dsl_text
     out["dsl_shape_trace"] = _trace_buf.getvalue()
-    out["status"] = "PASS" if "match=True" in dsl_text else "DSL_FAIL"
+    out["status"] = "PASS" if _overall_match(dsl_text) else "DSL_FAIL"
     return out
 
 
@@ -680,7 +681,7 @@ def _evaluate_translate_and_timing(
     except Exception:
         graph_text = "ERROR:\n" + traceback.format_exc()
     out["graph_correctness_text"] = graph_text
-    if "match=True" not in graph_text:
+    if not _overall_match(graph_text):
         out["status"] = "IR_FAIL"
         return out
 

@@ -152,29 +152,35 @@ same post-validator. The differences are:
   nodes rebuild. Pass 2's composition step re-runs the full root DSL
   against the canonical precompute, catching any silent shape
   divergence introduced by the per-node input substitution.
-- **`is_root` flag** flows through every gate. When `is_root=False`:
+- **`is_root` flag** flows through every compliance gate. When `is_root=False`:
   - DSL output may be a tuple/list of tensors (children with
     multi-tensor `forward`s);
-  - shape strictness is relaxed in `_compare_against_gold` (numel must
-    still match, but reshapes/flattens are permitted);
   - the regex op-table drops sink-op requirements (`offchip_store`)
-    since non-root DSLs don't terminate at off-chip;
+    since non-root DSLs don't terminate at off-chip — they hand a
+    stream up to their parent;
   - the deterministic-translate post-validator runs but doesn't enforce
     the kernel-level output contract.
-- **Dataflow compliance** replaces the textual `offchip_load`/`offchip_store`
-  requirement for `refactor_final`. An AST walk
-  (`_check_dataflow_invariant` in `orchestrator.py`) confirms that every
-  DSL-consumer call (`binary_*`, `unary_*`, `accum_*`, sinks, …) takes
-  tensor inputs sourced from a DSL producer (`offchip_load*`,
-  `select_gen`, …), another consumer, a blackbox-child return, or a
-  positional intermediate arg (parent contract). Raw `tensors[...]`
-  reads flowing into a consumer are flagged. Blackbox call sites are
-  exempt — their stubs accept either vanilla raw tensors or tiled
-  streams. Consequence: a pure orchestrator parent (only blackbox
-  calls + threading) emits no compliance violations even though it
-  never calls `offchip_load`/`offchip_store` itself; the textual
-  `offchip_store` requirement is dropped whenever blackbox children
-  are present, since the children carry the sink internally.
+  Correctness comparison itself no longer branches on `is_root`: every
+  comparison is shape-relaxed (flatten + numel-match + element-wise
+  rel_err), so a stream-shaped DSL output matches a vanilla 2D gold
+  uniformly across root and non-root nodes.
+- **Root must terminate with `offchip_store`** regardless of decomposition.
+  The kernel's externally-observable output is written off-chip exactly
+  once at the root, even when the root's body is a pure orchestrator
+  that threads tensors through child blackboxes — the orchestrator-style
+  root must wrap its final value as `offchip_store(<final_stream>)`.
+  The `offchip_load` requirement, however, is dropped on the root because
+  the AST dataflow walk (`_check_dataflow_invariant`) subsumes it: a
+  function that consumes only intermediate args or blackbox returns
+  generates no violations even though it never calls `offchip_load`.
+- **Dataflow compliance** is the AST walk in
+  `_check_dataflow_invariant` (`orchestrator.py`): every DSL-consumer
+  call (`binary_*`, `unary_*`, `accum_*`, sinks, …) must take tensor
+  inputs sourced from a DSL producer (`offchip_load*`, `select_gen`,
+  …), another consumer, a blackbox-child return, or a positional
+  intermediate arg (parent contract). Raw `tensors[...]` reads flowing
+  into a consumer are flagged. Blackbox call sites are exempt — their
+  stubs accept either vanilla raw tensors or tiled streams.
 - **Pass-1 prompt additions**: the node's user prompt carries the
   parent-declared contract block (input shapes + values + output
   shape/permutation) and, for non-leaf nodes, the blackbox signatures

@@ -19,10 +19,13 @@ the stub returns a Tensor; if it returns a tuple, the stub returns a
 tuple of the same length.
 
 The first call to a given stub records a ``Contract`` on the supplied
-``ContractRecorder``; subsequent calls are pure passthrough. This means
-the contract reflects the parent's first invocation — appropriate
-because the parent should call each stub exactly once per Pass-1 gate
-run (single straight-line call).
+``ContractRecorder``; subsequent calls are pure passthrough. The
+implementer is free to call a stub zero, one, or multiple times
+(including inside loops or conditionals); when called multiple times,
+the recorded contract reflects the first invocation, and the child's
+Pass-1 verification runs against that first call site's shapes.
+Implementers may also choose not to call a stub at all — if the
+parent's DSL is correct without invoking the child, that's accepted.
 """
 
 from dataclasses import dataclass

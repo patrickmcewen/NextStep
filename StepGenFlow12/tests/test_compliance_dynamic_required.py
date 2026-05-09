@@ -8,7 +8,10 @@ REFACTOR_PASS = "refactor_final"   # the existing standalone-mode pass key
 # Existing required-op (blackbox-name) textual check.
 # ---------------------------------------------------------------------------
 
-def test_extra_required_ops_flags_missing_blackbox():
+def test_extra_required_ops_does_not_flag_uncalled_blackbox():
+    """Blackboxes are tools, not a quota: a root that ignores its declared
+    children entirely (and instead implements the kernel directly with DSL
+    ops) must NOT be flagged for missing child names."""
     code = '''
 def tiled_reference(dims, tensors):
     x = offchip_load(tensors["x"], ...)
@@ -18,8 +21,9 @@ def tiled_reference(dims, tensors):
         code, REFACTOR_PASS, is_root=True,
         extra_required_ops=("attention", "feed_forward"),
     )
-    assert any("attention" in v for v in violations)
-    assert any("feed_forward" in v for v in violations)
+    blackbox_violations = [v for v in violations
+                           if "attention" in v or "feed_forward" in v]
+    assert blackbox_violations == [], blackbox_violations
 
 
 def test_extra_required_ops_satisfied_when_called():
@@ -53,36 +57,77 @@ def tiled_reference(dims, tensors):
 
 
 # ---------------------------------------------------------------------------
-# Dataflow walk subsumes the textual offchip_load/offchip_store requirement.
+# offchip_store is required at root regardless of decomposition;
+# offchip_load is dropped (subsumed by the AST dataflow walk).
 # ---------------------------------------------------------------------------
 
-def test_orchestrator_only_root_passes_without_loads_or_stores():
-    """Root that is purely blackbox calls + threading must NOT be flagged for
-    missing offchip_load/offchip_store; its children carry those internally."""
-    code = '''
+def test_orchestrator_root_with_blackbox_child_must_call_offchip_store():
+    """Root that is a pure blackbox orchestrator still needs offchip_store —
+    the kernel's externally-observable output goes off-chip via a single sink
+    at the root, regardless of whether children handle their own intermediate
+    storage internally."""
+    bad = '''
 def tiled_reference(dims, tensors):
     x = tensors["x"]
     return moe_path(x, out_shapes=((4, 8),), out_perms=(None,))
 '''
     violations = _check_banned_ops(
-        code, REFACTOR_PASS, is_root=True,
+        bad, REFACTOR_PASS, is_root=True,
         extra_required_ops=("moe_path",),
     )
-    assert violations == []
+    assert any("offchip_store" in v for v in violations), violations
+
+    good = '''
+def tiled_reference(dims, tensors):
+    x = tensors["x"]
+    return offchip_store(moe_path(x, out_shapes=((4, 8),), out_perms=(None,)))
+'''
+    violations = _check_banned_ops(
+        good, REFACTOR_PASS, is_root=True,
+        extra_required_ops=("moe_path",),
+    )
+    assert violations == [], violations
 
 
-def test_two_blackbox_passthrough_root_passes():
-    code = '''
+def test_two_blackbox_passthrough_root_must_call_offchip_store():
+    bad = '''
 def tiled_reference(dims, tensors):
     inp = tensors["input_tensor"]
     res = attention_path(inp, out_shapes=((4, 8),))
     return moe_path(res, out_shapes=((4, 8),))
 '''
     violations = _check_banned_ops(
-        code, REFACTOR_PASS, is_root=True,
+        bad, REFACTOR_PASS, is_root=True,
         extra_required_ops=("attention_path", "moe_path"),
     )
-    assert violations == []
+    assert any("offchip_store" in v for v in violations), violations
+
+    good = '''
+def tiled_reference(dims, tensors):
+    inp = tensors["input_tensor"]
+    res = attention_path(inp, out_shapes=((4, 8),))
+    out = moe_path(res, out_shapes=((4, 8),))
+    return offchip_store(out)
+'''
+    violations = _check_banned_ops(
+        good, REFACTOR_PASS, is_root=True,
+        extra_required_ops=("attention_path", "moe_path"),
+    )
+    assert violations == [], violations
+
+
+def test_nonroot_with_blackbox_child_does_not_need_offchip_store():
+    """Non-root nodes hand a stream up to their parent — they never need
+    offchip_store. The is_root=False carve-out remains."""
+    code = '''
+def helper(x, *, out_shapes, out_perms=None):
+    return moe_path(x, out_shapes=out_shapes)
+'''
+    violations = _check_banned_ops(
+        code, REFACTOR_PASS, is_root=False,
+        extra_required_ops=("moe_path",),
+    )
+    assert violations == [], violations
 
 
 def test_mixed_root_with_proper_loads_passes():
@@ -212,7 +257,7 @@ def test_blackbox_call_can_take_raw_subscript_directly():
     must not flag a raw `tensors[...]` flowing into a blackbox."""
     code = '''
 def tiled_reference(dims, tensors):
-    return moe_path(tensors["x"], out_shapes=((4, 8),))
+    return offchip_store(moe_path(tensors["x"], out_shapes=((4, 8),)))
 '''
     violations = _check_banned_ops(
         code, REFACTOR_PASS, is_root=True,

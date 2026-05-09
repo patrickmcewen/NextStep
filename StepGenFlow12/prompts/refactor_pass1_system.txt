@@ -72,5 +72,17 @@ where the positional parameters are the named tiled inputs declared by the paren
 
 If your node's PyTorch reference returns a single tensor, your function returns a single tensor. If it returns a tuple of N tensors (e.g. ``return Q, K, V``), your function must return a tuple of the same length. ``out_shapes`` always has length N (the parent will pass a 1-tuple for single-output children). ``out_perms`` is parallel to ``out_shapes``; ``None`` entries mean the matching output keeps its native layout.
 
+## Off-Chip Sink (root only)
+
+The root function (`tiled_reference`) is the only place where the kernel writes its result off-chip. It **must** terminate with a single `offchip_store(...)` whose argument is the stream that carries the kernel's output. This is true regardless of whether the root's body is a leaf computation or a pure orchestrator that threads tensors through child blackboxes — even an orchestrator-style root must wrap its final value in `offchip_store(...)`:
+
+```python
+def tiled_reference(dims, tensors):
+    ...
+    return offchip_store(<final_stream>)
+```
+
+Non-root functions **must not** call `offchip_store`. They hand a stream tensor up to their parent (via `return`); the parent (and ultimately the root) is responsible for the off-chip write. The regex compliance check rejects a root that omits `offchip_store`.
+
 The judge will reject any function whose name or signature deviates from the one rendered in the user prompt.
 {few_shot_examples}

@@ -164,7 +164,7 @@ def expert_addr_gen(x, expert_addr_base, num_tile_per_expert):
     base = expert_addr_base + expert_indices * num_tile_per_expert
     offsets = torch.arange(num_tile_per_expert, dtype=base.dtype)
     addrs = base.unsqueeze(-1) + offsets
-    return addrs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).float()
+    return addrs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
 
 def filter_last_tile(seq_len):
