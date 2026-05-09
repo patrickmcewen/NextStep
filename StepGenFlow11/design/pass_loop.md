@@ -3,21 +3,25 @@
 Each LLM pass — `refactor_final`, `translate`, the `direct` variants —
 runs a turn-based loop with a maximum turn budget. The loop is the same
 shape across passes; what differs between passes is the *executor*, the
-*compliance rules*, the *judge prompt*, and whether a *post-validator* is
-attached. This document describes the shape and the contracts of each
-gate.
+*compliance rules*, the *judge prompt*, and whether a *post-validator*
+is attached. This document describes the shape and the contracts of
+each gate.
 
 ## Per-turn shape
 
 Per turn:
 
 1. The accumulated conversation (system prompt + alternating user/assistant
-   turns + appended feedback) is sent to the LLM.
+   turns + appended feedback) is sent to the LLM. Under
+   `--stateless-refactor`, the conversation is collapsed each turn to
+   `(original user prompt + last failed code + last feedback)` — see
+   below.
 2. The assistant's response is parsed for a Python code block
    (` ```python ... ``` `, bare ` ``` ... ```, or, as a fallback, a whole
    response that parses as valid Python).
 3. The extracted code runs through up to four sequential gates:
-   correctness → regex compliance → judge → post-validator.
+   correctness, regex compliance, judge, post-validator (gate ordering
+   is configurable — see "Gate ordering" below).
 4. If every gate passes, the turn succeeds and the loop exits.
 5. Otherwise a feedback string is built from whichever gate failed and
    appended as the next user turn. The model retries on the next turn.
@@ -34,12 +38,18 @@ A response that yields no extractable code is treated as a recoverable
 protocol error: the loop appends a "no code block" reminder to the
 conversation and burns one turn rather than aborting.
 
+A model-side `LLM_BAD_REQUEST` (provider returned a structured error such
+as a context-length overflow) is also recorded as a single turn's
+status and burns the turn rather than aborting; the loop continues with
+the same conversation.
+
 ## User-prompt assembly
 
 The first turn's prompt carries the kernel context the model needs:
 
 - the kernel name,
-- the original PyTorch reference (verbatim from StepDB),
+- the original PyTorch reference (verbatim from StepDB, or the planner
+  node's `reference_code` for non-root nodes),
 - the dims dict (JSON-rendered),
 - a description of every entry in the precomputed `tensors` dict
   (per-key shape + dtype) plus the source of the precompute function
@@ -47,6 +57,8 @@ The first turn's prompt carries the kernel context the model needs:
   exactly how each tensor was built,
 - the previous pass's verified output, when present (refactor passes
   receive PyTorch; translate passes receive the DSL form),
+- for planner non-root nodes, a "Verified sub-task DSLs" block listing
+  each child's verified DSL form,
 - the function signature the pass must produce (`tiled_reference` for
   refactor, `build_graph` for translate),
 - a hard prohibition on creating new torch tensors (no `torch.randn`,
@@ -55,6 +67,16 @@ The first turn's prompt carries the kernel context the model needs:
 Subsequent turns' prompts carry only the feedback string for the failure
 that ended the prior turn; the conversation history retains the full
 context.
+
+### Stateless mode
+
+Under `--stateless-refactor`, the per-turn conversation is rebuilt each
+turn as `(original user prompt + latest failed extracted_code +
+latest feedback string)` rather than being grown by appending. The
+prompt-cache prefix stays stable across turns and per-turn context is
+capped at O(1). This is a refactor-pass-only mode; translate passes
+keep growing their conversation regardless. Off by default —
+accumulating chat history is the existing behavior.
 
 ## Executors
 
@@ -67,8 +89,17 @@ or a structured failure description:
 | `dsl` | exec'd as `tiled_reference(dims, tensors)` with the DSL surface injected into the namespace. Validates a refactor pass — the DSL is directly runnable, so a refactor-pass output gets a real correctness signal before the translator ever runs. |
 | `graph` | exec'd as `build_graph(dims, tensors)`, run through the STeP simulator. Validates a translate pass — the lowered IR graph is dispatched and its output compared to gold. |
 
-Each executor compares the result tensor's shape against gold, then
-computes max-absolute and relative error and accepts on `rel_err < 1e-5`.
+Each executor compares the result against gold:
+
+- For root nodes (and all standalone-mode passes), shapes must match
+  exactly and `rel_err < 1e-5` against gold.
+- For planner non-root nodes (`is_root=False`), the executor accepts a
+  tuple/list result alongside a tuple/list gold (per-output comparison),
+  and shape strictness is relaxed for single-tensor outputs — both
+  tensors are flattened before the element-wise comparison; numel must
+  still match. The kernel-level output contract is preserved at the
+  root.
+
 On mismatch, the worst-error index is reported alongside the gold and
 candidate values at that index. Gold is memoized per `(kernel, dims)` for
 the process lifetime.
@@ -91,20 +122,19 @@ against it.
 
 ## Compliance check
 
-After correctness passes, the candidate code runs through a regex compliance
-check. Compliance is **lexical** — it does not parse the code, just searches
-the function body for forbidden or required tokens. The check produces a
-list of violation strings; an empty list means compliant.
+A regex compliance check runs the candidate code through a per-pass
+table of allowed / banned / required tokens. Compliance is **lexical**
+— it does not parse the code, just searches the function body for
+forbidden or required tokens. The check produces a list of violation
+strings; an empty list means compliant.
 
 Two backends, switched by mode:
 
 - **Standalone mode.** Compliance rules are a hard-coded set of per-pass
   tables: an `allowed_torch` allowlist, an `allowed_F` allowlist, a
   `banned_patterns` list of `(substring, fix-hint)` pairs, and a
-  `required_ops` list. Tables for the refactor passes accumulate
-  cumulatively across the pass sequence — a `refactor_final` check
-  enforces every prior refactor pass's rules in addition to its own.
-  Translate passes share an analogous cumulative group.
+  `required_ops` list. Each pass's table is independent — there is no
+  cumulative inheritance across passes.
 - **Bundle mode.** A single check driven by the bundle manifest's
   `compliance` block: `allowed_ops`, `banned_patterns`, `required_ops`.
   Empty allowlist disables the allowlist branch. Banned-pattern entries
@@ -114,6 +144,10 @@ For translate passes the check is scoped to the body of `build_graph`
 only — scaffold helpers and DSL function definitions are expected to
 contain `torch.*` calls and shouldn't be flagged.
 
+For planner non-root refactor passes (`is_root=False`), the rules
+relax: sink-op requirements (`offchip_store`) drop, since non-root
+DSLs don't terminate at off-chip.
+
 When the check finds violations on otherwise-correct code, the next-turn
 feedback explicitly says "your output is correct, but you used these
 disallowed operations" — distinguishing compliance from correctness
@@ -122,7 +156,7 @@ matters because the model's repair strategy is different in each case.
 ## Judge
 
 For passes that have a judge agent, a second LLM is run after the regex
-check passes (and, for selected refactor passes, *also* on regex-rejected
+check passes (and, for the refactor pass, *also* on regex-rejected
 turns to give richer line-specific feedback alongside the regex output).
 
 The judge sees the candidate code plus a short context block:
@@ -160,9 +194,51 @@ string that distinguishes the three cases. This is how translator-side
 constraints get fixed inside the refactor loop rather than failing later
 in a separate pass.
 
+For planner non-root nodes, the post-validator is plumbed with
+`is_root=False` and runs the same translate-and-execute cycle, but the
+output contract is relaxed alongside the executor's relaxation.
+
 In bundle mode the post-validator wraps the bundle's own
 `transpiler.translate` callable, so the bundle's invented translation
 rules become the gate.
+
+## Gate ordering
+
+`--check-order` chooses between two orderings:
+
+- **`correctness-first`** (default): `correctness → regex → judge →
+  post-validator`. The candidate code is exec'd first; only correct
+  proposals pay the structural-review cost.
+- **`compliance-first`**: `regex → judge → correctness → post-validator`.
+  Structural rejection happens before exec, so a proposal that's
+  obviously non-canonical is rejected without paying for execution.
+  Useful when correctness is expensive (large tiles) and the model is
+  repeatedly emitting structurally-broken code.
+
+The two orderings change which `status.txt` value lands when an early
+gate rejects. Under `correctness-first`, the noncompliant /
+judge-rejected statuses imply correctness already passed; under
+`compliance-first`, they don't.
+
+## Status vocabulary
+
+`status.txt` carries one of:
+
+| value | meaning |
+|---|---|
+| `PASS` | every gate passed; pass loop exited successfully |
+| `NO_CODE_EXTRACTED` | response had no parseable code block |
+| `LLM_BAD_REQUEST: <exc>` | provider returned a structured error (e.g., context-length overflow); turn burned, loop continues |
+| `FAIL: <error head>` | correctness check rejected the candidate |
+| `CORRECT_BUT_NONCOMPLIANT` | correctness PASS, regex compliance found violations |
+| `NONCOMPLIANT` | regex compliance found violations under `compliance-first` (correctness not yet checked) |
+| `CORRECT_BUT_JUDGE_REJECTED` | correctness + regex PASS, judge said REJECT |
+| `JUDGE_REJECTED` | judge rejected under `compliance-first` (correctness not yet checked) |
+| `CORRECT_BUT_POST_VALIDATOR_REJECTED` | correctness + regex + judge PASS, post-validator rejected |
+
+The `CORRECT_BUT_*` and bare-name variants exist as a pair so the same
+gate's verdict can be distinguished by whether correctness has already
+been verified at the time it fired.
 
 ## Feedback channels
 

@@ -108,7 +108,7 @@ def main():
              "where the refactor pass is flaky.",
     )
     parser.add_argument(
-        "--max-plan-depth", type=int, default=2,
+        "--max-plan-depth", type=int, default=4,
         help="Maximum recursion depth of the planner tree. Depth 0 is the root, "
              "depth 1 is its direct children, etc. Any node at depth >= "
              "--max-plan-depth is forced to LEAF without consulting the LLM. "
@@ -121,6 +121,15 @@ def main():
              "attempts in parallel. Default True — saves LLM tokens on easy "
              "nodes that succeed on the first try. Pass --no-non-root-sequential "
              "to spawn all N attempts in parallel even for non-root nodes.",
+    )
+    parser.add_argument(
+        "--stateless-refactor", action="store_true",
+        help="Run the refactor agent in stateless mode: each turn rebuilds the "
+             "user prompt as (original prompt + latest failed code + latest "
+             "feedback) and discards the rest of the chat history. Caps "
+             "per-turn context at O(1) and keeps the prompt-cache prefix "
+             "stable across turns. Off by default — accumulating chat history "
+             "is the existing behavior.",
     )
     args = parser.parse_args()
 
@@ -160,6 +169,7 @@ def main():
         non_root_sequential=args.non_root_sequential,
         max_plan_depth=args.max_plan_depth,
         resume_planner=args.resume_planner,
+        stateless_refactor=args.stateless_refactor,
     ))
 
     if result["success"]:

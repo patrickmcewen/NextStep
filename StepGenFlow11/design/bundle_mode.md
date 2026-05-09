@@ -27,7 +27,12 @@ asserted up front. Bundle mode forces:
   bundle's abstraction (which the bundle is required to make directly
   runnable; see below);
 - the standard step-DSL judge agent is replaced with a bundle-templated
-  one.
+  one;
+- Phase 0 (the decomposition planner) is asserted disabled. The
+  planner's `compose-equivalent` guard and few-shot composition logic
+  assume the standalone DSL surface; mixing them with a bundle's
+  invented vocabulary would silently break either the guard or the
+  refactor prompt. Bundle runs must be invoked with `--no-plan`.
 
 Standalone-mode features that bundle mode keeps unchanged: parallel
 outer iterations, the per-turn loop and feedback channels, resume from a
@@ -89,9 +94,10 @@ deterministic translate. Several things collapse:
   catches transpiler bugs separately. Splitting these two responsibilities
   cleanly is what makes the bundle author's surface (the abstraction) and
   the orchestrator's ground truth (IR semantics) testable in isolation.
-- **No cumulative-table compliance.** Compliance is one allowlist plus
-  one banned-pattern list plus one required-ops list, exactly as the
-  manifest declares.
+- **Compliance is bundle-driven.** Compliance is one allowlist plus one
+  banned-pattern list plus one required-ops list, exactly as the manifest
+  declares — there are no per-pass tables to inherit, since bundle mode
+  runs only one pass.
 
 ## Compliance config
 

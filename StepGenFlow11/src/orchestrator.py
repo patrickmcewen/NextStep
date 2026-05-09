@@ -1041,6 +1041,31 @@ def _gate_post_validator(post_validator, code, turn_dir: Path, log) -> _GateResu
     return _GateResult(feedback, "CORRECT_BUT_POST_VALIDATOR_REJECTED", 0)
 
 
+def _build_stateless_user_prompt(original_user_prompt: str,
+                                  last_code: str | None,
+                                  last_feedback: str) -> str:
+    """Compose a single-message user prompt for the next stateless turn.
+
+    Used by ``_run_pass_loop`` in stateless mode: each turn ships only the
+    original task + the most recent failed attempt + the most recent error,
+    discarding the accumulating chat history. Keeps per-turn context O(1)
+    and the prompt-cache prefix stable across turns. ``last_code`` is None
+    on the no-code-extracted path; we just omit that section.
+    """
+    parts = [original_user_prompt, "\n\n---\n"]
+    if last_code is not None:
+        parts.append(
+            "### Your Most Recent Attempt (FAILED)\n\n"
+            f"```python\n{last_code.rstrip()}\n```\n\n"
+        )
+    parts.append(f"### Feedback on That Attempt\n\n{last_feedback}\n\n")
+    parts.append(
+        "Produce a corrected implementation. The original task and "
+        "constraints are above; write a fresh, complete function."
+    )
+    return "".join(parts)
+
+
 async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          ckpt_dir: Path, *, executor: str, tensors: dict,
                          prev_code=None, log=print,
@@ -1049,7 +1074,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          compliance_override: dict | None = None,
                          check_order: str,
                          prebuilt_user_prompt: str | None = None,
-                         is_root: bool = True):
+                         is_root: bool = True,
+                         stateless: bool = False):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1057,6 +1083,13 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     string treats the turn as failed and feeds that string back into the next
     user prompt — this is how deterministic translation surfaces errors back to
     the refactor pass.
+
+    ``stateless`` (default False) controls how multi-turn context is handled.
+    When False, the conversation accumulates: each turn appends the assistant
+    response and the user feedback, so the model sees its full attempt history.
+    When True, each turn rebuilds the conversation as a single user message
+    containing the original prompt + the latest failed attempt + the latest
+    feedback — no history beyond the most recent failure.
 
     Returns dict with success, code.
     """
@@ -1067,6 +1100,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                                              prev_code=prev_code,
                                              tensors=tensors,
                                              dsl_code=dsl_code)
+    original_user_prompt = user_prompt
     conversation = [{"role": "user", "content": user_prompt}]
 
     pass_dir = ckpt_dir / pass_name
@@ -1075,12 +1109,20 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     _write(pass_dir / "system_prompt.txt", agent.instructions)
 
     last_code = None
+    last_feedback: str | None = None
     success = False
     total_tokens = 0
 
     for turn in range(max_turns):
         turn_dir = pass_dir / f"turn_{turn}"
         log(f"    [{pass_name}] Turn {turn + 1}/{max_turns}...")
+
+        if stateless and turn > 0:
+            assert last_feedback is not None, (
+                "stateless mode: turn>0 must have last_feedback set by prior turn")
+            conversation = [{"role": "user", "content":
+                _build_stateless_user_prompt(
+                    original_user_prompt, last_code, last_feedback)}]
 
         last_user_msg = conversation[-1]["content"] if conversation[-1]["role"] == "user" else ""
         _write(turn_dir / "user_prompt.txt", last_user_msg)
@@ -1097,7 +1139,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         if run_result.context_wrapper.usage is not None:
             total_tokens += run_result.context_wrapper.usage.total_tokens
         assistant_text = run_result.final_output or ""
-        conversation.append({"role": "assistant", "content": assistant_text})
+        if not stateless:
+            conversation.append({"role": "assistant", "content": assistant_text})
         _write(turn_dir / "response.txt", assistant_text)
         reasoning = _reasoning_text(run_result)
         if reasoning:
@@ -1107,12 +1150,15 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         if not code:
             log(f"      No code block found ({len(assistant_text)} chars). Retrying.")
             _write(turn_dir / "status.txt", "NO_CODE_EXTRACTED")
-            conversation.append({"role": "user", "content":
+            nocode_feedback = (
                 "Your response did not contain extractable Python. Either wrap "
                 "the implementation in a ```python ... ``` fence, OR make the "
                 "entire response valid Python source with no surrounding prose "
                 "(comments are fine). Your previous response failed both checks."
-            })
+            )
+            last_feedback = nocode_feedback
+            if not stateless:
+                conversation.append({"role": "user", "content": nocode_feedback})
             continue
 
         last_code = code
@@ -1233,7 +1279,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
             "\n\n**Fix the specific error above by making targeted changes to your "
             "previous code."
         )
-        conversation.append({"role": "user", "content": feedback})
+        last_feedback = feedback
+        if not stateless:
+            conversation.append({"role": "user", "content": feedback})
 
     return {"success": success, "code": last_code, "total_tokens": total_tokens}
 
@@ -1266,7 +1314,8 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
                               agent_factory, max_turns, log,
                               children_dsls, node_attempts: int = 1,
                               non_root_sequential: bool = True,
-                              translate_fn=None):
+                              translate_fn=None,
+                              stateless: bool = False):
     """Refactor a single tree node. Returns the same dict shape as ``_run_pass_loop``.
 
     Gold is always computed from ``node.reference_code`` (the original Model,
@@ -1397,6 +1446,7 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
             judge_agent=refactor_judge_agent,
             post_validator=post_validator,
             is_root=is_root,
+            stateless=stateless,
         )
 
     run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
@@ -1445,7 +1495,8 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
                         node_attempts: int = 1,
                         non_root_sequential: bool = True,
                         verified_cache: dict[str, str] | None = None,
-                        translate_fn=None) -> dict:
+                        translate_fn=None,
+                        stateless: bool = False) -> dict:
     """Walk tree leaves->root, refactor each node, sibling-parallel.
 
     ``verified_cache`` (when provided) maps ``node.path`` to a previously-
@@ -1497,6 +1548,7 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
             node_attempts=node_attempts,
             non_root_sequential=non_root_sequential,
             translate_fn=translate_fn,
+            stateless=stateless,
         )
         if result["success"]:
             verified[node.path] = result["code"]
@@ -1569,7 +1621,8 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
                              tensors: dict | None = None,
                              resumed_tree=None,
                              verified_cache: dict[str, str] | None = None,
-                             translate_fn=None):
+                             translate_fn=None,
+                             stateless_refactor: bool = False):
     """Top-level Phase 0+1 loop with re-plan on failure.
 
     When ``resumed_tree`` is provided, the Phase 0 plan call is skipped and the
@@ -1618,6 +1671,7 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             non_root_sequential=non_root_sequential,
             verified_cache=verified_cache,
             translate_fn=translate_fn,
+            stateless=stateless_refactor,
         )
         if result["success"]:
             log(f"[planner] === Phase 0+1 SUCCEEDED (used {replans_used} replan(s)) ===")
@@ -1834,6 +1888,7 @@ async def run_kernel(
     non_root_sequential: bool = True,
     max_plan_depth: int | None = 3,
     resume_planner: str | None = None,
+    stateless_refactor: bool = False,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -2046,6 +2101,7 @@ async def run_kernel(
             resumed_tree=resumed_tree,
             verified_cache=verified_cache,
             resume_planner_dir=Path(resume_planner) if resume_planner else None,
+            stateless_refactor=stateless_refactor,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2107,6 +2163,7 @@ async def _run_outer_iteration(
     resumed_tree=None,
     verified_cache: dict[str, str] | None = None,
     resume_planner_dir: Path | None = None,
+    stateless_refactor: bool = False,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -2184,6 +2241,7 @@ async def _run_outer_iteration(
             resumed_tree=resumed_tree,
             verified_cache=verified_cache,
             translate_fn=(translate_fn if translator == "auto" else None),
+            stateless_refactor=stateless_refactor,
         )
         if not plan_result["success"]:
             log(f"  -> Planner phase FAILED at {plan_result.get('failing_node')}")
@@ -2233,6 +2291,7 @@ async def _run_outer_iteration(
             post_validator=post_validator,
             compliance_override=compliance_override,
             check_order=check_order,
+            stateless=stateless_refactor,
         )
         outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:

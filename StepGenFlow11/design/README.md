@@ -14,19 +14,26 @@ emulated output matches a PyTorch reference within floating-point tolerance.
 The kernel name selects a PyTorch reference module from `StepDB`; the preset
 selects a concrete `dims` dict; an external `precompute` step builds the
 input `tensors` dict. The flow is LLM-driven on the parts that need code
-synthesis (the refactor pass, optionally the translation pass, and the
-optional autotuner) and deterministic on the parts that don't (gold
-comparison, AST-level translation, regex compliance, the timing model).
+synthesis (the decomposition planner, the refactor pass, optionally the
+translation pass, and the optional autotuner) and deterministic on the
+parts that don't (gold comparison, AST-level translation, regex compliance,
+the timing model).
 
 ```
    PyTorch ref + dims + tensors          (per kernel × preset)
               │
               ▼
+       ┌──────────────┐  Phase 0
+       │  planner     │  LLM decomposes the kernel into a tree of
+       │  (loop)      │  sub-Models; refactor walks post-order
+       └──────┬───────┘  (skipped under --no-plan or bundle mode)
+              │ tree
+              ▼
        ┌──────────────┐  Phase 1
-       │  refactor    │  LLM rewrites PyTorch into DSL form
-       │  (loop)      │  gated on tiled-DSL correctness vs gold
-       └──────┬───────┘
-              │ dsl_code.py
+       │  refactor    │  LLM rewrites each tree node into DSL form,
+       │  (loop)      │  parents using verified children as few-shot
+       └──────┬───────┘  gated on tiled-DSL correctness vs gold
+              │ dsl_code.py (root DSL)
               ▼
        ┌──────────────┐  Phase 2
        │  translate   │  DSL → STeP IR (deterministic AST rewrite,
@@ -38,15 +45,15 @@ comparison, AST-level translation, regex compliance, the timing model).
               │
               ▼ (optional)
        ┌──────────────┐
-       │  autotune    │  LLM rewrites build_graph for cycles,
-       │  (loop)      │  re-checked against gold every turn
-       └──────────────┘
+       │  autotune    │  LLM rewrites the verified DSL for cycles
+       │  (chain)     │  / memory; triple-gated DSL→translate→IR
+       └──────────────┘  every turn; chained agents per pass spec
 ```
 
 `max_outer` independent attempts at the implementer pipeline run in parallel
 per kernel; the first to succeed wins. The autotuner is opt-in via
 `run.py --autotune` and runs per-outer (immediately after each outer
-produces a verified `build_graph`, in that outer's own coroutine);
+produces a verified DSL, in that outer's own coroutine);
 it can also be invoked standalone via `run_autotune.py` against a
 finished implementer checkpoint. A separate batch driver
 (`run_regression.py`) fans out across many `(kernel, preset)` jobs as
@@ -73,18 +80,23 @@ unchanged.
 ## Documentation index
 
 - [pipeline.md](pipeline.md) — invocation, the standard / direct / bundle
-  pipeline shapes, the two-phase structure, parallel outer iterations,
+  pipeline shapes, the three-phase structure, parallel outer iterations,
   the `--translator` switch, resume.
+- [planner.md](planner.md) — Phase 0 decomposition: tree decomposition
+  contract, planner LLM pass and guards, post-order walk with sibling
+  parallelism, per-node refactor with relaxed gates for non-root,
+  replanning, resume-planner.
 - [pass_loop.md](pass_loop.md) — the LLM-driven per-pass turn loop:
   prompt assembly, executor types, correctness, compliance, judge,
-  post-validator, feedback channels.
+  post-validator, gate ordering, feedback channels.
 - [bundle_mode.md](bundle_mode.md) — what `--bundle-dir` swaps in, how
   the abstraction is mounted, how the judge is templated, how the
   pipeline collapses.
 - [regression_runner.md](regression_runner.md) — multi-kernel batch
   driver: subset selection, subprocess model, parallelism cap, summary.
-- [autotuner.md](autotuner.md) — performance-tuning subsystem: baseline
-  resume, the LLM rewrite loop against the analytical timing model,
-  best tracking.
+- [autotuner.md](autotuner.md) — performance-tuning subsystem: DSL-form
+  rewrite loop with triple-gate correctness chain, chain-of-passes
+  schema, agent variants (`general` / `parallel` / `memory`),
+  feasibility halting.
 - [logging.md](logging.md) — the on-disk checkpoint tree, per-turn
   artifacts, `result.json`, regression summary.

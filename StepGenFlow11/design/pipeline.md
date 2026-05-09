@@ -17,20 +17,36 @@ arguments:
 | `--model` / `--config` | LLM profile name (loads `configs/<name>.json`) or explicit JSON path |
 | `--max-outer` | number of independent outer attempts to run in parallel |
 | `--max-turns` | cap on turns per LLM pass loop |
+| `--results-dir` | top-level directory for run logs |
+| `--experience-dir` | directory for successful implementations (legacy / external use) |
+| `--checkpoint-dir` | override the default timestamped checkpoint root |
 | `--pipeline` | `standard` (lowering + translate), `direct`, or `direct_no_functional` |
 | `--translator` | `auto` (deterministic AST rewrite, default) or `llm` |
 | `--resume` | path to a saved DSL checkpoint; skips lowering |
+| `--resume-planner` | path to a crashed outer's directory; resumes a planner walk |
 | `--few-shot` | example program paths shown to the refactor agent |
 | `--bundle-dir` | bundle directory; activates bundle mode |
-| `--checkpoint-dir` | override the default timestamped checkpoint root |
-| `--autotune` | run the autotuner on each outer's verified `build_graph` (off by default) |
+| `--check-order` | `correctness-first` (default) or `compliance-first` — see [pass_loop.md](pass_loop.md) |
+| `--no-plan` | disable Phase 0 (decomposition planner); fall back to single-shot refactor |
+| `--max-replans` | global re-plan budget on Phase 1 failure |
+| `--node-attempts` | per-tree-node parallel refactor attempts |
+| `--max-plan-depth` | maximum recursion depth of the planner tree |
+| `--non-root-sequential` / `--no-non-root-sequential` | with `--node-attempts > 1`, run non-root attempts sequentially with early-exit (default) or in parallel |
+| `--stateless-refactor` | discard refactor chat history; rebuild the prompt each turn from (orig + last failed code + last feedback) |
+| `--autotune` | run the autotuner on each outer's verified DSL (off by default) |
 | `--autotune-config` | path to `autotune_config.json` (loaded only when `--autotune` is set) |
-| `--autotune-max-turns` | override `max_turns` from the autotune config |
-| `--autotune-agent` | autotune agent variant (`general` or `parallel`) |
+| `--autotune-max-turns` | override `max_turns` from the autotune config — only used when the config has no `passes` list |
+| `--autotune-agent` | autotune agent variant — only used when the config has no `passes` list |
 
 LLM configuration (provider URL, API key, model id, optional reasoning
 effort) is loaded from JSON profiles under a repo-root `configs/` directory
 keyed by model name.
+
+`--resume` and `--resume-planner` are mutually exclusive: `--resume` skips
+lowering entirely (a verified `dsl_code.py` already exists);
+`--resume-planner` re-runs lowering using a saved decomposition tree plus
+any per-node DSLs that were verified before the crash. See
+[planner.md](planner.md) for the resume-planner contract.
 
 ## Pipelines
 
@@ -39,31 +55,46 @@ bundle mode:
 
 | pipeline | phase 1 (lowering) | phase 2 (translation) |
 |---|---|---|
-| `standard` | LLM `refactor_final` pass — PyTorch → DSL form | deterministic AST rewrite (`auto`) **or** LLM `translate` pass (`llm`) |
+| `standard` | LLM `refactor_final` pass — PyTorch → DSL form, optionally driven by the planner | deterministic AST rewrite (`auto`) **or** LLM `translate` pass (`llm`) |
 | `direct` | (none) | LLM `translate_full` — PyTorch → STeP graph in one pass |
 | `direct_no_functional` | (none) | LLM `translate_full_no_functional` — variant prompt that excludes the `functional.py` reference |
 | bundle | LLM `refactor_final` with bundle-supplied prompt | bundle's own deterministic transpiler |
 
 `standard` + `auto` is the canonical configuration: the refactor pass is the
-only LLM call, and translation is a pure AST rewrite. The `direct` shapes
-exist as ablations that skip the DSL intermediate. Bundle mode is structurally
-the same as `standard` + `auto`, with the bundle replacing the hard-coded
-DSL surface, the refactor prompt, and the translator.
+only LLM call on the lowering side, and translation is a pure AST rewrite.
+The `direct` shapes exist as ablations that skip the DSL intermediate.
+Bundle mode is structurally the same as `standard` + `auto`, with the
+bundle replacing the hard-coded DSL surface, the refactor prompt, and the
+translator.
 
-## Two-phase structure
+Phase-2 translate passes have their own per-pass LLM prompt name — the
+canonical case is `translate`; the `direct` shapes use `translate_full`
+and `translate_full_no_functional` (different system prompts, different
+compliance tables).
 
-For pipelines that have a lowering phase, the flow runs **phase 1 to
-verified DSL form** before starting phase 2.
+## Three-phase structure
 
-1. **Phase 1 — lowering.** The LLM is given the PyTorch reference, the
-   dims, the precomputed tensor descriptions, and a system prompt that
-   describes the DSL surface. It must emit a `tiled_reference(dims, tensors)`
-   that calls only DSL operators. Each turn is gated on **tiled-DSL
+For pipelines that have a lowering phase, the flow runs **phase 0 → phase
+1 → phase 2** in order, each gated separately.
+
+1. **Phase 0 — decomposition planner** (`standard` only, on by default).
+   The planner LLM decomposes the kernel into a tree of sub-Models. The
+   planner's per-node guard checks (`compose-equivalent`,
+   `anti-passthrough`, etc.) and the tree walk are documented in
+   [planner.md](planner.md). With `--no-plan`, this phase collapses to a
+   single-leaf tree equivalent to the legacy single-shot path.
+2. **Phase 1 — lowering.** For each tree node in post-order, the LLM is
+   given the node's PyTorch reference, the dims, the precomputed tensor
+   descriptions, any verified child DSLs as few-shot context, and a
+   system prompt that describes the DSL surface. It must emit a
+   `tiled_reference(dims, tensors)` (or, for non-root nodes, the node's
+   own `Model.forward` lifted to DSL — possibly tuple-returning) that
+   calls only DSL operators. Each turn is gated on **tiled-DSL
    correctness** — the candidate code is exec'd against the precomputed
    tensors and its output compared to gold (see [pass_loop.md](pass_loop.md)
-   for the executors). On success the verified DSL source is persisted as
-   the run's `dsl_code.py`.
-2. **Phase 2 — translation.** Under `--translator=auto` the DSL source
+   for the executors). On success the verified DSL source is persisted;
+   the root node's DSL is the run's `dsl_code.py`.
+3. **Phase 2 — translation.** Under `--translator=auto` the DSL source
    is fed through a deterministic AST translator that emits a
    `build_graph(dims, tensors)` returning `(graph, output_op)`; the graph
    is executed on the STeP simulator and compared to gold. Under
@@ -92,33 +123,39 @@ Outer attempts share precomputed gold tensors (memoized per `(kernel, dims)`
 to avoid re-allocating multi-GiB references) but otherwise have no shared
 state.
 
-Under `--autotune`, each outer that produces a verified `build_graph`
+Under `--autotune`, each outer that produces a verified `dsl_code.py`
 runs the autotuner inline before its coroutine returns. Because each
 outer is its own task, an outer's autotune runs concurrently with
 whatever the other outers are still doing on the functional pipeline.
 The autotuner writes under `outer_<i>/autotune/`, and an autotune
 crash is trapped at the boundary so the outer's functional success is
-preserved. See [autotuner.md](autotuner.md) for the per-outer schema.
+preserved. The autotune step itself can be a chain of passes (see
+[autotuner.md](autotuner.md) for the chain schema and per-outer schema).
 
 ## Resume
 
-A run can be resumed from a saved DSL checkpoint to skip the lowering phase.
-The `--resume` argument accepts:
+Two resume modes serve different recovery scenarios:
 
-- a path to a `dsl_code.py` file directly,
-- a path to an `outer_<N>/` directory containing `dsl_code.py`,
-- a path to a checkpoint root, in which case the flow searches for
+- **`--resume`** loads a verified `dsl_code.py` and skips Phase 0 + Phase 1
+  entirely. The resumed run starts at Phase 2. Use this when iterating on
+  the translator without re-paying for the refactor pass, or when feeding
+  a previously-verified DSL form into a new translate run. Accepts a
+  `dsl_code.py` file, an `outer_<N>/` directory containing one, or a
+  checkpoint root, in which case the flow searches for
   `<kernel_name>/outer_*/dsl_code.py`.
+- **`--resume-planner`** loads a crashed outer's saved tree plus any
+  per-node DSLs that were verified before the crash, and re-runs only the
+  non-verified nodes. Use this when an outer crashed mid-Phase-1 and the
+  invested per-node refactor work is worth recovering. See
+  [planner.md](planner.md) for the resume contract and on-disk layout.
 
-When resuming, every outer attempt loads the same DSL code, skips phase 1,
-and starts at phase 2. This is for two cases: iterating on the translator
-without re-paying for the refactor pass, and feeding a previously-verified
-DSL form into a new LLM translate run.
+Both modes are stateless re-entries: the resumed process writes a new
+checkpoint directory; the prior one is left untouched. There is no
+analogue of an outer-flow `state.json` here — each StepGenFlow invocation
+is treated as a fresh job.
 
-Resume is a stateless re-entry: the resumed process writes a new checkpoint
-directory; the prior one is left untouched and is the source from which
-the DSL code was lifted. There is no analogue of the outer-flow
-`state.json` here — each StepGenFlow invocation is treated as a fresh job.
+When `--resume` is set, every outer attempt loads the same DSL code,
+skips phases 0 and 1, and starts at phase 2.
 
 ## Few-shot examples
 
@@ -131,6 +168,10 @@ to seed another's). Resolution rules are the same as `--resume`: a
 `dsl_code.py`, an `outer_<N>/` directory, or a checkpoint root. The kernel
 name is recovered from the resolved checkpoint's `config.json` so the
 matching PyTorch reference can be loaded from StepDB.
+
+Few-shot examples are distinct from the planner's own
+"verified sub-task DSLs" block, which is rendered automatically into a
+parent node's user prompt from its just-verified children.
 
 ## Run-time invariants
 
@@ -147,3 +188,6 @@ matching PyTorch reference can be loaded from StepDB.
 - `--translator=auto` is incompatible with the `direct` pipeline shapes
   (the AST translator consumes DSL output, which the direct shapes never
   produce). Bundle mode forces `auto`.
+- Phase 0 (the planner) is incompatible with `--bundle-dir`, with
+  `--pipeline != standard`, and with `--resume`. See [planner.md](planner.md)
+  for the rationale.
