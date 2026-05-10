@@ -440,3 +440,32 @@ def tiled_reference(dims, tensors):
         blackbox_names=("child",),
     )
     assert rawness["child"] == (False,)
+
+
+def test_compliance_allows_torch_tensor_for_list_int_conversion():
+    """``torch.tensor(<list_of_ints>)`` is the sole permitted ``torch.*``
+    constructor — required to feed list[int] inputs into ``metadata_gen``
+    for ragged dataflow."""
+    code = '''
+def tiled_reference(dims, tensors):
+    x = offchip_load(tensors["x"], ...)
+    seq_len_t = torch.tensor(tensors["num_token_list"])
+    seq_len = metadata_gen(seq_len_t)
+    return offchip_store(x)
+'''
+    violations = _check_banned_ops(code, REFACTOR_PASS, is_root=True)
+    torch_violations = [v for v in violations if "torch.tensor" in v]
+    assert torch_violations == [], torch_violations
+
+
+def test_compliance_still_blocks_other_torch_constructors():
+    """``torch.zeros``/``torch.ones`` etc. remain banned — the allowance is
+    narrow and specifically for list[int] → tensor conversion."""
+    code = '''
+def tiled_reference(dims, tensors):
+    z = torch.zeros(4, 8)
+    return offchip_store(z)
+'''
+    violations = _check_banned_ops(code, REFACTOR_PASS, is_root=True)
+    torch_violations = [v for v in violations if "torch.zeros" in v]
+    assert len(torch_violations) >= 1, violations

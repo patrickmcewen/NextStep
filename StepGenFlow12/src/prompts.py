@@ -607,7 +607,7 @@ def build_pass1_user_prompt(
     children_signatures: list[tuple[
         str,                                # child_name
         tuple[str, ...],                    # arg_names
-        tuple[tuple[int, ...], ...],        # arg_shapes (vanilla)
+        tuple,                              # arg_specs (ArgSpec per arg)
         tuple[tuple[int, ...], ...],        # out_shapes (one entry per output)
         bool,                               # out_is_tuple
     ]],
@@ -633,9 +633,10 @@ def build_pass1_user_prompt(
     contract:
         ``Contract`` for non-root nodes, ``None`` for root.
     children_signatures:
-        List of ``(child_name, arg_names, vanilla_shapes, out_shapes,
-        out_is_tuple)`` 5-tuples, one per declared child. Empty for
-        leaf nodes.
+        List of ``(child_name, arg_names, arg_specs, out_shapes,
+        out_is_tuple)`` 5-tuples, one per declared child. ``arg_specs``
+        is a tuple of ``ArgSpec`` values (one per arg) — see
+        ``src.node_signature``. Empty for leaf nodes.
     function_signature:
         The exact signature string the LLM must produce (e.g.
         ``"def attention(Q, *, out_shapes, out_perms=None):"``).
@@ -725,15 +726,36 @@ def build_pass1_user_prompt(
             onchip_tag,
             "",
         ])
-        for arg_name, vanilla_shape, tiled_shape, raw in zip(
-            contract.arg_names, contract.vanilla_shapes, contract.tiled_shapes,
+        from src.node_signature import (
+            ListOfIntArg as _ListOfIntArg,
+            ListOfTensorArg as _ListOfTensorArg,
+            TensorArg as _TensorArg,
+        )
+        for arg_name, spec, tiled_shape, raw in zip(
+            contract.arg_names, contract.arg_specs, contract.tiled_shapes,
             contract.arg_is_raw,
         ):
             tag = "**RAW**" if raw else "**on-chip**"
-            lines.append(
-                f"  `{arg_name}`: vanilla shape {vanilla_shape}, "
-                f"tiled shape declared by parent {tiled_shape} — {tag}"
-            )
+            if isinstance(spec, _TensorArg):
+                lines.append(
+                    f"  `{arg_name}`: vanilla shape {spec.shape}, "
+                    f"tiled shape declared by parent {tiled_shape} — {tag}"
+                )
+            elif isinstance(spec, _ListOfTensorArg):
+                lines.append(
+                    f"  `{arg_name}`: list[Tensor{spec.elem_shape}] x "
+                    f"{spec.length} — {tag}. Iterate at host time and call "
+                    f"`offchip_load` per element (e.g. "
+                    f"`[offchip_load({arg_name}[i], ...) for i in range(len({arg_name}))]`); "
+                    f"do NOT pass the list itself to a DSL consumer."
+                )
+            else:
+                assert isinstance(spec, _ListOfIntArg)
+                lines.append(
+                    f"  `{arg_name}`: list[int] x {spec.length} — {tag}. "
+                    f"Convert to a tensor with `torch.tensor({arg_name})` "
+                    f"before any DSL consumer (e.g. feed into `metadata_gen`)."
+                )
         lines.extend([
             "",
             f"  Required output shapes (one per produced tensor): "
@@ -769,12 +791,13 @@ def build_pass1_user_prompt(
             "(e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).",
             "",
         ])
+        from src.node_signature import format_arg_spec
         for entry in children_signatures:
-            child_name, arg_names, vanilla_shapes, out_shapes, out_is_tuple = entry
+            child_name, arg_names, arg_specs, out_shapes, out_is_tuple = entry
             sig_args = ", ".join(arg_names)
             lines.append(f"  `{child_name}({sig_args}, *, out_shapes, out_perms=None)`")
-            for arg_name, vshape in zip(arg_names, vanilla_shapes):
-                lines.append(f"    - `{arg_name}` vanilla shape: {vshape}")
+            for arg_name, spec in zip(arg_names, arg_specs):
+                lines.append(f"    - `{arg_name}` {format_arg_spec(spec)}")
             if out_is_tuple:
                 lines.append(
                     f"    - returns a tuple of {len(out_shapes)} tensors; "

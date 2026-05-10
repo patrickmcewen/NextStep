@@ -2,7 +2,7 @@
 
 A ``Contract`` is what ties a parent's Pass-1 verification to its child's
 Pass-1 problem statement: the child receives the actual tiled input
-tensors that flowed into its stub call site, plus the parent-declared
+values that flowed into its stub call site, plus the parent-declared
 output shapes and optional per-output permutations.
 
 Outputs are always represented as tuples (length 1 for single-output
@@ -21,11 +21,28 @@ a malformed call site fails at the boundary rather than corrupting the
 child's Pass-1 problem statement. ``vanilla_shapes`` describes the
 underlying PyTorch reference's pre-tile shapes and is **not** subject
 to the invariant.
+
+Arg kinds
+---------
+Each positional input is classified by ``arg_specs`` (parallel to
+``arg_names``). Three kinds are supported (see ``node_signature.py``):
+``TensorArg`` (a single tensor), ``ListOfTensorArg`` (a static list of
+identically-shaped tensors — per-expert weight stacks), and
+``ListOfIntArg`` (a static list of ints — per-batch sequence lengths).
+For tensor args, ``vanilla_shapes[i]`` and ``tiled_shapes[i]`` hold the
+tensor's vanilla / tile-stream shape. For list args those entries are
+``()`` — read ``arg_specs[i]`` to get the per-element shape and length.
+``tiled_values[i]`` is correspondingly a ``Tensor`` for tensor args,
+``list[Tensor]`` for ``ListOfTensorArg``, or ``list[int]`` for
+``ListOfIntArg``.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+
+from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
 
 # STeP streams = (stream_dims..., tile_row, tile_col). Minimum stream rank
 # is 1 stream dim + 2 tile dims = 3.
@@ -37,9 +54,10 @@ class Contract:
     arg_names: tuple[str, ...]
     vanilla_shapes: tuple[tuple[int, ...], ...]
     tiled_shapes: tuple[tuple[int, ...], ...]
-    tiled_values: tuple[torch.Tensor, ...]
+    tiled_values: tuple[Any, ...]
     out_shapes: tuple[tuple[int, ...], ...]
     out_perms: tuple[tuple[int, ...] | None, ...]
+    arg_specs: tuple[ArgSpec, ...] = ()
     # Stub outputs at this call site, post permute+reshape per ``out_perms`` /
     # ``out_shapes``. Always stored as a tuple parallel to ``out_shapes`` even
     # when the underlying ref returns a single Tensor; ``out_is_tuple`` records
@@ -74,3 +92,25 @@ class Contract:
             f"arg_name); got arg_is_raw={self.arg_is_raw!r}, "
             f"arg_names={self.arg_names!r}"
         )
+        # ``arg_specs`` defaults to an all-``TensorArg`` view derived from
+        # ``vanilla_shapes`` so legacy callers (and pre-Stage-1.5 tests) keep
+        # working without supplying it explicitly. Stub creation populates it
+        # explicitly when a list-typed arg is present.
+        if not self.arg_specs:
+            object.__setattr__(self, "arg_specs", tuple(
+                TensorArg(shape=s) for s in self.vanilla_shapes))
+        assert len(self.arg_specs) == len(self.arg_names), (
+            f"Contract.arg_specs length ({len(self.arg_specs)}) must equal "
+            f"arg_names length ({len(self.arg_names)})")
+        for i, spec in enumerate(self.arg_specs):
+            if isinstance(spec, TensorArg):
+                continue
+            assert isinstance(spec, (ListOfTensorArg, ListOfIntArg)), (
+                f"Contract.arg_specs[{i}] has unsupported type "
+                f"{type(spec).__name__}")
+            assert self.vanilla_shapes[i] == () and self.tiled_shapes[i] == (), (
+                f"Contract.arg_specs[{i}] is a list arg ({spec!r}); the "
+                f"corresponding vanilla_shapes/tiled_shapes entries must be "
+                f"`()` (read arg_specs for shape info). Got "
+                f"vanilla={self.vanilla_shapes[i]!r}, "
+                f"tiled={self.tiled_shapes[i]!r}")

@@ -1,5 +1,6 @@
 from src.prompts import build_pass1_user_prompt
 from src.contract import Contract
+from src.node_signature import TensorArg
 
 
 def test_root_prompt_skips_contract_block():
@@ -11,7 +12,8 @@ def test_root_prompt_skips_contract_block():
         tensors={"x": __import__("torch").randn(2, 4)},
         contract=None,
         children_signatures=[
-            ("attention", ("Q", "K", "V"), ((2, 4, 8, 16),) * 3,
+            ("attention", ("Q", "K", "V"),
+             tuple(TensorArg(shape=(2, 4, 8, 16)) for _ in range(3)),
              ((2, 4, 8, 16),), False),
         ],
         function_signature="def tiled_reference(dims, tensors):",

@@ -69,7 +69,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--autotune-agent", default=None, choices=[None, "general", "parallel"],
                    help="Pass-through autotune agent variant.")
     p.add_argument("--check-order", default=None,
-                   choices=[None, "correctness-first", "compliance-first"],
+                   choices=[None, "correctness-first", "compliance-first", "always-both"],
                    help="Pass-through gate ordering for each per-job run.py invocation.")
     p.add_argument(
         "--no-plan", action="store_true",

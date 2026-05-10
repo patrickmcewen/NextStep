@@ -120,3 +120,198 @@ def compute_gold(dims, tensors):
     check_children_called_with_tensors_only(
         _REFACTOR_PASSES_INT, children, dims={},
         original_reference_code=function_based_ref)
+
+
+# ---------------------------------------------------------------------------
+# Parent-level list inputs are allowed; flowing them into a child is not.
+# ---------------------------------------------------------------------------
+
+_PARENT_REF_WITH_LIST = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, w_list, num_token_list):
+        return x
+
+def get_inputs(dims):
+    import torch
+    return [
+        torch.randn(4, 8),
+        [torch.randn(8, 8) for _ in range(3)],
+        [2, 5, 3, 7],
+    ]
+"""
+
+_LEAF_REF_TAKES_LIST = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, w_list):
+        out = x
+        for w in w_list:
+            out = out + x @ w
+        return out
+
+def get_inputs(dims):
+    import torch
+    return [torch.randn(4, 8), [torch.randn(8, 8) for _ in range(3)]]
+"""
+
+_REFACTOR_PASSES_LIST_TO_CHILD = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.expert_block = ExpertBlockModel()
+
+    def forward(self, x, w_list, num_token_list):
+        # Anti-pattern: parent forwards the whole list to a child instead
+        # of iterating it and passing per-element tensors.
+        return self.expert_block(x, w_list)
+"""
+
+_REFACTOR_STACKS_LIST_BEFORE_CHILD = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.expert_block = ExpertBlockModel()
+
+    def forward(self, x, w_list, num_token_list):
+        # Correct pattern: stack the list to a tensor at the call site.
+        w_stacked = torch.stack(w_list, dim=0)
+        return self.expert_block(x, w_stacked)
+"""
+
+_LEAF_REF_TAKES_STACKED_TENSOR = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, w_stacked):
+        out = x
+        for e in range(w_stacked.shape[0]):
+            out = out + x @ w_stacked[e]
+        return out
+
+def get_inputs(dims):
+    import torch
+    return [torch.randn(4, 8), torch.randn(3, 8, 8)]
+"""
+
+
+def test_guard_accepts_list_of_tensors_passed_to_child():
+    """list[Tensor] (homogeneous element shape) is a supported child arg kind
+    — make_stub records it as ListOfTensorArg and Pass-1 prompt rendering
+    formats it as ``list[Tensor(...)] x N`` so the LLM can iterate it."""
+    children = [_StubChild(name="expert_block", reference_code=_LEAF_REF_TAKES_LIST)]
+    check_children_called_with_tensors_only(
+        _REFACTOR_PASSES_LIST_TO_CHILD, children, dims={},
+        original_reference_code=_PARENT_REF_WITH_LIST)
+
+
+def test_guard_passes_when_parent_stacks_list_before_child_call():
+    """A parent that stacks a list[Tensor] into a 3D tensor before calling
+    its child still passes — the alternative legitimate pattern."""
+    children = [_StubChild(name="expert_block",
+                           reference_code=_LEAF_REF_TAKES_STACKED_TENSOR)]
+    check_children_called_with_tensors_only(
+        _REFACTOR_STACKS_LIST_BEFORE_CHILD, children, dims={},
+        original_reference_code=_PARENT_REF_WITH_LIST)
+
+
+_LEAF_REF_TAKES_LIST_OF_INT = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, num_token_list):
+        out = torch.zeros_like(x)
+        for i in range(x.shape[0]):
+            out[i, :num_token_list[i]] = x[i, :num_token_list[i]]
+        return out
+
+def get_inputs(dims):
+    import torch
+    return [torch.randn(4, 8), [2, 5, 3, 7]]
+"""
+
+_REFACTOR_PASSES_LIST_OF_INT_TO_CHILD = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cache_writer = CacheWriterModel()
+
+    def forward(self, x, w_list, num_token_list):
+        return self.cache_writer(x, num_token_list)
+"""
+
+
+def test_guard_accepts_list_of_int_passed_to_child():
+    """list[int] (e.g. per-batch sequence lengths) is supported at child
+    call sites; the child's DSL output converts it to a tensor and feeds
+    ``metadata_gen`` / ``cache_*_addr_gen`` etc."""
+    children = [_StubChild(name="cache_writer",
+                           reference_code=_LEAF_REF_TAKES_LIST_OF_INT)]
+    check_children_called_with_tensors_only(
+        _REFACTOR_PASSES_LIST_OF_INT_TO_CHILD, children, dims={},
+        original_reference_code=_PARENT_REF_WITH_LIST)
+
+
+_LEAF_REF_TAKES_BAD_LIST = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, mixed_list):
+        return x
+
+def get_inputs(dims):
+    import torch
+    return [torch.randn(4, 8), [torch.randn(8), 3]]
+"""
+
+_REFACTOR_PASSES_MIXED_LIST = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bad = BadModel()
+
+    def forward(self, x, w_list, num_token_list):
+        # Build a mixed-type list inline and pass it to the child.
+        return self.bad(x, [w_list[0], num_token_list[0]])
+"""
+
+
+def test_guard_rejects_mixed_list_at_child_call_site():
+    """Mixed-type lists (e.g. [Tensor, int]) cannot be classified as either
+    list[Tensor] or list[int] — must be rejected with a clear message."""
+    children = [_StubChild(name="bad", reference_code=_LEAF_REF_TAKES_BAD_LIST)]
+    with pytest.raises(GuardFailure) as exc_info:
+        check_children_called_with_tensors_only(
+            _REFACTOR_PASSES_MIXED_LIST, children, dims={},
+            original_reference_code=_PARENT_REF_WITH_LIST)
+    msg = str(exc_info.value)
+    assert "bad" in msg
+    assert "mixed/unsupported" in msg

@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
     parser.add_argument("--max-outer", type=int, default=3, help="Max outer loop iterations")
-    parser.add_argument("--max-turns", type=int, default=10, help="Max tool-call rounds per inner loop")
+    parser.add_argument("--max-turns", type=int, default=16, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="/workspace/results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
     parser.add_argument("--checkpoint-dir", default="/workspace/checkpoints", help="Override checkpoint directory (default: checkpoints/<timestamp>)")
@@ -95,12 +95,16 @@ def main():
                              "Validated by the agent factory at run time.")
     parser.add_argument(
         "--check-order", default="correctness-first",
-        choices=["correctness-first", "compliance-first"],
+        choices=["correctness-first", "compliance-first", "always-both"],
         help="Order of per-turn gates. 'correctness-first' (default) runs the "
              "code first, then compliance/judge/post-validator — exactly as before. "
              "'compliance-first' runs the regex compliance and LLM judge before "
              "executing the code, so structurally noncompliant code is rejected "
-             "without being run.",
+             "without being run. 'always-both' runs every gate (correctness, "
+             "compliance, judge, post-validator) without short-circuiting on the "
+             "first failure and concatenates all gate feedback into the next "
+             "user turn — maximum signal per turn at the cost of extra judge "
+             "calls when correctness already fails.",
     )
     parser.add_argument(
         "--no-plan", action="store_true",
@@ -118,7 +122,7 @@ def main():
              "where the refactor pass is flaky.",
     )
     parser.add_argument(
-        "--max-plan-depth", type=int, default=4,
+        "--max-plan-depth", type=int, default=5,
         help="Maximum recursion depth of the planner tree. Depth 0 is the root, "
              "depth 1 is its direct children, etc. Any node at depth >= "
              "--max-plan-depth is forced to LEAF without consulting the LLM. "

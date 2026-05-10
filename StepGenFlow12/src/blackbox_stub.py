@@ -5,10 +5,15 @@ exposed as a callable stub injected into the executor namespace. The
 stub replicates the child's PyTorch reference semantics with a fixed
 input/output reshape protocol.
 
-Inputs are restricted to pure reshape — the parent must not permute,
-slice, or otherwise non-bijectively transform a tensor before passing
-it to a stub. The stub's input recovery is ``flatten().reshape(vanilla)``,
-which is correct only for invertible reshape.
+Tensor inputs are restricted to pure reshape — the parent must not
+permute, slice, or otherwise non-bijectively transform a tensor before
+passing it to a stub. The stub's input recovery is
+``flatten().reshape(vanilla)``, which is correct only for invertible
+reshape. List inputs (``list[Tensor]`` or ``list[int]``, classified by
+``ArgSpec``) are passed through unchanged — they correspond to static
+graph-construction-time iteration at the DSL/STeP target (e.g. per-
+expert weight stacks, per-batch sequence-length metadata) and must
+preserve their list-ness.
 
 Outputs are template-driven and always plural: the parent calls the stub
 with ``out_shapes=(<shape_0>, <shape_1>, ...)`` (and optionally
@@ -34,6 +39,7 @@ import torch
 import torch.nn as nn
 
 from src.contract import Contract
+from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
 
 
 @dataclass
@@ -41,13 +47,58 @@ class ContractRecorder:
     contract: Contract | None = None
 
 
+def _vanillify(name: str, value, spec: ArgSpec):
+    """Recover the underlying-reference input from a tile-stream value.
+
+    Tensor args are reshape-recovered via ``.reshape(-1).reshape(vanilla)``;
+    list args pass through unchanged (their elements correspond to per-
+    iteration host-side loads in the DSL target, not stream tensors).
+    """
+    if isinstance(spec, TensorArg):
+        assert isinstance(value, torch.Tensor), (
+            f"stub arg {name!r} was declared TensorArg but the parent "
+            f"passed a {type(value).__name__}")
+        return value.reshape(-1).reshape(spec.shape)
+    if isinstance(spec, ListOfTensorArg):
+        assert isinstance(value, list) and len(value) == spec.length, (
+            f"stub arg {name!r} was declared ListOfTensorArg(length={spec.length}) "
+            f"but the parent passed a {type(value).__name__} of length "
+            f"{len(value) if hasattr(value, '__len__') else '?'}")
+        for i, t in enumerate(value):
+            assert isinstance(t, torch.Tensor), (
+                f"stub arg {name!r}[{i}] is not a Tensor (got {type(t).__name__})")
+        return value
+    assert isinstance(spec, ListOfIntArg)
+    assert isinstance(value, list) and len(value) == spec.length, (
+        f"stub arg {name!r} was declared ListOfIntArg(length={spec.length}) "
+        f"but the parent passed {type(value).__name__}")
+    return value
+
+
+def _tiled_shape_of(value, spec: ArgSpec) -> tuple[int, ...]:
+    """Tile-stream shape for tensor args; ``()`` for list args."""
+    if isinstance(spec, TensorArg):
+        return tuple(value.shape)
+    return ()
+
+
+def _clone_value(value, spec: ArgSpec):
+    """Detach-and-clone for tensor args; deep copy for list args."""
+    if isinstance(spec, TensorArg):
+        return value.detach().clone()
+    if isinstance(spec, ListOfTensorArg):
+        return [t.detach().clone() for t in value]
+    assert isinstance(spec, ListOfIntArg)
+    return list(value)
+
+
 def make_stub(*, ref_module: nn.Module,
               arg_names: tuple[str, ...],
-              vanilla_shapes: tuple[tuple[int, ...], ...],
+              arg_specs: tuple[ArgSpec, ...],
               recorder: ContractRecorder):
-    assert len(arg_names) == len(vanilla_shapes), (
-        f"arg_names ({len(arg_names)}) and vanilla_shapes "
-        f"({len(vanilla_shapes)}) length mismatch")
+    assert len(arg_names) == len(arg_specs), (
+        f"arg_names ({len(arg_names)}) and arg_specs "
+        f"({len(arg_specs)}) length mismatch")
 
     def stub(*tiled_args, out_shapes, out_perms=None):
         assert len(tiled_args) == len(arg_names), (
@@ -63,11 +114,10 @@ def make_stub(*, ref_module: nn.Module,
             f"out_perms must be a tuple of length {len(out_shapes)} "
             f"(or None for all-None), got {out_perms!r}")
 
-        vanilla_args = []
-        for t, vshape, name in zip(tiled_args, vanilla_shapes, arg_names):
-            assert isinstance(t, torch.Tensor), (
-                f"stub arg {name!r} must be a Tensor, got {type(t).__name__}")
-            vanilla_args.append(t.reshape(-1).reshape(vshape))
+        vanilla_args = [
+            _vanillify(name, value, spec)
+            for name, value, spec in zip(arg_names, tiled_args, arg_specs)
+        ]
 
         with torch.no_grad():
             raw = ref_module(*vanilla_args)
@@ -85,14 +135,21 @@ def make_stub(*, ref_module: nn.Module,
         if recorder.contract is None:
             recorder.contract = Contract(
                 arg_names=arg_names,
-                vanilla_shapes=vanilla_shapes,
-                tiled_shapes=tuple(tuple(t.shape) for t in tiled_args),
-                tiled_values=tuple(t.detach().clone() for t in tiled_args),
+                vanilla_shapes=tuple(
+                    spec.shape if isinstance(spec, TensorArg) else ()
+                    for spec in arg_specs),
+                tiled_shapes=tuple(
+                    _tiled_shape_of(v, spec)
+                    for v, spec in zip(tiled_args, arg_specs)),
+                tiled_values=tuple(
+                    _clone_value(v, spec)
+                    for v, spec in zip(tiled_args, arg_specs)),
                 out_shapes=tuple(tuple(s) for s in out_shapes),
                 out_perms=tuple(
                     None if p is None else tuple(p) for p in out_perms),
                 tiled_outputs=tuple(r.detach().clone() for r in results),
                 out_is_tuple=isinstance(raw, tuple),
+                arg_specs=arg_specs,
             )
 
         if isinstance(raw, tuple):

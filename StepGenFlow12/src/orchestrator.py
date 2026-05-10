@@ -555,7 +555,12 @@ _CORRECTNESS_CHECKERS = {
 _PASS_RULES: dict[str, dict] = {
     # Phase 1: PyTorch -> DSL form. Output must be pure DSL.
     "refactor_final": {
-        "allowed_torch": set(),
+        # ``torch.tensor`` is permitted exclusively for converting list[int]
+        # positional inputs (per-batch sequence lengths, etc.) into a 1D int
+        # tensor for DSL producers like ``metadata_gen``. Any other use is
+        # caught downstream by the dataflow invariant (a fresh tensor whose
+        # source isn't a DSL producer can't reach a DSL consumer).
+        "allowed_torch": {"torch.tensor"},
         "allowed_F": set(),
         "banned_patterns": [
             (".unsqueeze(", "use promote(x, rank) or promote_outer(x)"),
@@ -1569,7 +1574,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          entry_point: str = "tiled_reference",
                          call_args: tuple | None = None,
                          call_kwargs: dict | None = None,
-                         raw_arg_names: frozenset[str] = frozenset()):
+                         raw_arg_names: frozenset[str] = frozenset(),
+                         pre_turn_hook=None):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1584,6 +1590,11 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     When True, each turn rebuilds the conversation as a single user message
     containing the original prompt + the latest failed attempt + the latest
     feedback — no history beyond the most recent failure.
+
+    ``pre_turn_hook`` is an optional zero-arg callable invoked at the top of
+    each turn iteration, before any code or gate runs. Used by pass1 to clear
+    per-turn state (e.g. ``ContractRecorder``s) so that side effects observed
+    on a failed turn do not leak into the harvest of a later winning turn.
 
     Returns dict with success, code.
     """
@@ -1610,6 +1621,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     for turn in range(max_turns):
         turn_dir = pass_dir / f"turn_{turn}"
         log(f"    [{pass_name}] Turn {turn + 1}/{max_turns}...")
+
+        if pre_turn_hook is not None:
+            pre_turn_hook()
 
         if stateless and turn > 0:
             assert last_feedback is not None, (
@@ -1660,20 +1674,33 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         log(f"      Extracted code: {len(code)} chars")
 
         # ----- Per-turn gate cascade -----
-        assert check_order in ("correctness-first", "compliance-first"), \
+        assert check_order in ("correctness-first", "compliance-first", "always-both"), \
             f"Unknown check_order={check_order!r}"
 
         if check_order == "correctness-first":
             gate_order = ["correctness", "compliance", "judge", "post_validator"]
             correctness_verified = True
-        else:  # "compliance-first"
+            break_on_fail = True
+        elif check_order == "compliance-first":
             gate_order = ["compliance", "judge", "correctness", "post_validator"]
             correctness_verified = False
+            break_on_fail = True
+        else:  # "always-both"
+            # Same order as correctness-first so the compliance/judge gates
+            # see an accurate correctness_verified flag, but never short-
+            # circuits — every applicable gate runs and their feedback is
+            # concatenated into the next user turn.
+            gate_order = ["correctness", "compliance", "judge", "post_validator"]
+            correctness_verified = True
+            break_on_fail = False
 
         shape_trace = ""
-        turn_feedback = None
-        turn_status = None
+        turn_feedbacks: list[str] = []
+        turn_statuses: list[str] = []
+        turn_feedback: str | None = None
+        turn_status: str | None = None
         success_this_turn = False
+        compliance_invoked_judge = False
 
         try:
             for gate_name in gate_order:
@@ -1687,6 +1714,13 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         call_kwargs=call_kwargs)
                     correctness_verified = (res.feedback is None)
                 elif gate_name == "compliance":
+                    # _gate_compliance also runs the judge inline when it
+                    # fails on refactor_final with a judge_agent set; track
+                    # that so the standalone judge gate below doesn't burn a
+                    # duplicate LLM call for the same answer.
+                    inline_judge_eligible = (
+                        pass_name == "refactor_final" and judge_agent is not None
+                    )
                     res = await _gate_compliance(
                         code, pass_name, compliance_override, judge_agent,
                         tensors, turn_dir, log,
@@ -1694,20 +1728,36 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         is_root=is_root,
                         extra_required_ops=extra_required_ops,
                         raw_arg_names=raw_arg_names)
+                    if res.feedback is not None and inline_judge_eligible:
+                        compliance_invoked_judge = True
                 elif gate_name == "judge":
-                    res = await _gate_judge(
-                        judge_agent, code, tensors, turn_dir, log,
-                        correctness_verified=correctness_verified)
+                    if compliance_invoked_judge:
+                        res = _GateResult(None, "PASS", 0)
+                    else:
+                        res = await _gate_judge(
+                            judge_agent, code, tensors, turn_dir, log,
+                            correctness_verified=correctness_verified)
                 else:  # "post_validator"
-                    res = _gate_post_validator(post_validator, code, turn_dir, log)
+                    # Translate-check requires the DSL to be runnable; skip
+                    # if correctness failed (matches existing cascade behavior
+                    # in correctness-first/compliance-first).
+                    if not correctness_verified:
+                        res = _GateResult(None, "PASS", 0)
+                    else:
+                        res = _gate_post_validator(post_validator, code, turn_dir, log)
                 total_tokens += res.tokens
                 if res.feedback is not None:
-                    turn_feedback = res.feedback
-                    turn_status = res.status
-                    break
-            else:
+                    turn_feedbacks.append(res.feedback)
+                    turn_statuses.append(res.status)
+                    if break_on_fail:
+                        break
+
+            if not turn_feedbacks:
                 turn_status = "PASS"
                 success_this_turn = True
+            else:
+                turn_feedback = "\n\n---\n\n".join(turn_feedbacks)
+                turn_status = " ; ".join(turn_statuses)
         except Exception:
             err = traceback.format_exc()
             turn_feedback = f"## Error running code\n{err}"
@@ -2036,15 +2086,17 @@ def _build_node_index(tree, tensors: dict):
             # scalar params (e.g. eps) that don't have a .shape.
             tensor_only = {n: t for n, t in tensors.items() if isinstance(t, torch.Tensor)}
             arg_names = tuple(tensor_only.keys())
-            arg_shapes = tuple(tuple(tensor_only[n].shape) for n in arg_names)
-            from src.node_signature import NodeSignature as _NS
+            from src.node_signature import (
+                NodeSignature as _NS, TensorArg as _TensorArg)
+            arg_specs = tuple(
+                _TensorArg(shape=tuple(tensor_only[n].shape)) for n in arg_names)
             # Function-based-root NodeSignature is a placeholder: it is created
             # solely so the dict has an entry for ``node.path``. The root's own
             # signature is never consumed downstream — only its CHILDREN's
             # signatures matter, and the function-based-root-with-children case
             # is already rejected at refactor_tree entry.
             signatures[node.path] = _NS(
-                arg_names=arg_names, arg_shapes=arg_shapes,
+                arg_names=arg_names, arg_specs=arg_specs,
                 out_shapes=(), weight_names=(), out_is_tuple=False,
             )
             canonical_inputs = dict(tensors)
@@ -2234,6 +2286,13 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
     # children_signatures (path, sig) pairs are kept for prompt-shape compat.
     children_signatures = [(m[0], m[2]) for m in children_meta]
 
+    from src.node_signature import (
+        ListOfIntArg as _ListOfIntArg,
+        ListOfTensorArg as _ListOfTensorArg,
+        TensorArg as _TensorArg,
+        format_arg_spec as _format_arg_spec,
+    )
+
     # Build child_blackbox_block and contract_block strings for the agent factory
     child_blackbox_block = ""
     if children_signatures:
@@ -2242,8 +2301,8 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
             child_name = child_path.rsplit("/", 1)[-1]
             sig_args = ", ".join(child_sig.arg_names)
             lines.append(f"`{child_name}({sig_args}, *, out_shapes, out_perms=None)`")
-            for aname, ashape in zip(child_sig.arg_names, child_sig.arg_shapes):
-                lines.append(f"  - `{aname}` vanilla shape: {ashape}")
+            for aname, spec in zip(child_sig.arg_names, child_sig.arg_specs):
+                lines.append(f"  - `{aname}` {_format_arg_spec(spec)}")
             if child_sig.out_is_tuple:
                 lines.append(
                     f"  returns a tuple of {len(child_sig.out_shapes)} tensors "
@@ -2259,9 +2318,9 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
     contract_block = ""
     if not is_root and parent_contract is not None:
         lines = []
-        for aname, vshape, tshape, raw in zip(
+        for aname, spec, tshape, raw in zip(
             parent_contract.arg_names,
-            parent_contract.vanilla_shapes,
+            parent_contract.arg_specs,
             parent_contract.tiled_shapes,
             parent_contract.arg_is_raw,
         ):
@@ -2276,9 +2335,25 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
                     "on-chip (already produced by a sibling DSL op or "
                     "blackbox; pass directly to consumers)"
                 )
-            lines.append(
-                f"`{aname}`: vanilla shape {vshape}, tiled shape {tshape} — {tag}"
-            )
+            if isinstance(spec, _TensorArg):
+                lines.append(
+                    f"`{aname}`: vanilla shape {spec.shape}, "
+                    f"tiled shape {tshape} — {tag}"
+                )
+            elif isinstance(spec, _ListOfTensorArg):
+                lines.append(
+                    f"`{aname}`: list[Tensor{spec.elem_shape}] x {spec.length} — {tag}. "
+                    f"Iterate at host time and call `offchip_load` per element "
+                    f"(e.g. `[offchip_load({aname}[i], ...) for i in range(len({aname}))]`); "
+                    f"do NOT pass the list itself to a DSL consumer."
+                )
+            else:
+                assert isinstance(spec, _ListOfIntArg)
+                lines.append(
+                    f"`{aname}`: list[int] x {spec.length} — {tag}. "
+                    f"Convert to a tensor with `torch.tensor({aname})` before "
+                    f"any DSL consumer (e.g. feed into `metadata_gen`)."
+                )
         lines.append(
             f"Required output shapes (one per produced tensor): "
             f"`{list(parent_contract.out_shapes)}`"
@@ -2291,10 +2366,10 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
 
     # Build the user prompt
     # children_signatures expected as list of (child_name, arg_names,
-    # vanilla_shapes, out_shapes, out_is_tuple)
+    # arg_specs, out_shapes, out_is_tuple)
     children_sig_triples = [
         (child_path.rsplit("/", 1)[-1], child_sig.arg_names,
-         child_sig.arg_shapes, child_sig.out_shapes, child_sig.out_is_tuple)
+         child_sig.arg_specs, child_sig.out_shapes, child_sig.out_is_tuple)
         for child_path, child_sig in children_signatures
     ]
     # For internal nodes the planner already produced a decomposed parent
@@ -2325,11 +2400,13 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         "agent_factory must expose __llm_config__ for make_pass1_agent; "
         "wrap your factory so it sets agent_factory.__llm_config__ = llm_config")
     is_leaf = not children_signatures
+    few_shot_examples = getattr(agent_factory, "__few_shot_examples__", None)
     agent = make_pass1_agent(
         llm_config,
         is_leaf=is_leaf,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
+        few_shot_examples=few_shot_examples,
     )
     judge_agent = make_pass1_judge_agent(
         llm_config,
@@ -2382,21 +2459,34 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         attempt_dir.mkdir(parents=True, exist_ok=True)
         attempt_log = _make_attempt_log(
             log, node.path, attempt_idx, node_attempts)
-        # Per-attempt recorders + stubs. Sharing one set across parallel
-        # attempts caused the harvester to read contracts that a failed
-        # sibling had recorded (see checkpoints/2026-05-10-013023 outer_0:
-        # attempt_1's failed run called expert_mlp(...), then attempt_0's
-        # winning run inlined it, leaving the harvester with a contract
-        # but no AST call site → "call-name resolution drift" assert).
+        # Per-attempt recorders + stubs, reset before every turn within the
+        # attempt. Two leaks the harvester would otherwise see:
+        #   1. Cross-attempt: a sibling attempt's failed run records a
+        #      contract that the winning attempt then inlines (see
+        #      checkpoints/2026-05-10-013023 outer_0 — fixed by
+        #      instantiating recorders inside _one_attempt).
+        #   2. Cross-turn: an earlier failed turn within this attempt calls
+        #      a child stub, then the winning turn inlines it (see
+        #      checkpoints/2026-05-10-032138 outer_1: turn_3 called
+        #      expert_compute, turn_5 won by inlining; the recorder still
+        #      held turn_3's contract → drift assert in _pass1_walk).
+        # Resetting at the top of every turn — combined with the loop's
+        # break-on-success — guarantees the surviving recorder state was
+        # produced by the winning turn alone.
         child_recorders = {m[0]: ContractRecorder() for m in children_meta}
         extras: dict = {}
         for child_path, child_name, child_sig, child_ref in children_meta:
             extras[child_name] = make_stub(
                 ref_module=child_ref,
                 arg_names=child_sig.arg_names,
-                vanilla_shapes=child_sig.arg_shapes,
+                arg_specs=child_sig.arg_specs,
                 recorder=child_recorders[child_path],
             )
+
+        def _reset_recorders():
+            for r in child_recorders.values():
+                r.contract = None
+
         result = await _run_pass_loop(
             agent, "refactor_final",
             kernel_name=synth_name, dims=dims, max_turns=max_turns,
@@ -2413,6 +2503,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
             call_args=call_args,
             call_kwargs=call_kwargs,
             raw_arg_names=raw_arg_names_set,
+            pre_turn_hook=_reset_recorders,
         )
         # Attach this attempt's recorders so the harvester reads only the
         # winner's stub state, not a sibling's leftovers.
@@ -2506,9 +2597,11 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
         return {node.path: result}
 
     # Harvest per-child contracts from the stubs the parent called.
-    # Recorders here are the WINNING attempt's recorders (per-attempt — see
-    # _refactor_one_node_pass1._one_attempt), so contract presence reflects
-    # only the verified code path, not failed sibling attempts.
+    # Recorders here are scoped to the winning attempt AND reset before every
+    # turn within that attempt (see _refactor_one_node_pass1._one_attempt),
+    # so contract presence reflects only the winning turn's verified code
+    # path — neither failed sibling attempts nor earlier failed turns within
+    # this attempt can leak in.
     #
     # Stamp ``arg_is_raw`` onto each contract by statically classifying the
     # parent's verified code at the child's first call site. The parent's own
@@ -2545,14 +2638,15 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
                 f"inlined by the parent — pruning subtree from refactor walk")
             inlined_children.add(child.path)
             continue
-        # Anything else is real drift — per-attempt recorders should have
-        # eliminated the cross-attempt leakage that produced this case
-        # historically, so a half-set/half-AST state now indicates a genuine
-        # bug worth surfacing loudly.
+        # Anything else is real drift — per-attempt + per-turn recorder
+        # scoping should have eliminated both forms of leakage that produced
+        # this case historically, so a half-set/half-AST state now indicates
+        # a genuine bug worth surfacing loudly.
         assert c is not None and in_ast, (
             f"Parent {node.path!r}: drift for child {child.name!r} "
             f"(contract_recorded={c is not None}, in_ast={in_ast}) — "
-            f"per-attempt recorders should make this impossible; investigate")
+            f"per-attempt + per-turn recorder scoping should make this "
+            f"impossible; investigate")
         rawness = rawness_map[child.name]
         assert len(rawness) == len(c.arg_names), (
             f"Parent {node.path!r}: rawness tuple for child {child.name!r} "
@@ -3186,8 +3280,8 @@ async def run_kernel(
     assert not (translator == "auto" and (pipeline == "direct" or pipeline == "direct_no_functional")), (
         "translator='auto' requires pipeline='standard' (it consumes refactor_final's DSL output)"
     )
-    assert check_order in {"correctness-first", "compliance-first"}, \
-        f"Unknown check_order={check_order!r}. Known: correctness-first, compliance-first"
+    assert check_order in {"correctness-first", "compliance-first", "always-both"}, \
+        f"Unknown check_order={check_order!r}. Known: correctness-first, compliance-first, always-both"
 
     if plan_enabled:
         assert bundle_dir is None, (
@@ -3394,6 +3488,7 @@ async def run_kernel(
             resume_planner_dir=Path(resume_planner) if resume_planner else None,
             resume_after_pass1_dir=Path(resume_after_pass1) if resume_after_pass1 else None,
             stateless_refactor=stateless_refactor,
+            few_shot_examples=few_shot_examples,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3528,6 +3623,7 @@ async def _run_outer_iteration_body(
     resume_planner_dir: Path | None = None,
     resume_after_pass1_dir: Path | None = None,
     stateless_refactor: bool = False,
+    few_shot_examples: list | None = None,
     _log=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
@@ -3649,6 +3745,7 @@ async def _run_outer_iteration_body(
         _agent_factory.__planner_agent__ = planner_agent
         _agent_factory.__refactor_judge_agent__ = judge_agents.get("refactor_final")
         _agent_factory.__llm_config__ = llm_config
+        _agent_factory.__few_shot_examples__ = few_shot_examples
 
         log(f"  Planner phase (plan + per-node refactor)")
         print(f"{tag} Planner phase starting")

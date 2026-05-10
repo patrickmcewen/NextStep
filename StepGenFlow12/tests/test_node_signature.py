@@ -1,6 +1,14 @@
+import pytest
 import torch
 import torch.nn as nn
-from src.node_signature import extract_signature
+
+from src.node_signature import (
+    ListOfIntArg,
+    ListOfTensorArg,
+    TensorArg,
+    classify_arg,
+    extract_signature,
+)
 
 REF_CODE = """
 import torch
@@ -85,3 +93,101 @@ class Model(nn.Module):
     except AssertionError:
         raised = True
     assert raised
+
+
+# ---------------------------------------------------------------------------
+# List-typed forward args (per-expert weight stacks, per-batch seq lengths)
+# ---------------------------------------------------------------------------
+
+def test_classify_arg_tensor():
+    spec = classify_arg("x", torch.randn(4, 8))
+    assert spec == TensorArg(shape=(4, 8))
+
+
+def test_classify_arg_list_of_tensor_homogeneous():
+    weights = [torch.randn(8, 16) for _ in range(3)]
+    spec = classify_arg("w_gate_list", weights)
+    assert spec == ListOfTensorArg(length=3, elem_shape=(8, 16))
+
+
+def test_classify_arg_list_of_tensor_rejects_mismatched_shapes():
+    weights = [torch.randn(8, 16), torch.randn(8, 32)]
+    with pytest.raises(AssertionError, match="mismatched element shapes"):
+        classify_arg("w_gate_list", weights)
+
+
+def test_classify_arg_list_of_int():
+    spec = classify_arg("num_token_list", [3, 7, 2, 5])
+    assert spec == ListOfIntArg(length=4)
+
+
+def test_classify_arg_rejects_mixed_list():
+    with pytest.raises(AssertionError, match="mixed/unsupported element types"):
+        classify_arg("bad", [torch.randn(4), 3])
+
+
+def test_classify_arg_rejects_empty_list():
+    with pytest.raises(AssertionError):
+        classify_arg("empty", [])
+
+
+def test_classify_arg_rejects_scalar_int():
+    with pytest.raises(AssertionError, match="unsupported type"):
+        classify_arg("k", 7)
+
+
+def test_classify_arg_rejects_dict():
+    with pytest.raises(AssertionError, match="unsupported type"):
+        classify_arg("d", {"a": 1})
+
+
+# Reference module that takes the three supported arg kinds in one forward.
+LIST_INPUT_REF = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, w_gate_list, num_token_list):
+        # Mirrors the end_to_end pattern: per-expert weight loop + ragged
+        # per-row indexing via a Python int list.
+        out = torch.zeros_like(x)
+        for e_idx, w in enumerate(w_gate_list):
+            out = out + x @ w @ w.T
+        for i in range(x.shape[0]):
+            out[i, :num_token_list[i]] = out[i, :num_token_list[i]] * 2.0
+        return out
+"""
+
+
+def test_extract_signature_with_list_inputs():
+    canonical_inputs = {
+        "x": torch.randn(4, 8),
+        "w_gate_list": [torch.randn(8, 8) for _ in range(3)],
+        "num_token_list": [2, 5, 3, 7],
+    }
+    sig = extract_signature(LIST_INPUT_REF, canonical_inputs)
+    assert sig.arg_names == ("x", "w_gate_list", "num_token_list")
+    assert sig.arg_specs == (
+        TensorArg(shape=(4, 8)),
+        ListOfTensorArg(length=3, elem_shape=(8, 8)),
+        ListOfIntArg(length=4),
+    )
+    assert sig.out_shapes == ((4, 8),)
+
+
+def test_arg_shapes_property_fails_loud_on_list_args():
+    """The legacy ``arg_shapes`` accessor is tensor-only — list specs raise.
+
+    Downstream consumers (make_stub, Pass-1 prompt rendering of child arg
+    shapes) don't yet know how to format list specs; a clean assertion here
+    is the right failure mode until they do.
+    """
+    canonical_inputs = {
+        "x": torch.randn(4, 8),
+        "w_gate_list": [torch.randn(8, 8) for _ in range(3)],
+        "num_token_list": [2, 5, 3, 7],
+    }
+    sig = extract_signature(LIST_INPUT_REF, canonical_inputs)
+    with pytest.raises(AssertionError, match="arg_shapes is only valid"):
+        _ = sig.arg_shapes

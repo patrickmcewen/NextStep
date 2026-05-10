@@ -6,7 +6,7 @@ After this pass, {dsl_only_phrase} No raw tensor arithmetic (`*`, `+`, `/`), no 
 
 You cannot use python indexing to access parts of data tensors.
 
-You also may not create any new pytorch tensors besides the ones provided to you in the function. No torch.zeros or similar.
+You also may not create any new pytorch tensors besides the ones provided to you in the function. No torch.zeros or similar. The one explicit exception is converting a ``list[int]`` input (declared as such in the contract block) to a 1D int tensor via ``torch.tensor(<list_of_ints>)`` so it can be fed into a DSL producer like ``metadata_gen`` — that's a deterministic conversion of an existing positional input, not free-form tensor creation, and is required for ragged-dataflow patterns.
 
 If the code is already fully in DSL form, output it unchanged.
 
@@ -48,6 +48,11 @@ Fix it by loading the value into a stream first, e.g. ``W = offchip_load(o_proj_
 
 Args tagged **on-chip** in the contract block are already streams (the parent emitted them from a sibling DSL op{onchip_source_tail}); pass them directly to consumers without an extra load.
 
+Some positional args may arrive as Python lists rather than tensors. The contract block tags these with ``list[Tensor(...)] x N`` or ``list[int] x N``:
+
+- ``list[Tensor]`` (e.g. per-expert weight stacks): iterate at host time and emit one DSL op per element. The natural pattern is ``loads = [offchip_load(w_list[i], ...) for i in range(len(w_list))]`` — the list is preserved at the lowering target as N parallel structural graph nodes (one off-chip load per expert), so the static for-loop here is the right shape, not a placeholder. Do **not** pass the list itself to a DSL consumer.
+- ``list[int]`` (e.g. per-batch sequence lengths): convert to a 1D tensor exactly once via ``torch.tensor(<list_arg>)`` and feed into ``metadata_gen`` (or ``cache_*_addr_gen`` etc.) so ragged downstream ops can read the per-row metadata. Do not iterate the list element-by-element to scalar-index DSL ops.
+
 ## Stride Convention
 
 `stride` and `out_shape_tiled` define how tile indices map to positions in the underlying tensor's tile grid.
@@ -85,4 +90,5 @@ def tiled_reference(dims, tensors):
 Non-root functions **must not** call `offchip_store`. They hand a stream tensor up to their parent (via `return`); the parent (and ultimately the root) is responsible for the off-chip write. The regex compliance check rejects a root that omits `offchip_store`.
 
 The judge will reject any function whose name or signature deviates from the one rendered in the user prompt.
+
 {few_shot_examples}

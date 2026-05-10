@@ -43,6 +43,7 @@ DSL_FUNCTIONS = {
 - `tensors["key"]` — accessing tensors to pass to `offchip_load` or `select_gen`
 - Python scalars and control flow: `B // tile_n`, `range()`, `for`, `if`, `len()`
 - List operations: `[].append()`, `parts[i]` indexing
+- ``torch.tensor(<list_of_ints>)`` to convert a ``list[int]`` positional input (e.g. per-batch sequence lengths) into a 1D int tensor before feeding it to a DSL producer such as ``metadata_gen`` / ``cache_*_addr_gen``. This is the only permitted ``torch.*`` tensor constructor; it's a deterministic conversion of an existing input, not free-form tensor creation.
 
 ## What is NOT allowed
 

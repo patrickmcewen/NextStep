@@ -715,17 +715,46 @@ def check_children_called_with_tensors_only(refactored_parent_code: str,
         if child.name not in captured:
             continue  # check_no_dead_children already covers unreached children
         for i, arg in enumerate(captured[child.name]):
-            if not isinstance(arg, torch.Tensor):
+            if isinstance(arg, torch.Tensor):
+                continue
+            if isinstance(arg, list) and len(arg) > 0:
+                if all(isinstance(x, torch.Tensor) for x in arg):
+                    elem_shape = tuple(arg[0].shape)
+                    bad = [
+                        j for j, x in enumerate(arg)
+                        if tuple(x.shape) != elem_shape
+                    ]
+                    if bad:
+                        raise GuardFailure(
+                            f"child {child.name!r} is called with a "
+                            f"list[Tensor] at position {i} whose elements "
+                            f"have mismatched shapes (index 0: {elem_shape}, "
+                            f"indices {bad[:5]}{'...' if len(bad) > 5 else ''} "
+                            f"differ). list[Tensor] inputs must be "
+                            f"homogeneous — every element must share the "
+                            f"same shape so the child can iterate them with "
+                            f"identical per-element DSL ops."
+                        )
+                    continue
+                if all(isinstance(x, int) and not isinstance(x, bool)
+                       for x in arg):
+                    continue
+                types = sorted({type(x).__name__ for x in arg})
                 raise GuardFailure(
-                    f"child {child.name!r} is called with a non-tensor arg at "
-                    f"position {i} (type={type(arg).__name__}, value={arg!r}). "
-                    f"Every parent→child call must pass tensors only — Python "
-                    f"scalars (loop indices, integer flags, etc.) cannot be "
-                    f"recorded in the per-child contract or lowered to DSL. "
-                    f"Restructure so this position is a tensor (e.g. expand a "
-                    f"per-expert loop over a one-hot routing tensor) or absorb "
-                    f"the iteration into the child."
+                    f"child {child.name!r} is called with a list at position "
+                    f"{i} with mixed/unsupported element types ({types}). "
+                    f"Only homogeneous list[Tensor] and list[int] are "
+                    f"supported as child call-site args."
                 )
+            raise GuardFailure(
+                f"child {child.name!r} is called with an unsupported arg at "
+                f"position {i} (type={type(arg).__name__}). Allowed kinds at "
+                f"a child call site: torch.Tensor, list[Tensor] (homogeneous "
+                f"shapes), list[int]. Python scalars cannot be recorded in "
+                f"the per-child contract — restructure so this position is "
+                f"a tensor (e.g. expand a per-expert loop over a one-hot "
+                f"routing tensor) or absorb the iteration into the child."
+            )
 
 
 def build_node_tensors(reference_code: str, dims: dict) -> dict:

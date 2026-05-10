@@ -144,3 +144,69 @@ def test_refactor_tree_rejects_function_based_root_with_children():
 
     with pytest.raises(AssertionError, match="function-based"):
         asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# List-typed root inputs (per-expert weight stacks, per-batch seq lengths)
+# ---------------------------------------------------------------------------
+
+LEAF_LIST_INPUT_REF = '''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, w_gate_list, num_token_list):
+        out = torch.zeros_like(x)
+        for w in w_gate_list:
+            out = out + x @ w
+        for i in range(x.shape[0]):
+            out[i, :num_token_list[i]] = out[i, :num_token_list[i]] * 2.0
+        return out
+
+
+def get_inputs(dims):
+    return [
+        torch.randn(4, 8),
+        [torch.randn(8, 8) for _ in range(3)],
+        [2, 5, 3, 7],
+    ]
+
+
+def compute_gold(dims):
+    inputs = get_inputs(dims)
+    return Model()(*inputs)
+'''
+
+
+def test_build_node_index_root_with_list_inputs():
+    """The end_to_end crash repro: root forward takes list[Tensor] + list[int].
+
+    Pre-fix, _build_node_index → extract_signature → tuple(t.shape) crashed
+    on the first list. Post-fix, signature classifies each input as TensorArg,
+    ListOfTensorArg, or ListOfIntArg.
+    """
+    from src.node_signature import ListOfIntArg, ListOfTensorArg, TensorArg
+    from src.orchestrator import _build_node_index
+
+    leaf = PlanNode(
+        name="root", path="root",
+        reference_code=LEAF_LIST_INPUT_REF,
+        refactored_code=None, is_leaf=True, children=(),
+    )
+    tree = Tree(root=leaf)
+    tensors = {
+        "x": torch.randn(4, 8),
+        "w_gate_list": [torch.randn(8, 8) for _ in range(3)],
+        "num_token_list": [2, 5, 3, 7],
+    }
+    signatures, ref_modules = _build_node_index(tree, tensors)
+
+    sig = signatures["root"]
+    assert sig.arg_names == ("x", "w_gate_list", "num_token_list")
+    assert sig.arg_specs == (
+        TensorArg(shape=(4, 8)),
+        ListOfTensorArg(length=3, elem_shape=(8, 8)),
+        ListOfIntArg(length=4),
+    )
+    assert sig.out_shapes == ((4, 8),)
