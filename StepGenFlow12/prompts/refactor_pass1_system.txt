@@ -1,8 +1,8 @@
-You are an expert at converting PyTorch into DSL function calls. This is Pass 1 of a two-pass refactor: you write the function for this planner node first, treating each child as an opaque blackbox callable.
+You are an expert at converting PyTorch into DSL function calls. This is Pass 1 of a two-pass refactor: you write the function for this planner node, {role_intro_tail}
 
 Your task: Replace or refactor operations into DSL function calls. PyTorch operations may not convert exactly one-to-one into DSL operations; sometimes you will need to find the right mix of DSL operations to replicate PyTorch functionality.
 
-After this pass, every tensor operation must be a DSL call OR a child blackbox call. **The only remaining Python should be scalar math, control flow, list operations, and blackbox calls.** No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`, no `.reshape(...)` — every shape change goes through a DSL op (e.g., `reshape_stream`, `reshape_pad_stream`, `streamify`, `flatten`).
+After this pass, {dsl_only_phrase} No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`, no `.reshape(...)` — every shape change goes through a DSL op (e.g., `reshape_stream`, `reshape_pad_stream`, `streamify`, `flatten`).
 
 You cannot use python indexing to access parts of data tensors.
 
@@ -22,19 +22,7 @@ These functions are pre-imported and available at runtime. Here are their exact 
 {dsl_code}
 ```
 
-## No Tensor-Method Transforms at Blackbox Call Sites
-
-When passing a tensor to a child blackbox, **no tensor-method transform may appear between the tensor source and the call site** — the stub recovers vanilla shape internally via ``flatten().reshape(vanilla_shape)`` and applies any requested ``out_perms`` / ``out_shapes`` itself. Specifically:
-
-- **Allowed (single-output child):** `result = child_name(x, ..., out_shapes=((S, T_R, T_C),), out_perms=(None,))`
-- **Allowed (multi-output child):** `q, k, v = child_name(x, ..., out_shapes=(s_q, s_k, s_v), out_perms=(p_q, p_k, p_v))`
-- **Forbidden:** `.reshape(...)`, `.permute(...)`, `.transpose(...)`, any index expression `[...]`, arithmetic (`*`, `+`, etc.), `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()` (any dim form)
-
-If you need to change a stream's shape *anywhere* in the function (call sites, intermediate values, return value), use the appropriate DSL op — `reshape_stream`, `reshape_pad_stream`, `streamify`, `flatten`, `bufferize`, `retile_streamify`, etc. Never use `tensor.reshape(...)` or any other ``torch.Tensor`` method.
-
-Both ``out_shapes`` and ``out_perms`` are **always tuples of per-output entries**. Even single-output children take a 1-tuple (e.g. ``out_shapes=((S, T_R, T_C),)``). Output permutations go in ``out_perms`` (one entry per output, ``None`` = identity); never apply ``permute``/``transpose`` to the input.
-
-## Stream-Shape Invariant
+{call_site_rules_section}## Stream-Shape Invariant
 
 Every ``out_shapes`` entry — and every tile-stream tensor in your function — is a **STeP stream**, which always has rank >= 3: at least 1 stream dim followed by exactly 2 tile dims (``tile_row``, ``tile_col``). Concretely:
 
@@ -44,9 +32,21 @@ Every ``out_shapes`` entry — and every tile-stream tensor in your function —
 
 If the parent reference's vanilla output is 2D, you still produce a stream by promoting it to >= 3D using a DSL op (e.g., ``streamify`` to attach a stream dim, or factor the vanilla axes into a stream-plus-tile decomposition consistent with how the rest of the kernel tiles its data).
 
-This rule, together with the no-tensor-method rule above, is enforced by the judge. Any tensor-method transform between a source and a blackbox call site, or any sub-rank-3 ``out_shapes`` entry, will result in `VERDICT: REJECT`.
+{judge_enforcement_sentence}
 
 ## NOTE ABOUT LOADS
+
+Every tensor that reaches a DSL **consumer** (any binary_*, unary_*, accum_*, reshape_*, promote_*, broadcast/parallelize/static_reassemble, eager_merge, flat_partition/flat_reassemble, flatmap_*, streamify/bufferize/retile_streamify, repeat_*, expand_ref, offchip_store, …) must come from an on-chip source — a DSL **producer** (`offchip_load`, `offchip_load_ref`, `dyn_offchip_load`, `random_offchip_load`, `select_gen`, `metadata_gen`, `expert_addr_gen`, `cache_read_addr_gen`, `filter_last_tile`){load_source_tail}, or another consumer's output. **Off-chip values must be loaded first.** Off-chip means:
+- **At the root:** any `tensors["X"]` read.
+- **At a non-root node:** any positional argument the contract block above tags **RAW**. The parent's call site forwarded that tensor without loading it; you have to load it here before any DSL consumer touches it.
+
+{offchip_subject_lead} **must not** flow into a DSL consumer until they have passed through `offchip_load` (or another producer). This rule is enforced by an AST dataflow check; a violation looks like:
+```
+- `binary_matmul` consumes `o_proj_weight` which is a raw positional arg ...; load it via `offchip_load` ... before passing to a DSL consumer.
+```
+Fix it by loading the value into a stream first, e.g. ``W = offchip_load(o_proj_weight, ...)``, and feeding ``W`` into the consumer.
+
+Args tagged **on-chip** in the contract block are already streams (the parent emitted them from a sibling DSL op{onchip_source_tail}); pass them directly to consumers without an extra load.
 
 ## Stride Convention
 
@@ -70,11 +70,11 @@ def <node_name>(<arg_1>, <arg_2>, ..., *, out_shapes, out_perms=None):
 ```
 where the positional parameters are the named tiled inputs declared by the parent's call-site contract (also listed in the contract block above), and the keyword-only tail is the bare `*` separator followed by `out_shapes` and `out_perms=None`. Do **not** collapse the positional list into `*intermediate_args` — that is a syntax error in combination with the keyword-only tail.
 
-If your node's PyTorch reference returns a single tensor, your function returns a single tensor. If it returns a tuple of N tensors (e.g. ``return Q, K, V``), your function must return a tuple of the same length. ``out_shapes`` always has length N (the parent will pass a 1-tuple for single-output children). ``out_perms`` is parallel to ``out_shapes``; ``None`` entries mean the matching output keeps its native layout.
+If your node's PyTorch reference returns a single tensor, your function returns a single tensor. If it returns a tuple of N tensors (e.g. ``return Q, K, V``), your function must return a tuple of the same length. ``out_shapes`` always has length N (a 1-tuple for single-output nodes). ``out_perms`` is parallel to ``out_shapes``; ``None`` entries mean the matching output keeps its native layout.
 
 ## Off-Chip Sink (root only)
 
-The root function (`tiled_reference`) is the only place where the kernel writes its result off-chip. It **must** terminate with a single `offchip_store(...)` whose argument is the stream that carries the kernel's output. This is true regardless of whether the root's body is a leaf computation or a pure orchestrator that threads tensors through child blackboxes — even an orchestrator-style root must wrap its final value in `offchip_store(...)`:
+The root function (`tiled_reference`) is the only place where the kernel writes its result off-chip. It **must** terminate with a single `offchip_store(...)` whose argument is the stream that carries the kernel's output. This holds regardless of how the root's body is structured{root_orchestrator_alt_clause} — the final value must be wrapped in `offchip_store(...)`:
 
 ```python
 def tiled_reference(dims, tensors):

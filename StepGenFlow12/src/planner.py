@@ -360,6 +360,136 @@ def _camel_case(snake: str) -> str:
     return "".join(part.capitalize() for part in snake.split("_"))
 
 
+# Names reserved across the tree: ``tiled_reference`` is the hardcoded entry
+# point for the root DSL function; if a descendant claimed that name, its
+# ``def {name}(...)`` would collide with the root's def in the pass-2
+# composed namespace. Add other globally-reserved names here if they emerge.
+_RESERVED_NODE_NAMES: frozenset[str] = frozenset({"tiled_reference"})
+
+
+def disambiguate_tree(tree: "Tree") -> tuple["Tree", dict[str, tuple[str, str]]]:
+    """Ensure every node's ``name`` is globally unique across the tree.
+
+    Two distinct nodes sharing a ``name`` corrupts the pipeline silently:
+
+    - **Pass-1 stub injection** keys by ``child.name``: two siblings with
+      the same name would inject one stub on top of the other, recording
+      a contract for only one of them.
+    - **Pass-2 composition** keys by ``node.name`` (``descendants[node.name]
+      = pass1_dsls[node.path]`` in ``_pass2_compose``): any cross-tree
+      duplicate silently clobbers, so the composed graph executes the
+      wrong DSL body.
+    - **Parent/child name collision** (e.g. parent function defined as
+      ``def moe_dispatch(...)`` with a child also named ``moe_dispatch``)
+      shadows the child's stub in the parent's namespace, forcing the LLM
+      into ugly aliasing workarounds that the textual rawness extractor
+      can't follow.
+
+    A pre-order walk fixes the first occurrence's name (or root) and
+    renames any later collider to a path-derived disambiguation. Each
+    rename also rewrites the offending node's *parent* refactored_code
+    so its ``self.{old}`` and ``{OldCamel}Model`` references point at
+    the new name. The pass-1 LLM is generated *after* this disambiguation
+    runs, so its prompts are built from the new ``node.name`` and need
+    no further rewrite.
+
+    Returns ``(new_tree, renames)`` where ``renames`` maps the *original*
+    path of each renamed node to ``(old_name, new_name)`` for logging.
+    An empty ``renames`` dict means the tree was already unique
+    (in which case ``new_tree is tree``).
+    """
+    used: set[str] = set(_RESERVED_NODE_NAMES)
+    renames_by_path: dict[str, str] = {}  # original node.path -> new node.name
+    log_renames: dict[str, tuple[str, str]] = {}  # original path -> (old, new)
+
+    def claim(node: PlanNode, parent_path: str) -> None:
+        if node.name not in used:
+            used.add(node.name)
+            return
+        # Disambiguate using the node's parent path (with `/` swapped for
+        # `_` so the result is still a valid Python identifier). Suffix
+        # with a counter only if the path-derived candidate also collides.
+        suffix = parent_path.replace("/", "_") if parent_path else "root"
+        candidate = f"{node.name}__{suffix}"
+        i = 2
+        while candidate in used:
+            candidate = f"{node.name}__{suffix}_{i}"
+            i += 1
+        renames_by_path[node.path] = candidate
+        log_renames[node.path] = (node.name, candidate)
+        used.add(candidate)
+
+    # Pre-order walk: parent's name is fixed before its children are
+    # considered, so on a parent/child collision the child gets renamed
+    # (matches the existing user expectation that the parent path keeps
+    # its function name).
+    def walk(node: PlanNode, parent_path: str) -> None:
+        claim(node, parent_path)
+        for c in node.children:
+            walk(c, node.path)
+
+    walk(tree.root, "")
+    if not renames_by_path:
+        return tree, {}
+
+    return _rebuild_with_renames(tree, renames_by_path), log_renames
+
+
+def _rebuild_with_renames(tree: "Tree", renames: dict[str, str]) -> "Tree":
+    """Reconstruct ``tree`` so that any node whose path is in ``renames``
+    carries the new name, its path is rebuilt from ancestors' new paths,
+    and its parent's ``refactored_code`` references the new name."""
+
+    def rebuild(node: PlanNode, new_parent_path: str | None) -> PlanNode:
+        new_name = renames.get(node.path, node.name)
+        new_path = (node.path if new_parent_path is None
+                    else f"{new_parent_path}/{new_name}")
+        # If any of *this* node's direct children are being renamed, the
+        # textual references in this node's own refactored_code need to
+        # be patched (``self.<old>`` and ``<OldCamel>Model``).
+        child_renames: dict[str, str] = {}
+        for c in node.children:
+            new_child_name = renames.get(c.path, c.name)
+            if new_child_name != c.name:
+                child_renames[c.name] = new_child_name
+        new_refactored = node.refactored_code
+        if new_refactored is not None and child_renames:
+            new_refactored = _rewrite_parent_refactored_code(
+                new_refactored, child_renames)
+        new_children = tuple(rebuild(c, new_path) for c in node.children)
+        return PlanNode(
+            name=new_name,
+            path=new_path,
+            reference_code=node.reference_code,
+            refactored_code=new_refactored,
+            is_leaf=node.is_leaf,
+            children=new_children,
+        )
+
+    return Tree(root=rebuild(tree.root, None))
+
+
+def _rewrite_parent_refactored_code(code: str,
+                                     renames: dict[str, str]) -> str:
+    """Apply child renames (old_snake -> new_snake) to a parent's
+    refactored Module code. Two textual surfaces are referenced:
+
+    - ``self.<old>``           -> ``self.<new>``           (init + forward)
+    - ``<OldCamel>Model``      -> ``<NewCamel>Model``      (class injection)
+
+    Both replacements are word-boundary-anchored so a child whose name is
+    a prefix of another (``q``, ``q_proj``) doesn't bleed into the longer
+    one's references.
+    """
+    for old, new in renames.items():
+        old_camel = _camel_case(old)
+        new_camel = _camel_case(new)
+        code = re.sub(rf"\bself\.{re.escape(old)}\b", f"self.{new}", code)
+        code = re.sub(rf"\b{re.escape(old_camel)}Model\b",
+                      f"{new_camel}Model", code)
+    return code
+
+
 def check_no_dead_children(refactored_parent_code: str, children: list) -> None:
     """Each child must be invoked at least once from the refactored parent's
     ``forward``. A child that is bound in ``__init__`` but never called is a

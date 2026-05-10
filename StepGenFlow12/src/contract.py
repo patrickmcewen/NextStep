@@ -47,6 +47,16 @@ class Contract:
     # in the same shape the LLM-emitted function will return.
     tiled_outputs: tuple[torch.Tensor, ...] = ()
     out_is_tuple: bool = False
+    # Per-arg rawness flag, parallel to ``arg_names``. ``True`` = the parent's
+    # call site fed in a value that had not yet passed through a DSL source
+    # operator (raw ``tensors[...]`` read or a raw forwarded positional arg) —
+    # the child must call ``offchip_load`` (or another producer) on it before
+    # feeding it to a DSL consumer. ``False`` = the parent's call site fed in
+    # an on-chip value (DSL producer/consumer/blackbox output, or an already-
+    # on-chip intermediate arg). Empty tuple = un-stamped (legacy/test
+    # construction); the orchestrator stamps this after the parent's pass-1
+    # code is verified, by static AST inspection of the call site.
+    arg_is_raw: tuple[bool, ...] = ()
 
     def __post_init__(self):
         for i, shape in enumerate(self.out_shapes):
@@ -58,3 +68,9 @@ class Contract:
                 f"call site (the parent must request a tiled output shape, "
                 f"not a vanilla one)."
             )
+        assert len(self.arg_is_raw) in (0, len(self.arg_names)), (
+            f"Contract.arg_is_raw length ({len(self.arg_is_raw)}) must be "
+            f"either 0 (un-stamped) or {len(self.arg_names)} (one entry per "
+            f"arg_name); got arg_is_raw={self.arg_is_raw!r}, "
+            f"arg_names={self.arg_names!r}"
+        )

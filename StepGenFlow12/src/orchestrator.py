@@ -25,6 +25,7 @@ Checkpoint structure:
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -454,12 +455,58 @@ def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
     ``call_kwargs`` so the LLM-emitted
     ``<node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)`` is
     exercised against parent-recorded inputs.
+
+    For non-root nodes, ``call_kwargs["out_shapes"]`` is the contract the
+    parent declared when calling this child's stub. We enforce it as a
+    hard shape gate *before* the value check: the DSL output must equal
+    the declared shape exactly. A numel-only check (correct for root,
+    where ``offchip_store`` always emits 2D against possibly-ND gold)
+    silently lets through implementations whose flat elements match gold
+    but whose stream rank differs from the contract — those then crash
+    pass-2 the moment a downstream consumer asserts on stream rank.
     """
     result = _exec_dsl_ref(code, dims, tensors, extra_globals=extra_globals,
                            entry_point=entry_point,
                            call_args=call_args,
                            call_kwargs=call_kwargs)
+    declared = (call_kwargs or {}).get("out_shapes")
+    if declared is not None:
+        shape_violation = _check_declared_out_shapes(result, declared)
+        if shape_violation is not None:
+            return f"match=False\n{shape_violation}"
     return _compare_against_gold(result, kernel_name, dims, "dsl")
+
+
+def _check_declared_out_shapes(result, declared) -> str | None:
+    """Return a violation report if ``result``'s shape doesn't match the
+    contract's declared ``out_shapes``, else None.
+
+    ``declared`` is the parent's ``out_shapes=`` argument — a tuple of
+    shape tuples, one per output. ``result`` is a Tensor when the ref
+    returns a single output, or a tuple/list when it returns multiple.
+    Single-output is encoded as ``len(declared) == 1`` whether the
+    underlying ref returns ``Tensor`` or ``(Tensor,)``.
+    """
+    declared = tuple(tuple(int(d) for d in s) for s in declared)
+    result_seq = result if isinstance(result, (tuple, list)) else (result,)
+    if len(result_seq) != len(declared):
+        return (
+            f"DECLARED-SHAPE LENGTH MISMATCH: out_shapes declares "
+            f"{len(declared)} output(s), dsl returned {len(result_seq)}"
+        )
+    for i, (r, d) in enumerate(zip(result_seq, declared)):
+        if not hasattr(r, "shape"):
+            return (
+                f"DECLARED-SHAPE TYPE MISMATCH: out_shapes[{i}] declared {d}, "
+                f"dsl returned {type(r).__name__}"
+            )
+        actual = tuple(int(s) for s in r.shape)
+        if actual != d:
+            return (
+                f"DECLARED-SHAPE MISMATCH: out_shapes[{i}] declared {d}, "
+                f"dsl returned {actual}"
+            )
+    return None
 
 
 def _run_graph_correctness(code, kernel_name, dims, tensors, *,
@@ -640,12 +687,21 @@ _SRC_CONSUMER = "consumer"
 _SRC_BLACKBOX = "blackbox"
 _SRC_INTERMEDIATE_ARG = "intermediate_arg"
 _SRC_RAW_TENSORS = "raw_tensors_subscript"
+# Positional arg of a non-root function whose parent's call site fed in a raw
+# tensor (no DSL source op applied yet). Treated identically to
+# ``_SRC_RAW_TENSORS`` by the consumer-source rule: must pass through a DSL
+# producer (``offchip_load`` etc.) before reaching a DSL consumer.
+_SRC_RAW_INTERMEDIATE_ARG = "raw_intermediate_arg"
 _SRC_NON_TENSOR = "non_tensor"
 _SRC_UNKNOWN = "unknown"
 
 _ONCHIP_SOURCES = frozenset({
     _SRC_PRODUCER, _SRC_CONSUMER, _SRC_BLACKBOX, _SRC_INTERMEDIATE_ARG,
 })
+
+# Source classifications that flag a value as still-raw (off-chip) when fed
+# directly into a DSL consumer.
+_RAW_SOURCES = frozenset({_SRC_RAW_TENSORS, _SRC_RAW_INTERMEDIATE_ARG})
 
 # Regex to find torch.XXX( and F.XXX( calls
 _TORCH_CALL_RE = re.compile(r'\btorch\.(\w+)\s*\(')
@@ -793,6 +849,12 @@ def _check_consumer_arg(arg: ast.AST,
             return (f"- `{op}` consumes `{arg.id}` which holds a raw "
                     f"`tensors[...]` read; load it via `offchip_load` (or "
                     f"another source op) before passing to a DSL consumer")
+        if src == _SRC_RAW_INTERMEDIATE_ARG:
+            return (f"- `{op}` consumes `{arg.id}` which is a raw positional "
+                    f"arg (the parent's call site forwarded an off-chip "
+                    f"tensor); load it via `offchip_load` (or another source "
+                    f"op) before passing to a DSL consumer. (Raw args may "
+                    f"still be passed straight to a child blackbox.)")
         return None
     if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
         # Method-chain like ``tensors["x"].reshape(...)`` — recurse on the receiver.
@@ -800,20 +862,31 @@ def _check_consumer_arg(arg: ast.AST,
     return None
 
 
-def _check_func_dataflow(func: ast.FunctionDef,
-                          blackbox_set: frozenset[str]) -> list[str]:
-    """Per-function dataflow check; see ``_check_dataflow_invariant``."""
+def _build_name_to_source(func: ast.FunctionDef,
+                           blackbox_set: frozenset[str],
+                           raw_arg_names: frozenset[str]) -> dict[str, str]:
+    """Build the per-function name → source classification map.
+
+    Positional args in ``raw_arg_names`` bind to ``_SRC_RAW_INTERMEDIATE_ARG``
+    instead of ``_SRC_INTERMEDIATE_ARG``; this is how the parent's static
+    call-site classification flows into the child's dataflow check.
+    """
     name_to_source: dict[str, str] = {}
-    # Positional args other than dims/tensors are intermediate (on-chip per
-    # parent contract). Keyword-only args (out_shapes, out_perms) are scalars.
+    # Positional args other than dims/tensors are intermediate. By default
+    # they're on-chip (the parent contract guarantees that for non-raw args);
+    # those listed in ``raw_arg_names`` were forwarded raw at the call site.
+    # Keyword-only args (out_shapes, out_perms) are scalars.
     for arg in func.args.args:
         if arg.arg in {"dims", "tensors", "self"}:
             continue
-        name_to_source[arg.arg] = _SRC_INTERMEDIATE_ARG
+        if arg.arg in raw_arg_names:
+            name_to_source[arg.arg] = _SRC_RAW_INTERMEDIATE_ARG
+        else:
+            name_to_source[arg.arg] = _SRC_INTERMEDIATE_ARG
     for arg in func.args.kwonlyargs:
         name_to_source[arg.arg] = _SRC_NON_TENSOR
 
-    # First pass: bind every assignment target to the source of its RHS.
+    # Bind every assignment target to the source of its RHS.
     for node in _walk_no_nested_def(func):
         if isinstance(node, ast.Assign):
             src = _classify_value(node.value, name_to_source, blackbox_set)
@@ -823,7 +896,16 @@ def _check_func_dataflow(func: ast.FunctionDef,
             src = _classify_value(node.value, name_to_source, blackbox_set)
             _bind_target(node.target, src, name_to_source)
 
-    # Second pass: every DSL-consumer call's tensor arg must be on-chip.
+    return name_to_source
+
+
+def _check_func_dataflow(func: ast.FunctionDef,
+                          blackbox_set: frozenset[str],
+                          raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
+    """Per-function dataflow check; see ``_check_dataflow_invariant``."""
+    name_to_source = _build_name_to_source(func, blackbox_set, raw_arg_names)
+
+    # Every DSL-consumer call's tensor arg must be on-chip.
     violations: list[str] = []
     for node in _walk_no_nested_def(func):
         if not isinstance(node, ast.Call):
@@ -845,7 +927,8 @@ def _check_func_dataflow(func: ast.FunctionDef,
 
 
 def _check_dataflow_invariant(code: str, *,
-                               blackbox_names: tuple[str, ...] = ()) -> list[str]:
+                               blackbox_names: tuple[str, ...] = (),
+                               raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
     """AST-level dataflow check for ``refactor_final`` output.
 
     For every DSL consumer call (``binary_*``, ``unary_*``, ``offchip_store``,
@@ -871,14 +954,74 @@ def _check_dataflow_invariant(code: str, *,
     violations: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
-            violations.extend(_check_func_dataflow(node, blackbox_set))
+            violations.extend(_check_func_dataflow(
+                node, blackbox_set, raw_arg_names))
     # Deduplicate while preserving order.
     return list(dict.fromkeys(violations))
 
 
+def _extract_call_site_rawness(
+    code: str,
+    *,
+    child_names: tuple[str, ...],
+    blackbox_names: tuple[str, ...],
+    parent_raw_arg_names: frozenset[str] = frozenset(),
+) -> dict[str, tuple[bool, ...]]:
+    """Statically classify each child stub call site's positional args as raw / on-chip.
+
+    Walks ``code``'s top-level functions and, for each child name in
+    ``child_names``, finds the **first** call to that child (matching the
+    Contract-on-first-call semantics in ``make_stub``) and returns a per-arg
+    bool tuple: ``True`` means the parent's expression at that position
+    classifies as raw (``_SRC_RAW_TENSORS`` or ``_SRC_RAW_INTERMEDIATE_ARG``).
+
+    ``blackbox_names`` (typically the same as ``child_names``) is the set of
+    names treated as blackbox callables for source classification.
+
+    ``parent_raw_arg_names`` is the parent's own raw positional arg names
+    (taken from the parent's contract). Forwarding a raw arg straight into a
+    grandchild keeps it raw, so the parent's rawness must propagate when we
+    classify expressions referring to those args.
+
+    A child name absent from the returned dict means no call site was found
+    in the parent code; callers should fail loudly in that case (the parent's
+    compliance gate already requires that each stub it returned be tracked).
+    """
+    blackbox_set = frozenset(blackbox_names)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return {}
+
+    targets = set(child_names)
+    found: dict[str, tuple[bool, ...]] = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        # Build the per-function name_to_source the same way the dataflow
+        # check does, so rawness conclusions stay aligned with what the check
+        # would enforce. Feed in the parent's own raw arg names so a forwarded
+        # raw arg stays raw at the grandchild's call site.
+        name_to_source = _build_name_to_source(
+            func, blackbox_set, raw_arg_names=parent_raw_arg_names)
+        for node in _walk_no_nested_def(func):
+            if not isinstance(node, ast.Call):
+                continue
+            cname = _call_name(node)
+            if cname not in targets or cname in found:
+                continue
+            arg_is_raw: list[bool] = []
+            for arg in node.args:
+                src = _classify_value(arg, name_to_source, blackbox_set)
+                arg_is_raw.append(src in _RAW_SOURCES)
+            found[cname] = tuple(arg_is_raw)
+    return found
+
+
 def _check_banned_ops(code: str, pass_name: str, *,
                        is_root: bool = True,
-                       extra_required_ops: tuple[str, ...] = ()) -> list[str]:
+                       extra_required_ops: tuple[str, ...] = (),
+                       raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
     """Check whether ``code`` complies with this pass's output constraints.
 
     Returns a list of violation messages; empty means compliant. Each pass's
@@ -953,6 +1096,7 @@ def _check_banned_ops(code: str, pass_name: str, *,
     if pass_name == "refactor_final":
         violations.extend(_check_dataflow_invariant(
             code, blackbox_names=tuple(extra_required_ops),
+            raw_arg_names=raw_arg_names,
         ))
 
     # Deduplicate while preserving order
@@ -1257,7 +1401,9 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
                            tensors, turn_dir: Path, log,
                            *, correctness_verified: bool,
                            is_root: bool = True,
-                           extra_required_ops: tuple[str, ...] = ()) -> _GateResult:
+                           extra_required_ops: tuple[str, ...] = (),
+                           raw_arg_names: frozenset[str] = frozenset()
+                           ) -> _GateResult:
     """Regex compliance check.
 
     On failure, on `pass_name == "refactor_final"` with a non-None judge_agent,
@@ -1269,7 +1415,8 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
                                               is_root=is_root)
     else:
         violations = _check_banned_ops(code, pass_name, is_root=is_root,
-                                       extra_required_ops=extra_required_ops)
+                                       extra_required_ops=extra_required_ops,
+                                       raw_arg_names=raw_arg_names)
 
     if not violations:
         return _GateResult(None, "PASS", 0)
@@ -1420,7 +1567,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          extra_globals: dict | None = None,
                          entry_point: str = "tiled_reference",
                          call_args: tuple | None = None,
-                         call_kwargs: dict | None = None):
+                         call_kwargs: dict | None = None,
+                         raw_arg_names: frozenset[str] = frozenset()):
     """Run a single pass agent (lowering or translator).
 
     ``post_validator`` is an optional ``(code, turn_dir) -> str | None`` callable
@@ -1543,7 +1691,8 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         tensors, turn_dir, log,
                         correctness_verified=correctness_verified,
                         is_root=is_root,
-                        extra_required_ops=extra_required_ops)
+                        extra_required_ops=extra_required_ops,
+                        raw_arg_names=raw_arg_names)
                 elif gate_name == "judge":
                     res = await _gate_judge(
                         judge_agent, code, tensors, turn_dir, log,
@@ -2101,13 +2250,25 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
     contract_block = ""
     if not is_root and parent_contract is not None:
         lines = []
-        for aname, vshape, tshape in zip(
+        for aname, vshape, tshape, raw in zip(
             parent_contract.arg_names,
             parent_contract.vanilla_shapes,
             parent_contract.tiled_shapes,
+            parent_contract.arg_is_raw,
         ):
+            if raw:
+                tag = (
+                    "RAW (off-chip — must be loaded with `offchip_load` "
+                    "before any DSL consumer; may be passed directly to a "
+                    "child blackbox)"
+                )
+            else:
+                tag = (
+                    "on-chip (already produced by a sibling DSL op or "
+                    "blackbox; pass directly to consumers)"
+                )
             lines.append(
-                f"`{aname}`: vanilla shape {vshape}, tiled shape {tshape}"
+                f"`{aname}`: vanilla shape {vshape}, tiled shape {tshape} — {tag}"
             )
         lines.append(
             f"Required output shapes (one per produced tensor): "
@@ -2154,13 +2315,16 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
     assert llm_config is not None, (
         "agent_factory must expose __llm_config__ for make_pass1_agent; "
         "wrap your factory so it sets agent_factory.__llm_config__ = llm_config")
+    is_leaf = not children_signatures
     agent = make_pass1_agent(
         llm_config,
+        is_leaf=is_leaf,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
     )
     judge_agent = make_pass1_judge_agent(
         llm_config,
+        is_leaf=is_leaf,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
         function_signature=function_signature,
@@ -2179,6 +2343,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         entry_point = "tiled_reference"
         call_args: tuple | None = None
         call_kwargs: dict | None = None
+        raw_arg_names_set: frozenset[str] = frozenset()
     else:
         entry_point = node.name
         call_args = tuple(parent_contract.tiled_values)
@@ -2186,6 +2351,19 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
             "out_shapes": parent_contract.out_shapes,
             "out_perms": parent_contract.out_perms,
         }
+        # Non-root nodes inherit per-arg rawness from the parent's recorded
+        # call site. The pass-1 walk stamps ``arg_is_raw`` onto every child
+        # contract before recursing, so its length must match arg_names here.
+        assert len(parent_contract.arg_is_raw) == len(parent_contract.arg_names), (
+            f"non-root node {node.path!r}: parent_contract.arg_is_raw "
+            f"({parent_contract.arg_is_raw}) length must match arg_names "
+            f"({parent_contract.arg_names}); the orchestrator should stamp "
+            f"rawness from the parent's verified code before this point")
+        raw_arg_names_set = frozenset(
+            name for name, raw in zip(
+                parent_contract.arg_names, parent_contract.arg_is_raw)
+            if raw
+        )
 
     async def _one_attempt(attempt_idx: int) -> dict:
         attempt_dir = (
@@ -2210,6 +2388,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
             entry_point=entry_point,
             call_args=call_args,
             call_kwargs=call_kwargs,
+            raw_arg_names=raw_arg_names_set,
         )
 
     run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
@@ -2304,14 +2483,46 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
     if not result["success"]:
         return {node.path: result}
 
-    # Harvest per-child contracts from the stubs the parent called
+    # Harvest per-child contracts from the stubs the parent called.
+    #
+    # Stamp ``arg_is_raw`` onto each contract by statically classifying the
+    # parent's verified code at the child's first call site. The parent's own
+    # raw arg names (from its own contract) propagate so that an arg forwarded
+    # raw through multiple levels stays raw.
+    parent_raw_args = (
+        frozenset()
+        if parent_contract is None
+        else frozenset(
+            name for name, raw in zip(
+                parent_contract.arg_names, parent_contract.arg_is_raw)
+            if raw
+        )
+    )
+    child_names = tuple(c.name for c in node.children)
+    rawness_map = _extract_call_site_rawness(
+        result["code"],
+        child_names=child_names,
+        blackbox_names=child_names,
+        parent_raw_arg_names=parent_raw_args,
+    )
+
     child_contracts: dict = {}
     for child in node.children:
         c = child_recorders[child.path].contract
         assert c is not None, (
             f"Parent {node.path!r} succeeded Pass 1 without calling child "
             f"blackbox {child.name!r} — compliance gate is broken")
-        child_contracts[child.path] = c
+        assert child.name in rawness_map, (
+            f"Parent {node.path!r}: stub {child.name!r} fired (contract "
+            f"recorded) but no textual call site was found by the rawness "
+            f"extractor — call-name resolution drift between the runtime "
+            f"stub and the AST walk")
+        rawness = rawness_map[child.name]
+        assert len(rawness) == len(c.arg_names), (
+            f"Parent {node.path!r}: rawness tuple for child {child.name!r} "
+            f"has {len(rawness)} entries but contract.arg_names has "
+            f"{len(c.arg_names)} — call-site arity drift")
+        child_contracts[child.path] = dataclasses.replace(c, arg_is_raw=rawness)
 
     out: dict = {node.path: {"dsl": result["code"], "success": True}}
 
@@ -2368,17 +2579,28 @@ def _pass2_compose_namespace(*, parent_dsl: str,
 
 def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
                     dims: dict, tensors: dict, root_kernel: str,
-                    ckpt_root, log) -> dict:
+                    ckpt_root, log, plan_iter: int = 0) -> dict:
     """Run deterministic Pass 2 at the root level.
 
     Builds a shared namespace containing every descendant's Pass-1 DSL function,
     then runs ``tiled_reference(dims, tensors)`` and compares to gold.
+
+    Writes per-iteration artifacts to
+    ``<ckpt_root>/pass2/iteration_<plan_iter>/`` mirroring the pass1
+    layout — ``composed_code.py`` (full descendants+root source),
+    ``shape_trace.txt`` (captured step_dsl shape prints from the exec),
+    ``correctness_result.txt`` (the comparison report), and
+    ``status.txt`` (``PASS`` or ``MISMATCH: <first line>``). On exec
+    crash these last three are absent; the outer-iteration wrapper
+    logs the traceback to ``<ckpt_root>/log.txt``.
 
     Returns:
         {"success": True, "root_dsl": <composed string>}  on success
         {"success": False, "failing_node": <root path>, "exec_log": <str>} on failure
     """
     from src.tools import _exec_dsl_ref
+
+    pass2_dir = ckpt_root / "pass2" / f"iteration_{plan_iter}"
 
     # Collect descendant DSLs in post-order. We keep a list (not a
     # name-keyed dict) because the planner can produce nested same-named
@@ -2397,7 +2619,11 @@ def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
         descendants_in_order.append(pass1_dsls[node.path])
 
     root_dsl = pass1_dsls[tree.root.path]
-    log("[pass2] composing root with all descendants name-rebound")
+    composed_source = "\n\n".join(descendants_in_order + [root_dsl])
+    _write(pass2_dir / "composed_code.py", composed_source)
+
+    log(f"[pass2] composing root with all descendants name-rebound "
+        f"(artifacts: {pass2_dir})")
 
     # Build a namespace containing scaffold + all descendants + root, then
     # re-execute the root through the standard executor with the composed
@@ -2412,12 +2638,24 @@ def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
     extras = {k: v for k, v in composed_ns.items()
               if callable(v) and k != "tiled_reference"}
 
-    result = _exec_dsl_ref(root_dsl, dims, tensors, extra_globals=extras)
+    # Capture step_dsl's shape-trace prints into pass2's folder rather
+    # than letting them disappear into the parent process's stdout.
+    _trace_buf = io.StringIO()
+    with contextlib.redirect_stdout(_trace_buf):
+        result = _exec_dsl_ref(root_dsl, dims, tensors, extra_globals=extras)
+    shape_trace = _trace_buf.getvalue()
+    if shape_trace:
+        _write(pass2_dir / "shape_trace.txt", shape_trace)
 
     report = _compare_against_gold(result, root_kernel, dims)
+    _write(pass2_dir / "correctness_result.txt", report)
+
     if _overall_match(report):
-        composed_source = "\n\n".join(list(descendants.values()) + [root_dsl])
+        _write(pass2_dir / "status.txt", "PASS")
         return {"success": True, "root_dsl": composed_source}
+
+    first_line = report.splitlines()[0] if report else "(empty)"
+    _write(pass2_dir / "status.txt", f"MISMATCH: {first_line}")
     log(f"[pass2] root mismatch: {report[:200]}")
     return {"success": False, "failing_node": tree.root.path,
             "exec_log": report}
@@ -2491,6 +2729,7 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
         tree=tree, pass1_dsls=pass1_dsls,
         dims=dims, tensors=tensors,
         root_kernel=root_kernel, ckpt_root=ckpt_root, log=log,
+        plan_iter=plan_iter,
     )
     if not pass2["success"]:
         return {"success": False,
@@ -2584,6 +2823,13 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             tensors=tensors,
         )
         tree = Tree(root=root_node)
+    # Globally disambiguate node names BEFORE pass-1 / pass-2 see the tree.
+    # Idempotent — a tree loaded from disk that's already unique is unchanged.
+    from src.planner import disambiguate_tree
+    tree, renamed = disambiguate_tree(tree)
+    if renamed:
+        log(f"[planner] iteration {plan_iter}: disambiguated "
+            f"{len(renamed)} name collision(s): {renamed}")
     _persist_tree(tree, iter_dir)
     n_nodes = sum(1 for _ in tree.iter_topological())
     cached_n = sum(1 for n in tree.iter_topological()
@@ -2633,6 +2879,13 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             tensors=tensors,
         )
         tree = _replace_subtree(tree, owner.path, new_subtree)
+        # Re-run global disambiguation: the replanned subtree may have
+        # introduced fresh name collisions with surviving parts of the
+        # tree. Idempotent for the unchanged portion.
+        tree, renamed = disambiguate_tree(tree)
+        if renamed:
+            log(f"[planner] iteration {plan_iter + 1}: disambiguated "
+                f"{len(renamed)} name collision(s) post-replan: {renamed}")
         replans_used += 1
         plan_iter += 1
         _persist_tree(tree, next_iter_dir)
@@ -2832,6 +3085,7 @@ async def run_kernel(
     non_root_sequential: bool = True,
     max_plan_depth: int | None = 3,
     resume_planner: str | None = None,
+    resume_after_pass1: str | None = None,
     stateless_refactor: bool = False,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
@@ -3015,6 +3269,20 @@ async def run_kernel(
               f"({sum(1 for _ in resumed_tree.iter_topological())} nodes, "
               f"{len(verified_cache)} cached DSLs)")
 
+    if resume_after_pass1 is not None:
+        assert plan_enabled, "--resume-after-pass1 requires plan_enabled (no --no-plan)"
+        resume_dir = Path(resume_after_pass1)
+        assert resume_dir.is_dir(), (
+            f"--resume-after-pass1: not a directory: {resume_dir}")
+        # Load+report up front so a missing tree / empty pass1 surfaces here
+        # rather than inside the per-outer body where the failure is harder
+        # to relate to a CLI mistake.
+        _resume_tree = _load_tree_from_dir(resume_dir)
+        _resume_dsls = _load_verified_dsls(resume_dir)
+        n_nodes = sum(1 for _ in _resume_tree.iter_topological())
+        print(f"  Resume-after-pass1 source: {resume_dir} "
+              f"({n_nodes} tree node(s), {len(_resume_dsls)} cached DSL(s))")
+
     # Run all outer iterations in parallel — they are independent attempts.
     # Each outer that has plan_enabled runs its own planner phase + refactor walk
     # (so we get max_outer parallel attempts at the lowering stage, restoring
@@ -3045,6 +3313,7 @@ async def run_kernel(
             resumed_tree=resumed_tree,
             verified_cache=verified_cache,
             resume_planner_dir=Path(resume_planner) if resume_planner else None,
+            resume_after_pass1_dir=Path(resume_after_pass1) if resume_after_pass1 else None,
             stateless_refactor=stateless_refactor,
         ))
 
@@ -3152,6 +3421,7 @@ async def _run_outer_iteration_body(
     resumed_tree=None,
     verified_cache: dict[str, str] | None = None,
     resume_planner_dir: Path | None = None,
+    resume_after_pass1_dir: Path | None = None,
     stateless_refactor: bool = False,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
@@ -3192,7 +3462,63 @@ async def _run_outer_iteration_body(
     # Phase 1: Lowering pass (refactor_final). Skipped on resume and on
     # direct pipelines (which have lowering_passes == []).
     # ============================================================
-    if resume_dsl_code is not None:
+    if resume_after_pass1_dir is not None:
+        # Skip planner + pass1 entirely. Copy plan/ and pass1/ from the source
+        # outer dir so this run is self-contained, then load tree + DSLs and
+        # run only pass2 composition. Failures here exit the iteration cleanly
+        # — no replan loop (replan would force pass1 to re-run, contradicting
+        # the resume contract).
+        for sub in ("plan", "pass1"):
+            src = resume_after_pass1_dir / sub
+            if src.is_dir():
+                shutil.copytree(src, outer_dir / sub, dirs_exist_ok=True)
+        log(f"  Resume-after-pass1: copied plan/ + pass1/ from {resume_after_pass1_dir}")
+
+        tree = _load_tree_from_dir(outer_dir)
+        pass1_dsls = _load_verified_dsls(outer_dir)
+        missing = [n.path for n in tree.iter_topological()
+                   if n.path not in pass1_dsls]
+        if missing:
+            msg = (f"resume-after-pass1: {len(missing)} node(s) without cached "
+                   f"PASS DSL — cannot compose. Missing: {missing}")
+            log(f"  -> FAILED: {msg}")
+            print(f"{tag} FAILED — {msg}")
+            log_file.close()
+            return {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "total_tokens": 0,
+                "cycle_count": None,
+                "final_diagnosis": msg,
+            }
+
+        log(f"  Running pass2 compose on {len(pass1_dsls)} cached DSL(s)")
+        pass2 = _pass2_compose(
+            tree=tree, pass1_dsls=pass1_dsls,
+            dims=dims, tensors=tensors,
+            root_kernel=kernel_name, ckpt_root=outer_dir, log=log,
+        )
+        if not pass2["success"]:
+            msg = f"pass2 mismatch on resume: {pass2.get('exec_log', '')[:200]}"
+            log(f"  -> FAILED: {msg}")
+            print(f"{tag} FAILED — pass2 mismatch on resume")
+            log_file.close()
+            return {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "total_tokens": 0,
+                "cycle_count": None,
+                "final_diagnosis": msg,
+            }
+        dsl_code = pass2["root_dsl"]
+        _write(outer_dir / "dsl_code.py", dsl_code)
+        log(f"  -> Pass2 OK on resume ({len(dsl_code)} chars)")
+        print(f"{tag} Pass2 OK on resume — proceeding to translation")
+    elif resume_dsl_code is not None:
         dsl_code = resume_dsl_code
         _write(outer_dir / "dsl_code.py", dsl_code)
         log(f"  Resumed from checkpoint — using saved dsl_code ({len(dsl_code)} chars)")

@@ -55,6 +55,7 @@ def test_nonroot_prompt_includes_contract():
         tiled_values=(torch.randn(2, 4, 2, 4, 4, 4),),
         out_shapes=((2, 4, 2, 4, 4, 4),),
         out_perms=(None,),
+        arg_is_raw=(False,),
     )
     prompt = build_pass1_user_prompt(
         node_name="attention",
@@ -69,6 +70,10 @@ def test_nonroot_prompt_includes_contract():
     assert "(2, 4, 2, 4, 4, 4)" in prompt   # tiled shape rendered
     assert "(2, 4, 8, 16)" in prompt         # vanilla shape rendered
     assert "single tensor" in prompt         # one-output indicator
+    # The single arg's row should carry the on-chip tag.
+    arg_row = next(l for l in prompt.splitlines() if "`Q`" in l)
+    assert "**on-chip**" in arg_row
+    assert "**RAW**" not in arg_row
 
 
 def test_nonroot_prompt_renders_multi_output_contract():
@@ -82,6 +87,7 @@ def test_nonroot_prompt_renders_multi_output_contract():
         tiled_values=(torch.randn(4, 96),),
         out_shapes=((4, 4, 4, 8), (4, 4, 1, 8), (4, 4, 1, 8)),
         out_perms=(None, (1, 0, 2, 3), None),
+        arg_is_raw=(True,),
     )
     prompt = build_pass1_user_prompt(
         node_name="preprocess_heads",
@@ -103,3 +109,40 @@ def test_nonroot_prompt_renders_multi_output_contract():
     assert "out_perms" in prompt
     # Number-of-outputs indicator
     assert "Number of outputs: 3" in prompt
+    # The single arg's row should carry the RAW tag.
+    arg_row = next(l for l in prompt.splitlines() if "`x`:" in l)
+    assert "**RAW**" in arg_row
+
+
+def test_nonroot_prompt_mixes_raw_and_onchip_args():
+    """Mixed arg list: one on-chip (sibling DSL output), one raw (forwarded
+    weight). Both tags should appear, paired with the right arg name."""
+    import torch
+    contract = Contract(
+        arg_names=("x_stream", "weight"),
+        vanilla_shapes=((4, 16), (16, 16)),
+        tiled_shapes=((4, 1, 16), (16, 16)),
+        tiled_values=(torch.randn(4, 1, 16), torch.randn(16, 16)),
+        out_shapes=((4, 1, 16),),
+        out_perms=(None,),
+        arg_is_raw=(False, True),
+    )
+    prompt = build_pass1_user_prompt(
+        node_name="proj",
+        is_root=False,
+        reference_code="class Model: ...",
+        dims={"S": 4},
+        tensors={},
+        contract=contract,
+        children_signatures=[],
+        function_signature="def proj(x_stream, weight, *, out_shapes, out_perms=None):",
+    )
+    # Both tags rendered.
+    assert "**on-chip**" in prompt
+    assert "**RAW**" in prompt
+    # Tag pairs with the correct arg name on the same line.
+    onchip_lines = [l for l in prompt.splitlines() if "**on-chip**" in l]
+    raw_lines = [l for l in prompt.splitlines() if "**RAW**" in l and "loaded" not in l]
+    # The single arg-row each.
+    assert any("`x_stream`" in l for l in onchip_lines)
+    assert any("`weight`" in l for l in raw_lines)

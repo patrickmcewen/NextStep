@@ -60,6 +60,16 @@ def main():
                              "and any per-node verified DSLs (from <OUTER_DIR>/refactor/.../"
                              "extracted_code.py with status PASS), then re-runs only the "
                              "non-verified nodes. Mutually exclusive with --resume.")
+    parser.add_argument("--resume-after-pass1", default=None, metavar="OUTER_DIR",
+                        help="Resume an outer iteration after pass1 completed but pass2 "
+                             "(or downstream translation) failed. Loads the saved tree "
+                             "and per-node verified DSLs from <OUTER_DIR>, then runs ONLY "
+                             "pass2 composition + translation — planner and pass1 LLM are "
+                             "skipped entirely. Requires every node in the tree to have "
+                             "a cached PASS DSL; fails fast with the missing list "
+                             "otherwise. Forces --max-outer=1 since the operation is "
+                             "deterministic. Mutually exclusive with --resume / "
+                             "--resume-planner.")
     parser.add_argument("--few-shot", nargs="+", default=None, metavar="PATH",
                         help="Optional paths to previously completed step program "
                              "directories. Each contributes a PyTorch→DSL example pair "
@@ -133,11 +143,23 @@ def main():
     )
     args = parser.parse_args()
 
-    assert not (args.resume and args.resume_planner), (
-        "--resume and --resume-planner are mutually exclusive: --resume skips "
-        "lowering entirely (final dsl_code.py needed); --resume-planner re-runs "
-        "lowering using a saved tree + per-node verified DSLs."
+    _resume_modes_set = sum(
+        1 for m in (args.resume, args.resume_planner, args.resume_after_pass1) if m
     )
+    assert _resume_modes_set <= 1, (
+        "--resume, --resume-planner, and --resume-after-pass1 are pairwise "
+        "mutually exclusive. --resume skips lowering entirely (final "
+        "dsl_code.py needed); --resume-planner re-runs pass1 using a saved "
+        "tree + per-node verified DSLs (verified_cache is currently not wired "
+        "through, so pass1 runs from scratch); --resume-after-pass1 skips "
+        "planner + pass1 entirely and runs only pass2 composition + translation."
+    )
+
+    if args.resume_after_pass1 and args.max_outer != 1:
+        # The resume operation is deterministic — running it across N parallel
+        # outers just produces N identical results. Force 1 to save compute.
+        print(f"--resume-after-pass1 forces --max-outer=1 (was {args.max_outer})")
+        args.max_outer = 1
 
     llm_config = load_llm_config(args.config, args.model)
 
@@ -169,6 +191,7 @@ def main():
         non_root_sequential=args.non_root_sequential,
         max_plan_depth=args.max_plan_depth,
         resume_planner=args.resume_planner,
+        resume_after_pass1=args.resume_after_pass1,
         stateless_refactor=args.stateless_refactor,
     ))
 

@@ -1,4 +1,8 @@
-from src.orchestrator import _check_banned_ops, _check_dataflow_invariant
+from src.orchestrator import (
+    _check_banned_ops,
+    _check_dataflow_invariant,
+    _extract_call_site_rawness,
+)
 
 
 REFACTOR_PASS = "refactor_final"   # the existing standalone-mode pass key
@@ -264,3 +268,175 @@ def tiled_reference(dims, tensors):
         extra_required_ops=("moe_path",),
     )
     assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# Raw-positional-arg rule: a non-root function whose contract tags a positional
+# arg as raw must `offchip_load` (or another producer) it before feeding it to
+# any DSL consumer. Blackbox-child call sites remain exempt.
+# ---------------------------------------------------------------------------
+
+def test_raw_positional_arg_into_consumer_is_flagged():
+    """Forwarded raw weight fed straight into binary_matmul must be flagged."""
+    code = '''
+def attention_o_proj(Q, weight, *, out_shapes, out_perms=None):
+    out = binary_matmul(Q, weight)
+    return out
+'''
+    violations = _check_dataflow_invariant(
+        code,
+        blackbox_names=(),
+        raw_arg_names=frozenset({"weight"}),
+    )
+    assert any("weight" in v and "binary_matmul" in v for v in violations), violations
+
+
+def test_raw_positional_arg_loaded_first_is_ok():
+    """Same code with offchip_load on the raw weight must pass."""
+    code = '''
+def attention_o_proj(Q, weight, *, out_shapes, out_perms=None):
+    W = offchip_load(weight, ...)
+    out = binary_matmul(Q, W)
+    return out
+'''
+    violations = _check_dataflow_invariant(
+        code,
+        blackbox_names=(),
+        raw_arg_names=frozenset({"weight"}),
+    )
+    assert violations == []
+
+
+def test_raw_positional_arg_into_blackbox_is_ok():
+    """Raw arg may flow straight into a child blackbox without a load."""
+    code = '''
+def parent(x, weight, *, out_shapes, out_perms=None):
+    out = inner(x, weight, out_shapes=((4, 1, 8),))
+    return out
+'''
+    violations = _check_dataflow_invariant(
+        code,
+        blackbox_names=("inner",),
+        raw_arg_names=frozenset({"weight"}),
+    )
+    assert violations == []
+
+
+def test_onchip_positional_arg_no_load_required():
+    """An on-chip positional arg (parent fed in a streamed value) feeds
+    consumers directly — no load required."""
+    code = '''
+def proj(x_stream, *, out_shapes, out_perms=None):
+    return unary_square(x_stream)
+'''
+    violations = _check_dataflow_invariant(
+        code,
+        blackbox_names=(),
+        raw_arg_names=frozenset(),  # no raw args
+    )
+    assert violations == []
+
+
+def test_method_chain_on_raw_arg_into_consumer_is_flagged():
+    """``raw_arg.reshape(...)`` then into a consumer must still be flagged
+    because the receiver classification propagates via _classify_value."""
+    code = '''
+def proj(weight, *, out_shapes, out_perms=None):
+    return unary_square(weight.reshape(4, 8))
+'''
+    violations = _check_dataflow_invariant(
+        code,
+        blackbox_names=(),
+        raw_arg_names=frozenset({"weight"}),
+    )
+    assert any("weight" in v and "unary_square" in v for v in violations), violations
+
+
+# ---------------------------------------------------------------------------
+# Static rawness extractor over a parent's verified code.
+# ---------------------------------------------------------------------------
+
+def test_extractor_classifies_root_call_site():
+    """At the root, every `tensors[...]` arg is raw; blackbox returns are on-chip."""
+    code = '''
+def tiled_reference(dims, tensors):
+    Q, K, V = pre_attention(tensors["x"], tensors["q_proj"],
+                             out_shapes=((4,1,8),(4,1,8),(4,1,8)))
+    out = attention_o_proj(Q, K, V, tensors["o_proj_weight"], tensors["x"],
+                            out_shapes=((4,1,8),))
+    return offchip_store(out)
+'''
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("pre_attention", "attention_o_proj"),
+        blackbox_names=("pre_attention", "attention_o_proj"),
+    )
+    assert rawness["pre_attention"] == (True, True)
+    # Q, K, V are blackbox returns (on-chip); o_proj_weight + x are raw.
+    assert rawness["attention_o_proj"] == (False, False, False, True, True)
+
+
+def test_extractor_propagates_parent_raw_args():
+    """A non-root parent forwarding its own raw arg keeps it raw at the
+    grandchild's call site — only when ``parent_raw_arg_names`` is fed in."""
+    code = '''
+def pre_attention(input_tensor, q_proj, k_proj, v_proj, cos, sin,
+                   *, out_shapes, out_perms=None):
+    Q, K, V = pre_attn_norm_and_proj(
+        input_tensor, q_proj, k_proj, v_proj, cos,
+        out_shapes=out_shapes,
+    )
+    Q, K, V = per_head_norm_and_rope(
+        Q, K, V, cos, sin, out_shapes=out_shapes,
+    )
+    return Q, K, V
+'''
+    parent_raw = frozenset({
+        "input_tensor", "q_proj", "k_proj", "v_proj", "cos", "sin",
+    })
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("pre_attn_norm_and_proj", "per_head_norm_and_rope"),
+        blackbox_names=("pre_attn_norm_and_proj", "per_head_norm_and_rope"),
+        parent_raw_arg_names=parent_raw,
+    )
+    # First call: every arg is a forwarded raw arg.
+    assert rawness["pre_attn_norm_and_proj"] == (True, True, True, True, True)
+    # Second call: Q/K/V come from the prior blackbox (on-chip); cos/sin are
+    # forwarded raw args from the parent.
+    assert rawness["per_head_norm_and_rope"] == (False, False, False, True, True)
+
+
+def test_extractor_records_only_first_call():
+    """Contracts are recorded on first stub invocation; the extractor must
+    mirror that by classifying the first textual call site only."""
+    code = '''
+def parent(x, weight, *, out_shapes, out_perms=None):
+    a = inner(x, out_shapes=((4,1,8),))
+    b = inner(weight, out_shapes=((4,1,8),))
+    return b
+'''
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("inner",),
+        blackbox_names=("inner",),
+        parent_raw_arg_names=frozenset({"weight"}),
+    )
+    # First call passes ``x`` (on-chip intermediate arg).
+    assert rawness["inner"] == (False,)
+
+
+def test_extractor_handles_dsl_producer_arg():
+    """An arg whose name was assigned from a DSL producer is on-chip."""
+    code = '''
+def tiled_reference(dims, tensors):
+    x = offchip_load(tensors["x"], ...)
+    out = child(x, out_shapes=((4,1,8),))
+    return offchip_store(out)
+'''
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("child",),
+        blackbox_names=("child",),
+    )
+    assert rawness["child"] == (False,)

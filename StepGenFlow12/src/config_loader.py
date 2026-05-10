@@ -6,7 +6,7 @@ from pathlib import Path
 _CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "configs"
 
 
-def load_llm_config(config_path: str | None, model: str) -> dict:
+def load_llm_config(config_path, model: str) -> dict:
     """Return the LLM config dict for this invocation.
 
     If ``config_path`` is given, load that file directly.

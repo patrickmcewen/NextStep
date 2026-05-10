@@ -690,6 +690,27 @@ def build_pass1_user_prompt(
     # Contract block — non-root only
     if not is_root:
         assert contract is not None, "Non-root node must have a Contract"
+        assert len(contract.arg_is_raw) == len(contract.arg_names), (
+            "Non-root contract must have arg_is_raw stamped (length must "
+            f"match arg_names); got arg_is_raw={contract.arg_is_raw!r}, "
+            f"arg_names={contract.arg_names!r}"
+        )
+        # Leaves have no children, so the "may pass to child blackbox" /
+        # "or child blackbox in parent's body" clauses are stripped.
+        raw_tag = (
+            "  - **RAW**: the parent forwarded an off-chip tensor that has "
+            "not yet passed through a DSL source operator. Before feeding it "
+            "to any DSL consumer (binary_*, unary_*, accum_*, reshape_*, "
+            "promote_*, …) you must load it with `offchip_load` (or another "
+            "producer like `select_gen` / `metadata_gen`)."
+        )
+        if has_children:
+            raw_tag += " It may still be passed straight to a child blackbox without loading."
+        onchip_tag = (
+            "  - **on-chip**: already produced by a sibling DSL op"
+            + (" or child blackbox" if has_children else "")
+            + " in the parent's body — pass it directly to consumers."
+        )
         lines.extend([
             "",
             "### Contract (declared by parent)",
@@ -697,13 +718,19 @@ def build_pass1_user_prompt(
             "Your parent has called your stub with these inputs. You must handle",
             "exactly this call site — do not change the function signature.",
             "",
+            "Each input is tagged **RAW** or **on-chip**:",
+            raw_tag,
+            onchip_tag,
+            "",
         ])
-        for arg_name, vanilla_shape, tiled_shape in zip(
-            contract.arg_names, contract.vanilla_shapes, contract.tiled_shapes
+        for arg_name, vanilla_shape, tiled_shape, raw in zip(
+            contract.arg_names, contract.vanilla_shapes, contract.tiled_shapes,
+            contract.arg_is_raw,
         ):
+            tag = "**RAW**" if raw else "**on-chip**"
             lines.append(
                 f"  `{arg_name}`: vanilla shape {vanilla_shape}, "
-                f"tiled shape declared by parent {tiled_shape}"
+                f"tiled shape declared by parent {tiled_shape} — {tag}"
             )
         lines.extend([
             "",

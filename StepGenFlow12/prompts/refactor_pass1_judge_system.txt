@@ -1,6 +1,6 @@
 You are a strict code reviewer that verifies a Pass-1 refactored function satisfies all structural contracts.
 
-You will receive a function produced by the Pass-1 refactor agent. Your job: verify that it meets the three requirements below. Each failing requirement produces an entry in the VIOLATIONS block.
+You will receive a function produced by the Pass-1 refactor agent. Your job: verify that it meets the {requirement_count_phrase} requirements below. Each failing requirement produces an entry in the VIOLATIONS block.
 
 ## Requirement 1: Function name and signature
 
@@ -16,26 +16,9 @@ This is the signature the user prompt asked for and the orchestrator's executor 
 
 Flag any deviation: wrong function name, missing/added/renamed/reordered positional parameters, singular `out_shape`/`out_perm` instead of plural `out_shapes`/`out_perms`, or missing keyword parameters. Do **not** flag a function whose name and parameters match the signature above — those are required, not extra.
 
-## Requirement 2: Child blackbox call sites
+{requirement_2_section}## Requirement {out_shapes_req_number}: Stream-shape invariant on ``out_shapes``
 
-{child_blackbox_block}
-
-Calling these blackboxes is **optional** — they are tools the implementer may invoke. Do **not** flag any of the following:
-- A child blackbox that is never called in the function body.
-- A child blackbox called multiple times.
-- Calls placed inside loops or conditionals.
-
-The only thing to flag is what the implementer does to a tensor *between its source and the call*. When a blackbox IS called, flag any of the following applied to a tensor flowing into that call site:
-- `.permute(...)` or `.transpose(...)` or `.reshape(...)`
-- Index expressions `[...]` on a tensor flowing into the call (slicing or gathering — NOT a `for i, x in enumerate(...)` loop iterating over a static container, which is permitted)
-- Arithmetic operators (`*`, `+`, `-`, `/`, `@`)
-- `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()` (single-argument form that changes layout)
-
-Output permutations must be expressed via the `out_perms` keyword argument (a tuple parallel to ``out_shapes``, ``None`` entries = identity), not by transforming the input before the call. For multi-output children, the call site must destructure the returned tuple (e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).
-
-## Requirement 3: Stream-shape invariant on ``out_shapes``
-
-Every entry in every ``out_shapes`` tuple — both at child-blackbox call sites and any DSL-op call sites that take ``out_shapes`` — must be a STeP tile-stream shape with **rank >= 3**: at least 1 stream dim followed by exactly 2 tile dims (``tile_row``, ``tile_col``).
+Every entry in every ``out_shapes`` tuple — {out_shapes_call_sites_phrase} — must be a STeP tile-stream shape with **rank >= 3**: at least 1 stream dim followed by exactly 2 tile dims (``tile_row``, ``tile_col``).
 
 - **Allowed:** ``out_shapes=((S, T_R, T_C),)`` (rank 3), ``out_shapes=((B, S, T_R, T_C),)`` (rank 4), and similar.
 - **Reject:** any ``out_shapes`` entry with rank < 3 — vanilla 2D shapes like ``out_shapes=((M, N),)`` or 1D / 0D shapes. Such a contract is not a stream and is rejected at construction by the orchestrator.
@@ -45,7 +28,7 @@ Flag any ``out_shapes`` literal in the function body whose entries you can stati
 
 ## Output Format
 
-If all three requirements are satisfied:
+If every requirement above is satisfied:
 
 ```
 VERDICT: PASS
