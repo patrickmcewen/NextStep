@@ -522,7 +522,7 @@ def _run_graph_correctness(code, kernel_name, dims, tensors, *,
     from timing_and_emulator.functional import execute
     graph, output_op = _exec_build_graph(code, dims, tensors)
     try:
-        sim = execute(graph, output_op)
+        sim = execute(graph, output_op, input_tensors=tensors)
     except Exception as exc:
         # Enhance emulator errors with node + user code context
         stripped = code.replace("import ", "# import ")  # strip imports for line matching
@@ -577,6 +577,7 @@ _PASS_RULES: dict[str, dict] = {
             ("torch.exp",    "use unary_exp(x)"),
             ("torch.rsqrt",  "use unary_rsqrt(x)"),
             ("F.silu",       "use unary_silu(x)"),
+            (".float(",      "changing dtype is not allowed")
             #("out_shape_tiled=(1,)",
             # "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
         ],
@@ -686,6 +687,21 @@ _DSL_CONSUMERS: frozenset[str] = frozenset({
     # Sink
     "offchip_store", "random_offchip_store",
 })
+
+# DSL producers that ingest a raw off-chip tensor in one of their slots; value
+# is ``(arg_name, positional_index)`` for that slot. Producers absent from this
+# map (``expert_addr_gen``, ``cache_read_addr_gen``, ``filter_last_tile``)
+# operate on on-chip streams or scalars and aren't subject to the corollary
+# check. ``offchip_load_ref.ref`` and ``random_offchip_load.raddr`` are on-chip
+# stream slots on those producers, so we point at the raw slot only.
+_PRODUCER_RAW_ARG_POS: dict[str, tuple[str, int]] = {
+    "offchip_load":         ("underlying", 0),
+    "offchip_load_ref":     ("underlying", 1),
+    "dyn_offchip_load":     ("underlying", 0),
+    "random_offchip_load":  ("underlying", 0),
+    "select_gen":           ("underlying", 0),
+    "metadata_gen":         ("tensor", 0),
+}
 
 # Source classifications for a Name's binding, used by the dataflow walk.
 _SRC_PRODUCER = "producer"
@@ -868,6 +884,33 @@ def _check_consumer_arg(arg: ast.AST,
     return None
 
 
+def _check_producer_arg(arg: ast.AST,
+                         name_to_source: dict[str, str],
+                         blackbox_set: frozenset[str],
+                         *, op: str, arg_name: str) -> str | None:
+    """Return a violation message if ``arg`` is an on-chip stream being fed
+    into a DSL source op's raw-tensor slot; ``None`` otherwise.
+
+    Source ops (``offchip_load`` and friends) ingest a raw off-chip tensor.
+    Their raw-tensor argument must be ``tensors["X"]`` or a forwarded raw
+    intermediate. Passing an already-on-chip value (output of a DSL op or
+    blackbox child, or an intermediate arg the parent populated from a child
+    return) means the value isn't a raw tensor; at translation time this
+    surfaces deep inside STeP IR as
+    ``'<NodeClass>' object has no attribute 'dtype'``. Conservative: only
+    on-chip sources are flagged; raw / unknown / non-tensor sources pass.
+    """
+    src = _classify_value(arg, name_to_source, blackbox_set)
+    if src not in _ONCHIP_SOURCES:
+        return None
+    label = f"`{arg.id}`" if isinstance(arg, ast.Name) else "an on-chip expression"
+    return (f"- `{op}` receives {label} for {arg_name!r}, which is already "
+            f"on-chip (bound from a DSL op or blackbox child). Source ops "
+            f"require a raw off-chip tensor (`tensors[\"X\"]` or a forwarded "
+            f"raw intermediate arg). To re-tile an on-chip stream, use "
+            f"`bufferize` / `streamify` / `retile_streamify` / `restream` instead.")
+
+
 def _build_name_to_source(func: ast.FunctionDef,
                            blackbox_set: frozenset[str],
                            raw_arg_names: frozenset[str]) -> dict[str, str]:
@@ -908,27 +951,89 @@ def _build_name_to_source(func: ast.FunctionDef,
 def _check_func_dataflow(func: ast.FunctionDef,
                           blackbox_set: frozenset[str],
                           raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
-    """Per-function dataflow check; see ``_check_dataflow_invariant``."""
-    name_to_source = _build_name_to_source(func, blackbox_set, raw_arg_names)
+    """Per-function dataflow check; see ``_check_dataflow_invariant``.
 
-    # Every DSL-consumer call's tensor arg must be on-chip.
+    Flow-sensitive: bindings are tracked as the body executes, so a parameter
+    that gets shadowed mid-function (e.g. ``w_gate = flatten(w_gate_tile, ...)``
+    after an earlier ``random_offchip_load(w_gate, addr, ...)``) is checked
+    against its incoming source at the earlier use site, not the post-shadow
+    one. Without this, a legitimate producer call on a still-raw parameter
+    would be flagged as on-chip after the rebind.
+
+    The classification dict is mutated in place across branches; if/else
+    branches don't fork the state, so a binding made in one branch leaks to
+    the other. That can mask a real consumer/producer violation in the
+    second branch (false negative) but never invents one (the bias matches
+    the existing ``conservative`` consumer check). Forking is left as
+    follow-up if real DSL output starts to need it.
+    """
+    name_to_source: dict[str, str] = {}
+    for arg in func.args.args:
+        if arg.arg in {"dims", "tensors", "self"}:
+            continue
+        name_to_source[arg.arg] = (
+            _SRC_RAW_INTERMEDIATE_ARG if arg.arg in raw_arg_names
+            else _SRC_INTERMEDIATE_ARG)
+    for arg in func.args.kwonlyargs:
+        name_to_source[arg.arg] = _SRC_NON_TENSOR
+
     violations: list[str] = []
-    for node in _walk_no_nested_def(func):
-        if not isinstance(node, ast.Call):
-            continue
-        call_name = _call_name(node)
-        if call_name not in _DSL_CONSUMERS:
-            continue
-        for arg in node.args:
-            v = _check_consumer_arg(arg, name_to_source, blackbox_set, op=call_name)
-            if v is not None:
-                violations.append(v)
-        for kw in node.keywords:
-            if kw.arg is None:  # **kwargs unpacking — skip
+
+    def check_call(call: ast.Call) -> None:
+        cname = _call_name(call)
+        if cname in _DSL_CONSUMERS:
+            for a in call.args:
+                v = _check_consumer_arg(a, name_to_source, blackbox_set, op=cname)
+                if v is not None:
+                    violations.append(v)
+            for kw in call.keywords:
+                if kw.arg is None:  # **kwargs unpacking — skip
+                    continue
+                v = _check_consumer_arg(kw.value, name_to_source, blackbox_set, op=cname)
+                if v is not None:
+                    violations.append(v)
+        elif cname in _PRODUCER_RAW_ARG_POS:
+            arg_name, pos = _PRODUCER_RAW_ARG_POS[cname]
+            kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+            a = kwargs.get(arg_name)
+            if a is None and pos < len(call.args):
+                a = call.args[pos]
+            if a is not None:
+                v = _check_producer_arg(a, name_to_source, blackbox_set,
+                                         op=cname, arg_name=arg_name)
+                if v is not None:
+                    violations.append(v)
+
+    def scan(stmts: list) -> None:
+        for stmt in stmts:
+            # Nested defs are their own scope; the outer ``ast.walk`` in
+            # ``_check_dataflow_invariant`` visits each FunctionDef and calls
+            # this checker on it independently, so we skip them here.
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            v = _check_consumer_arg(kw.value, name_to_source, blackbox_set, op=call_name)
-            if v is not None:
-                violations.append(v)
+            # 1. Check every Call inside this statement against current bindings.
+            for sub in ast.walk(stmt):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if isinstance(sub, ast.Call):
+                    check_call(sub)
+            # 2. Apply binding updates so subsequent statements see the new src.
+            if isinstance(stmt, ast.Assign):
+                src = _classify_value(stmt.value, name_to_source, blackbox_set)
+                for tgt in stmt.targets:
+                    _bind_target(tgt, src, name_to_source)
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                src = _classify_value(stmt.value, name_to_source, blackbox_set)
+                _bind_target(stmt.target, src, name_to_source)
+            # 3. Recurse into control-flow bodies in execution order.
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                scan(stmt.body)
+                scan(stmt.orelse)
+            elif isinstance(stmt, ast.If):
+                scan(stmt.body)
+                scan(stmt.orelse)
+
+    scan(func.body)
     return violations
 
 
