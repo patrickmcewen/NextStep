@@ -662,6 +662,72 @@ def check_compose(original_reference_code: str,
             )
 
 
+def check_children_called_with_tensors_only(refactored_parent_code: str,
+                                              children: list,
+                                              dims: dict,
+                                              original_reference_code: str) -> None:
+    """Every parent→child call site must pass tensors only.
+
+    Pass-1 records each child call's args as a per-position ``(name, shape)``
+    contract and replays them through a blackbox stub; a Python int or other
+    scalar at any call-site position cannot be expressed in that contract or
+    in the DSL the child gets lowered to, so it has to be rejected here
+    rather than crashing later in ``_build_node_index``. Function-based
+    parents (``forward(self, dims, tensors)``) are skipped — they're already
+    rejected at ``refactor_tree`` entry.
+    """
+    if not has_class_model(original_reference_code):
+        return
+
+    orig_ns: dict = {}
+    exec(original_reference_code, orig_ns)
+    inputs = orig_ns["get_inputs"](dims)
+    if isinstance(inputs, list):
+        inputs = tuple(inputs)
+    elif not isinstance(inputs, tuple):
+        inputs = (inputs,)
+
+    new_ns: dict = {}
+    for child in children:
+        child_ns: dict = {}
+        exec(child.reference_code, child_ns)
+        new_ns[f"{_camel_case(child.name)}Model"] = child_ns["Model"]
+    exec(refactored_parent_code, new_ns)
+    parent_model = new_ns["Model"]()
+
+    child_attr_names = {c.name for c in children}
+    captured: dict = {}
+    hooks = []
+    for attr_name, submodule in parent_model.named_children():
+        if attr_name in child_attr_names:
+            def make_hook(cname):
+                def hook(_module, args):
+                    captured.setdefault(cname, args)
+                return hook
+            hooks.append(submodule.register_forward_pre_hook(make_hook(attr_name)))
+
+    with torch.no_grad():
+        parent_model(*inputs)
+    for h in hooks:
+        h.remove()
+
+    for child in children:
+        if child.name not in captured:
+            continue  # check_no_dead_children already covers unreached children
+        for i, arg in enumerate(captured[child.name]):
+            if not isinstance(arg, torch.Tensor):
+                raise GuardFailure(
+                    f"child {child.name!r} is called with a non-tensor arg at "
+                    f"position {i} (type={type(arg).__name__}, value={arg!r}). "
+                    f"Every parent→child call must pass tensors only — Python "
+                    f"scalars (loop indices, integer flags, etc.) cannot be "
+                    f"recorded in the per-child contract or lowered to DSL. "
+                    f"Restructure so this position is a tensor (e.g. expand a "
+                    f"per-expert loop over a one-hot routing tensor) or absorb "
+                    f"the iteration into the child."
+                )
+
+
 def build_node_tensors(reference_code: str, dims: dict) -> dict:
     """Run ``get_inputs(dims)`` and zip the resulting tuple with the names of
     ``Model.forward``'s positional arguments (excluding ``self``).
@@ -859,6 +925,8 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             check_compose(reference_code, refactored_full,
                           list(children_full), dims,
                           tensors=tensors if not has_class_model(reference_code) else None)
+            check_children_called_with_tensors_only(
+                refactored_full, list(children_full), dims, reference_code)
         except GuardFailure as exc:
             log(f"[planner] node={path!r} attempt {attempt + 1}: GUARD FAILED ({exc}) — retrying")
             _set_status(f"GUARD_FAILED: {exc}")

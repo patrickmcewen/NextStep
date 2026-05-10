@@ -646,12 +646,14 @@ def build_pass1_user_prompt(
     if has_children:
         ref_header = "### PyTorch Reference (planner-decomposed parent)"
         ref_note = (
-            "This is the planner's already-validated decomposition of this node. "
-            "The child sub-models it calls (held as `self.<child_name>` "
-            "attributes) correspond 1:1 to the blackboxes listed below — "
-            "your job is to replace each `self.<child_name>(args)` call with "
-            "`<child_name>(args, out_shapes=..., out_perms=...)`. Do not "
-            "re-derive the split; preserve the call structure."
+            "This is the planner's reference decomposition. Its "
+            "`self.<child_name>(args)` call sites correspond 1:1 to the "
+            "blackboxes listed below; replacing them with "
+            "`<child_name>(args, out_shapes=..., out_perms=...)` is the "
+            "expected default. Inlining a child's logic directly into your "
+            "DSL is also acceptable when it produces correct output — see "
+            "the 'Child Blackboxes Available' section. Do not change the "
+            "function signature."
         )
     else:
         ref_header = "### PyTorch Reference"

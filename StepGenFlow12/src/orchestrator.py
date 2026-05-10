@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2147,8 +2148,8 @@ def _build_node_index(tree, tensors: dict):
     return signatures, ref_modules
 
 
-async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures,
-                                    extras, dims, root_kernel, ckpt_root,
+async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
+                                    dims, root_kernel, ckpt_root,
                                     agent_factory, max_turns, log,
                                     node_attempts: int = 1,
                                     non_root_sequential: bool = True,
@@ -2162,10 +2163,15 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
     (the child names) into ``_run_pass_loop``.
 
     ``parent_contract`` is the Contract recorded by the grandparent's stub call, or
-    None for the root node.  ``children_signatures`` is a list of
-    ``(child_path, NodeSignature)`` pairs.  ``extras`` maps child name → stub callable.
+    None for the root node. ``children_meta`` is a list of
+    ``(child_path, child_name, NodeSignature, ref_module)`` tuples; per-attempt
+    ``ContractRecorder`` instances and stubs are built fresh inside
+    ``_one_attempt`` so contract state from a failed sibling attempt cannot
+    leak into the winner's harvest. The winner's recorders are returned in
+    ``result["child_recorders"]``.
     """
     from src.agents import make_pass1_agent, make_pass1_judge_agent
+    from src.blackbox_stub import ContractRecorder, make_stub
     from src.prompts import build_pass1_user_prompt
     from src.planner import build_node_tensors, has_class_model
 
@@ -2224,6 +2230,9 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         # Non-root: positional args are the tiled intermediate args from the contract
         sig_args = ", ".join(parent_contract.arg_names)
         function_signature = f"def {node.name}({sig_args}, *, out_shapes, out_perms=None):"
+
+    # children_signatures (path, sig) pairs are kept for prompt-shape compat.
+    children_signatures = [(m[0], m[2]) for m in children_meta]
 
     # Build child_blackbox_block and contract_block strings for the agent factory
     child_blackbox_block = ""
@@ -2373,7 +2382,22 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
         attempt_dir.mkdir(parents=True, exist_ok=True)
         attempt_log = _make_attempt_log(
             log, node.path, attempt_idx, node_attempts)
-        return await _run_pass_loop(
+        # Per-attempt recorders + stubs. Sharing one set across parallel
+        # attempts caused the harvester to read contracts that a failed
+        # sibling had recorded (see checkpoints/2026-05-10-013023 outer_0:
+        # attempt_1's failed run called expert_mlp(...), then attempt_0's
+        # winning run inlined it, leaving the harvester with a contract
+        # but no AST call site → "call-name resolution drift" assert).
+        child_recorders = {m[0]: ContractRecorder() for m in children_meta}
+        extras: dict = {}
+        for child_path, child_name, child_sig, child_ref in children_meta:
+            extras[child_name] = make_stub(
+                ref_module=child_ref,
+                arg_names=child_sig.arg_names,
+                vanilla_shapes=child_sig.arg_shapes,
+                recorder=child_recorders[child_path],
+            )
+        result = await _run_pass_loop(
             agent, "refactor_final",
             kernel_name=synth_name, dims=dims, max_turns=max_turns,
             ckpt_dir=attempt_dir, executor="dsl", tensors=node_tensors,
@@ -2390,6 +2414,10 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_signatures
             call_kwargs=call_kwargs,
             raw_arg_names=raw_arg_names_set,
         )
+        # Attach this attempt's recorders so the harvester reads only the
+        # winner's stub state, not a sibling's leftovers.
+        result["child_recorders"] = child_recorders
+        return result
 
     run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
 
@@ -2445,28 +2473,22 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
     Returns a dict mapping node.path -> result dict.  Each result dict has at
     least ``{"success": bool}``.  On success, ``result["dsl"]`` holds the
     verified DSL string.
+
+    Lenient child policy: a planned child whose stub never fired AND whose
+    name doesn't appear in the parent's verified code is treated as inlined.
+    The walk drops that subtree (no refactor, no contract, no pass2 entry)
+    instead of asserting. See orchestrator.py docstring on _pass1_walk for
+    the strict-mode alternative.
     """
-    from src.blackbox_stub import ContractRecorder, make_stub
-
-    # Build one blackbox stub per child, each backed by a ContractRecorder
-    child_recorders = {c.path: ContractRecorder() for c in node.children}
-    extras: dict = {}
-    for child in node.children:
-        sig = signatures[child.path]
-        extras[child.name] = make_stub(
-            ref_module=ref_modules[child.path],
-            arg_names=sig.arg_names,
-            vanilla_shapes=sig.arg_shapes,
-            recorder=child_recorders[child.path],
-        )
-
-    children_signatures = [(c.path, signatures[c.path]) for c in node.children]
+    children_meta = [
+        (c.path, c.name, signatures[c.path], ref_modules[c.path])
+        for c in node.children
+    ]
 
     result = await _refactor_one_node_pass1(
         node=node,
         parent_contract=parent_contract,
-        children_signatures=children_signatures,
-        extras=extras,
+        children_meta=children_meta,
         dims=dims,
         root_kernel=root_kernel,
         ckpt_root=ckpt_root,
@@ -2484,11 +2506,15 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
         return {node.path: result}
 
     # Harvest per-child contracts from the stubs the parent called.
+    # Recorders here are the WINNING attempt's recorders (per-attempt — see
+    # _refactor_one_node_pass1._one_attempt), so contract presence reflects
+    # only the verified code path, not failed sibling attempts.
     #
     # Stamp ``arg_is_raw`` onto each contract by statically classifying the
     # parent's verified code at the child's first call site. The parent's own
     # raw arg names (from its own contract) propagate so that an arg forwarded
     # raw through multiple levels stays raw.
+    winning_recorders = result.get("child_recorders", {})
     parent_raw_args = (
         frozenset()
         if parent_contract is None
@@ -2507,16 +2533,26 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
     )
 
     child_contracts: dict = {}
+    inlined_children: set[str] = set()
     for child in node.children:
-        c = child_recorders[child.path].contract
-        assert c is not None, (
-            f"Parent {node.path!r} succeeded Pass 1 without calling child "
-            f"blackbox {child.name!r} — compliance gate is broken")
-        assert child.name in rawness_map, (
-            f"Parent {node.path!r}: stub {child.name!r} fired (contract "
-            f"recorded) but no textual call site was found by the rawness "
-            f"extractor — call-name resolution drift between the runtime "
-            f"stub and the AST walk")
+        c = winning_recorders.get(child.path)
+        c = c.contract if c is not None else None
+        in_ast = child.name in rawness_map
+        if c is None and not in_ast:
+            # Lenient case: the winner inlined this child entirely. Drop the
+            # subtree from the refactor walk and from pass2 composition.
+            log(f"[pass1] node {node.path!r}: child {child.name!r} was "
+                f"inlined by the parent — pruning subtree from refactor walk")
+            inlined_children.add(child.path)
+            continue
+        # Anything else is real drift — per-attempt recorders should have
+        # eliminated the cross-attempt leakage that produced this case
+        # historically, so a half-set/half-AST state now indicates a genuine
+        # bug worth surfacing loudly.
+        assert c is not None and in_ast, (
+            f"Parent {node.path!r}: drift for child {child.name!r} "
+            f"(contract_recorded={c is not None}, in_ast={in_ast}) — "
+            f"per-attempt recorders should make this impossible; investigate")
         rawness = rawness_map[child.name]
         assert len(rawness) == len(c.arg_names), (
             f"Parent {node.path!r}: rawness tuple for child {child.name!r} "
@@ -2524,9 +2560,19 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
             f"{len(c.arg_names)} — call-site arity drift")
         child_contracts[child.path] = dataclasses.replace(c, arg_is_raw=rawness)
 
+    # Persist the inlined-children list so resume reads can reproduce the
+    # decision without re-running the rawness extractor.
+    if inlined_children:
+        node_pass1_dir = ckpt_root / "pass1" / f"iteration_{plan_iter}" / node.path
+        node_pass1_dir.mkdir(parents=True, exist_ok=True)
+        inlined_names = sorted(p.rsplit("/", 1)[-1] for p in inlined_children)
+        (node_pass1_dir / "inlined_children.txt").write_text(
+            "\n".join(inlined_names) + "\n")
+
     out: dict = {node.path: {"dsl": result["code"], "success": True}}
 
-    if node.children:
+    live_children = [c for c in node.children if c.path not in inlined_children]
+    if live_children:
         sub_results = await asyncio.gather(*[
             _pass1_walk(
                 node=child,
@@ -2545,7 +2591,7 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
                 tensors=tensors,
                 plan_iter=plan_iter,
             )
-            for child in node.children
+            for child in live_children
         ])
         for sr in sub_results:
             out.update(sr)
@@ -2616,7 +2662,14 @@ def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
     for node in tree.iter_topological():   # post-order (children before parent)
         if node.path == tree.root.path:
             continue
-        descendants_in_order.append(pass1_dsls[node.path])
+        # Lenient mode: a planner-tree node may have been inlined by its
+        # parent (no Pass-1 DSL on disk). Such a node has no caller in the
+        # composed namespace, so skipping it leaves the rest of the
+        # composition intact.
+        dsl = pass1_dsls.get(node.path)
+        if dsl is None:
+            continue
+        descendants_in_order.append(dsl)
 
     root_dsl = pass1_dsls[tree.root.path]
     composed_source = "\n\n".join(descendants_in_order + [root_dsl])
@@ -2930,6 +2983,32 @@ def _load_tree_from_dir(outer_dir: Path):
         )
 
     return Tree(root=_load_node(tree_dict))
+
+
+def _required_nodes(tree, pass1_dsls: dict[str, str]) -> set[str]:
+    """Compute the set of node paths whose Pass-1 DSL must exist for pass2.
+
+    Lenient pass1 lets a parent inline a planned child (no DSL emitted for
+    that subtree). Pass2 composition still works because the parent doesn't
+    reference the child's name. To validate that a resumed checkpoint can be
+    composed, we walk the tree top-down and demand a DSL only for nodes
+    whose parent's DSL textually calls them — i.e. nodes that are still
+    referenced from the surviving composition.
+
+    Children of an inlined node are unreachable transitively and are not
+    required either, since their only consumer was the now-collapsed
+    parent node.
+    """
+    required: set[str] = {tree.root.path}
+    queue = [tree.root]
+    while queue:
+        node = queue.pop()
+        parent_dsl = pass1_dsls.get(node.path, "")
+        for child in node.children:
+            if re.search(rf"\b{re.escape(child.name)}\s*\(", parent_dsl):
+                required.add(child.path)
+                queue.append(child)
+    return required
 
 
 def _load_verified_dsls(outer_dir: Path) -> dict[str, str]:
@@ -3369,32 +3448,58 @@ async def _run_outer_iteration(
     silently held by ``asyncio.gather(return_exceptions=True)`` until all
     siblings finish. Sibling outers are unaffected (we still return a
     failure-shaped dict rather than raising).
+
+    Also owns the per-outer log file and a write lock. Pass1 spawns many
+    parallel attempts that all funnel ``log()`` calls into this single file;
+    without serialization, the crash handler's multi-line traceback can
+    interleave with sibling status lines and become unreadable (observed in
+    checkpoints/2026-05-10-005659/.../outer_0/log.txt). The lock guards every
+    write+flush so each line — including the full crash dump — is atomic
+    against any concurrent writer.
     """
+    outer_dir.mkdir(parents=True, exist_ok=True)
+    log_path = outer_dir / "log.txt"
+    log_file = open(log_path, "w")
+    log_lock = threading.Lock()
+
+    def log(msg: str) -> None:
+        with log_lock:
+            log_file.write(msg + "\n")
+            log_file.flush()
+
     try:
-        return await _run_outer_iteration_body(
-            i, max_outer, outer_dir,
-            kernel_name, dims, tensors,
-            pass_agents, judge_agents, max_turns,
-            ckpt_root, preset, experience_dir, llm_config,
-            **kwargs,
-        )
-    except Exception:
-        err = traceback.format_exc()
-        outer_dir.mkdir(parents=True, exist_ok=True)
-        # Append (not overwrite) — body may have already written progress.
-        with open(outer_dir / "log.txt", "a") as f:
-            f.write(f"\n--- CRASHED ---\n{err}\n")
-        last_line = err.strip().splitlines()[-1] if err.strip() else "<unknown>"
-        print(f"[outer_{i}] CRASHED — {last_line}", flush=True)
-        return {
-            "success": False,
-            "outer_iteration": i,
-            "outer_iterations": max_outer,
-            "total_tool_calls": 0,
-            "total_tokens": 0,
-            "cycle_count": None,
-            "final_diagnosis": last_line,
-        }
+        try:
+            return await _run_outer_iteration_body(
+                i, max_outer, outer_dir,
+                kernel_name, dims, tensors,
+                pass_agents, judge_agents, max_turns,
+                ckpt_root, preset, experience_dir, llm_config,
+                _log=log,
+                **kwargs,
+            )
+        except Exception:
+            err = traceback.format_exc()
+            # Atomic multi-line dump: hold the lock for the whole traceback so
+            # parallel pass1 writers can't interleave into it.
+            with log_lock:
+                log_file.write(f"\n--- CRASHED ---\n{err}\n")
+                log_file.flush()
+            last_line = err.strip().splitlines()[-1] if err.strip() else "<unknown>"
+            print(f"[outer_{i}] CRASHED — {last_line}", flush=True)
+            # Also persist a standalone crash file so the traceback survives
+            # even if the log gets rotated/truncated by something else.
+            (outer_dir / "crash.txt").write_text(err)
+            return {
+                "success": False,
+                "outer_iteration": i,
+                "outer_iterations": max_outer,
+                "total_tool_calls": 0,
+                "total_tokens": 0,
+                "cycle_count": None,
+                "final_diagnosis": last_line,
+            }
+    finally:
+        log_file.close()
 
 
 async def _run_outer_iteration_body(
@@ -3423,6 +3528,7 @@ async def _run_outer_iteration_body(
     resume_planner_dir: Path | None = None,
     resume_after_pass1_dir: Path | None = None,
     stateless_refactor: bool = False,
+    _log=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
 
@@ -3435,16 +3541,18 @@ async def _run_outer_iteration_body(
         translate_fn: DSL→STeP translator callable. Defaults to
             ``_dsl_to_step_translate``; bundle-dir mode passes
             ``transpiler.translate`` from the bundle.
+        _log: provided by ``_run_outer_iteration``. The wrapper owns the log
+            file + write-lock so the crash handler can atomically dump
+            tracebacks alongside the body's own writes. Asserted non-None so
+            we never silently fall back to an unsynchronized writer.
     """
+    assert _log is not None, (
+        "_run_outer_iteration_body requires log callable from the wrapper"
+    )
     if translate_fn is None:
         translate_fn = _dsl_to_step_translate
+    log = _log
     log_path = outer_dir / "log.txt"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_path, "w")
-
-    def log(msg):
-        log_file.write(msg + "\n")
-        log_file.flush()
 
     tag = f"[outer_{i}]"
     print(f"{tag} Started — log: {log_path}")
@@ -3476,14 +3584,16 @@ async def _run_outer_iteration_body(
 
         tree = _load_tree_from_dir(outer_dir)
         pass1_dsls = _load_verified_dsls(outer_dir)
-        missing = [n.path for n in tree.iter_topological()
-                   if n.path not in pass1_dsls]
+        # Lenient: a planner-tree node may have been inlined by its parent
+        # (no PASS DSL on disk by design). Only nodes whose parent's verified
+        # DSL still calls them are required for composition.
+        required = _required_nodes(tree, pass1_dsls)
+        missing = [p for p in required if p not in pass1_dsls]
         if missing:
             msg = (f"resume-after-pass1: {len(missing)} node(s) without cached "
                    f"PASS DSL — cannot compose. Missing: {missing}")
             log(f"  -> FAILED: {msg}")
             print(f"{tag} FAILED — {msg}")
-            log_file.close()
             return {
                 "success": False,
                 "outer_iteration": i,
@@ -3504,7 +3614,6 @@ async def _run_outer_iteration_body(
             msg = f"pass2 mismatch on resume: {pass2.get('exec_log', '')[:200]}"
             log(f"  -> FAILED: {msg}")
             print(f"{tag} FAILED — pass2 mismatch on resume")
-            log_file.close()
             return {
                 "success": False,
                 "outer_iteration": i,
@@ -3562,7 +3671,6 @@ async def _run_outer_iteration_body(
         if not plan_result["success"]:
             log(f"  -> Planner phase FAILED at {plan_result.get('failing_node')}")
             print(f"{tag} Planner phase FAILED")
-            log_file.close()
             return {
                 "success": False,
                 "outer_iteration": i,
@@ -3620,7 +3728,6 @@ async def _run_outer_iteration_body(
             log(f"  -> {pass_name} FAILED")
             log(f"Lowering pipeline failed")
             print(f"{tag} Lowering FAILED")
-            log_file.close()
             return {
                 "success": False,
                 "outer_iteration": i,
@@ -3719,7 +3826,6 @@ async def _run_outer_iteration_body(
                     log=log,
                     tag=tag,
                 )
-            log_file.close()
             return result
         elif graph_result is not None:
             log(f"-> FAIL: {graph_result.splitlines()[0]}")
@@ -3729,7 +3835,6 @@ async def _run_outer_iteration_body(
         log(f"Translation pipeline failed")
         print(f"{tag} Translation FAILED")
 
-    log_file.close()
     return {
         "success": False,
         "outer_iteration": i,

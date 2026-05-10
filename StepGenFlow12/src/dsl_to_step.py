@@ -90,11 +90,22 @@ class _BranchRef(tuple):
         return tuple(s.shape) + tuple(s.stream_dtype.shape)
 
 
+def _dsl2step_stream(x):
+    # Resolve the underlying STeP stream object, accepting either a StepOps
+    # node (where the stream lives on `.stream`) or a (node, idx) branch ref
+    # from a multi-output op (Parallelize / Broadcast / FlatPartition / EagerMerge).
+    if isinstance(x, tuple) and len(x) == 2:
+        node, idx = x
+        return node.stream_idx(idx)
+    return x.stream
+
+
 def _dsl2step_out_tile(x, mode, accum_rank):
-    sd = x.stream.stream_dtype
+    s = _dsl2step_stream(x)
+    sd = s.stream_dtype
     if mode == 'elem':
         return sd
-    dims = x.stream.shape[-accum_rank:]
+    dims = s.shape[-accum_rank:]
     if any(not isinstance(d, int) for d in dims):
         # Stream dim is symbolic (DynDim from FlatPartition / FlatReassemble);
         # fall back to the input tile dtype and let STeP resolve the size.
@@ -109,16 +120,11 @@ def _dsl2step_out_tile(x, mode, accum_rank):
 
 
 def _dsl2step_init(x):
-    return Empty(shape=(1, 1), dtype=x.stream.stream_dtype.tile_dtype)
+    return Empty(shape=(1, 1), dtype=_dsl2step_stream(x).stream_dtype.tile_dtype)
 
 
 def _dsl2step_in_tile(x):
-    # Resolve the input stream's tile dtype, accepting either a StepOps node or
-    # a (node, idx) branch ref produced by multi-output ops.
-    if isinstance(x, tuple) and len(x) == 2:
-        node, idx = x
-        return node.stream_idx(idx).stream_dtype
-    return x.stream.stream_dtype
+    return _dsl2step_stream(x).stream_dtype
 
 
 def _seal_unused_branches(graph):
@@ -146,11 +152,24 @@ def translate(dsl_code: str) -> str:
     """Convert DSL ``tiled_reference`` source into a STeP ``build_graph`` source."""
     tree = ast.parse(dsl_code)
     fn = None
+    helper_defs = []
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "tiled_reference":
-            fn = node
-            break
+        if isinstance(node, ast.FunctionDef):
+            if node.name == "tiled_reference":
+                fn = node
+            else:
+                helper_defs.append(node)
     assert fn is not None, "translate: input must define def tiled_reference(...)"
+
+    # Relocate sibling top-level defs into tiled_reference's body. Reasons:
+    #   - As nested defs they close over `graph` (inserted below at body[0]),
+    #     so their rewritten DSL calls — which all spell `BinaryMap(graph, ...)`
+    #     etc. — resolve correctly without plumbing `graph` through signatures.
+    #   - They flow through the same rewrite pipeline as the rest of the body.
+    #   - Their `return` statements pass through unchanged because `fn_depth`
+    #     is > 0 inside any nested def (only the outermost build_graph return
+    #     gets the OffChipStore wrap).
+    fn.body = helper_defs + fn.body
 
     state = _State()
     body = _strip_empty_shape_guards(fn.body)

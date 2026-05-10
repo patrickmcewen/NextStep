@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
     parser.add_argument("--max-outer", type=int, default=3, help="Max outer loop iterations")
-    parser.add_argument("--max-turns", type=int, default=16, help="Max tool-call rounds per inner loop")
+    parser.add_argument("--max-turns", type=int, default=10, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="/workspace/results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
     parser.add_argument("--checkpoint-dir", default="/workspace/checkpoints", help="Override checkpoint directory (default: checkpoints/<timestamp>)")
@@ -118,7 +118,7 @@ def main():
              "where the refactor pass is flaky.",
     )
     parser.add_argument(
-        "--max-plan-depth", type=int, default=3,
+        "--max-plan-depth", type=int, default=4,
         help="Maximum recursion depth of the planner tree. Depth 0 is the root, "
              "depth 1 is its direct children, etc. Any node at depth >= "
              "--max-plan-depth is forced to LEAF without consulting the LLM. "
