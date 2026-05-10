@@ -676,7 +676,7 @@ _DSL_CONSUMERS: frozenset[str] = frozenset({
     "promote", "promote_outer", "flatten",
     "reshape_stream", "reshape_pad_stream",
     "expand_ref", "repeat_ref", "repeat_static",
-    "streamify", "dyn_streamify", "bufferize", "retile_streamify",
+    "streamify", "dyn_streamify", "bufferize", "retile_streamify", "restream",
     # Multi-output
     "broadcast", "parallelize", "static_reassemble",
     # Routing

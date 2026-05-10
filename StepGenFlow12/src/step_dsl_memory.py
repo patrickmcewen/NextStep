@@ -536,6 +536,26 @@ METRIC_FNS["streamify"]    = _metrics_streamify_family
 METRIC_FNS["dyn_streamify"] = _metrics_streamify_family
 
 
+def _metrics_restream(args, kwargs, output, mock_bf16):
+    """Restream: lowers to Bufferize + Streamify. Charged as the Streamify
+    half (buffer_size + tile_size) — the Bufferize half is a retype with no
+    extra storage. Buffer grid = all stream dims of the input x (matches
+    eager rule rank=x.ndim-2).
+    """
+    x = _tensor_of(args[0])
+    tile_b = _tile_bytes(x, mock_bf16)
+    buffer_grid = tuple(x.shape[:-2])
+    n_buffer_tiles = 1
+    for d in buffer_grid:
+        n_buffer_tiles *= int(d)
+    buffer_b = n_buffer_tiles * tile_b
+    total = buffer_b + tile_b
+    return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
+
+
+METRIC_FNS["restream"] = _metrics_restream
+
+
 # ---------------------------------------------------------------------------
 # Per-op metric implementations — routing / multi-output family
 # ---------------------------------------------------------------------------

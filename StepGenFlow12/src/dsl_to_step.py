@@ -998,6 +998,21 @@ def _h_streamify(state, target, call):
     )
 
 
+def _h_restream(state, target, call):
+    # restream(x, stride, out_shape_tiled) lowers to Bufferize(rank=full) +
+    # Streamify. The buffer rank is read off the input stream at graph-build
+    # time via {x}.stream.rank, mirroring the eager rule "bufferize all stream dims".
+    x               = _src(_arg(call, 0, "x"))
+    stride          = _src(_arg(call, 1, "stride"))
+    out_shape_tiled = _src(_arg(call, 2, "out_shape_tiled"))
+    buf = state.fresh("restream_buf")
+    return _block(
+        f"{buf} = Bufferize(graph, {x}, rank={x}.stream.rank)\n"
+        f"{target} = Streamify(graph, {buf}, stride=tuple({stride}), "
+        f"out_shape_tiled=tuple({out_shape_tiled}))\n"
+    )
+
+
 def _h_retile_streamify(state, target, call):
     x         = _src(_arg(call, 0, "x"))
     chunk     = _src(_arg(call, 1, "chunk"))
@@ -1079,6 +1094,7 @@ _DISPATCH = {
     "repeat_ref":           _h_repeat_ref,
     "repeat_static":        _h_repeat_static,
     "streamify":            _h_streamify,
+    "restream":             _h_restream,
     "retile_streamify":     _h_retile_streamify,
     "bufferize":            _h_bufferize,
     "dyn_streamify":        _h_dyn_streamify,

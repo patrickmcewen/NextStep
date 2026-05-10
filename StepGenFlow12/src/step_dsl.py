@@ -770,6 +770,33 @@ def bufferize(x, rank):
     return Buffered(x, buffer_rank=rank)
 
 
+def restream(x, stride, out_shape_tiled):
+    """Re-stream an on-chip tile-stream tensor with a new layout.
+
+    Convenience for ``streamify(bufferize(x, rank=x.ndim - 2), stride,
+    out_shape_tiled)``: bufferizes *all* of ``x``'s stream dims into the
+    buffer, then re-streams over the resulting tile grid using the
+    requested ``stride`` and ``out_shape_tiled`` (same semantics as
+    ``streamify`` — tile dims are preserved). Use ``retile_streamify``
+    before or after to change tile dims.
+
+    Lowers to a Bufferize -> Streamify pair in the STeP graph.
+    """
+    assert isinstance(x, torch.Tensor), (
+        f"restream: expected on-chip stream tensor, got {type(x).__name__}. "
+        "If x is already a Buffered, use streamify(x, stride, out_shape_tiled) directly."
+    )
+    assert x.ndim >= 3, (
+        f"restream: input must have >=1 stream dim + 2 tile dims, got ndim={x.ndim} "
+        f"(shape={tuple(x.shape)})"
+    )
+    return streamify(
+        bufferize(x, rank=x.ndim - 2),
+        stride=stride,
+        out_shape_tiled=out_shape_tiled,
+    )
+
+
 def dyn_streamify(x, ref):
     assert isinstance(x, Buffered), \
         f"dyn_streamify expects a Buffered (output of bufferize()), got {type(x).__name__}"
@@ -916,7 +943,7 @@ DSL_FUNCTIONS = {
     # Stream shape
     "promote", "promote_outer", "flatten", "reshape_stream", "reshape_pad_stream",
     "expand_ref", "repeat_ref", "repeat_static", "streamify", "dyn_streamify",
-    "bufferize", "retile_streamify",
+    "bufferize", "restream", "retile_streamify",
     # Multi-output
     "broadcast", "parallelize", "static_reassemble",
     # Routing

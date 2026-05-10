@@ -22,7 +22,7 @@ Your output is one of two response formats:
 
 DECISION: leaf
 
-  Use this when the kernel cannot/shouldn't logically be split any further and must be lowered
+  Use this when the kernel is already small/regular enough to be lowered to DSL
   in a single refactor pass. Once you declare leaf, the kernel will be passed
   whole to the refactor agent.
 
@@ -130,9 +130,10 @@ Natural incentive — read this carefully:
   This means:
     - Don't leaf a kernel that's too complex to be lowered in one pass.
       The downstream pass will fail and you'll be asked to re-plan.
-    - You should always default towards trying to split further. The downstream
-      agent implementing your kernels in DSL form can choose on its own to use your
-      emitted subroutines or inline them if it is easier.
+    - Don't over-decompose into trivial pieces. Each child should do
+      meaningful work.
+    - Aim for splits where each piece is a recognizable computation
+      (a softmax, a matmul, a reduction) — these tend to lower cleanly.
 
 How children's verified DSLs are used at the parent level:
 
