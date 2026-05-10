@@ -10,41 +10,13 @@ mathematically equivalent to the no-max formulation since exp(-row_max)
 cancels in num/denom, but it keeps exp() from overflowing in fp32.
 
 Inputs, expert routing (loaded from .npz by precompute), trace-derived
-`num_token_list`, and prefilled k_cache/v_cache come from
-StepDB/precompute.py via the `tensors` arg, so reference and step_impl see
-byte-identical inputs.
+``num_token_list``, and prefilled k_cache/v_cache come from
+StepDB/precompute.py via ``get_inputs(dims)``, so reference and step_impl
+see byte-identical inputs.
 """
-from types import SimpleNamespace
-
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-
-
-# Inlined model configs. Mirrors end_to_end.model_configs in step_tl, but
-# kept here as concrete literals so the LLM reading this reference sees
-# every value `mc.<attr>` resolves to without external imports.
-_MODEL_CONFIGS = {
-    ("mixtral", False): SimpleNamespace(
-        hidden_dim=4096, head_dim=128, num_heads=32, num_kv_heads=8,
-        query_per_kvhead=4,
-        n_routed_experts=8, n_activated_experts=2,
-        dim=4096, moe_inter_dim=14336),
-    ("mixtral", True): SimpleNamespace(
-        hidden_dim=512, head_dim=32, num_heads=16, num_kv_heads=4,
-        query_per_kvhead=4,
-        n_routed_experts=8, n_activated_experts=2,
-        dim=512, moe_inter_dim=1792),
-    ("qwen", False): SimpleNamespace(
-        hidden_dim=2048, head_dim=64, num_heads=32, num_kv_heads=4,
-        query_per_kvhead=8,
-        n_routed_experts=128, n_activated_experts=8,
-        dim=2048, moe_inter_dim=768),
-    ("qwen", True): SimpleNamespace(
-        hidden_dim=128, head_dim=16, num_heads=8, num_kv_heads=2,
-        query_per_kvhead=4,
-        n_routed_experts=128, n_activated_experts=8,
-        dim=128, moe_inter_dim=48),
-}
 
 
 def _rms_norm(x, eps=1e-6):
@@ -58,45 +30,40 @@ def _rotate_half(x):
     return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
-def _model_config(model_name, is_small):
-    key = (model_name, is_small)
-    assert key in _MODEL_CONFIGS, (
-        f"Unknown model_name/is_small combination: {key!r}. "
-        f"Known: {list(_MODEL_CONFIGS.keys())}"
-    )
-    return _MODEL_CONFIGS[key]
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
 
+    def forward(self, input_tensor, q_proj, k_proj, v_proj,
+                cos, sin, k_cache, v_cache,
+                expert_indices, expert_weights,
+                w_gate_list, w_up_list, w_down_list,
+                num_token_list, o_proj_weight):
+        # Derive per-call shape constants from the tensor args. Matches the
+        # ``mc.*`` attrs used by precompute.py / step_impl.py: head_dim is
+        # the trailing dim of cos/sin; num_heads / num_kv_heads come from
+        # the projection columns; n_routed_experts is the expert-list length;
+        # dim is the trailing dim of any expert's down projection.
+        batch, _ = input_tensor.shape
+        head_dim = cos.shape[-1]
+        num_heads = q_proj.shape[1] // head_dim
+        num_kv_heads = k_proj.shape[1] // head_dim
+        query_per_kvhead = num_heads // num_kv_heads
+        n_routed_experts = len(w_gate_list)
+        dim = w_down_list[0].shape[1]
 
-def compute_gold(dims, tensors):
-    model_name = dims["model_name"]
-    batch = dims.get("batch", 64)
-    is_small = dims.get("is_small", False)
-    mc = _model_config(model_name, is_small)
+        # Don't mutate caller-owned KV cache: precompute returns a single
+        # buffer reused across reference + step_impl invocations.
+        k_cache = k_cache.clone()
+        v_cache = v_cache.clone()
 
-    input_tensor = tensors["input_tensor"]
-    q_proj = tensors["q_proj"]
-    k_proj = tensors["k_proj"]
-    v_proj = tensors["v_proj"]
-    cos = tensors["cos"]
-    sin = tensors["sin"]
-    k_cache = tensors["k_cache"].clone()
-    v_cache = tensors["v_cache"].clone()
-    expert_indices = tensors["expert_indices"]
-    expert_weights = tensors["expert_weights"]
-    w_gate_list = tensors["w_gate_list"]
-    w_up_list = tensors["w_up_list"]
-    w_down_list = tensors["w_down_list"]
-    num_token_list = tensors["num_token_list"]
-    o_proj_weight = tensors["o_proj_weight"]
-
-    with torch.no_grad():
         # [1] RMS Norm on input
         normed = _rms_norm(input_tensor)
 
         # [2] QKV projections
-        Q = (normed @ q_proj).view(batch, mc.num_heads, mc.head_dim)
-        K = (normed @ k_proj).view(batch, mc.num_kv_heads, mc.head_dim)
-        V = (normed @ v_proj).view(batch, mc.num_kv_heads, mc.head_dim)
+        Q = (normed @ q_proj).view(batch, num_heads, head_dim)
+        K = (normed @ k_proj).view(batch, num_kv_heads, head_dim)
+        V = (normed @ v_proj).view(batch, num_kv_heads, head_dim)
 
         # [3] RMS Norm on Q and K (per-head normalization)
         Q = _rms_norm(Q)
@@ -112,12 +79,12 @@ def compute_gold(dims, tensors):
             v_cache[i, num_token_list[i]] = V[i]
 
         # [6] GQA attention (numerically-stable softmax, no 1/sqrt(d) scaling)
-        attn_output = torch.zeros(batch, mc.num_heads, mc.head_dim)
+        attn_output = torch.zeros(batch, num_heads, head_dim)
         for i in range(batch):
             seq_len = num_token_list[i] + 1
-            for h_kv in range(mc.num_kv_heads):
-                q_lo = h_kv * mc.query_per_kvhead
-                q_hi = q_lo + mc.query_per_kvhead
+            for h_kv in range(num_kv_heads):
+                q_lo = h_kv * query_per_kvhead
+                q_hi = q_lo + query_per_kvhead
                 q_group = Q[i, q_lo:q_hi, :]
                 k_seq = k_cache[i, :seq_len, h_kv, :]
                 v_seq = v_cache[i, :seq_len, h_kv, :]
@@ -129,7 +96,7 @@ def compute_gold(dims, tensors):
                 attn_output[i, q_lo:q_hi, :] = context / exp_scores.sum(dim=-1, keepdim=True)
 
         # [7] O-projection
-        attn_flat = attn_output.view(batch, mc.num_heads * mc.head_dim)
+        attn_flat = attn_output.view(batch, num_heads * head_dim)
         o_proj_out = attn_flat @ o_proj_weight
 
         # [8] Residual add
@@ -139,8 +106,8 @@ def compute_gold(dims, tensors):
         normed_2 = _rms_norm(res_add_0)
 
         # [10] MoE: y[i] = sum_j w[i,j] * down_j(silu(gate_j(x)) * up_j(x))
-        moe_output = torch.zeros(batch, mc.dim)
-        for e in range(mc.n_routed_experts):
+        moe_output = torch.zeros(batch, dim)
+        for e in range(n_routed_experts):
             idx, top_pos = torch.where(expert_indices == e)
             if len(idx) == 0:
                 continue
@@ -151,6 +118,32 @@ def compute_gold(dims, tensors):
             moe_output[idx] += down_out * expert_weights[idx, top_pos, None]
 
         # [11] Final residual add
-        output = moe_output + res_add_0
+        return moe_output + res_add_0
 
-    return output
+
+def get_init_inputs(dims):
+    return []
+
+
+def get_inputs(dims):
+    """Return the 15 positional tensor args for ``Model.forward``.
+
+    Delegates to ``StepDB/precompute.py:_precompute_end_to_end`` so the
+    reference and step_impl see byte-identical tensors (including the
+    routing .npz, the trace-derived ``num_token_list``, and the prefilled
+    KV caches).
+    """
+    from precompute import precompute_tensors  # StepDB/precompute.py
+    t = precompute_tensors("end_to_end", dims)
+    return [
+        t["input_tensor"], t["q_proj"], t["k_proj"], t["v_proj"],
+        t["cos"], t["sin"], t["k_cache"], t["v_cache"],
+        t["expert_indices"], t["expert_weights"],
+        t["w_gate_list"], t["w_up_list"], t["w_down_list"],
+        t["num_token_list"], t["o_proj_weight"],
+    ]
+
+
+def compute_gold(dims):
+    with torch.no_grad():
+        return Model(*get_init_inputs(dims))(*get_inputs(dims))
