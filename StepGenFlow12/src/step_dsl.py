@@ -366,6 +366,20 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
+    # out_shape_tiled enumerates the stream positions to read; an empty tuple
+    # produces a zero-rank stream which the rest of the DSL cannot represent
+    # (every StepTensor has at least one stream dim). Catch this up front
+    # with a concrete fix-up suggestion — otherwise the failure surfaces deep
+    # in torch as "meshgrid expects a non-empty TensorList", which gives the
+    # caller no signal about what to change.
+    assert len(out_shape_tiled) >= 1, (
+        f"offchip_load: out_shape_tiled must have at least one streaming "
+        f"dimension, got {out_shape_tiled!r}. To load the underlying as a "
+        f"single tile, use out_shape_tiled=(1,) with stride=(1,) and a "
+        f"tile_row/tile_col that covers the whole matrix; the result has "
+        f"stream shape (1,) and can be broadcast (e.g. via offchip_load_ref) "
+        f"to a wider consumer stream."
+    )
     R, C = underlying.shape[-2], underlying.shape[-1]
 
     # ---- Tiling invariant: must actually stream, not load as one giant tile ----

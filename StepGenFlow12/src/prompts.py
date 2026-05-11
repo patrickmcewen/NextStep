@@ -830,6 +830,8 @@ def build_pass1_user_prompt(
         "Output a single Python function with this exact signature. "
         "No imports. No new torch tensors. "
         "Above the function definition, include a comment with your implementation reasoning.",
+        "IMPORTANTLY, your implementation MUST match the numerical outputs of the reference pytorch code.",
+        "It is NOT sufficient to simply match the required shape of the output tensors, although that is also required.",
     ])
 
     return "\n".join(lines)

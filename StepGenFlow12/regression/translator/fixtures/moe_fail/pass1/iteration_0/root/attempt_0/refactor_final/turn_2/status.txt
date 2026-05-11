@@ -1,0 +1,1 @@
+FAIL: assert inp_stream[:-expand_rank] == ref_stream[:-expand_rank], (

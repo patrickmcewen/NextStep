@@ -56,7 +56,8 @@ from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES, PIPELINES,
                          _format_tensors_description,
                          resolve_few_shot_examples)
 from src.tools import (_exec_build_graph, _exec_dsl_ref,
-                       _validate_functional_mod, enhance_emulator_error)
+                       _validate_functional_mod, enhance_emulator_error,
+                       _wrap_on_chip_call_args)
 from src.gold_cache import _GOLD_CACHE, _gold_key, _get_gold, _inject_gold
 
 # ---------------------------------------------------------------------------
@@ -577,7 +578,8 @@ _PASS_RULES: dict[str, dict] = {
             ("torch.exp",    "use unary_exp(x)"),
             ("torch.rsqrt",  "use unary_rsqrt(x)"),
             ("F.silu",       "use unary_silu(x)"),
-            (".float(",      "changing dtype is not allowed")
+            (".float(",      "changing dtype is not allowed"),
+            (".tensor.shape[", "use `.shape[...]` instead — the bare `.shape` accessor is exposed on both `StepTensor` (Pass-1) and STeP graph ops (translation); `.tensor` is the underlying torch.Tensor and not part of the public surface")
             #("out_shape_tiled=(1,)",
             # "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
         ],
@@ -2537,7 +2539,18 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         raw_arg_names_set: frozenset[str] = frozenset()
     else:
         entry_point = node.name
-        call_args = tuple(parent_contract.tiled_values)
+        # Wrap on-chip TensorArg inputs as StepTensors before invoking the
+        # child. The contract block tells the LLM that on-chip args "may be
+        # passed directly to DSL consumers"; without wrapping, that promise
+        # only holds in Pass-2 composition (where the parent's DSL produces
+        # StepTensors) and not in Pass-1 isolation (where the framework
+        # hands raw tensors). RAW args and list args pass through unchanged.
+        call_args = _wrap_on_chip_call_args(
+            tuple(parent_contract.tiled_values),
+            parent_contract.arg_specs,
+            parent_contract.arg_is_raw,
+            parent_contract.tiled_shapes,
+        )
         call_kwargs = {
             "out_shapes": parent_contract.out_shapes,
             "out_perms": parent_contract.out_perms,

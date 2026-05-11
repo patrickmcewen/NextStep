@@ -1,0 +1,90 @@
+{
+  "name": "root",
+  "path": "root",
+  "is_leaf": false,
+  "has_refactored": true,
+  "children": [
+    {
+      "name": "pre_attention",
+      "path": "root/pre_attention",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "pre_attn_norm_and_proj",
+          "path": "root/pre_attention/pre_attn_norm_and_proj",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "per_head_norm_and_rope",
+          "path": "root/pre_attention/per_head_norm_and_rope",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "name": "attention_o_proj",
+      "path": "root/attention_o_proj",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "attention",
+          "path": "root/attention_o_proj/attention",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "compute_qkv",
+              "path": "root/attention_o_proj/attention/compute_qkv",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            },
+            {
+              "name": "attention_compute",
+              "path": "root/attention_o_proj/attention/attention_compute",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "moe",
+      "path": "root/moe",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "moe_dispatch",
+          "path": "root/moe/moe_dispatch",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "rms_norm",
+              "path": "root/moe/moe_dispatch/rms_norm",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            },
+            {
+              "name": "moe_dispatch__root_moe_moe_dispatch",
+              "path": "root/moe/moe_dispatch/moe_dispatch__root_moe_moe_dispatch",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

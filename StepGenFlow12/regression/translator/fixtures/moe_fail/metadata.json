@@ -1,0 +1,6 @@
+{
+  "kernel": "moe_routed",
+  "preset": "large_d1k",
+  "source": "/workspace/checkpoints/2026-05-11-035055/moe_routed/outer_1",
+  "notes": ""
+}

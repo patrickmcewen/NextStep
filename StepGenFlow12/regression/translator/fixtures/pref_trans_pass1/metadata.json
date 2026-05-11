@@ -1,0 +1,6 @@
+{
+  "kernel": "prefill_transformer_simple",
+  "preset": "small",
+  "source": "/workspace/checkpoints/2026-05-11-045915/prefill_transformer_simple/outer_0",
+  "notes": ""
+}

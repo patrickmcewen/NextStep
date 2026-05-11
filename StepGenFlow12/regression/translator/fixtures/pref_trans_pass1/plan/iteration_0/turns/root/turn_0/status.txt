@@ -1,0 +1,1 @@
+MALFORMED_SPLIT: child 'pre_attention': missing 'def get_inputs' in body

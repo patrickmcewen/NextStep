@@ -42,7 +42,8 @@ IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 
 from step_py.ops import StepOps
 
-from src.step_dsl import StepTensor
+from src.step_dsl import StepTensor, Tile, _elem_from_torch
+from src.node_signature import TensorArg
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +260,50 @@ def _build_dsl_scaffold() -> str:
         from src import step_dsl as _src_step_dsl
         sys.modules["step_dsl"] = _src_step_dsl
     return _DSL_IMPORTS
+
+
+def _wrap_on_chip_call_args(
+    call_args: tuple,
+    arg_specs: tuple,
+    arg_is_raw: tuple[bool, ...],
+    tiled_shapes: tuple[tuple[int, ...], ...],
+) -> tuple:
+    """Wrap on-chip ``TensorArg`` entries as ``StepTensor`` before a non-root
+    DSL entry-point invocation.
+
+    Pass-1 hands the child raw ``torch.Tensor``s for every positional input,
+    while Pass-2 composition feeds it ``StepTensor``s from the parent's DSL
+    ops. The contract block in the LLM prompt promises that on-chip args
+    "may be passed directly to DSL consumers" — wrapping here makes that
+    true in Pass-1 so the two passes share a calling convention and the
+    LLM does not need an ``isinstance(x, StepTensor)`` guard at every leaf.
+
+    RAW args stay raw (the LLM is told to load them with ``offchip_load``
+    before any DSL consumer). List args also pass through unchanged — the
+    contract block instructs the LLM to iterate at host time and load each
+    element separately, so their elements are not wrapped here.
+    """
+    assert len(call_args) == len(arg_specs) == len(arg_is_raw) == len(tiled_shapes), (
+        f"length mismatch: call_args={len(call_args)} arg_specs={len(arg_specs)} "
+        f"arg_is_raw={len(arg_is_raw)} tiled_shapes={len(tiled_shapes)}"
+    )
+    wrapped = []
+    for value, spec, raw, tshape in zip(
+        call_args, arg_specs, arg_is_raw, tiled_shapes
+    ):
+        if raw or not isinstance(spec, TensorArg):
+            wrapped.append(value)
+            continue
+        assert isinstance(value, torch.Tensor), (
+            f"on-chip TensorArg must be a torch.Tensor, "
+            f"got {type(value).__name__}")
+        assert len(tshape) >= 2, (
+            f"on-chip TensorArg tiled shape {tshape} must be rank >= 2 "
+            f"(last two dims are the tile)")
+        tile_shape = (int(tshape[-2]), int(tshape[-1]))
+        stream_dtype = Tile(_elem_from_torch(value.dtype), tile_shape)
+        wrapped.append(StepTensor(value, stream_dtype=stream_dtype))
+    return tuple(wrapped)
 
 
 def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,

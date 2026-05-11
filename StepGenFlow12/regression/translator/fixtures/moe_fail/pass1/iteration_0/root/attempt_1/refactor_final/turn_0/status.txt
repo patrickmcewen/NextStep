@@ -1,0 +1,1 @@
+FAIL: assert isinstance(stream_dtype, allowed), (
