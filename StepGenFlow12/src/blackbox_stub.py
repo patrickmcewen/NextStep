@@ -18,10 +18,14 @@ preserve their list-ness.
 Outputs are template-driven and always plural: the parent calls the stub
 with ``out_shapes=(<shape_0>, <shape_1>, ...)`` (and optionally
 ``out_perms=(<perm_0>, <perm_1>, ...)`` where each entry may be ``None``).
-For each output the stub applies permute (if any) then reshape. If the
-underlying reference returns a single Tensor (``len(out_shapes) == 1``)
-the stub returns a Tensor; if it returns a tuple, the stub returns a
-tuple of the same length.
+For each output the stub applies permute (if any), reshape, and then
+wraps the result in a ``StepTensor`` so the parent's DSL ops can chain
+on the return without re-attaching the stream wrapper. The tile shape is
+the last two dims of the matching ``out_shape`` (each ``out_shape`` must
+therefore be rank >= 2); the remaining leading dims are stream dims. If
+the underlying reference returns a single Tensor (``len(out_shapes) ==
+1``) the stub returns a single ``StepTensor``; if it returns a tuple,
+the stub returns a tuple of ``StepTensor``s of the same length.
 
 The first call to a given stub records a ``Contract`` on the supplied
 ``ContractRecorder``; subsequent calls are pure passthrough. The
@@ -40,6 +44,7 @@ import torch.nn as nn
 
 from src.contract import Contract
 from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
+from src.step_dsl import StepTensor, Tile, _elem_from_torch
 
 
 @dataclass
@@ -82,6 +87,20 @@ def _tiled_shape_of(value, spec: ArgSpec) -> tuple[int, ...]:
     return ()
 
 
+def _unwrap_steptensor(v):
+    """Recursively unwrap StepTensor → torch.Tensor through lists.
+
+    Top-level StepTensor → its underlying ``.tensor``. List → element-wise
+    unwrap (handles ``list[StepTensor]`` and ``list[Tensor]`` uniformly).
+    Anything else (raw Tensor, int, list[int]) passes through untouched.
+    """
+    if isinstance(v, StepTensor):
+        return v.tensor
+    if isinstance(v, list):
+        return [_unwrap_steptensor(x) for x in v]
+    return v
+
+
 def _clone_value(value, spec: ArgSpec):
     """Detach-and-clone for tensor args; deep copy for list args."""
     if isinstance(spec, TensorArg):
@@ -114,9 +133,16 @@ def make_stub(*, ref_module: nn.Module,
             f"out_perms must be a tuple of length {len(out_shapes)} "
             f"(or None for all-None), got {out_perms!r}")
 
+        # Parent DSL ops may hand us StepTensor-wrapped inputs (chained stub
+        # calls produce StepTensors; ``list(parallelize(...))`` produces a
+        # list of StepTensors). Strip the wrapper recursively so ref_module
+        # and the contract helpers (_vanillify / _clone_value /
+        # _tiled_shape_of) always see raw torch.Tensors.
+        unwrapped_args = tuple(_unwrap_steptensor(a) for a in tiled_args)
+
         vanilla_args = [
             _vanillify(name, value, spec)
-            for name, value, spec in zip(arg_names, tiled_args, arg_specs)
+            for name, value, spec in zip(arg_names, unwrapped_args, arg_specs)
         ]
 
         with torch.no_grad():
@@ -140,10 +166,10 @@ def make_stub(*, ref_module: nn.Module,
                     for spec in arg_specs),
                 tiled_shapes=tuple(
                     _tiled_shape_of(v, spec)
-                    for v, spec in zip(tiled_args, arg_specs)),
+                    for v, spec in zip(unwrapped_args, arg_specs)),
                 tiled_values=tuple(
                     _clone_value(v, spec)
-                    for v, spec in zip(tiled_args, arg_specs)),
+                    for v, spec in zip(unwrapped_args, arg_specs)),
                 out_shapes=tuple(tuple(s) for s in out_shapes),
                 out_perms=tuple(
                     None if p is None else tuple(p) for p in out_perms),
@@ -152,9 +178,22 @@ def make_stub(*, ref_module: nn.Module,
                 arg_specs=arg_specs,
             )
 
+        # Wrap each output as a StepTensor so the parent's DSL ops can
+        # chain on the return without re-attaching the wrapper. Tile shape
+        # is the last two dims of out_shape; the remaining leading dims
+        # are stream dims (rank may be 0).
+        wrapped = []
+        for raw_out, out_shape in zip(results, out_shapes):
+            assert len(out_shape) >= 2, (
+                f"stub output shape {out_shape} must be rank >= 2 to wrap "
+                f"as a tile-stream StepTensor (last 2 dims are the tile)")
+            tile_shape = (int(out_shape[-2]), int(out_shape[-1]))
+            stream_dtype = Tile(_elem_from_torch(raw_out.dtype), tile_shape)
+            wrapped.append(StepTensor(raw_out, stream_dtype=stream_dtype))
+
         if isinstance(raw, tuple):
-            return tuple(results)
-        return results[0]
+            return tuple(wrapped)
+        return wrapped[0]
 
     stub.__name__ = "blackbox_stub"
     return stub

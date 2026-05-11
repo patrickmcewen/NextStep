@@ -1,0 +1,1 @@
+FAIL: AssertionError: binary_matmul: stream shape mismatch — a has stream (1, 64) (shape (1, 64, 1, 512)) but b has stream (1, 64, 1) (shape (1, 64, 1, 512, 512)). Both operands must have identical stream shapes.

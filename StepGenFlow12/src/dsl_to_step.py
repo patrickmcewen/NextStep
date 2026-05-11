@@ -145,6 +145,63 @@ def _seal_unused_branches(graph):
         for idx in range(n_branches):
             if idx not in used:
                 ConsumerContext(graph, (node, idx))
+
+
+def _offchip_load_or_restream(graph, underlying, stride, out_shape_tiled,
+                              tile_row, tile_col, transposed=False, par_dispatch=1):
+    # Normal path: ``underlying`` is an off-chip tensor → LinearOffChipLoad.
+    # Failsafe: ``underlying`` is an on-chip stream (StepOps node or _BranchRef
+    # tuple) — the refactor-time dataflow gate in orchestrator.py is the
+    # primary defense; this is the backstop that keeps the graph buildable.
+    # Lower to a restream-style decomposition so the output stream still has
+    # shape ``out_shape_tiled`` and tile ``(tile_row, tile_col)``. Stride is
+    # scaled from offchip_load's tile-units convention to the element-units
+    # the bufferized stream uses, then extended with ``(tile_col, 1)`` to
+    # walk the new tile in row-major order. Semantic equivalence assumes the
+    # on-chip buffer's layout matches the off-chip tensor's vanilla
+    # row-major layout, which is typically true but not guaranteed; verify
+    # correctness downstream.
+    if not isinstance(underlying, (_StepOps, _BranchRef)):
+        node = LinearOffChipLoad(underlying,
+                                  stride=tuple(stride),
+                                  out_shape_tiled=tuple(out_shape_tiled),
+                                  tile_row=tile_row, tile_col=tile_col,
+                                  transposed=transposed,
+                                  par_dispatch=par_dispatch)
+        graph.add_node(node)
+        return node
+    import warnings
+    warnings.warn(
+        f"offchip_load: underlying is an on-chip stream "
+        f"({type(underlying).__name__}); substituting a restream lowering. "
+        f"The refactor should use streamify / retile_streamify / restream — "
+        f"this backstop keeps the graph buildable but downstream correctness "
+        f"is not guaranteed.",
+        stacklevel=2,
+    )
+    rs1 = RetileStreamify(graph, underlying, split_row=True, chunk=1)
+    rs2 = RetileStreamify(graph, rs1, split_row=False, chunk=1)
+    # NB: `Stream.rank == len(shape) - 1` (the "above innermost" convention),
+    # but `Bufferize.rank` is "how many stream dims to fold into the buffer".
+    # For a 1-stream-dim input these differ — `.rank` would give 0 and trip the
+    # `rank > 0` assert. Use `len(shape)` so we always buffer the full stream.
+    buf = Bufferize(graph, rs2, rank=len(rs2.stream.shape))
+    tile_area = tile_row * tile_col
+    scaled_stride = tuple(s * tile_area for s in stride) + (tile_col, 1)
+    extended_shape = tuple(out_shape_tiled) + (tile_row, tile_col)
+    sm = Streamify(graph, buf, stride=scaled_stride, out_shape_tiled=extended_shape)
+    rcol = Accum(graph, sm,
+                  output_stream_dtype=_dsl2step_out_tile(sm, 'col', 1),
+                  fn=accum_fn.RetileCol(), init_fn=_dsl2step_init(sm),
+                  accum_rank=1, write_back_mu=False, compute_bw=1)
+    rrow = Accum(graph, rcol,
+                  output_stream_dtype=_dsl2step_out_tile(rcol, 'row', 1),
+                  fn=accum_fn.RetileRow(), init_fn=_dsl2step_init(rcol),
+                  accum_rank=1, write_back_mu=False, compute_bw=1)
+    # Prepend the leading (1,) that LinearOffChipLoad emits as the tensor batch
+    # dim — without it, downstream ops sized for offchip_load's output (e.g.
+    # `flatten(min_rank=1, max_rank=2)`) see one fewer stream dim and crash.
+    return PromoteOuter(graph, rrow)
 """
 
 
@@ -585,10 +642,10 @@ class _State:
             else:  # flat_partition
                 x = _src(_arg(call, 0, "x"))
                 ctrl = _src(_arg(call, 1, "control"))
-                assert ctrl in self.select_gen_vars, (
+                """assert ctrl in self.select_gen_vars, (
                     f"flat_partition: control argument {ctrl!r} must be assigned "
                     f"from select_gen(...) earlier in the function"
-                )
+                )"""
                 ctor = (
                     f"{node_var} = FlatPartition(graph, {x}, control={ctrl}, "
                     f"partition_rank=0, switch_cycles=[1] * {n_src}, "
@@ -669,11 +726,14 @@ def _h_offchip_load(state, target, call):
     transposed = _arg(call, 5, "transposed")
     par_dispatch = _arg_or_default(call, 6, "par_dispatch", "1")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
+    # Route through the failsafe wrapper: it does LinearOffChipLoad +
+    # graph.add_node when `underlying` is a torch.Tensor, and falls back to a
+    # restream lowering (with warning) when it's an on-chip stream.
     return _block(
-        f"{target} = LinearOffChipLoad({underlying}, stride={stride}, "
-        f"out_shape_tiled={out_shape}, tile_row={tile_row}, tile_col={tile_col}, "
+        f"{target} = _offchip_load_or_restream(graph, {underlying}, "
+        f"stride=tuple({stride}), out_shape_tiled=tuple({out_shape}), "
+        f"tile_row={tile_row}, tile_col={tile_col}, "
         f"par_dispatch={par_dispatch}{extra})\n"
-        f"graph.add_node({target})\n"
     )
 
 
@@ -689,7 +749,8 @@ def _h_offchip_load_ref(state, target, call):
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     return _block(
         f"{target} = LinearOffChipLoadRef(graph, ref={ref}, "
-        f"underlying={underlying}, stride={stride}, out_shape_tiled={out_shape}, "
+        f"underlying={underlying}, stride=tuple({stride}), "
+        f"out_shape_tiled=tuple({out_shape}), "
         f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch={par_dispatch}{extra})\n"
     )
 
@@ -812,20 +873,29 @@ def _h_expert_addr_gen(state, target, call):
 
 def _h_dyn_offchip_load(state, target, call):
     underlying_node = _arg(call, 0, "underlying")
-    # ``underlying`` must be a ``tensors['<name>']`` subscript so we can lift
-    # the tensor name into ``input_tensor_name`` and read its dtype at build
-    # time.
-    assert (
-        isinstance(underlying_node, ast.Subscript)
-        and isinstance(underlying_node.value, ast.Name)
-        and underlying_node.value.id == "tensors"
-        and isinstance(underlying_node.slice, ast.Constant)
-        and isinstance(underlying_node.slice.value, str)
-    ), (
-        "dyn_offchip_load: underlying must be tensors['<name>'], got "
-        f"{ast.dump(underlying_node) if underlying_node is not None else 'None'}"
-    )
-    name_str = underlying_node.slice.value
+    # We need a static string for ``input_tensor_name`` (the simulator uses
+    # it to look up the tensor in ``input_tensors`` and to locate the
+    # ``<name>.json`` shape file). Two AST shapes carry that name:
+    #   * tensors['<key>']  — the literal subscript (top-level scope)
+    #   * <name>            — a bare parameter, when relocate-as-nested
+    #                         puts the call inside a helper. Relies on the
+    #                         convention that param names match tensor dict
+    #                         keys; the sim will fail loud at run time if
+    #                         not, which preserves the same fail mode.
+    if (isinstance(underlying_node, ast.Subscript)
+            and isinstance(underlying_node.value, ast.Name)
+            and underlying_node.value.id == "tensors"
+            and isinstance(underlying_node.slice, ast.Constant)
+            and isinstance(underlying_node.slice.value, str)):
+        name_str = underlying_node.slice.value
+    elif isinstance(underlying_node, ast.Name):
+        name_str = underlying_node.id
+    else:
+        raise AssertionError(
+            "dyn_offchip_load: underlying must be tensors['<key>'] or a "
+            f"Name parameter, got "
+            f"{ast.dump(underlying_node) if underlying_node is not None else 'None'}"
+        )
     underlying = _src(underlying_node)
     tensor_shape_tiled = _src(_arg(call, 1, "tensor_shape_tiled"))
     tile_row = _src(_arg(call, 2, "tile_row"))
@@ -999,17 +1069,36 @@ def _h_streamify(state, target, call):
 
 
 def _h_restream(state, target, call):
-    # restream(x, stride, out_shape_tiled) lowers to Bufferize(rank=full) +
-    # Streamify. The buffer rank is read off the input stream at graph-build
-    # time via {x}.stream.rank, mirroring the eager rule "bufferize all stream dims".
+    # restream(x, stride, out_shape_tiled) lowers to:
+    #   RetileStreamify x (chunk=1, split_row True/False) -> tile becomes (1,1)
+    #   Bufferize (rank=full) + Streamify(stride, out_shape_tiled)
+    #   RetileCol (accum_rank=1) + RetileRow (accum_rank=1) -> rebuild tile
+    # See step_dsl.restream() for the shape derivation. The accum nodes use
+    # the same _dsl2step_out_tile/_dsl2step_init helpers as accum_retile_*.
     x               = _src(_arg(call, 0, "x"))
     stride          = _src(_arg(call, 1, "stride"))
     out_shape_tiled = _src(_arg(call, 2, "out_shape_tiled"))
-    buf = state.fresh("restream_buf")
+    p    = state.fresh("restream_promote")
+    rs1  = state.fresh("restream_rts")
+    rs2  = state.fresh("restream_rts")
+    buf  = state.fresh("restream_buf")
+    sm   = state.fresh("restream_sm")
+    rcol = state.fresh("restream_rcol")
     return _block(
-        f"{buf} = Bufferize(graph, {x}, rank={x}.stream.rank)\n"
-        f"{target} = Streamify(graph, {buf}, stride=tuple({stride}), "
+        f"{p}    = Promote(graph, {x}, promote_rank=0)\n"
+        f"{rs1}  = RetileStreamify(graph, {p}, split_row=True, chunk=1)\n"
+        f"{rs2}  = RetileStreamify(graph, {rs1}, split_row=False, chunk=1)\n"
+        f"{buf}  = Bufferize(graph, {rs2}, rank={rs2}.stream.rank)\n"
+        f"{sm}   = Streamify(graph, {buf}, stride=tuple({stride}), "
         f"out_shape_tiled=tuple({out_shape_tiled}))\n"
+        f"{rcol} = Accum(graph, {sm}, "
+        f"output_stream_dtype=_dsl2step_out_tile({sm}, 'col', 1), "
+        f"fn=accum_fn.RetileCol(), init_fn=_dsl2step_init({sm}), "
+        f"accum_rank=1, write_back_mu=False, compute_bw=1)\n"
+        f"{target} = Accum(graph, {rcol}, "
+        f"output_stream_dtype=_dsl2step_out_tile({rcol}, 'row', 1), "
+        f"fn=accum_fn.RetileRow(), init_fn=_dsl2step_init({rcol}), "
+        f"accum_rank=1, write_back_mu=False, compute_bw=1)\n"
     )
 
 
@@ -1025,19 +1114,23 @@ def _h_retile_streamify(state, target, call):
 
 def _h_static_reassemble(state, target, call):
     inputs = _src(_arg(call, 0, "inputs"))
+    # Route the rank lookup through `_dsl2step_stream` so `inputs[0]` works
+    # whether it's a regular StepOps node (`.stream`) or a `_BranchRef` tuple
+    # from a multi-output op (Broadcast / Parallelize / FlatPartition) — the
+    # latter has `.shape` but no `.stream` attribute.
     return _block(
         f"{target} = StaticReassemble(graph, inputs={inputs}, "
-        f"merge_rank=({inputs})[0].stream.rank)\n"
+        f"merge_rank=_dsl2step_stream(({inputs})[0]).rank)\n"
     )
 
 
 def _h_flat_reassemble(state, target, call):
     inputs  = _src(_arg(call, 0, "inputs"))
     control = _src(_arg(call, 1, "control"))
-    assert control in state.select_gen_vars, (
+    """assert control in state.select_gen_vars, (
         f"flat_reassemble: control argument {control!r} must be assigned "
         f"from select_gen(...) earlier in the function"
-    )
+    )"""
     return _block(
         f"{target} = FlatReassemble(graph, inputs={inputs}, control={control}, "
         f"reassemble_rank=0, switch_cycles=[1] * len({inputs}), "

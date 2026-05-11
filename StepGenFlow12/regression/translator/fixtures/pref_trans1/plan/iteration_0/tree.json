@@ -1,0 +1,80 @@
+{
+  "name": "root",
+  "path": "root",
+  "is_leaf": false,
+  "has_refactored": true,
+  "children": [
+    {
+      "name": "attention_block",
+      "path": "root/attention_block",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "pre_attention_norm",
+          "path": "root/attention_block/pre_attention_norm",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "qkv_projection",
+          "path": "root/attention_block/qkv_projection",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "per_head_norm",
+          "path": "root/attention_block/per_head_norm",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "apply_rope",
+          "path": "root/attention_block/apply_rope",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "attention",
+          "path": "root/attention_block/attention",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "prepare_qkv",
+              "path": "root/attention_block/attention/prepare_qkv",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            },
+            {
+              "name": "attention_weights",
+              "path": "root/attention_block/attention/attention_weights",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            },
+            {
+              "name": "apply_weights_and_reshape",
+              "path": "root/attention_block/attention/apply_weights_and_reshape",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            }
+          ]
+        },
+        {
+          "name": "o_proj_residual",
+          "path": "root/attention_block/o_proj_residual",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        }
+      ]
+    }
+  ]
+}

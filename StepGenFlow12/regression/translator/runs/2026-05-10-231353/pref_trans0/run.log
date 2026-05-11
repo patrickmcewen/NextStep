@@ -1,0 +1,9 @@
+Pre-computed tensors: ['cos', 'expert_multihot', 'expert_onehot', 'expert_weights', 'input_tensor', 'k_proj', 'o_proj_weight', 'q_proj', 'router_w', 'sin', 'v_proj', 'w_down', 'w_gate', 'w_up']
+Pipeline: standard (1 lowering + 1 translation passes)
+  Resume-after-pass1 source: /workspace/NextStep/StepGenFlow12/regression/translator/fixtures/pref_trans0 (16 tree node(s), 15 cached DSL(s))
+[outer_0] Started — log: /workspace/NextStep/StepGenFlow12/regression/translator/runs/2026-05-10-231353/pref_trans0/checkpoints/2026-05-10-231357/prefill_transformer_simple/outer_0/log.txt
+[outer_0] Pass2 OK on resume — proceeding to translation
+[outer_0] CRASHED —     in_stream = Stream(dtype=MultiHot(total_n=8), shape=(1, 64, 2))
+
+FAILED — prefill_transformer_simple/small
+  Final diagnosis:     in_stream = Stream(dtype=MultiHot(total_n=8), shape=(1, 64, 2))

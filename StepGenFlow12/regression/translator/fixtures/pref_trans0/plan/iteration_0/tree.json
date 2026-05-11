@@ -1,0 +1,121 @@
+{
+  "name": "root",
+  "path": "root",
+  "is_leaf": false,
+  "has_refactored": true,
+  "children": [
+    {
+      "name": "pre_attention",
+      "path": "root/pre_attention",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "proj_and_norm",
+          "path": "root/pre_attention/proj_and_norm",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "pre_attention_and_qkv",
+              "path": "root/pre_attention/proj_and_norm/pre_attention_and_qkv",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            },
+            {
+              "name": "per_head_norm",
+              "path": "root/pre_attention/proj_and_norm/per_head_norm",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            }
+          ]
+        },
+        {
+          "name": "rope",
+          "path": "root/pre_attention/rope",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "name": "attention",
+      "path": "root/attention",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "attention_compute",
+          "path": "root/attention/attention_compute",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "attention_compute__root_attention_attention_compute",
+              "path": "root/attention/attention_compute/attention_compute__root_attention_attention_compute",
+              "is_leaf": false,
+              "has_refactored": true,
+              "children": [
+                {
+                  "name": "compute_e",
+                  "path": "root/attention/attention_compute/attention_compute__root_attention_attention_compute/compute_e",
+                  "is_leaf": true,
+                  "has_refactored": false,
+                  "children": []
+                },
+                {
+                  "name": "compute_attn",
+                  "path": "root/attention/attention_compute/attention_compute__root_attention_attention_compute/compute_attn",
+                  "is_leaf": true,
+                  "has_refactored": false,
+                  "children": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "moe",
+      "path": "root/moe",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "post_attn_rms_norm",
+          "path": "root/moe/post_attn_rms_norm",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "moe__root_moe",
+          "path": "root/moe/moe__root_moe",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "moe_compute",
+              "path": "root/moe/moe__root_moe/moe_compute",
+              "is_leaf": false,
+              "has_refactored": true,
+              "children": [
+                {
+                  "name": "expert_compute",
+                  "path": "root/moe/moe__root_moe/moe_compute/expert_compute",
+                  "is_leaf": true,
+                  "has_refactored": false,
+                  "children": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+FAIL: AssertionError: Tile count mismatch: input has 8 vs selector with 128. The input stream and selector stream must have the same number of stream elements, meaning that x.reshape(-1, tile_r, tile_c) and control.reshape(-1, n) must resolve to the same number of elements in the upper (-1) dimensions.

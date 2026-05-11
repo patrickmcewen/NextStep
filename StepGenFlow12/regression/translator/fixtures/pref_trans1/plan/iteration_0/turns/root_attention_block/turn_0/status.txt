@@ -1,0 +1,1 @@
+SPLIT_OK: children=['pre_attention_norm', 'qkv_projection', 'per_head_norm', 'apply_rope', 'attention', 'o_proj_residual']

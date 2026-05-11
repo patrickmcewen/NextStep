@@ -27,9 +27,6 @@ from src import step_dsl
 
 MOCK_BF16: bool = True  # default; matches simulator scripts in step_tl/
 
-# Re-export non-function symbols that DSL programs touch directly.
-Buffered = step_dsl.Buffered
-
 # ---------------------------------------------------------------------------
 # Records and tracker
 # ---------------------------------------------------------------------------
@@ -233,21 +230,20 @@ def _make_wrapper(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
 def _safe_output_shape(out: Any) -> tuple:
     """Return the shape tuple for whatever a DSL op returned.
 
-    DSL ops return torch.Tensor, list[Tensor], Buffered, or _OffsetTile.
-    Raises AssertionError for any other type so unexpected outputs surface
-    immediately rather than silently producing an empty shape.
+    DSL ops return torch.Tensor (sink), StepTensor (covers Tile/DynTile/Buffer/
+    Select/Bool streams and offset-carrying tiles), or list[StepTensor]
+    (parallelize, broadcast, eager_merge). AssertionError on any other type so
+    unexpected outputs surface immediately instead of producing empty shapes.
     """
+    if isinstance(out, step_dsl.StepTensor):
+        return tuple(out.tensor.shape)
     if isinstance(out, torch.Tensor):
         return tuple(out.shape)
     if isinstance(out, list):
-        assert out and all(isinstance(x, torch.Tensor) for x in out), (
-            f"_safe_output_shape: list output must be non-empty list of tensors, got {out!r}"
+        assert out and all(isinstance(x, step_dsl.StepTensor) for x in out), (
+            f"_safe_output_shape: list output must be non-empty list of StepTensor, got {out!r}"
         )
-        return tuple(out[0].shape)
-    if isinstance(out, step_dsl.Buffered):
-        return tuple(out.tensor.shape)
-    if isinstance(out, step_dsl._OffsetTile):
-        return tuple(out.data.shape)
+        return tuple(out[0].tensor.shape)
     raise AssertionError(
         f"_safe_output_shape: unexpected output type {type(out).__name__}"
     )
@@ -265,16 +261,17 @@ def _metrics_offchip_load_like(args, kwargs, output, mock_bf16):
       off_chip = stream.total_elements * tile_r * tile_c * n_byte
       on_chip  = tile_r * tile_c * n_byte   (both count_fifos modes)
     """
-    tile_bytes = _tile_bytes(output, mock_bf16)
-    n_stream = _stream_total_elements(output)
-    extra = {"tile_shape": _tile_shape(output)}
+    out_t = _tensor_of(output)
+    tile_bytes = _tile_bytes(out_t, mock_bf16)
+    n_stream = _stream_total_elements(out_t)
+    extra = {"tile_shape": _tile_shape(out_t)}
     return n_stream * tile_bytes, tile_bytes, tile_bytes, extra
 
 
 def _metrics_offchip_store(args, kwargs, output, mock_bf16):
     """OffChipStore: same formula as load, computed from the *input* stream
     (the data being written), not the flattened 2D output."""
-    inp = args[0]
+    inp = _tensor_of(args[0])
     tile_bytes = _tile_bytes(inp, mock_bf16)
     n_stream = _stream_total_elements(inp)
     extra = {"tile_shape": _tile_shape(inp)}
@@ -284,16 +281,17 @@ def _metrics_offchip_store(args, kwargs, output, mock_bf16):
 def _metrics_random_offchip_store(args, kwargs, output, mock_bf16):
     """RandomOffChipStore: traffic over the ack stream * tile bytes.
 
-    Tile bytes use the *underlying* tensor's dtype (positional arg 0), not
-    the float32 'ones' ack tile that the DSL returns. Default buffer_depth
-    is 1 in the DSL, so on-chip terms collapse to tile_bytes.
+    Tile bytes use the *underlying* tensor's dtype (positional arg 0, a raw
+    torch.Tensor), not the float32 'ones' ack tile that the DSL returns.
+    Default buffer_depth is 1 in the DSL, so on-chip terms collapse to
+    tile_bytes.
     """
-    underlying = args[0]
+    underlying = args[0]  # raw torch.Tensor; not a StepTensor
     tile_row = args[3] if len(args) > 3 else kwargs["tile_row"]
     tile_col = args[4] if len(args) > 4 else kwargs["tile_col"]
     n_byte = _n_byte(underlying.dtype, mock_bf16)
     tile_bytes = int(tile_row) * int(tile_col) * n_byte
-    n_stream = _stream_total_elements(output)  # ack stream
+    n_stream = _stream_total_elements(_tensor_of(output))  # ack stream
     extra = {"tile_shape": (int(tile_row), int(tile_col))}
     return n_stream * tile_bytes, tile_bytes, tile_bytes, extra
 
@@ -312,11 +310,17 @@ METRIC_FNS["random_offchip_store"] = _metrics_random_offchip_store
 
 
 def _tensor_of(x):
-    """Underlying tensor for shape/dtype lookup. Handles Buffered and _OffsetTile."""
-    if isinstance(x, step_dsl.Buffered):
+    """Underlying torch.Tensor for shape/dtype lookup.
+
+    Accepts a StepTensor (unwrapped via .tensor — covers Tile, Buffer, Select,
+    and offset-carrying variants) or a raw torch.Tensor (e.g. `underlying` arg
+    to random_offchip_store, or offchip_store's raw sink return).
+    """
+    if isinstance(x, step_dsl.StepTensor):
         return x.tensor
-    if isinstance(x, step_dsl._OffsetTile):
-        return x.data
+    assert isinstance(x, torch.Tensor), (
+        f"_tensor_of: expected StepTensor or torch.Tensor, got {type(x).__name__}"
+    )
     return x
 
 
@@ -478,15 +482,16 @@ def _metrics_bufferize(args, kwargs, output, mock_bf16):
       buffer_size = output_buffer.stream_dtype.size_in_bytes()
                   = prod(buffer_grid) * tile_bytes
 
-    DSL: bufferize(x, rank) returns Buffered(x, buffer_rank=rank).
-      input tensor x has shape (*stream_dims, tile_r, tile_c)
-      buffer_grid = x.shape[-2-rank : -2]  (the rank dims before the tile dims)
+    DSL: bufferize(x, rank) returns a StepTensor with stream_dtype=Buffer(...).
+      input tensor x has shape (*stream_dims, tile_r, tile_c).
+      buffer_grid = output.stream_dtype.shape (the bufferized rank dims).
     """
-    x = _tensor_of(args[0])          # input tensor
-    buf_out = output                  # Buffered
-    assert isinstance(buf_out, step_dsl.Buffered)
+    x = _tensor_of(args[0])           # input tensor (Tile stream)
+    assert isinstance(output, step_dsl.StepTensor) and isinstance(
+        output.stream_dtype, step_dsl.Buffer
+    ), f"bufferize output must be StepTensor with Buffer stream_dtype, got {output!r}"
     tile_b = _tile_bytes(x, mock_bf16)
-    buffer_grid = buf_out.buffer_shape  # e.g. (2,) for rank=1
+    buffer_grid = output.stream_dtype.shape   # e.g. (2,) for rank=1
     n_buffer_tiles = 1
     for d in buffer_grid:
         n_buffer_tiles *= int(d)
@@ -503,12 +508,15 @@ def _metrics_streamify_family(args, kwargs, output, mock_bf16):
       buffer_size = in_buffer.size_in_bytes()
                   = prod(buffer.shape) * tile_bytes
 
-    DSL: streamify(buf, stride, out_shape_tiled) or dyn_streamify(buf, ...) where buf is Buffered.
+    DSL: streamify(buf, stride, out_shape_tiled) or dyn_streamify(buf, ...)
+    where buf is a StepTensor with stream_dtype=Buffer(...).
     """
-    buf = args[0]                     # Buffered
-    assert isinstance(buf, step_dsl.Buffered)
+    buf = args[0]
+    assert isinstance(buf, step_dsl.StepTensor) and isinstance(
+        buf.stream_dtype, step_dsl.Buffer
+    ), f"streamify input must be StepTensor with Buffer stream_dtype, got {buf!r}"
     tile_b = _tile_bytes(buf.tensor, mock_bf16)
-    buffer_grid = buf.buffer_shape
+    buffer_grid = buf.stream_dtype.shape
     n_buffer_tiles = 1
     for d in buffer_grid:
         n_buffer_tiles *= int(d)

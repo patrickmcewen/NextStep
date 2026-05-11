@@ -2877,24 +2877,19 @@ def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
     log(f"[pass2] composing root with all descendants name-rebound "
         f"(artifacts: {pass2_dir})")
 
-    # Build a namespace containing scaffold + all descendants + root, then
-    # re-execute the root through the standard executor with the composed
-    # bindings as ``extra_globals``. We extract the extras by walking
-    # ``composed_ns`` itself (all callables except the root entry point)
-    # rather than indexing by descendant key — this is robust to the
-    # same-name shadowing case: the parent's ``def`` overwrote the leaf in
-    # ``composed_ns``, but the leaf survives via the parent's captured
-    # ``_<name>_child`` alias, which is *also* a callable in ``composed_ns``.
-    composed_ns = _pass2_compose_namespace(
-        parent_dsl=root_dsl, child_dsls_in_order=descendants_in_order)
-    extras = {k: v for k, v in composed_ns.items()
-              if callable(v) and k != "tiled_reference"}
+    # Exec scaffold + every descendant + root in a single namespace so they
+    # share one ``StepTensor`` class. The previous approach built a separate
+    # ``composed_ns`` and passed its callables as ``extra_globals`` to a
+    # fresh ``_exec_dsl_ref`` namespace — but ``_exec_dsl_ref`` re-execs the
+    # scaffold, producing a second ``StepTensor`` class. Values produced by
+    # the children carried the first class; the root's ``offchip_store``
+    # checked against the second, so ``isinstance`` failed.
 
     # Capture step_dsl's shape-trace prints into pass2's folder rather
     # than letting them disappear into the parent process's stdout.
     _trace_buf = io.StringIO()
     with contextlib.redirect_stdout(_trace_buf):
-        result = _exec_dsl_ref(root_dsl, dims, tensors, extra_globals=extras)
+        result = _exec_dsl_ref(composed_source, dims, tensors)
     shape_trace = _trace_buf.getvalue()
     if shape_trace:
         _write(pass2_dir / "shape_trace.txt", shape_trace)

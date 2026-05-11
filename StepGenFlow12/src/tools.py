@@ -42,6 +42,8 @@ IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 
 from step_py.ops import StepOps
 
+from src.step_dsl import StepTensor
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -229,18 +231,34 @@ def enhance_emulator_error(exc: Exception, user_code: str) -> str:
 # (gated_mlp, linear, …) actually lands in the exec namespace, instead of the
 # standalone ops (offchip_load, binary_matmul, …) the system prompt doesn't
 # describe.
-_DSL_PY = Path(__file__).resolve().parent / "step_dsl.py"
-_DSL_IMPORTS = "import torch\nimport torch.nn.functional as F\nimport math\n\n"
+_DSL_IMPORTS = (
+    "import torch\n"
+    "import torch.nn.functional as F\n"
+    "import math\n"
+    "from step_dsl import *\n"
+)
 
 
 def _build_dsl_scaffold() -> str:
-    step_dsl_mod = sys.modules.get("step_dsl")
-    src_path = (
-        Path(step_dsl_mod.__file__)
-        if step_dsl_mod is not None and getattr(step_dsl_mod, "__file__", None)
-        else _DSL_PY
-    )
-    return _DSL_IMPORTS + src_path.read_text() + "\n"
+    # Wire the DSL surface via ``from step_dsl import *`` rather than
+    # re-exec'ing the module source. The old approach created a parallel
+    # ``StepTensor``/``Tile`` class set inside the user namespace, so values
+    # produced by Python helpers that imported ``StepTensor`` from the
+    # module directly (e.g. blackbox stubs) failed ``isinstance`` checks in
+    # DSL ops running in the user namespace. With a single import the two
+    # namespaces share class identity.
+    #
+    # Two run modes need this name to resolve:
+    #   * Bundle mode — the orchestrator pre-registers the bundle's
+    #     ``abstraction.py`` as ``sys.modules["step_dsl"]`` before any
+    #     scaffold-using code runs.
+    #   * Standalone mode — nothing else registers the name, so we point
+    #     it at ``src.step_dsl`` here. Done lazily and only when unset so
+    #     bundle's prior binding is never overwritten.
+    if "step_dsl" not in sys.modules:
+        from src import step_dsl as _src_step_dsl
+        sys.modules["step_dsl"] = _src_step_dsl
+    return _DSL_IMPORTS
 
 
 def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
@@ -308,16 +326,29 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     finally:
         _builtins.isinstance = _saved_isinstance
         torch.Tensor = _saved_torch_tensor
+    # Unwrap StepTensor returns to raw torch.Tensor for downstream consumers
+    # (gold comparison uses ``result.reshape(-1)``, which only works on raw
+    # tensors). A non-root planner node naturally ends with a DSL op that
+    # produces a StepTensor; requiring callers to append offchip_store just
+    # to satisfy this boundary would be artificial — offchip_store is a sink.
     if isinstance(result, (tuple, list)):
-        for i, t in enumerate(result):
+        unwrapped = type(result)(
+            t.tensor if isinstance(t, StepTensor) else t for t in result
+        )
+        for i, t in enumerate(unwrapped):
             assert isinstance(t, torch.Tensor), (
                 f"{entry_point} returned a {type(result).__name__}; element "
-                f"[{i}] must be a torch.Tensor, got {type(t).__name__}"
+                f"[{i}] must be a torch.Tensor or StepTensor, got "
+                f"{type(result[i]).__name__}"
             )
+        result = unwrapped
     else:
+        if isinstance(result, StepTensor):
+            result = result.tensor
         assert isinstance(result, torch.Tensor), (
-            f"{entry_point} must return a torch.Tensor (or tuple/list of "
-            f"tensors for tuple-returning planner nodes), got {type(result).__name__}"
+            f"{entry_point} must return a torch.Tensor or StepTensor (or "
+            f"tuple/list of those for tuple-returning planner nodes), "
+            f"got {type(result).__name__}"
         )
     return result
 

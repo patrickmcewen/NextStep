@@ -1,0 +1,1 @@
+FAIL: AssertionError: x stream shape must equal ref stream shape minus its trailing dim: [1, 64] vs [1]

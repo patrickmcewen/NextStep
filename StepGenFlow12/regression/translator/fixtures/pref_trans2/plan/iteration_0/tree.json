@@ -1,0 +1,83 @@
+{
+  "name": "root",
+  "path": "root",
+  "is_leaf": false,
+  "has_refactored": true,
+  "children": [
+    {
+      "name": "attention_block",
+      "path": "root/attention_block",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "qkv_preprocess",
+          "path": "root/attention_block/qkv_preprocess",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "attention_o_proj",
+          "path": "root/attention_block/attention_o_proj",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "attention_core",
+              "path": "root/attention_block/attention_o_proj/attention_core",
+              "is_leaf": false,
+              "has_refactored": true,
+              "children": [
+                {
+                  "name": "attention_compute",
+                  "path": "root/attention_block/attention_o_proj/attention_core/attention_compute",
+                  "is_leaf": true,
+                  "has_refactored": false,
+                  "children": []
+                }
+              ]
+            },
+            {
+              "name": "o_proj",
+              "path": "root/attention_block/attention_o_proj/o_proj",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "moe_block",
+      "path": "root/moe_block",
+      "is_leaf": false,
+      "has_refactored": true,
+      "children": [
+        {
+          "name": "rms_norm",
+          "path": "root/moe_block/rms_norm",
+          "is_leaf": true,
+          "has_refactored": false,
+          "children": []
+        },
+        {
+          "name": "moe_aggregation",
+          "path": "root/moe_block/moe_aggregation",
+          "is_leaf": false,
+          "has_refactored": true,
+          "children": [
+            {
+              "name": "expert_contribute",
+              "path": "root/moe_block/moe_aggregation/expert_contribute",
+              "is_leaf": true,
+              "has_refactored": false,
+              "children": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

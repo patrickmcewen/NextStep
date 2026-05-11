@@ -6,7 +6,7 @@ After this pass, {dsl_only_phrase} No raw tensor arithmetic (`*`, `+`, `/`), no 
 
 You cannot use python indexing to access parts of data tensors.
 
-You also may not create any new pytorch tensors besides the ones provided to you in the function. No torch.zeros or similar. The one explicit exception is converting a ``list[int]`` input (declared as such in the contract block) to a 1D int tensor via ``torch.tensor(<list_of_ints>)`` so it can be fed into a DSL producer like ``metadata_gen`` — that's a deterministic conversion of an existing positional input, not free-form tensor creation, and is required for ragged-dataflow patterns.
+You also may not create any new pytorch tensors besides the ones provided to you in the function, except for specifically torch.zeros(). The one explicit exception is converting a ``list[int]`` input (declared as such in the contract block) to a 1D int tensor via ``torch.tensor(<list_of_ints>)`` so it can be fed into a DSL producer like ``metadata_gen`` — that's a deterministic conversion of an existing positional input, not free-form tensor creation, and is required for ragged-dataflow patterns.
 
 If the code is already fully in DSL form, output it unchanged.
 

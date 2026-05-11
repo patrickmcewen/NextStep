@@ -1,0 +1,13 @@
+{
+  "results": [
+    {
+      "fixture": "pref_trans_pass0",
+      "kernel": "prefill_transformer_simple",
+      "preset": "small",
+      "status": "fail",
+      "exit_code": 1,
+      "duration_s": 10.7,
+      "log": "regression/translator/runs/2026-05-11-005758/pref_trans_pass0/run.log"
+    }
+  ]
+}
