@@ -771,16 +771,44 @@ def bufferize(x, rank):
 
 
 def restream(x, stride, out_shape_tiled):
-    """Re-stream an on-chip tile-stream tensor with a new layout.
+    """Re-stream an on-chip tile-stream tensor with an arbitrary new
+    stream layout AND arbitrary new tile dims.
 
-    Convenience for ``streamify(bufferize(x, rank=x.ndim - 2), stride,
-    out_shape_tiled)``: bufferizes *all* of ``x``'s stream dims into the
-    buffer, then re-streams over the resulting tile grid using the
-    requested ``stride`` and ``out_shape_tiled`` (same semantics as
-    ``streamify`` — tile dims are preserved). Use ``retile_streamify``
-    before or after to change tile dims.
+    The input ``x`` has shape ``(*stream_in, Tr_in, Tc_in)``. The output
+    has shape ``(*out_shape_tiled[:-2], out_shape_tiled[-2], out_shape_tiled[-1])``,
+    i.e. the LAST TWO entries of ``out_shape_tiled`` become the new tile
+    dims and the leading entries form the output's outer stream.
 
-    Lowers to a Bufferize -> Streamify pair in the STeP graph.
+    Pipeline (micro-tile fixed at (1, 1) for full element-level flexibility):
+      1. ``promote(rank=0)`` once — add a single singleton stream dim before
+         the tile. ``retile_streamify`` merges its new chunks dim INTO the
+         last existing stream dim; the singleton absorbs the row chunks
+         without polluting the original input stream. The second
+         ``retile_streamify`` then absorbs the col chunks into the (no
+         longer singleton) last dim, which is fine because we will linearize
+         the whole thing in the bufferize step anyway.
+      2. ``retile_streamify(chunk=1, split_row=True)`` and
+         ``retile_streamify(chunk=1, split_row=False)`` — peel ``Tr_in`` and
+         then ``Tc_in`` into stream chunks of size 1, leaving (1, 1) tiles.
+      3. ``bufferize(rank=full)`` + ``streamify(stride, out_shape_tiled)`` —
+         re-layout the linearized element buffer using the user-supplied
+         layout. Output shape: ``(*out_shape_tiled, 1, 1)``.
+      4. ``accum_retile_col(rank=1)`` then ``accum_retile_row(rank=1)`` —
+         fold the trailing two stream dims (which are
+         ``out_shape_tiled[-2:]``) back into a tile, in that order so that
+         the inner stream dim becomes tile-cols and the next becomes
+         tile-rows.
+
+    ``stride`` must have the same length as ``out_shape_tiled`` and is
+    interpreted over the linearized element buffer of size
+    ``prod(stream_in) * Tr_in * Tc_in`` (since micro = (1, 1)).
+
+    Cost: this generalization captures every input element into the buffer,
+    so the bufferize/streamify cost scales with ``prod(stream_in) *
+    Tr_in * Tc_in``. Use only when arbitrary tile-dim changes are required;
+    if you only need to re-layout streams (preserving tile dims), prefer the
+    cheaper composition ``streamify(bufferize(x, rank=x.ndim - 2), stride,
+    out_shape_tiled)`` directly.
     """
     assert isinstance(x, torch.Tensor), (
         f"restream: expected on-chip stream tensor, got {type(x).__name__}. "
@@ -790,11 +818,26 @@ def restream(x, stride, out_shape_tiled):
         f"restream: input must have >=1 stream dim + 2 tile dims, got ndim={x.ndim} "
         f"(shape={tuple(x.shape)})"
     )
-    return streamify(
-        bufferize(x, rank=x.ndim - 2),
+    assert len(out_shape_tiled) >= 2, (
+        f"restream: out_shape_tiled must end in (out_tile_r, out_tile_c) and "
+        f"thus have length >= 2, got {tuple(out_shape_tiled)}"
+    )
+    assert len(stride) == len(out_shape_tiled), (
+        f"restream: stride {tuple(stride)} and out_shape_tiled {tuple(out_shape_tiled)} "
+        f"must have same length"
+    )
+
+    y = promote(x, rank=0)
+    y = retile_streamify(y, chunk=1, split_row=True)
+    y = retile_streamify(y, chunk=1, split_row=False)
+    y = streamify(
+        bufferize(y, rank=y.ndim - 2),
         stride=stride,
         out_shape_tiled=out_shape_tiled,
     )
+    y = accum_retile_col(y, rank=1)
+    y = accum_retile_row(y, rank=1)
+    return y
 
 
 def dyn_streamify(x, ref):

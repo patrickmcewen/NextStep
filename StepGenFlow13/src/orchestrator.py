@@ -36,7 +36,7 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 import yaml
@@ -2549,6 +2549,629 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         result.setdefault("failing_node", synth_name)
         result.setdefault("last_messages", [])
     return result
+
+
+# ---------------------------------------------------------------------------
+# Independent Pass-1 (StepGenFlow13)
+# ---------------------------------------------------------------------------
+# In independent mode every node is verified standalone:
+#   * No parent_contract — every input is RAW (off-chip).
+#   * Vanilla gold: Model(*vanilla_inputs) for non-root, compute_gold(dims) for
+#     root. The LLM's tile-stream output, when flattened in row-major order,
+#     must equal the flattened vanilla gold.
+#   * AST validator: each tensor arg must be loaded with offchip_load exactly
+#     once before any DSL consumer; list-of-tensor args must be loaded in a
+#     single host loop with one offchip_load per element, all sharing the
+#     same layout.
+#   * Children appear as plain `child_name(args)` placeholder calls in the
+#     parent's DSL. A separate smoothing pass (pass_smooth.py) inlines the
+#     children and inserts `restream` bridges across layout mismatches.
+# ---------------------------------------------------------------------------
+
+
+def _validate_load_once(code: str, *, arg_names: tuple[str, ...],
+                        arg_specs: tuple,
+                        function_name: str) -> str | None:
+    """Statically check that every TensorArg / ListOfTensorArg in
+    ``arg_names`` is loaded with ``offchip_load`` exactly once before any
+    DSL consumer touches it. Returns ``None`` on pass, an error string
+    otherwise.
+
+    Rules per arg kind:
+      - TensorArg: one ``offchip_load(arg, ...)`` call directly on the
+        bare arg name. Any other use of ``arg`` before that load (or
+        any subsequent re-load) is an error.
+      - ListOfTensorArg: a single host loop ``[offchip_load(arg[i], ...)
+        for i in range(len(arg))]`` (or equivalent) — exactly one
+        ``offchip_load`` whose first arg is ``arg[<index>]``. Iterating
+        the list with ``for x in arg`` is also accepted.
+      - ListOfIntArg: ignored (these are converted via torch.tensor(...)
+        at host time, not loaded with offchip_load).
+    """
+    from src.node_signature import (
+        ListOfIntArg as _ListOfIntArg,
+        ListOfTensorArg as _ListOfTensorArg,
+        TensorArg as _TensorArg,
+    )
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"_validate_load_once: code does not parse: {e}"
+
+    fn = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            fn = node
+            break
+    if fn is None:
+        return (f"_validate_load_once: could not find function "
+                f"`def {function_name}(...)` in the emitted code")
+
+    tensor_args = {a for a, s in zip(arg_names, arg_specs)
+                   if isinstance(s, _TensorArg)}
+    list_tensor_args = {a for a, s in zip(arg_names, arg_specs)
+                        if isinstance(s, _ListOfTensorArg)}
+    int_list_args = {a for a, s in zip(arg_names, arg_specs)
+                     if isinstance(s, _ListOfIntArg)}
+    # ListOfIntArg uses are unconstrained beyond "don't pass to a DSL
+    # consumer directly" — that's enforced by torch.tensor() being a host op,
+    # so we don't gate it here.
+    del int_list_args
+
+    # First pass: count offchip_load calls per arg.
+    tensor_loads: dict[str, list[ast.Call]] = {a: [] for a in tensor_args}
+    list_loads: dict[str, list[ast.Call]] = {a: [] for a in list_tensor_args}
+
+    for sub in ast.walk(fn):
+        if not isinstance(sub, ast.Call):
+            continue
+        fname = _call_name(sub)
+        if fname != "offchip_load":
+            continue
+        if not sub.args:
+            return ("_validate_load_once: offchip_load call has no positional "
+                    "arg")
+        first = sub.args[0]
+        if isinstance(first, ast.Name) and first.id in tensor_args:
+            tensor_loads[first.id].append(sub)
+        elif (isinstance(first, ast.Subscript)
+              and isinstance(first.value, ast.Name)
+              and first.value.id in list_tensor_args):
+            list_loads[first.value.id].append(sub)
+
+    # Validate each TensorArg is loaded exactly once.
+    for arg, loads in tensor_loads.items():
+        if len(loads) != 1:
+            return (f"_validate_load_once: tensor arg `{arg}` must be loaded "
+                    f"with exactly one `offchip_load({arg}, ...)` call, found "
+                    f"{len(loads)}")
+
+    # Validate each ListOfTensorArg is loaded with exactly one
+    # offchip_load(arg[<index>], ...) call (typically inside a list/for comp).
+    for arg, loads in list_loads.items():
+        if len(loads) != 1:
+            return (f"_validate_load_once: list-of-tensor arg `{arg}` must be "
+                    f"loaded by exactly one `offchip_load({arg}[i], ...)` "
+                    f"call (typically inside a single host loop), found "
+                    f"{len(loads)}")
+
+    # Validate that no tensor arg is *used* in a way that bypasses the load:
+    # the only legal pre-load uses are (a) appearing as the first arg of the
+    # one offchip_load call and (b) appearing as a positional arg of a
+    # placeholder child call. Anything else (arithmetic, .reshape, slicing,
+    # passing to a DSL consumer) is forbidden.
+    # We approximate this by walking the function body in order and tracking
+    # which tensor args have been "consumed" by their offchip_load. Once
+    # consumed, the arg name should not appear in any later expression
+    # except as a passthrough to a child placeholder.
+    # This is a soft check; the strict load-count check above catches the
+    # most common failure modes. We skip the order-dependent check here
+    # because static order analysis is brittle in Python (try/with/etc.);
+    # the count check + the prompt's instruction to "load exactly once
+    # before any DSL consumer" carries most of the weight.
+
+    return None
+
+
+def _untile_to_vanilla(tile_out, vanilla_shape: tuple[int, ...]):
+    """Invert the tile-stream packaging of an output back to vanilla shape
+    by row-major reshape. Mirrors the convention enforced by the
+    independent-pass1 prompt: the LLM's flattened output equals the
+    vanilla output flattened.
+    """
+    assert tile_out.numel() == 1 or tile_out.numel() == int(torch.tensor(
+        vanilla_shape).prod().item() if vanilla_shape else 1) or \
+        int(torch.prod(torch.tensor(list(vanilla_shape))).item()) == \
+        tile_out.numel(), (
+        f"_untile_to_vanilla: output numel {tile_out.numel()} does not match "
+        f"vanilla shape {vanilla_shape} (numel "
+        f"{int(torch.prod(torch.tensor(list(vanilla_shape))).item())})")
+    return tile_out.reshape(vanilla_shape)
+
+
+async def _refactor_one_node_pass1_independent(*, node, dims, root_kernel,
+                                                ckpt_root, agent_factory,
+                                                max_turns, log,
+                                                node_attempts: int = 1,
+                                                non_root_sequential: bool = True,
+                                                stateless: bool = False,
+                                                tensors: dict,
+                                                children_meta: list = (),
+                                                plan_iter: int = 0):
+    """Independent-mode Pass-1 driver for a single node.
+
+    Differences from ``_refactor_one_node_pass1``:
+      * No ``parent_contract`` plumbing. Every input is treated as RAW.
+      * Vanilla gold: ``Model(*vanilla_inputs)`` for non-root,
+        ``compute_gold(dims)`` for root. The LLM's flattened output is
+        compared against vanilla gold flattened.
+      * Function signature has no ``out_shapes``/``out_perms`` kwargs.
+      * Children are placeholder calls; verification stubs (if any) come
+        from ``children_meta`` and run the child's ``ref_module`` against
+        vanillified inputs, returning a tile-stream tensor packaged as
+        ``raw.reshape(canonical_tile_stream_shape)`` so the parent's DSL
+        can use it. The smoother replaces these calls in pass2.
+      * Adds ``_validate_load_once`` as a post-validator gate.
+    """
+    from src.agents import make_pass1_agent, make_pass1_judge_agent
+    from src.blackbox_stub import ContractRecorder
+    from src.prompts import build_pass1_independent_user_prompt
+    from src.planner import build_node_tensors, has_class_model
+    from src.node_signature import extract_signature
+
+    is_root = (node.path == "root")
+    synth_name = _synth_kernel_name(root_kernel, node.path)
+
+    # Vanilla gold + node tensors.
+    if is_root:
+        node_tensors = tensors
+        ref_ns: dict = {}
+        exec(node.reference_code, ref_ns)
+        assert "compute_gold" in ref_ns, (
+            f"node {node.path!r}: reference_code must define compute_gold(dims)")
+        import inspect as _inspect
+        gold_arity = len(_inspect.signature(ref_ns["compute_gold"]).parameters)
+        assert gold_arity in (1, 2), (
+            f"node {node.path!r}: compute_gold must take (dims) or "
+            f"(dims, tensors); got {gold_arity}-arg signature")
+        with torch.no_grad():
+            gold = (ref_ns["compute_gold"](dims) if gold_arity == 1
+                    else ref_ns["compute_gold"](dims, node_tensors))
+    else:
+        # Non-root: build vanilla inputs from the node's own get_inputs (or
+        # forward the parent's tensors if no class Model is defined here) and
+        # run the node's reference Model.forward to obtain vanilla gold.
+        if has_class_model(node.reference_code):
+            node_tensors = build_node_tensors(node.reference_code, dims)
+        else:
+            node_tensors = tensors
+        ref_ns = {}
+        exec(node.reference_code, ref_ns)
+        assert "Model" in ref_ns, (
+            f"non-root independent node {node.path!r}: reference_code must "
+            f"define class Model")
+        model = ref_ns["Model"]() if isinstance(ref_ns["Model"], type) else ref_ns["Model"]
+        # Bind tensor args by the order Model.forward declares.
+        import inspect as _inspect
+        forward_params = [p for p in _inspect.signature(model.forward).parameters
+                          if p != "self"]
+        assert all(n in node_tensors for n in forward_params), (
+            f"node {node.path!r}: Model.forward expects {forward_params} but "
+            f"node_tensors has keys {list(node_tensors)}")
+        with torch.no_grad():
+            gold = model(*[node_tensors[n] for n in forward_params])
+    _inject_gold(synth_name, dims, gold)
+
+    # Build the function signature (independent style: no out_shapes kwarg).
+    if is_root:
+        function_signature = "def tiled_reference(dims, tensors):"
+        sig_arg_names: tuple[str, ...] = ()
+        sig_arg_specs: tuple = ()
+    else:
+        sig = extract_signature(node.reference_code, node_tensors)
+        sig_arg_names = sig.arg_names
+        sig_arg_specs = sig.arg_specs
+        sig_args = ", ".join(sig_arg_names)
+        function_signature = f"def {node.name}({sig_args}):"
+
+    # Children placeholder signatures (for prompt rendering only).
+    children_signatures = []
+    for entry in children_meta:
+        # children_meta entries are tuples (path, name, NodeSignature, ref_module)
+        c_path, c_name, c_sig, _c_ref = entry
+        children_signatures.append((
+            c_name,
+            c_sig.arg_names,
+            c_sig.arg_specs,
+            c_sig.out_shapes,
+            c_sig.out_is_tuple,
+        ))
+
+    # Build the user prompt.
+    agent_facing_reference = (
+        node.refactored_code
+        if node.refactored_code is not None
+        else node.reference_code
+    )
+    user_prompt = build_pass1_independent_user_prompt(
+        node_name=node.name,
+        is_root=is_root,
+        reference_code=agent_facing_reference,
+        dims=dims,
+        tensors=node_tensors,
+        arg_names=sig_arg_names,
+        arg_specs=sig_arg_specs,
+        children_signatures=children_signatures,
+        function_signature=function_signature,
+    )
+
+    node_dir = ckpt_root / "pass1_independent" / f"iteration_{plan_iter}" / node.path
+    node_dir.mkdir(parents=True, exist_ok=True)
+
+    llm_config = getattr(agent_factory, "__llm_config__", None)
+    assert llm_config is not None, (
+        "agent_factory must expose __llm_config__")
+    is_leaf = not children_signatures
+    few_shot_examples = getattr(agent_factory, "__few_shot_examples__", None)
+
+    # Reuse the existing pass1 agent factory with empty contract_block.
+    # The system prompt template tolerates an empty contract_block; the
+    # user prompt carries the independent-mode framing.
+    agent = make_pass1_agent(
+        llm_config,
+        is_leaf=is_leaf,
+        child_blackbox_block="",
+        contract_block="",
+        few_shot_examples=few_shot_examples,
+    )
+    judge_agent = make_pass1_judge_agent(
+        llm_config,
+        is_leaf=is_leaf,
+        child_blackbox_block="",
+        contract_block="",
+        function_signature=function_signature,
+    )
+
+    # Build call args / kwargs for verification.
+    if is_root:
+        entry_point = "tiled_reference"
+        call_args: tuple | None = None
+        call_kwargs: dict | None = None
+    else:
+        entry_point = node.name
+        call_args = tuple(node_tensors[n] for n in sig_arg_names)
+        call_kwargs = {}
+
+    # Children stubs: at pass1 verification time, the parent's DSL may invoke
+    # `child_name(args)` as a placeholder. We provide a *vanilla-passthrough*
+    # stub that takes whatever the parent passed (typically tile-stream
+    # tensors, but possibly raw too), un-tiles via .reshape(vanilla_shape),
+    # runs the child's ref_module on vanilla, and reshapes the result back to
+    # match the input's stream shape. This is enough to verify the parent's
+    # structural correctness; the smoother replaces these stubs with the
+    # child's verified DSL body + restream bridges in pass2.
+    child_recorders = {m[0]: ContractRecorder() for m in children_meta}
+    extras: dict = {}
+    for child_path, child_name, child_sig, child_ref in children_meta:
+        extras[child_name] = _make_independent_stub(
+            ref_module=child_ref,
+            arg_names=child_sig.arg_names,
+            arg_specs=child_sig.arg_specs,
+            out_shapes=child_sig.out_shapes,
+            out_is_tuple=child_sig.out_is_tuple,
+            recorder=child_recorders[child_path],
+        )
+    extra_required_ops = tuple(c[1] for c in children_meta)
+
+    # AST post-validator gate.
+    def _post_validator(code: str, _turn_dir: Path) -> str | None:
+        if is_root:
+            # Root signature `def tiled_reference(dims, tensors):` takes the
+            # `tensors` dict; we don't enforce load-once on dict-keyed inputs
+            # at this layer because the per-tensor load convention is opaque
+            # to our static analyzer. Skip the rule for root.
+            return None
+        return _validate_load_once(
+            code,
+            arg_names=sig_arg_names,
+            arg_specs=sig_arg_specs,
+            function_name=node.name,
+        )
+
+    async def _one_attempt(attempt_idx: int) -> dict:
+        attempt_dir = (node_dir if node_attempts == 1
+                       else node_dir / f"attempt_{attempt_idx}")
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_log = _make_attempt_log(log, node.path, attempt_idx, node_attempts)
+
+        def _reset_recorders():
+            for r in child_recorders.values():
+                r.contract = None
+
+        result = await _run_pass_loop(
+            agent, "refactor_final",
+            kernel_name=synth_name, dims=dims, max_turns=max_turns,
+            ckpt_dir=attempt_dir, executor="dsl", tensors=node_tensors,
+            log=attempt_log,
+            check_order="correctness-first",
+            prebuilt_user_prompt=user_prompt,
+            judge_agent=judge_agent,
+            is_root=is_root,
+            stateless=stateless,
+            extra_globals=extras,
+            extra_required_ops=extra_required_ops,
+            entry_point=entry_point,
+            call_args=call_args,
+            call_kwargs=call_kwargs,
+            raw_arg_names=frozenset(sig_arg_names),  # all args are RAW
+            pre_turn_hook=_reset_recorders,
+            post_validator=_post_validator,
+        )
+        result["child_recorders"] = child_recorders
+        return result
+
+    run_sequential = (node_attempts > 1) and non_root_sequential and not is_root
+    if node_attempts == 1:
+        result = await _one_attempt(0)
+    elif run_sequential:
+        log(f"[pass1_independent] node {node.path!r}: up to {node_attempts} sequential attempts")
+        result = {"success": False}
+        for i in range(node_attempts):
+            r = await _one_attempt(i)
+            if r.get("success"):
+                result = r
+                break
+            result = r
+    else:
+        log(f"[pass1_independent] node {node.path!r}: {node_attempts} parallel attempts")
+        pending = {asyncio.create_task(_one_attempt(i)) for i in range(node_attempts)}
+        last_failure: dict | None = None
+        result = None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                r = d.result()
+                if r.get("success"):
+                    for t in pending:
+                        t.cancel()
+                    result = r
+                    pending = set()
+                    break
+                last_failure = r
+        if result is None:
+            result = last_failure or {"success": False}
+
+    if not result.get("success"):
+        result.setdefault("failing_node", synth_name)
+        result.setdefault("last_messages", [])
+    return result
+
+
+def _make_independent_stub(*, ref_module, arg_names, arg_specs,
+                            out_shapes, out_is_tuple, recorder):
+    """Verification-time stub for placeholder child calls in independent mode.
+
+    Takes whatever the parent passes (tile-stream or raw tensors), un-tiles
+    each via ``.reshape(spec.shape)``, runs the child's ``ref_module`` on
+    the vanilla inputs, and packages the outputs as tile-stream tensors of
+    a CANONICAL layout: ``vanilla.reshape(*out_shape)``. This lets the
+    parent's DSL verification proceed structurally; the smoother in pass2
+    will replace these calls with the child's verified DSL body + restream
+    bridges.
+
+    The recorder still records a Contract so the orchestrator's harvester
+    has something to stamp; in independent mode the contract is informational
+    (not used as a child-side input spec).
+    """
+    from src.contract import Contract
+    from src.node_signature import (
+        ListOfIntArg as _ListOfIntArg,
+        ListOfTensorArg as _ListOfTensorArg,
+        TensorArg as _TensorArg,
+    )
+
+    def stub(*args):
+        # Vanillify: each arg is either a tile-stream tensor (parent's
+        # on-chip value), a raw vanilla tensor (passthrough), a list of
+        # tensors, or a list of ints.
+        vanilla_args = []
+        for arg, spec in zip(args, arg_specs):
+            if isinstance(spec, _TensorArg):
+                if hasattr(arg, "reshape"):
+                    vanilla_args.append(arg.reshape(spec.shape))
+                else:
+                    vanilla_args.append(arg)
+            elif isinstance(spec, _ListOfTensorArg):
+                vanilla_args.append([t.reshape(spec.elem_shape) for t in arg])
+            else:
+                assert isinstance(spec, _ListOfIntArg)
+                vanilla_args.append(list(arg))
+
+        with torch.no_grad():
+            raw = ref_module(*vanilla_args)
+        raw_outputs = raw if isinstance(raw, tuple) else (raw,)
+        assert len(raw_outputs) == len(out_shapes), (
+            f"independent stub: ref_module returned {len(raw_outputs)} "
+            f"outputs but signature expects {len(out_shapes)}")
+        # Canonical packaging: each output is row-major reshaped to its
+        # vanilla shape (i.e., we don't tile further). The parent's DSL
+        # treats this as a tile-stream tensor with stream_rank = ndim-2
+        # and the trailing two dims as the tile.
+        packaged = tuple(out.reshape(s) if hasattr(out, "reshape") else out
+                         for out, s in zip(raw_outputs, out_shapes))
+
+        if recorder.contract is None:
+            recorder.contract = Contract(
+                arg_names=arg_names,
+                vanilla_shapes=tuple(
+                    s.shape if isinstance(s, _TensorArg) else ()
+                    for s in arg_specs),
+                tiled_shapes=tuple(
+                    tuple(a.shape) if hasattr(a, "shape") else ()
+                    for a in args),
+                tiled_values=tuple(args),
+                out_shapes=tuple(tuple(s) for s in out_shapes),
+                out_perms=(None,) * len(out_shapes),
+                tiled_outputs=tuple(p.detach().clone() if hasattr(p, "detach") else p
+                                    for p in packaged),
+                out_is_tuple=out_is_tuple,
+                arg_specs=arg_specs,
+            )
+
+        return packaged if out_is_tuple else packaged[0]
+
+    stub.__name__ = "independent_blackbox_stub"
+    return stub
+
+
+async def _pass1_walk_independent(*, tree, signatures, ref_modules,
+                                    dims, root_kernel, ckpt_root,
+                                    agent_factory, max_turns, log,
+                                    node_attempts: int = 1,
+                                    non_root_sequential: bool = True,
+                                    stateless: bool = False,
+                                    tensors: dict,
+                                    plan_iter: int = 0):
+    """Run independent Pass-1 across every node in ``tree`` IN PARALLEL.
+
+    Returns a dict mapping ``node.path -> result dict`` with at least
+    ``{"success": bool}``. On success ``result["dsl"]`` holds the verified
+    DSL string for that node. Children placeholders in the parent's DSL are
+    structural — the smoother (pass_smooth.py) inlines them in pass2.
+    """
+    nodes = list(tree.iter_topological())  # post-order
+
+    async def _one(node):
+        children_meta = [
+            (c.path, c.name, signatures[c.path], ref_modules[c.path])
+            for c in node.children
+        ]
+        return node.path, await _refactor_one_node_pass1_independent(
+            node=node,
+            dims=dims,
+            root_kernel=root_kernel,
+            ckpt_root=ckpt_root,
+            agent_factory=agent_factory,
+            max_turns=max_turns,
+            log=log,
+            node_attempts=node_attempts,
+            non_root_sequential=non_root_sequential,
+            stateless=stateless,
+            tensors=tensors,
+            children_meta=children_meta,
+            plan_iter=plan_iter,
+        )
+
+    results = await asyncio.gather(*(_one(n) for n in nodes))
+    return {path: r for path, r in results}
+
+
+async def run_independent_pipeline(*, tree, signatures, ref_modules,
+                                     dims, root_kernel, ckpt_root,
+                                     agent_factory, max_turns, log,
+                                     node_attempts: int = 1,
+                                     non_root_sequential: bool = True,
+                                     stateless: bool = False,
+                                     tensors: dict,
+                                     plan_iter: int = 0,
+                                     translate_fn: Callable | None = None):
+    """Top-level driver for the independent + smoothing pipeline.
+
+    1. Run ``_pass1_walk_independent`` across the entire tree (parallel).
+    2. Compose with ``smooth_compose_tree``.
+    3. Run a final correctness gate on the fused root DSL against
+       ``compute_gold`` (root's vanilla gold).
+    4. (Optional) Translate to STeP IR via ``translate_fn`` (e.g.
+       ``src.dsl_to_step.translate``).
+
+    Returns ``{"success": bool, "fused_dsl": str, "stages": {...}}``. On
+    failure, ``stages`` carries the failing node's report.
+    """
+    from src.pass_smooth import smooth_compose_tree
+
+    log("[independent] Stage 1: pass1_independent (parallel fanout)")
+    pass1_results = await _pass1_walk_independent(
+        tree=tree,
+        signatures=signatures,
+        ref_modules=ref_modules,
+        dims=dims,
+        root_kernel=root_kernel,
+        ckpt_root=ckpt_root,
+        agent_factory=agent_factory,
+        max_turns=max_turns,
+        log=log,
+        node_attempts=node_attempts,
+        non_root_sequential=non_root_sequential,
+        stateless=stateless,
+        tensors=tensors,
+        plan_iter=plan_iter,
+    )
+
+    failures = {p: r for p, r in pass1_results.items() if not r.get("success")}
+    if failures:
+        log(f"[independent] pass1_independent failed at {len(failures)} node(s): "
+            f"{list(failures)}")
+        return {
+            "success": False,
+            "stage": "pass1_independent",
+            "failures": failures,
+            "fused_dsl": None,
+        }
+
+    log("[independent] Stage 2: smoothing (post-order inline + bridges)")
+    pass1_dsls = {p: r["code"] for p, r in pass1_results.items()}
+    fused_dsl = smooth_compose_tree(
+        tree=tree,
+        pass1_dsls=pass1_dsls,
+        root_function_name="tiled_reference",
+        log=log,
+    )
+
+    log("[independent] Stage 3: final correctness gate on fused DSL")
+    final_dir = ckpt_root / "pass1_independent" / f"iteration_{plan_iter}" / "_fused"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    _write(final_dir / "fused_dsl.py", fused_dsl)
+
+    final_check = await _gate_correctness(
+        code=fused_dsl,
+        kernel_name=root_kernel,
+        dims=dims,
+        tensors=tensors,
+        executor="dsl",
+        turn_dir=final_dir,
+        log=log,
+        extra_globals=None,
+        entry_point="tiled_reference",
+        call_args=None,
+        call_kwargs=None,
+    )
+    if not final_check.passed:
+        log(f"[independent] final correctness FAILED: {final_check.feedback}")
+        return {
+            "success": False,
+            "stage": "final_correctness",
+            "feedback": final_check.feedback,
+            "fused_dsl": fused_dsl,
+        }
+
+    log("[independent] Stage 3 PASSED — fused DSL is correct")
+
+    if translate_fn is not None:
+        log("[independent] Stage 4: deterministic translate to STeP IR")
+        translated = translate_fn(fused_dsl)
+        _write(final_dir / "fused_step_ir.py", translated)
+        return {
+            "success": True,
+            "fused_dsl": fused_dsl,
+            "translated": translated,
+        }
+
+    return {
+        "success": True,
+        "fused_dsl": fused_dsl,
+    }
 
 
 async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,

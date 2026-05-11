@@ -835,6 +835,206 @@ def build_pass1_user_prompt(
     return "\n".join(lines)
 
 
+def build_pass1_independent_user_prompt(
+    *,
+    node_name: str,
+    is_root: bool,
+    reference_code: str,
+    dims: dict,
+    tensors: dict,
+    arg_names: tuple[str, ...],
+    arg_specs: tuple,
+    children_signatures: list[tuple[
+        str,                                # child_name
+        tuple[str, ...],                    # arg_names
+        tuple,                              # arg_specs (ArgSpec per arg)
+        tuple[tuple[int, ...], ...],        # out_shapes (vanilla shapes per output)
+        bool,                               # out_is_tuple
+    ]],
+    function_signature: str,
+) -> str:
+    """Build the Pass-1 user prompt for independent mode.
+
+    In independent mode the node has no parent contract. Every positional
+    input is RAW (off-chip): the kernel must call ``offchip_load`` (or, for
+    list-of-tensors args, a host loop with one ``offchip_load`` per element)
+    EXACTLY ONCE per arg, before any DSL consumer touches it. The kernel
+    then picks any tile-stream layout it wants. After pass1 verification a
+    deterministic smoothing pass will insert ``restream`` bridges at each
+    parent->child boundary, so the kernel does not need to coordinate
+    layouts with siblings.
+
+    Output convention (v1): the function returns its output tile-stream
+    tensor(s) directly. The flattened (row-major) form of the output must
+    equal the flattened form of the vanilla PyTorch reference output. The
+    LLM may permute internally for performance but must restore vanilla
+    element ordering before returning.
+
+    For non-leaf nodes, the parent reference contains ``self.<child>(args)``
+    call sites. The kernel may call ``<child>(args)`` from its DSL as a
+    placeholder: the smoother will inline the child's body at that site
+    and bridge layouts. The kernel may also inline a child's logic inline
+    if it produces correct output.
+    """
+    dims_json = json.dumps(dims, indent=2)
+
+    has_children = bool(children_signatures)
+    if has_children:
+        ref_header = "### PyTorch Reference (planner-decomposed parent)"
+        ref_note = (
+            "This is the planner's reference decomposition. Its "
+            "`self.<child_name>(args)` call sites correspond 1:1 to the "
+            "child placeholder callables listed below. Replacing them with "
+            "`<child_name>(args)` (no `out_shapes` kwarg) is the expected "
+            "default. A later smoothing pass will inline each child's body "
+            "and insert layout bridges (`restream`) automatically. Inlining "
+            "a child's logic directly here is also acceptable when it "
+            "produces correct output."
+        )
+    else:
+        ref_header = "### PyTorch Reference"
+        ref_note = None
+
+    lines = [
+        f"## Node: {node_name}",
+        "",
+        ref_header,
+        "",
+        "```python",
+        reference_code.rstrip(),
+        "```",
+    ]
+    if ref_note is not None:
+        lines.extend(["", ref_note])
+    lines.extend([
+        "",
+        "### Dimensions",
+        "",
+        "```json",
+        dims_json,
+        "```",
+    ])
+    if tensors:
+        lines.extend([
+            "",
+            "### Available Tensors",
+            "",
+            "```",
+            _format_tensors_description(tensors),
+            "```",
+        ])
+
+    # Independent-mode input rules: every arg is RAW.
+    from src.node_signature import (
+        ListOfIntArg as _ListOfIntArg,
+        ListOfTensorArg as _ListOfTensorArg,
+        TensorArg as _TensorArg,
+    )
+    lines.extend([
+        "",
+        "### Inputs (independent mode)",
+        "",
+        "Every positional input is **RAW** (off-chip). You must produce an "
+        "on-chip tile-stream tensor from each input EXACTLY ONCE before "
+        "feeding it to any DSL consumer (binary_*, unary_*, accum_*, "
+        "promote_*, reshape_*, …). For tensor args this means calling "
+        "`offchip_load` on the arg once. For list-of-tensors args this means "
+        "a single host-time loop that calls `offchip_load` once per element, "
+        "with the SAME `stride`/`out_shape_tiled`/`tile_row`/`tile_col` for "
+        "every element. Do NOT call `offchip_load` on the same arg twice "
+        "with different layouts — if you need a different layout downstream, "
+        "use `restream(...)` on the loaded value instead.",
+        "",
+        "You may pick any tile-stream layout you want for each loaded input.",
+        "",
+    ])
+    for arg_name, spec in zip(arg_names, arg_specs):
+        if isinstance(spec, _TensorArg):
+            lines.append(
+                f"  `{arg_name}`: tensor, vanilla shape {spec.shape} "
+                f"— call `offchip_load({arg_name}, ...)` once."
+            )
+        elif isinstance(spec, _ListOfTensorArg):
+            lines.append(
+                f"  `{arg_name}`: list[Tensor{spec.elem_shape}] x "
+                f"{spec.length} — at host time, "
+                f"`[offchip_load({arg_name}[i], ...) for i in range(len({arg_name}))]` "
+                f"with one shared layout across all elements."
+            )
+        else:
+            assert isinstance(spec, _ListOfIntArg)
+            lines.append(
+                f"  `{arg_name}`: list[int] x {spec.length} — convert with "
+                f"`torch.tensor({arg_name})` before any DSL consumer "
+                f"(e.g. feed into `metadata_gen`)."
+            )
+
+    # Child placeholders — non-leaf only.
+    if children_signatures:
+        from src.node_signature import format_arg_spec
+        lines.extend([
+            "",
+            "### Child Callables (placeholders)",
+            "",
+            "These children are pre-imported and callable from your DSL. In "
+            "independent mode you call them WITHOUT `out_shapes`/`out_perms`: "
+            "`<child_name>(arg1, arg2, ...)` returns a tile-stream tensor "
+            "(or a tuple of tile-stream tensors) whose FLATTENED form equals "
+            "the flattened form of the corresponding PyTorch reference output. "
+            "You may call `restream(...)` on the result if you need a "
+            "different layout downstream. Do not call them with `out_shapes` "
+            "or any other keyword args — those belong to the old contract "
+            "mode.",
+            "",
+        ])
+        for entry in children_signatures:
+            child_name, child_arg_names, child_arg_specs, child_out_shapes, child_out_is_tuple = entry
+            sig_args = ", ".join(child_arg_names)
+            lines.append(f"  `{child_name}({sig_args})`")
+            for c_arg, c_spec in zip(child_arg_names, child_arg_specs):
+                lines.append(f"    - `{c_arg}` {format_arg_spec(c_spec)}")
+            if child_out_is_tuple:
+                lines.append(
+                    f"    - returns a tuple of {len(child_out_shapes)} "
+                    f"tile-stream tensors; per-output vanilla shapes: "
+                    f"{list(child_out_shapes)}"
+                )
+            else:
+                lines.append(
+                    f"    - returns a single tile-stream tensor "
+                    f"(vanilla shape {child_out_shapes[0]})"
+                )
+
+    # Output convention.
+    lines.extend([
+        "",
+        "### Output convention",
+        "",
+        "Return your tile-stream output(s) directly. The function's return "
+        "value, when flattened in row-major order, must equal the vanilla "
+        "PyTorch reference output flattened in row-major order. Single-output "
+        "nodes return one tensor; multi-output nodes return a tuple. Do NOT "
+        "return permutation metadata — instead bring the output back to "
+        "vanilla element ordering with DSL ops before returning.",
+    ])
+
+    # Required function signature.
+    lines.extend([
+        "",
+        "### Required Function Signature",
+        "",
+        "```python",
+        function_signature,
+        "```",
+        "",
+        "Output a single Python function with this exact signature. "
+        "No imports. No new torch tensors. "
+        "Above the function definition, include a comment with your implementation reasoning.",
+    ])
+
+    return "\n".join(lines)
+
+
 def build_planner_system_prompt() -> str:
     """Load the planner agent's system prompt.
 

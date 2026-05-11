@@ -537,20 +537,52 @@ METRIC_FNS["dyn_streamify"] = _metrics_streamify_family
 
 
 def _metrics_restream(args, kwargs, output, mock_bf16):
-    """Restream: lowers to Bufferize + Streamify. Charged as the Streamify
-    half (buffer_size + tile_size) — the Bufferize half is a retype with no
-    extra storage. Buffer grid = all stream dims of the input x (matches
-    eager rule rank=x.ndim-2).
+    """Restream: lowers to Promote x2 (zero) + RetileStreamify x2 (zero) +
+    Bufferize + Streamify + RetileCol(rank=1) + RetileRow(rank=1).
+
+    Micro-tile is fixed at (1, 1), so the bufferize buffer holds *every*
+    input element. Cost model per lowered node, summed:
+
+      Bufferize/Streamify pair (single charge, mirroring the Bufferize+
+      Streamify shared-buffer convention used by the prior restream metric):
+        buffer_bytes + micro_tile_bytes
+        where buffer_bytes = (#input elements) * elem_bytes
+              micro_tile_bytes = elem_bytes  (1x1 tile)
+
+      RetileCol(rank=1) output tile is (1, out_tile_c): col_out_tile_b
+      RetileRow(rank=1) output tile is (out_tile_r, out_tile_c): row_out_tile_b
+      Each accum adds its input tile bytes in count_fifos=True mode
+      (matches _metrics_accum_unary).
     """
-    x = _tensor_of(args[0])
-    tile_b = _tile_bytes(x, mock_bf16)
-    buffer_grid = tuple(x.shape[:-2])
-    n_buffer_tiles = 1
-    for d in buffer_grid:
-        n_buffer_tiles *= int(d)
-    buffer_b = n_buffer_tiles * tile_b
-    total = buffer_b + tile_b
-    return 0, total, total, {"tile_bytes": tile_b, "buffer_bytes": buffer_b}
+    x   = _tensor_of(args[0])
+    out = _tensor_of(output)
+
+    elem_b = _n_byte(x.dtype, mock_bf16)
+
+    n_input_elems = 1
+    for d in x.shape:
+        n_input_elems *= int(d)
+    buffer_b = n_input_elems * elem_b
+    micro_tile_b = elem_b
+    bz_sm = buffer_b + micro_tile_b
+
+    out_tile_r = int(out.shape[-2])
+    out_tile_c = int(out.shape[-1])
+    col_out_tile_b = out_tile_c * elem_b
+    row_out_tile_b = out_tile_r * out_tile_c * elem_b
+
+    col_in_b = micro_tile_b
+    row_in_b = col_out_tile_b
+
+    no_fifo = bz_sm + col_out_tile_b + row_out_tile_b
+    fifo    = no_fifo + col_in_b + row_in_b
+
+    return 0, no_fifo, fifo, {
+        "buffer_bytes": buffer_b,
+        "micro_tile_bytes": micro_tile_b,
+        "col_out_tile_bytes": col_out_tile_b,
+        "row_out_tile_bytes": row_out_tile_b,
+    }
 
 
 METRIC_FNS["restream"] = _metrics_restream

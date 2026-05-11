@@ -999,17 +999,41 @@ def _h_streamify(state, target, call):
 
 
 def _h_restream(state, target, call):
-    # restream(x, stride, out_shape_tiled) lowers to Bufferize(rank=full) +
-    # Streamify. The buffer rank is read off the input stream at graph-build
-    # time via {x}.stream.rank, mirroring the eager rule "bufferize all stream dims".
+    # restream(x, stride, out_shape_tiled) lowers to:
+    #   Promote (rank=0)            -> singleton before tile to absorb row chunks
+    #   RetileStreamify (chunk=1, split_row=True)  -> peel Tr into the stream
+    #   RetileStreamify (chunk=1, split_row=False) -> peel Tc into the stream
+    #   Bufferize (rank=full) + Streamify(stride, out_shape_tiled)
+    #   RetileCol (accum_rank=1) + RetileRow (accum_rank=1) -> rebuild tile
+    # Only one Promote is needed: retile_streamify merges its new chunks dim
+    # into the last existing stream dim, so the singleton absorbs the row
+    # chunks without polluting the original stream. The col chunks then
+    # merge with that (now Tr-sized) dim, which is fine because the bufferize
+    # linearizes the whole stream anyway.
     x               = _src(_arg(call, 0, "x"))
     stride          = _src(_arg(call, 1, "stride"))
     out_shape_tiled = _src(_arg(call, 2, "out_shape_tiled"))
-    buf = state.fresh("restream_buf")
+    p    = state.fresh("restream_promote")
+    rs1  = state.fresh("restream_rts")
+    rs2  = state.fresh("restream_rts")
+    buf  = state.fresh("restream_buf")
+    sm   = state.fresh("restream_sm")
+    rcol = state.fresh("restream_rcol")
     return _block(
-        f"{buf} = Bufferize(graph, {x}, rank={x}.stream.rank)\n"
-        f"{target} = Streamify(graph, {buf}, stride=tuple({stride}), "
+        f"{p}    = Promote(graph, {x}, promote_rank=0)\n"
+        f"{rs1}  = RetileStreamify(graph, {p}, split_row=True, chunk=1)\n"
+        f"{rs2}  = RetileStreamify(graph, {rs1}, split_row=False, chunk=1)\n"
+        f"{buf}  = Bufferize(graph, {rs2}, rank={rs2}.stream.rank)\n"
+        f"{sm}   = Streamify(graph, {buf}, stride=tuple({stride}), "
         f"out_shape_tiled=tuple({out_shape_tiled}))\n"
+        f"{rcol} = Accum(graph, {sm}, "
+        f"output_stream_dtype=_dsl2step_out_tile({sm}, 'col', 1), "
+        f"fn=accum_fn.RetileCol(), init_fn=_dsl2step_init({sm}), "
+        f"accum_rank=1, write_back_mu=False, compute_bw=1)\n"
+        f"{target} = Accum(graph, {rcol}, "
+        f"output_stream_dtype=_dsl2step_out_tile({rcol}, 'row', 1), "
+        f"fn=accum_fn.RetileRow(), init_fn=_dsl2step_init({rcol}), "
+        f"accum_rank=1, write_back_mu=False, compute_bw=1)\n"
     )
 
 

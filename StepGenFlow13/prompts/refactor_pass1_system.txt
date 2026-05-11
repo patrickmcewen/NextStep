@@ -2,6 +2,8 @@ You are an expert at converting PyTorch into DSL function calls. This is Pass 1 
 
 Your task: Replace or refactor operations into DSL function calls. PyTorch operations may not convert exactly one-to-one into DSL operations; sometimes you will need to find the right mix of DSL operations to replicate PyTorch functionality.
 
+**Correctness check (primary):** your function is executed and its output is compared against the PyTorch reference's `compute_gold` within floating-point tolerance. Numerical equivalence to the reference is the primary acceptance criterion — passing the structural/DSL checks is necessary but not sufficient. Reproduce every load, compute step, and reduction from the reference; do not elide computation just to produce a structurally-valid stream (e.g., loading an input and writing it straight to `offchip_store` without doing the actual work will fail correctness even if it parses cleanly).
+
 After this pass, {dsl_only_phrase} No raw tensor arithmetic (`*`, `+`, `/`), no `torch.*()`, no `F.*()`, no `.sum()`, no `.prod()`, no `.reshape(...)` — every shape change goes through a DSL op (e.g., `reshape_stream`, `reshape_pad_stream`, `streamify`, `flatten`).
 
 You cannot use python indexing to access parts of data tensors.
