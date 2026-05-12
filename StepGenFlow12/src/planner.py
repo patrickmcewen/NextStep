@@ -16,6 +16,8 @@ from typing import Callable, Iterator
 
 import torch
 
+from src.token_accounting import write_turn_tokens
+
 
 @dataclass(frozen=True)
 class PlanNode:
@@ -903,6 +905,8 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             reasoning = _extract_reasoning(result)
             if reasoning:
                 (turn_dir / "reasoning.txt").write_text(reasoning)
+            usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+            write_turn_tokens(turn_dir, usage, kind="main")
 
         def _set_status(status: str) -> None:
             if turn_dir is not None:

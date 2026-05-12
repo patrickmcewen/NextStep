@@ -137,6 +137,12 @@ def main():
              "to spawn all N attempts in parallel even for non-root nodes.",
     )
     parser.add_argument(
+        "--no-judge", action="store_true",
+        help="Disable the LLM judge stack entirely. Regex compliance still runs; "
+             "refactor_final loses the line-specific judge feedback that "
+             "compliance-first / always-both modes rely on.",
+    )
+    parser.add_argument(
         "--stateless-refactor", action="store_true",
         help="Run the refactor agent in stateless mode: each turn rebuilds the "
              "user prompt as (original prompt + latest failed code + latest "
@@ -197,6 +203,7 @@ def main():
         resume_planner=args.resume_planner,
         resume_after_pass1=args.resume_after_pass1,
         stateless_refactor=args.stateless_refactor,
+        judge_enabled=not args.no_judge,
     ))
 
     if result["success"]:

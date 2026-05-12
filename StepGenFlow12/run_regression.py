@@ -26,7 +26,7 @@ from src.regression_runner import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_BENCH_CONFIG = Path("/workspace/DEIOpt/StepDB/bench_config.yaml")
+DEFAULT_BENCH_CONFIG = Path("/workspace/NextStep/StepDB/bench_config.yaml")
 DEFAULT_RUN_PY = REPO_ROOT / "run.py"
 
 

@@ -47,6 +47,7 @@ import yaml
 os.environ.setdefault("STEP_DSL_TRACE", "1")
 
 from src.dsl_to_step import translate as _dsl_to_step_translate
+from src.token_accounting import write_turn_tokens, summarize as _summarize_tokens
 from agents import Runner
 
 from src.agents import (make_judge_agent, make_bundle_judge_agent,
@@ -1309,6 +1310,7 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
     judge_prompt = f"Review this code:\n\n{context}\n```python\n{code}\n```" if context else \
                    f"Review this code for compliance:\n\n```python\n{code}\n```"
     result = await Runner.run(judge_agent, [{"role": "user", "content": judge_prompt}])
+    write_turn_tokens(turn_dir, result.context_wrapper.usage, kind="judge")
     tokens_used = 0
     if result.context_wrapper.usage is not None:
         tokens_used = result.context_wrapper.usage.total_tokens
@@ -1740,7 +1742,6 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
     last_code = None
     last_feedback: str | None = None
     success = False
-    total_tokens = 0
 
     for turn in range(max_turns):
         turn_dir = pass_dir / f"turn_{turn}"
@@ -1765,11 +1766,10 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         except _BadRequestError as exc:
             log(f"      LLM rejected request ({exc}); aborting this {pass_name} attempt.")
             _write(turn_dir / "status.txt", f"LLM_BAD_REQUEST: {exc}")
-            return {"success": False, "code": last_code, "total_tokens": total_tokens,
+            return {"success": False, "code": last_code,
                     "last_messages": [{"role": "user", "content": last_user_msg},
                                        {"role": "assistant", "content": f"<LLM rejected: {exc}>"}]}
-        if run_result.context_wrapper.usage is not None:
-            total_tokens += run_result.context_wrapper.usage.total_tokens
+        write_turn_tokens(turn_dir, run_result.context_wrapper.usage, kind="main")
         assistant_text = run_result.final_output or ""
         if not stateless:
             conversation.append({"role": "assistant", "content": assistant_text})
@@ -1869,7 +1869,6 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         res = _GateResult(None, "PASS", 0)
                     else:
                         res = _gate_post_validator(post_validator, code, turn_dir, log)
-                total_tokens += res.tokens
                 if res.feedback is not None:
                     turn_feedbacks.append(res.feedback)
                     turn_statuses.append(res.status)
@@ -1957,7 +1956,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
         if not stateless:
             conversation.append({"role": "user", "content": feedback})
 
-    return {"success": success, "code": last_code, "total_tokens": total_tokens}
+    return {"success": success, "code": last_code}
 
 
 # ---------------------------------------------------------------------------
@@ -3390,6 +3389,7 @@ async def run_kernel(
     resume_planner: str | None = None,
     resume_after_pass1: str | None = None,
     stateless_refactor: bool = False,
+    judge_enabled: bool = True,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -3523,7 +3523,9 @@ async def run_kernel(
     # judge prompt is templated from the bundle's compliance config so it
     # speaks the abstraction's invented operator surface; non-bundle mode
     # uses the per-pass step_dsl-aware templates.
-    if bundle_dir is not None:
+    if not judge_enabled:
+        judge_agents = {}
+    elif bundle_dir is not None:
         judge_agents = {"refactor_final": make_bundle_judge_agent(llm_config, bundle_compliance)}
     else:
         from src.prompts import _JUDGE_TEMPLATES
@@ -3634,7 +3636,6 @@ async def run_kernel(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
-                "total_tokens": 0,
                 "cycle_count": None,
                 "final_diagnosis": err_msg,
             }
@@ -3651,7 +3652,14 @@ async def run_kernel(
     # Return first success, or the last failure
     chosen = next((r for r in results if r["success"]), results[-1])
     chosen["per_outer"] = per_outer
-    chosen["total_tokens"] = sum(r.get("total_tokens", 0) for r in results)
+    # Disk-driven roll-up: read every per-turn tokens.json under ckpt_root and
+    # build a nested hierarchy that mirrors the directory layout (outers →
+    # plan/pass1/refactor_final/translator → iterations/attempts/turns). The
+    # in-memory accumulators are intentionally not used — disk is the only
+    # source of truth, so future LLM call sites get counted automatically as
+    # long as they call ``write_turn_tokens``.
+    chosen["tokens"] = _summarize_tokens(ckpt_root)
+    chosen["total_tokens"] = chosen["tokens"]["total"]["total"]
     _write(ckpt_root / "result.json", json.dumps(chosen, indent=2, default=str))
     return chosen
 
@@ -3719,7 +3727,6 @@ async def _run_outer_iteration(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
-                "total_tokens": 0,
                 "cycle_count": None,
                 "final_diagnosis": last_line,
             }
@@ -3790,7 +3797,6 @@ async def _run_outer_iteration_body(
         translator_passes = TRANSLATOR_PASSES
 
     dsl_code = None  # output of refactor_final, used as translation guide
-    outer_total_tokens = 0
 
     # ============================================================
     # Phase 1: Lowering pass (refactor_final). Skipped on resume and on
@@ -3825,7 +3831,6 @@ async def _run_outer_iteration_body(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
-                "total_tokens": 0,
                 "cycle_count": None,
                 "final_diagnosis": msg,
             }
@@ -3845,7 +3850,6 @@ async def _run_outer_iteration_body(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
-                "total_tokens": 0,
                 "cycle_count": None,
                 "final_diagnosis": msg,
             }
@@ -3903,7 +3907,6 @@ async def _run_outer_iteration_body(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
-                "total_tokens": outer_total_tokens,
                 "cycle_count": None,
                 "final_diagnosis": (
                     f"Planner phase failed at {plan_result.get('failing_node')}"
@@ -3944,7 +3947,6 @@ async def _run_outer_iteration_body(
             check_order=check_order,
             stateless=stateless_refactor,
         )
-        outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
             dsl_code = pass_result["code"]
             _write(outer_dir / "dsl_code.py", dsl_code)
@@ -3960,7 +3962,6 @@ async def _run_outer_iteration_body(
                 "outer_iteration": i,
                 "outer_iterations": max_outer,
                 "total_tool_calls": 0,
-                "total_tokens": outer_total_tokens,
                 "cycle_count": None,
             }
     else:
@@ -4008,7 +4009,6 @@ async def _run_outer_iteration_body(
             dsl_code=dsl_code,
             check_order=check_order,
         )
-        outer_total_tokens += pass_result.get("total_tokens", 0)
         if pass_result["success"]:
             translated_code = pass_result["code"]
             log(f"  -> {pass_name} OK")
@@ -4040,7 +4040,6 @@ async def _run_outer_iteration_body(
             result = _build_success_result(i, 0,
                                            {"code": final_code, "tool_outputs": []},
                                            [], dsl_code)
-            result["total_tokens"] = outer_total_tokens
             if autotune_options is not None:
                 log(f"{tag} starting autotune...")
                 print(f"{tag} starting autotune...")
@@ -4067,7 +4066,6 @@ async def _run_outer_iteration_body(
         "outer_iteration": i,
         "outer_iterations": max_outer,
         "total_tool_calls": 0,
-        "total_tokens": outer_total_tokens,
         "cycle_count": None,
         "tiled_code": dsl_code,
     }

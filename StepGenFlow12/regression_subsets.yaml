@@ -27,6 +27,13 @@ transformer_subparts:
   basic_prefill_attention: small
   prefill_transformer_simple: small
 
+just_the_subparts:
+  rms_norm: qwen_scale
+  qkv_projection: qwen_scale
+  rope: qwen_b64
+  sdpa_core_max: long_ctx_512
+  moe_routed: large_d1k
+
 moe_routed_mlp:
   moe_routed: large_d1k
   gated_mlp: qwen_16x
