@@ -38,7 +38,7 @@ import torch.nn.functional as F
 # from flat_partition, flat_reassemble, eager_merge (when any input has a
 # dyn outer), flatmap_filter_row_streamify, flatmap_counter, and flatten
 # across a dynamic group. User-facing `x.shape[i]` raises on a dynamic slot;
-# DSL-internal code uses `x.tensor.shape` as the escape hatch.
+# DSL-internal code uses `x.underlying_tensor.shape` as the escape hatch.
 # ---------------------------------------------------------------------------
 
 
@@ -170,7 +170,7 @@ class Index(_SelectBase):
 #
 # Indexing into a stream dim that is known-dynamic raises. Tile dims (the
 # last two) are always concrete and pass through. DSL-internal code that
-# needs the raw shape can read `x.tensor.shape` directly — that's the
+# needs the raw shape can read `x.underlying_tensor.shape` directly — that's the
 # documented escape hatch.
 # ---------------------------------------------------------------------------
 
@@ -263,20 +263,20 @@ class StepTensor:
     """torch.Tensor + stream_dtype + dyn-stream-dim mask.
 
     The wrapper is *composed*, not subclassed: real torch ops live on
-    `.tensor`. DSL functions assert on `stream_dtype`, compute new metadata,
+    `.underlying_tensor`. DSL functions assert on `stream_dtype`, compute new metadata,
     and re-wrap on return. Iteration through `.shape` is guarded so callers
     cannot silently read a symbolic stream size.
     """
 
-    __slots__ = ("tensor", "stream_dtype", "dyn_mask", "dyn_origins", "offsets")
+    __slots__ = ("underlying_tensor", "stream_dtype", "dyn_mask", "dyn_origins", "offsets")
 
-    def __init__(self, tensor, stream_dtype, dyn_mask=None, dyn_origins=None,
+    def __init__(self, underlying_tensor, stream_dtype, dyn_mask=None, dyn_origins=None,
                  offsets=None):
-        assert isinstance(tensor, torch.Tensor), \
-            f"StepTensor.tensor must be torch.Tensor, got {type(tensor).__name__}"
-        sr = _stream_rank(tensor, stream_dtype)
+        assert isinstance(underlying_tensor, torch.Tensor), \
+            f"StepTensor.underlying_tensor must be torch.Tensor, got {type(underlying_tensor).__name__}"
+        sr = _stream_rank(underlying_tensor, stream_dtype)
         assert sr >= 0, (
-            f"StepTensor: tensor.ndim={tensor.ndim} too small for "
+            f"StepTensor: underlying_tensor.ndim={underlying_tensor.ndim} too small for "
             f"stream_dtype={stream_dtype!r}"
         )
         if dyn_mask is None:
@@ -285,10 +285,10 @@ class StepTensor:
             dyn_origins = (None,) * sr
         assert len(dyn_mask) == sr, (
             f"StepTensor: dyn_mask len {len(dyn_mask)} != stream_rank {sr} "
-            f"(tensor.ndim={tensor.ndim}, stream_dtype={stream_dtype!r})"
+            f"(underlying_tensor.ndim={underlying_tensor.ndim}, stream_dtype={stream_dtype!r})"
         )
         assert len(dyn_origins) == sr
-        self.tensor = tensor
+        self.underlying_tensor = underlying_tensor
         self.stream_dtype = stream_dtype
         self.dyn_mask = tuple(dyn_mask)
         self.dyn_origins = tuple(dyn_origins)
@@ -296,23 +296,23 @@ class StepTensor:
 
     @property
     def shape(self):
-        return _GuardedShape(self.tensor.shape, self.dyn_mask, self.dyn_origins,
+        return _GuardedShape(self.underlying_tensor.shape, self.dyn_mask, self.dyn_origins,
                              "StepTensor", _elem_dims(self.stream_dtype))
 
     @property
     def ndim(self):
-        return self.tensor.ndim
+        return self.underlying_tensor.ndim
 
     @property
     def dtype(self):
-        return self.tensor.dtype
+        return self.underlying_tensor.dtype
 
     @property
     def stream_rank(self):
-        return _stream_rank(self.tensor, self.stream_dtype)
+        return _stream_rank(self.underlying_tensor, self.stream_dtype)
 
     def __repr__(self):
-        return (f"StepTensor(shape={tuple(self.tensor.shape)}, "
+        return (f"StepTensor(shape={tuple(self.underlying_tensor.shape)}, "
                 f"stream_dtype={self.stream_dtype}, dyn_mask={self.dyn_mask})")
 
 
@@ -324,7 +324,7 @@ class StepTensor:
 def _unwrap(x):
     """Return the underlying torch.Tensor for either a raw tensor or StepTensor."""
     if isinstance(x, StepTensor):
-        return x.tensor
+        return x.underlying_tensor
     assert isinstance(x, torch.Tensor), \
         f"expected torch.Tensor or StepTensor, got {type(x).__name__}"
     return x
@@ -429,6 +429,14 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"dyn_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     )
+    # The Rust simulator (step-perf/src/memory/dyn_linear_offchip_load.rs:83)
+    # panics with "Tensor shape tiled must have at least 2 dimensions" when
+    # the tiled shape is shorter than 2.
+    assert len(tensor_shape_tiled) >= 2, (
+        f"dyn_offchip_load: tensor_shape_tiled must have at least 2 dims "
+        f"(got {tuple(tensor_shape_tiled)}). The Rust simulator panics at "
+        f"startup otherwise."
+    )
     R, C = underlying.shape[-2], underlying.shape[-1]
     assert R % tile_row == 0 and C % tile_col == 0, (
         f"dyn_offchip_load: ({R},{C}) not divisible by tile ({tile_row},{tile_col})"
@@ -451,10 +459,10 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
     _assert_tile_kind(sd_ref, "offchip_load_ref (ref)")
-    loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed).tensor
+    loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed).underlying_tensor
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
-    ref_stream = list(ref.tensor.shape[:-2])
+    ref_stream = list(ref.underlying_tensor.shape[:-2])
     target = ref_stream + list(out_shape_tiled) + [loaded.shape[-2], loaded.shape[-1]]
     # Prepend singleton dims so loaded is broadcastable to target
     while loaded.ndim < len(target):
@@ -503,8 +511,8 @@ def cache_read_addr_gen(idx, seq_len, row_offset):
     sd_s, _, _ = _step_meta(seq_len, "cache_read_addr_gen (seq_len)")
     _assert_tile_kind(sd_i, "cache_read_addr_gen (idx)")
     _assert_tile_kind(sd_s, "cache_read_addr_gen (seq_len)")
-    idx_t = idx.tensor
-    seq_t = seq_len.tensor
+    idx_t = idx.underlying_tensor
+    seq_t = seq_len.underlying_tensor
     assert idx_t.shape[-2:] == (1, 1), (
         f"cache_read_addr_gen: idx tile shape must be (1,1), got {tuple(idx_t.shape[-2:])}"
     )
@@ -532,7 +540,15 @@ def expert_addr_gen(x, expert_addr_base, num_tile_per_expert):
     assert isinstance(sd, Index), (
         f"expert_addr_gen: input stream_dtype must be Index (one-hot Select), got {sd!r}"
     )
-    t = x.tensor
+    # The Rust simulator (step-perf/src/operator/flatmap.rs:319) only handles
+    # rank-0 input streams; len(mask)==1 means stream shape is (N,) i.e. rank 0.
+    # For multi-dim expert selection, use flat_partition for per-expert dispatch.
+    assert len(mask) == 1, (
+        f"expert_addr_gen: input must be a rank-0 stream (single stream dim); "
+        f"got stream rank {len(mask) - 1} (dyn_mask of length {len(mask)}). "
+        f"Use flat_partition for multi-dimensional expert selection."
+    )
+    t = x.underlying_tensor
     assert (t.sum(dim=-1) == 1).all(), (
         "expert_addr_gen: input must be one-hot (exactly one expert selected per element)"
     )
@@ -541,9 +557,9 @@ def expert_addr_gen(x, expert_addr_base, num_tile_per_expert):
     offsets = torch.arange(num_tile_per_expert, dtype=base.dtype)
     addrs = base.unsqueeze(-1) + offsets
     result = addrs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-    # Input stream rank = ndim - 1 (Select elem_dims=1); output stream rank =
-    # input + 2 (new num_tile_per_expert dim + the synthesized (1,1) "leading"
-    # tile pair before the final tile rc — see argmax+unsqueeze chain). The
+    # Input stream rank must be 0 (asserted above); output stream rank = 2
+    # (the new num_tile_per_expert dim + the synthesized (1,1) "leading" tile
+    # pair before the final tile rc — see argmax+unsqueeze chain). The
     # appended dims are static.
     return StepTensor(
         result,
@@ -556,7 +572,7 @@ def expert_addr_gen(x, expert_addr_base, num_tile_per_expert):
 def filter_last_tile(seq_len):
     sd, mask, orig = _step_meta(seq_len, "filter_last_tile")
     _assert_tile_kind(sd, "filter_last_tile")
-    t = seq_len.tensor
+    t = seq_len.underlying_tensor
     assert t.shape[-2:] == (1, 1), (
         f"filter_last_tile: input tile shape must be (1,1), got {tuple(t.shape[-2:])}"
     )
@@ -593,7 +609,7 @@ def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False,
     )
     sd_r, mask_r, orig_r = _step_meta(raddr, "random_offchip_load (raddr)")
     _assert_tile_kind(sd_r, "random_offchip_load (raddr)")
-    raddr_t = raddr.tensor
+    raddr_t = raddr.underlying_tensor
     assert raddr_t.shape[-2:] == (1, 1), (
         f"random_offchip_load: raddr tile shape must be (1,1), got {tuple(raddr_t.shape[-2:])}"
     )
@@ -632,12 +648,12 @@ def _assert_stream_match(a, b, op_name):
     sd_b, mask_b, orig_b = _step_meta(b, op_name)
     a_elem = _elem_dims(sd_a)
     b_elem = _elem_dims(sd_b)
-    a_stream = tuple(a.tensor.shape[: a.tensor.ndim - a_elem])
-    b_stream = tuple(b.tensor.shape[: b.tensor.ndim - b_elem])
+    a_stream = tuple(a.underlying_tensor.shape[: a.underlying_tensor.ndim - a_elem])
+    b_stream = tuple(b.underlying_tensor.shape[: b.underlying_tensor.ndim - b_elem])
     assert a_stream == b_stream, (
         f"{op_name}: stream shape mismatch — a has stream {a_stream} "
-        f"(shape {tuple(a.tensor.shape)}, dtype {sd_a!r}) but b has stream "
-        f"{b_stream} (shape {tuple(b.tensor.shape)}, dtype {sd_b!r}). Both "
+        f"(shape {tuple(a.underlying_tensor.shape)}, dtype {sd_a!r}) but b has stream "
+        f"{b_stream} (shape {tuple(b.underlying_tensor.shape)}, dtype {sd_b!r}). Both "
         f"operands must have identical stream shapes."
     )
     assert mask_a == mask_b, (
@@ -671,10 +687,10 @@ def binary_matmul(a, b, weight_transposed=False, *, compute_bw=1):
     _assert_float(b, "binary_matmul")
     _assert_stream_match(a, b, "binary_matmul")
     if weight_transposed:
-        result = torch.matmul(a.tensor, b.tensor.transpose(-2, -1))
+        result = torch.matmul(a.underlying_tensor, b.underlying_tensor.transpose(-2, -1))
         tile_shape = (a.stream_dtype.shape[0], b.stream_dtype.shape[0])
     else:
-        result = torch.matmul(a.tensor, b.tensor)
+        result = torch.matmul(a.underlying_tensor, b.underlying_tensor)
         tile_shape = (a.stream_dtype.shape[0], b.stream_dtype.shape[1])
     return StepTensor(
         result,
@@ -693,7 +709,7 @@ def _elementwise_binary(a, b, op_name, fn):
     _assert_float(a, op_name)
     _assert_float(b, op_name)
     _assert_stream_match(a, b, op_name)
-    result = fn(a.tensor, b.tensor)
+    result = fn(a.underlying_tensor, b.underlying_tensor)
     tile_shape = (int(result.shape[-2]), int(result.shape[-1]))
     return StepTensor(
         result,
@@ -722,7 +738,7 @@ def binary_is_equal(a, b, *, compute_bw=1):
     _assert_float(a, "binary_is_equal")
     _assert_float(b, "binary_is_equal")
     _assert_stream_match(a, b, "binary_is_equal")
-    result = (a.tensor == b.tensor).float()
+    result = (a.underlying_tensor == b.underlying_tensor).float()
     tile_shape = (int(result.shape[-2]), int(result.shape[-1]))
     # Output is logically a Bool tile (mirrors IR). The eager torch tensor is
     # stored as float32 for compatibility with downstream float ops, but the
@@ -739,14 +755,14 @@ def binary_set_offset(a, b, *, compute_bw=1):
     _assert_float(a, "binary_set_offset")
     _assert_float(b, "binary_set_offset")
     _assert_stream_match(a, b, "binary_set_offset")
-    assert b.tensor.shape[-2:] == (1, 1), (
-        f"binary_set_offset: b tile shape must be (1,1), got {tuple(b.tensor.shape[-2:])}"
+    assert b.underlying_tensor.shape[-2:] == (1, 1), (
+        f"binary_set_offset: b tile shape must be (1,1), got {tuple(b.underlying_tensor.shape[-2:])}"
     )
-    offsets = b.tensor[..., 0, 0].long()
+    offsets = b.underlying_tensor[..., 0, 0].long()
     # Carry `a` forward unchanged but attach offsets on the wrapper for the
     # downstream binary_row_wise_append to consume.
     return StepTensor(
-        a.tensor, stream_dtype=a.stream_dtype,
+        a.underlying_tensor, stream_dtype=a.stream_dtype,
         dyn_mask=a.dyn_mask, dyn_origins=a.dyn_origins,
         offsets=offsets,
     )
@@ -757,15 +773,15 @@ def binary_row_wise_append(a, b, *, compute_bw=1):
     _assert_float(a, "binary_row_wise_append")
     _assert_float(b, "binary_row_wise_append")
     _assert_stream_match(a, b, "binary_row_wise_append")
-    data = a.tensor
+    data = a.underlying_tensor
     if a.offsets is not None:
         offsets = a.offsets
     else:
         offsets = torch.zeros(data.shape[:-2], dtype=torch.long)
     tile_r, tile_c = data.shape[-2], data.shape[-1]
-    M = b.tensor.shape[-2]
-    assert b.tensor.shape[-1] == tile_c, (
-        f"binary_row_wise_append: column dim mismatch ({b.tensor.shape[-1]} vs {tile_c})"
+    M = b.underlying_tensor.shape[-2]
+    assert b.underlying_tensor.shape[-1] == tile_c, (
+        f"binary_row_wise_append: column dim mismatch ({b.underlying_tensor.shape[-1]} vs {tile_c})"
     )
     assert (offsets + M <= tile_r).all(), (
         f"binary_row_wise_append: not enough space to append {M} rows "
@@ -775,7 +791,7 @@ def binary_row_wise_append(a, b, *, compute_bw=1):
     row_idx = offsets.unsqueeze(-1) + torch.arange(M, dtype=torch.long, device=data.device)
     row_idx = row_idx.unsqueeze(-1).expand(*stream_shape, M, tile_c)
     result = data.clone()
-    result.scatter_(dim=-2, index=row_idx, src=b.tensor.to(data.dtype))
+    result.scatter_(dim=-2, index=row_idx, src=b.underlying_tensor.to(data.dtype))
     return StepTensor(
         result, stream_dtype=a.stream_dtype,
         dyn_mask=a.dyn_mask, dyn_origins=a.dyn_origins,
@@ -794,7 +810,7 @@ def binary_cache_write_addr_gen(idx, seq_len, row_offset, *, compute_bw=1):
     _assert_tile_kind(sd_i, "binary_cache_write_addr_gen (idx)")
     _assert_tile_kind(sd_s, "binary_cache_write_addr_gen (seq_len)")
     _assert_stream_match(idx, seq_len, "binary_cache_write_addr_gen")
-    idx_t, seq_t = idx.tensor, seq_len.tensor
+    idx_t, seq_t = idx.underlying_tensor, seq_len.underlying_tensor
     assert idx_t.shape[-2:] == (1, 1), (
         f"binary_cache_write_addr_gen: idx tile shape must be (1,1), got {tuple(idx_t.shape[-2:])}"
     )
@@ -818,11 +834,11 @@ def binary_cache_write_addr_gen(idx, seq_len, row_offset, *, compute_bw=1):
 # ---------------------------------------------------------------------------
 
 def _identity_unary(x, op_name, fn, allowed=(Float16, Float32)):
-    """Apply `fn` to x.tensor and rewrap. Element type preserved; tile shape
+    """Apply `fn` to x.underlying_tensor and rewrap. Element type preserved; tile shape
     derived from the result (allowing ops like rowwise_sum to shrink it)."""
     sd, mask, orig = _step_meta(x, op_name)
     _assert_elem_in(sd, op_name, allowed)
-    result = fn(x.tensor)
+    result = fn(x.underlying_tensor)
     tile_shape = (int(result.shape[-2]), int(result.shape[-1]))
     if isinstance(sd, DynTile):
         new_sd = DynTile(sd.tile_dtype, tile_shape)
@@ -891,17 +907,27 @@ def unary_select_to_scalar(x, *, compute_bw=1):
 
 
 def unary_to_const_int(x, constant, *, compute_bw=1):
-    """Promote a float-tile stream to an integer-tile stream of constants.
+    """Emit a Tile(Uint64) stream of `constant` matching the input cardinality.
 
-    Output stream_dtype = Tile(Uint64, ...) per the IR convention; the eager
-    torch tensor stays float32 for simulator compatibility (mirrors how
-    metadata_gen / binary_cache_write_addr_gen declare Uint64 while the
-    underlying storage is float).
+    Rust dispatch (step-perf/src/proto_driver/mod.rs ToConstInt arm at line 350)
+    only implements ToConstInt under the (Tile<u64>, Tile<u64>) match arm, so
+    the input must already be Uint64. To produce a constant address stream
+    keyed off a float cardinality source, derive a u64 stream first
+    (e.g. metadata_gen) and feed THAT through unary_to_const_int — or skip
+    the address stream entirely and bake the constant into the load via
+    linear_offchip_load_ref(ref=tok_stream, underlying=W[e_idx], ...).
+
+    `constant` must be an int (ToConstInt.constant is an int field in the
+    protobuf; floats are rejected by the proto setter at serialize time).
     """
     assert compute_bw >= 1, f"unary_to_const_int: compute_bw must be >= 1, got {compute_bw}"
+    assert isinstance(constant, int) and not isinstance(constant, bool), (
+        f"unary_to_const_int: constant must be int, got {type(constant).__name__} ({constant!r}). "
+        f"The Rust ToConstInt proto field is an int; passing a float trips the proto setter."
+    )
     sd, mask, orig = _step_meta(x, "unary_to_const_int")
-    _assert_elem_in(sd, "unary_to_const_int", (Float16, Float32))
-    result = torch.full_like(x.tensor, constant, dtype=torch.float32)
+    _assert_elem_in(sd, "unary_to_const_int", (Uint64,))
+    result = torch.full_like(x.underlying_tensor, constant, dtype=torch.float32)
     tile_shape = (int(result.shape[-2]), int(result.shape[-1]))
     return StepTensor(
         result, stream_dtype=Tile(Uint64(), tile_shape),
@@ -920,7 +946,7 @@ def _accum_reduce(x, rank, op_name, reduce_fn):
     assert rank <= len(mask), (
         f"{op_name}: rank {rank} exceeds input stream rank {len(mask)}"
     )
-    t = x.tensor
+    t = x.underlying_tensor
     for _ in range(rank):
         t = reduce_fn(t)
     return StepTensor(
@@ -966,7 +992,7 @@ def accum_retile_row(x, rank=1, *, compute_bw=1):
             f"accum_retile_row: stream dim {slot} is dynamic "
             f"(origin: {orig[slot]}); cannot absorb into a static tile."
         )
-    t = x.tensor
+    t = x.underlying_tensor
     tile_r = int(sd.shape[0])
     for _ in range(rank):
         s = t.shape
@@ -998,7 +1024,7 @@ def accum_retile_col(x, rank=1, *, compute_bw=1):
             f"accum_retile_col: stream dim {slot} is dynamic "
             f"(origin: {orig[slot]}); cannot absorb into a static tile."
         )
-    t = x.tensor
+    t = x.underlying_tensor
     tile_c = int(sd.shape[1])
     for _ in range(rank):
         s = t.shape
@@ -1027,7 +1053,7 @@ def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
     assert rank <= len(mask), (
         f"accum_signal_req_all_read: rank {rank} exceeds input stream rank {len(mask)}"
     )
-    stream_shape = x.tensor.shape[: x.tensor.ndim - 2 - rank]
+    stream_shape = x.underlying_tensor.shape[: x.underlying_tensor.ndim - 2 - rank]
     result = torch.ones(*stream_shape, 1, 1)
     return StepTensor(
         result, stream_dtype=Tile(sd.tile_dtype, (1, 1)),
@@ -1048,7 +1074,7 @@ def eager_merge(inputs):
     _assert_tile_kind(sd0, "eager_merge (inputs[0])")
     assert len(mask0) >= 1, (
         f"eager_merge: inputs must have at least one stream dim, got "
-        f"shape {tuple(inputs[0].tensor.shape)}"
+        f"shape {tuple(inputs[0].underlying_tensor.shape)}"
     )
     tile_shape = sd0.shape
     any_dyn_outer = bool(mask0[0])
@@ -1063,8 +1089,8 @@ def eager_merge(inputs):
         )
         any_dyn_outer = any_dyn_outer or bool(mask_i[0])
 
-    data = torch.cat([p.tensor for p in inputs], dim=0)
-    counts = [p.tensor.shape[0] for p in inputs]
+    data = torch.cat([p.underlying_tensor for p in inputs], dim=0)
+    counts = [p.underlying_tensor.shape[0] for p in inputs]
     select = torch.zeros(sum(counts), n)
     offset = 0
     for i, c in enumerate(counts):
@@ -1096,11 +1122,25 @@ def flat_partition(x, control, n):
         f"flat_partition: control total_n={sd_c.total_n} != n={n}"
     )
 
-    t = x.tensor
-    c = control.tensor
+    t = x.underlying_tensor
+    c = control.underlying_tensor
     assert c.shape[-1] == n, (
         f"flat_partition: control's last dim must equal n={n} (num consumers), "
         f"got control shape {tuple(c.shape)}."
+    )
+    # The Rust simulator (step-perf/src/operator/partition.rs:243) computes
+    # expected_stop_level = sel_level + partition_rank and panics at line 153
+    # when input emits a stop at a different level. The DSL convention is
+    # partition_rank=0, so input and control must have the SAME stream rank
+    # (= same number of dyn-mask entries / shape dims). The cardinality
+    # check below alone is not enough: it passes for (1,1,64,2) vs (1,64,2)
+    # because both flatten to 128, but the runtime would panic at 153.
+    assert len(t.shape) == len(c.shape) + 1, (
+        f"flat_partition: input stream rank ({len(t.shape) - 3}) must equal "
+        f"control stream rank ({len(c.shape) - 2}) for partition_rank=0. "
+        f"Input shape {tuple(t.shape)} (- 2 tile dims), control shape "
+        f"{tuple(c.shape)} (- 1 select-N dim). Without this alignment the "
+        f"simulator panics with stop-level mismatch at partition.rs:153."
     )
     tile_r, tile_c = t.shape[-2], t.shape[-1]
     flat_inp = t.reshape(-1, tile_r, tile_c)
@@ -1150,7 +1190,7 @@ def flat_reassemble(inputs, control):
     )
 
     tile_r, tile_c = tile_shape
-    ctrl_t = control.tensor
+    ctrl_t = control.underlying_tensor
     flat_mh = ctrl_t.reshape(-1, n)
     total = flat_mh.shape[0]
 
@@ -1160,11 +1200,11 @@ def flat_reassemble(inputs, control):
         group = []
         for i in range(n):
             if flat_mh[t, i] > 0:
-                if ptrs[i] < inputs[i].tensor.shape[0]:
-                    group.append(inputs[i].tensor[ptrs[i]])
+                if ptrs[i] < inputs[i].underlying_tensor.shape[0]:
+                    group.append(inputs[i].underlying_tensor[ptrs[i]])
                     ptrs[i] += 1
         if len(group) == 0:
-            group.append(torch.zeros_like(inputs[0].tensor[0:1].squeeze(0)))
+            group.append(torch.zeros_like(inputs[0].underlying_tensor[0:1].squeeze(0)))
         token_groups.append(torch.stack(group, dim=0))
 
     output = torch.stack(token_groups, dim=0)
@@ -1204,10 +1244,10 @@ def flatmap_filter_row_streamify(x, mask):
     _assert_tile_kind(sd_m, "flatmap_filter_row_streamify (mask)")
     assert len(mask_x) >= 1, (
         f"flatmap_filter_row_streamify: input must have >=1 stream dim, "
-        f"got shape {tuple(x.tensor.shape)}"
+        f"got shape {tuple(x.underlying_tensor.shape)}"
     )
-    t = x.tensor
-    m = mask.tensor
+    t = x.underlying_tensor
+    m = mask.underlying_tensor
     tile_r, tile_c = int(t.shape[-2]), int(t.shape[-1])
     flat_data = t.reshape(-1, tile_r, tile_c)
     flat_mask = m.reshape(-1, tile_r, 1)
@@ -1233,7 +1273,7 @@ def flatmap_counter(x):
     """Single-scalar in → arange stream out. Appends a new dynamic stream dim."""
     sd, mask, orig = _step_meta(x, "flatmap_counter")
     _assert_tile_kind(sd, "flatmap_counter")
-    t = x.tensor
+    t = x.underlying_tensor
     flat = t.reshape(-1)
     assert flat.numel() == 1, (
         "flatmap_counter: only single-scalar input supported"
@@ -1258,13 +1298,13 @@ def promote(x, rank=1):
     """
     sd, mask, orig = _step_meta(x, "promote")
     _assert_tile_kind(sd, "promote")
-    max_rank = x.tensor.ndim - 1
+    max_rank = x.underlying_tensor.ndim - 1
     assert rank >= 0, f"promote(rank={rank}): rank must be >= 0"
     assert rank <= max_rank, (
-        f"promote(rank={rank}): tensor has {x.tensor.ndim} dims "
-        f"({tuple(x.tensor.shape)}), max valid rank is {max_rank}."
+        f"promote(rank={rank}): tensor has {x.underlying_tensor.ndim} dims "
+        f"({tuple(x.underlying_tensor.shape)}), max valid rank is {max_rank}."
     )
-    result = x.tensor.unsqueeze(-(3 + rank))
+    result = x.underlying_tensor.unsqueeze(-(3 + rank))
     # Insert a static False slot at stream position (len(mask) - rank).
     n = len(mask)
     pos = n - rank
@@ -1282,14 +1322,14 @@ def promote_outer(x):
     # must be at least 3D (>=1 stream dim + 2 tile dims). Allowing a rank-0
     # stream here lets the DSL accept a "tile-only" tensor that the translator
     # cannot represent in STeP, surfacing only as a build_graph crash later.
-    assert x.tensor.ndim >= 3, (
+    assert x.underlying_tensor.ndim >= 3, (
         f"promote_outer: input must have >=1 stream dim (>=3D total), "
-        f"got shape {tuple(x.tensor.shape)}. If this is the output of a fully-"
+        f"got shape {tuple(x.underlying_tensor.shape)}. If this is the output of a fully-"
         f"collapsing accum (e.g. accum_retile_row(rank=stream_rank)), keep "
         f"a stream dim — drop one rank from the accum or skip an upstream "
         f"flatten that consumed the leading singleton."
     )
-    return StepTensor(x.tensor.unsqueeze(0), stream_dtype=sd,
+    return StepTensor(x.underlying_tensor.unsqueeze(0), stream_dtype=sd,
                       dyn_mask=(False,) + mask,
                       dyn_origins=(None,) + orig)
 
@@ -1302,7 +1342,7 @@ def flatten(x, min_rank, max_rank):
     """
     sd, mask, orig = _step_meta(x, "flatten")
     _assert_tile_kind(sd, "flatten")
-    t = x.tensor
+    t = x.underlying_tensor
     tile_r, tile_c = int(t.shape[-2]), int(t.shape[-1])
     stream_shape = list(t.shape[:-2])
     n = len(stream_shape)
@@ -1342,9 +1382,19 @@ def expand_ref(x, ref, expand_rank):
     sd_r, mask_r, orig_r = _step_meta(ref, "expand_ref (ref)")
     _assert_tile_kind(sd_x, "expand_ref (input)")
     _assert_tile_kind(sd_r, "expand_ref (ref)")
-    ref_stream = list(ref.tensor.shape[:-2])
-    inp_stream = list(x.tensor.shape[:-2])
+    ref_stream = list(ref.underlying_tensor.shape[:-2])
+    inp_stream = list(x.underlying_tensor.shape[:-2])
     assert expand_rank > 0, f"expand_rank must be > 0, got {expand_rank}"
+    # Stream rank == len(stream_shape) - 1. The Rust simulator
+    # (step-perf/src/operator/expand.rs:107) terminates the broadcast on a
+    # ref ValStop at level >= expand_rank; if ref.rank < expand_rank that
+    # token is never emitted and the simulator panics.
+    assert len(ref_stream) - 1 >= expand_rank, (
+        f"expand_ref: ref stream rank ({len(ref_stream) - 1}) must be >= "
+        f"expand_rank ({expand_rank}); ref stream shape={ref_stream}. "
+        f"Use a load that produces ref-cardinality weights (e.g. "
+        f"linear_offchip_load_ref) instead of broadcasting a static tile."
+    )
     assert inp_stream[-expand_rank:] == [1] * expand_rank, (
         f"expand_ref: trailing {expand_rank} stream dims must be 1, got {inp_stream}"
     )
@@ -1357,8 +1407,8 @@ def expand_ref(x, ref, expand_rank):
         f"expand_ref: leading dyn_mask mismatch: "
         f"input {mask_x[:-expand_rank]} vs ref {mask_r[:-expand_rank]}"
     )
-    expand_shape = ref_stream + list(x.tensor.shape[-2:])
-    result = x.tensor.expand(expand_shape).contiguous()
+    expand_shape = ref_stream + list(x.underlying_tensor.shape[-2:])
+    result = x.underlying_tensor.expand(expand_shape).contiguous()
     return StepTensor(result, stream_dtype=sd_x,
                       dyn_mask=mask_r, dyn_origins=orig_r)
 
@@ -1367,7 +1417,7 @@ def repeat_static(x, factor):
     """Insert a new static stream dim of `factor` just before the tile pair."""
     sd, mask, orig = _step_meta(x, "repeat_static")
     _assert_tile_kind(sd, "repeat_static")
-    result = x.tensor.unsqueeze(-3)
+    result = x.underlying_tensor.unsqueeze(-3)
     shape = list(result.shape)
     shape[-3] = factor
     result = result.expand(shape).contiguous()
@@ -1385,7 +1435,7 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
     """
     sd, mask, orig = _step_meta(x, "reshape_stream")
     _assert_tile_kind(sd, "reshape_stream")
-    t = x.tensor
+    t = x.underlying_tensor
     tile_r, tile_c = int(t.shape[-2]), int(t.shape[-1])
     stream_shape = list(t.shape[:-2])
     n = len(stream_shape)
@@ -1457,9 +1507,9 @@ def retile_streamify(x, chunk, split_row=True):
     sd, mask, orig = _step_meta(x, "retile_streamify")
     _assert_tile_kind(sd, "retile_streamify")
     assert len(mask) >= 1, (
-        f"retile_streamify: input must have >=1 stream dim, got shape {tuple(x.tensor.shape)}"
+        f"retile_streamify: input must have >=1 stream dim, got shape {tuple(x.underlying_tensor.shape)}"
     )
-    t = x.tensor
+    t = x.underlying_tensor
     tile_r, tile_c = int(t.shape[-2]), int(t.shape[-1])
     stream_shape = t.shape[:-2]
     last = stream_shape[-1]
@@ -1494,9 +1544,9 @@ def repeat_ref(x, ref):
     sd_r, mask_r, orig_r = _step_meta(ref, "repeat_ref (ref)")
     _assert_tile_kind(sd_x, "repeat_ref (input)")
     _assert_tile_kind(sd_r, "repeat_ref (ref)")
-    ref_stream = list(ref.tensor.shape[:-2])
-    inp_stream = list(x.tensor.shape[:-2])
-    tile_dims = list(x.tensor.shape[-2:])
+    ref_stream = list(ref.underlying_tensor.shape[:-2])
+    inp_stream = list(x.underlying_tensor.shape[:-2])
+    tile_dims = list(x.underlying_tensor.shape[-2:])
     assert inp_stream == ref_stream[:-1], (
         f"x stream shape must equal ref stream shape minus its trailing dim: "
         f"{inp_stream} vs {ref_stream[:-1]}"
@@ -1505,7 +1555,7 @@ def repeat_ref(x, ref):
         f"repeat_ref: input dyn_mask {mask_x} must equal ref's leading mask "
         f"{mask_r[:-1]}."
     )
-    result = x.tensor.unsqueeze(-3)
+    result = x.underlying_tensor.unsqueeze(-3)
     expand_shape = ref_stream + tile_dims
     result = result.expand(expand_shape).contiguous()
     return StepTensor(result, stream_dtype=sd_x,
@@ -1537,7 +1587,7 @@ def streamify(x, stride, out_shape_tiled):
         f"exceeds buffer grid {buffer_shape} (max_idx={max_idx}, n_tiles={n_tiles})"
     )
 
-    t = x.tensor
+    t = x.underlying_tensor
     buffer_rank = len(sd.shape)
     in_stream_rank = t.ndim - 2 - buffer_rank
     tile_r, tile_c = t.shape[-2], t.shape[-1]
@@ -1565,8 +1615,16 @@ def bufferize(x, rank):
     sd, mask, orig = _step_meta(x, "bufferize")
     _assert_tile_kind(sd, "bufferize")
     assert rank >= 1, f"bufferize: rank must be >= 1, got {rank}"
-    assert rank <= len(mask), (
-        f"bufferize: rank {rank} exceeds input stream rank {len(mask)}"
+    # The Rust simulator's Buffer::from_stream breaks on st >= rank; the max
+    # stop level emitted by a stream is len(mask) - 1 (= Stream.rank). If
+    # bufferize.rank == len(mask) the loop never completes and the simulator
+    # panics with "Stream terminated, but buffer was incomplete"
+    # (step-perf/src/operator/bufferize.rs:93).
+    assert rank <= len(mask) - 1, (
+        f"bufferize: rank ({rank}) must be <= input stream rank "
+        f"({len(mask) - 1}, dyn_mask length {len(mask)}). Otherwise the "
+        f"simulator never sees a stop at level rank and panics 'buffer "
+        f"incomplete' at bufferize.rs:93."
     )
     absorb_start = len(mask) - rank
     for i in range(absorb_start, len(mask)):
@@ -1577,9 +1635,9 @@ def bufferize(x, rank):
                 f"with flatten/promote so the dyn dim is the outermost in "
                 f"the bufferized group."
             )
-    buf_shape = tuple(int(x.tensor.shape[absorb_start + i]) for i in range(rank))
+    buf_shape = tuple(int(x.underlying_tensor.shape[absorb_start + i]) for i in range(rank))
     return StepTensor(
-        x.tensor, stream_dtype=Buffer(sd, buf_shape),
+        x.underlying_tensor, stream_dtype=Buffer(sd, buf_shape),
         dyn_mask=mask[:absorb_start], dyn_origins=orig[:absorb_start],
     )
 
@@ -1590,9 +1648,9 @@ def restream(x, stride, out_shape_tiled):
     through naturally."""
     sd, _, _ = _step_meta(x, "restream")
     _assert_tile_kind(sd, "restream")
-    assert x.tensor.ndim >= 3, (
-        f"restream: input must have >=1 stream dim + 2 tile dims, got ndim={x.tensor.ndim} "
-        f"(shape={tuple(x.tensor.shape)})"
+    assert x.underlying_tensor.ndim >= 3, (
+        f"restream: input must have >=1 stream dim + 2 tile dims, got ndim={x.underlying_tensor.ndim} "
+        f"(shape={tuple(x.underlying_tensor.shape)})"
     )
     assert len(out_shape_tiled) >= 2, (
         f"restream: out_shape_tiled must end in (out_tile_r, out_tile_c) and "
@@ -1607,7 +1665,7 @@ def restream(x, stride, out_shape_tiled):
     y = retile_streamify(y, chunk=1, split_row=True)
     y = retile_streamify(y, chunk=1, split_row=False)
     y = streamify(
-        bufferize(y, rank=y.tensor.ndim - 2),
+        bufferize(y, rank=y.underlying_tensor.ndim - 2),
         stride=stride,
         out_shape_tiled=out_shape_tiled,
     )
@@ -1625,8 +1683,8 @@ def dyn_streamify(x, ref):
     )
     _assert_tile_kind(sd_r, "dyn_streamify (ref)")
     bufferized_rank = len(sd.shape)
-    t = x.tensor
-    ref_t = ref.tensor
+    t = x.underlying_tensor
+    ref_t = ref.underlying_tensor
     ref_stream_shape = ref_t.shape[:-2]
     buf_and_tile_dims = t.shape[-(2 + bufferized_rank):]
     expand_shape = list(ref_stream_shape) + list(buf_and_tile_dims)
@@ -1644,7 +1702,7 @@ def broadcast(x, n):
     """n duplicate StepTensors. Each output's metadata mirrors `x`."""
     _step_meta(x, "broadcast")
     return [
-        StepTensor(x.tensor.clone(), stream_dtype=x.stream_dtype,
+        StepTensor(x.underlying_tensor.clone(), stream_dtype=x.stream_dtype,
                    dyn_mask=x.dyn_mask, dyn_origins=x.dyn_origins,
                    offsets=x.offsets)
         for _ in range(n)
@@ -1662,7 +1720,7 @@ def parallelize(x, n):
     _assert_tile_kind(sd, "parallelize")
     assert len(mask) >= 1, "parallelize: input must have >=1 stream dim"
     return [
-        StepTensor(x.tensor[i::n].contiguous(),
+        StepTensor(x.underlying_tensor[i::n].contiguous(),
                    stream_dtype=sd, dyn_mask=mask, dyn_origins=orig)
         for i in range(n)
     ]
@@ -1686,9 +1744,9 @@ def static_reassemble(inputs, target_stream_shape=None):
             f"static_reassemble: input {i} dyn_mask {mask_i} != {mask0}"
         )
 
-    S = inputs[0].tensor.shape[0]
-    stacked = torch.stack([p.tensor for p in inputs], dim=1)  # (S, n, *rest)
-    result = stacked.reshape(S * n, *inputs[0].tensor.shape[1:])
+    S = inputs[0].underlying_tensor.shape[0]
+    stacked = torch.stack([p.underlying_tensor for p in inputs], dim=1)  # (S, n, *rest)
+    result = stacked.reshape(S * n, *inputs[0].underlying_tensor.shape[1:])
     if target_stream_shape is not None:
         tile_r, tile_c = result.shape[-2], result.shape[-1]
         target = tuple(target_stream_shape) + (tile_r, tile_c)
@@ -1714,10 +1772,10 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
         f"binary_map_accum: rank {rank} exceeds stream rank {len(mask_a)}"
     )
     if weight_transposed:
-        mapped = torch.matmul(a.tensor, b.tensor.transpose(-2, -1))
+        mapped = torch.matmul(a.underlying_tensor, b.underlying_tensor.transpose(-2, -1))
         tile_shape = (sd_a.shape[0], b.stream_dtype.shape[0])
     else:
-        mapped = torch.matmul(a.tensor, b.tensor)
+        mapped = torch.matmul(a.underlying_tensor, b.underlying_tensor)
         tile_shape = (sd_a.shape[0], b.stream_dtype.shape[1])
     for _ in range(rank):
         mapped = mapped.sum(dim=-3)
@@ -1738,8 +1796,8 @@ def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr
     sd_a, mask_a, _ = _step_meta(waddr, "random_offchip_store (waddr)")
     _assert_tile_kind(sd_w, "random_offchip_store (wdata)")
     _assert_tile_kind(sd_a, "random_offchip_store (waddr)")
-    wdata_t = wdata.tensor
-    waddr_t = waddr.tensor
+    wdata_t = wdata.underlying_tensor
+    waddr_t = waddr.underlying_tensor
     assert waddr_t.shape[-2:] == (1, 1), (
         f"random_offchip_store: waddr tile shape must be (1,1), got {tuple(waddr_t.shape[-2:])}"
     )
@@ -1796,10 +1854,20 @@ def offchip_store(x, *, par_dispatch=1):
     # tensor_shape_tiled from a JSON file at startup instead of taking it as a Vec<usize>).
     # Since this DSL doesn't deal with on-disk shape files, dyn_offchip_store is omitted;
     # offchip_store covers the value-level behavior of both.
-    t = x.tensor
-    assert t.ndim >= 2, (
-        f"offchip_store: input must be a tile stream (at least 2D for tile_r, tile_c), "
-        f"got shape {tuple(t.shape)}."
+    t = x.underlying_tensor
+    # The Rust simulator (step-perf/src/memory/offchip_store.rs:99) panics at
+    # startup on rank-0 input streams (empty tensor_shape_tiled). The IR check
+    # is `len(in_stream.shape) >= 2`; in DSL terms the pre-strip stream shape
+    # (everything but the 2 tile dims) must have at least 2 entries, i.e. the
+    # DSL tensor must be at least 4-D. The post-strip `if len(stream_shape) == 1`
+    # branch below still handles the (1, S, tr, tc) → (S, tr, tc) shorthand.
+    assert t.ndim >= 4, (
+        f"offchip_store: input stream must have rank >= 1 (>= 2 stream dims "
+        f"+ 2 tile dims, so tensor ndim >= 4). Got shape {tuple(t.shape)} "
+        f"(stream shape {tuple(t.shape[:-2])}, rank {max(len(t.shape) - 3, -1)}). "
+        f"The Rust simulator panics at startup with empty tensor_shape_tiled "
+        f"(step-perf/src/memory/offchip_store.rs:99). Promote with "
+        f"`promote_outer` before storing if you need a leading singleton."
     )
     tile_r, tile_c = t.shape[-2], t.shape[-1]
 
@@ -1808,9 +1876,6 @@ def offchip_store(x, *, par_dispatch=1):
         t = t[0]
 
     stream_shape = t.shape[:-2]
-
-    if len(stream_shape) == 0:
-        return t  # single tile
 
     if len(stream_shape) == 1:
         return t.reshape(stream_shape[0] * tile_r, tile_c)
@@ -1872,7 +1937,7 @@ _STEP_DSL_TRACE = _step_dsl_os.environ.get("STEP_DSL_TRACE", "") == "1"
 
 def _step_dsl_fmt(v):
     if isinstance(v, StepTensor):
-        return f"{_step_dsl_fmt(v.tensor)}::{v.stream_dtype!r} dyn={v.dyn_mask}"
+        return f"{_step_dsl_fmt(v.underlying_tensor)}::{v.stream_dtype!r} dyn={v.dyn_mask}"
     if torch.is_tensor(v):
         s = tuple(v.shape)
         if len(s) >= 2:

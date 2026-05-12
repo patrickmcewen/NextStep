@@ -790,6 +790,9 @@ def build_pass1_user_prompt(
             "Multi-output children must be destructured at the call site "
             "(e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).",
             "",
+            "KEY (MUST-READ): If you find that the input or output tensors to a blackbox child",
+            "will be dynamic at runtime, you should not use the blackbox child.",
+            "Instead, you should complete the full inlined implementation yourself."
         ])
         from src.node_signature import format_arg_spec
         for entry in children_signatures:

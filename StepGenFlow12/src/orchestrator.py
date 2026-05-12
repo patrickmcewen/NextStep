@@ -579,7 +579,24 @@ _PASS_RULES: dict[str, dict] = {
             ("torch.rsqrt",  "use unary_rsqrt(x)"),
             ("F.silu",       "use unary_silu(x)"),
             (".float(",      "changing dtype is not allowed"),
-            (".tensor.shape[", "use `.shape[...]` instead — the bare `.shape` accessor is exposed on both `StepTensor` (Pass-1) and STeP graph ops (translation); `.tensor` is the underlying torch.Tensor and not part of the public surface")
+            (".underlying_tensor",
+             "do not access `.underlying_tensor` (the underlying torch.Tensor): it is "
+             "not part of the public DSL surface and is not present on STeP "
+             "graph ops after AST translation, so tunneling through it "
+             "produces code that passes Pass-1 eager DSL but crashes at "
+             "translation. For shape introspection use `.shape[k]` (exposed "
+             "on both StepTensor and graph ops); for compute use DSL ops "
+             "(binary_*, unary_*, accum_*, reshape_*, etc.) instead of raw "
+             "torch on the underlying tensor."),
+            ("StepTensor(",
+             "do not construct `StepTensor` manually. Every wrapper in well-"
+             "formed DSL code is produced by a DSL source/transform op "
+             "(offchip_load, select_gen, binary_*, unary_*, reshape_*, ...); "
+             "a manually-constructed StepTensor has no corresponding STeP IR "
+             "node behind it, so AST translation cannot reproduce the "
+             "compute. Entry-point on-chip args are already wrapped by the "
+             "framework — no `if not isinstance(x, StepTensor): x = "
+             "StepTensor(...)` workaround is needed."),
             #("out_shape_tiled=(1,)",
             # "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
         ],

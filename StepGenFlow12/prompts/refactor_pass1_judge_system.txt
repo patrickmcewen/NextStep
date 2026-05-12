@@ -26,6 +26,16 @@ Every entry in every ``out_shapes`` tuple — {out_shapes_call_sites_phrase} —
 
 Flag any ``out_shapes`` literal in the function body whose entries you can statically determine to have rank < 3, or any ``out_perms`` whose tuple length does not match the corresponding ``out_shapes`` entry's rank.
 
+## Requirement {wrapper_req_number}: Wrapper integrity — no ``.tensor`` access or manual ``StepTensor(...)`` construction
+
+The DSL wrapper is opaque to user code. Two anti-patterns silently pass Pass-1 eager execution because the wrapper still holds a real ``torch.Tensor``, but they break at AST translation because the STeP graph ops the wrapper is rewritten into do not expose ``.tensor`` and are not produced by direct constructor calls.
+
+- **``.tensor`` access** — reading the underlying ``torch.Tensor`` off a ``StepTensor`` in any form: ``x.tensor``, ``x.tensor.shape[-1]``, ``x.tensor[..., :half]``, ``foo(x.tensor)``, etc. For shape introspection use ``.shape[k]`` — that accessor is exposed on both ``StepTensor`` (Pass-1) and STeP graph ops (translation). For compute, use DSL ops (``binary_*``, ``unary_*``, ``accum_*``, ``reshape_*``, ``flatten``, ``promote_*``, ``expand_ref``, ``repeat_*``, etc.) — never raw ``torch`` on the underlying tensor.
+
+- **Manual ``StepTensor(...)`` construction** — calling the ``StepTensor`` constructor in the function body, including the ``if not isinstance(x, StepTensor): x = StepTensor(x, ...)`` entry-point-wrap workaround. Wrappers are produced only by DSL source/transform ops (``offchip_load``, ``select_gen``, ``binary_*``, ``unary_*``, ``reshape_*``, ``flatten``, ``promote_*``, ``flat_partition``, ...). A manually-constructed ``StepTensor`` has no corresponding STeP IR node behind it, so translation cannot reproduce the compute it claims to wrap. Entry-point on-chip args are wrapped by the framework before the function runs — no workaround is needed.
+
+Flag any ``.tensor`` attribute access on what could be a ``StepTensor``, and any ``StepTensor(...)`` constructor call in the function body. Do **not** flag ``isinstance(x, StepTensor)`` (no parens after the name in a constructor sense) or ``StepTensor`` appearing only in a type annotation — those reference the class without instantiating it.
+
 ## Output Format
 
 If every requirement above is satisfied:

@@ -64,22 +64,27 @@ _DSL_NAMES: set = set()
 # graph-build time using STeP's own stream inference, instead of re-implementing
 # STeP's shape algebra here.
 _HELPER_PRELUDE = """\
-# Expose `.shape` on StepOps nodes so DSL code that introspects tensor shapes
-# (e.g. `len(x.shape)`) keeps working at graph-build time. At DSL evaluation
-# time `x` is a torch.Tensor with `.shape == stream + tile`; we mirror that.
+# Expose `.shape` and `.stream_dtype` on StepOps nodes so DSL code that
+# introspects tensor metadata (e.g. `len(x.shape)`, `x.stream_dtype.shape[1]`,
+# `ctrl.stream_dtype.total_n`) keeps working at graph-build time. At DSL
+# evaluation time `x` is a StepTensor with `.shape == stream + tile` and a
+# `.stream_dtype` datatype object; we mirror both on the IR node.
 _StepOps = BinaryMap.__mro__[1]
 if not hasattr(_StepOps, 'shape'):
     _StepOps.shape = property(
         lambda self: tuple(self.stream.shape) + tuple(self.stream.stream_dtype.shape)
     )
+if not hasattr(_StepOps, 'stream_dtype'):
+    _StepOps.stream_dtype = property(lambda self: self.stream.stream_dtype)
 
 
 class _BranchRef(tuple):
     # tuple subclass for the ``(node, idx)`` refs emitted by multi-output ops
     # (Broadcast / Parallelize / FlatPartition). STeP IR `get_stream` accepts
     # any (StepOps, int) tuple — including subclasses — so wrapping doesn't
-    # change downstream semantics. The added `.shape` lets DSL-style shape
-    # introspection (`xi.shape[0]`) keep working on per-branch refs.
+    # change downstream semantics. The added `.shape` / `.stream_dtype` let
+    # DSL-style introspection (`xi.shape[0]`, `xi.stream_dtype.total_n`) keep
+    # working on per-branch refs.
     def __new__(cls, node, idx):
         return tuple.__new__(cls, (node, idx))
 
@@ -88,6 +93,11 @@ class _BranchRef(tuple):
         node, idx = self
         s = node.stream_idx(idx)
         return tuple(s.shape) + tuple(s.stream_dtype.shape)
+
+    @property
+    def stream_dtype(self):
+        node, idx = self
+        return node.stream_idx(idx).stream_dtype
 
 
 def _dsl2step_stream(x):
@@ -119,8 +129,15 @@ def _dsl2step_out_tile(x, mode, accum_rank):
     return Tile(tile_dtype=sd.tile_dtype, shape=(tr, tc * mul))
 
 
-def _dsl2step_init(x):
-    return Empty(shape=(1, 1), dtype=_dsl2step_stream(x).stream_dtype.tile_dtype)
+def _dsl2step_init(x, mode):
+    sd = _dsl2step_stream(x).stream_dtype
+    tr, tc = sd.shape
+    dt = sd.tile_dtype
+    if mode == 'row':
+        return Empty(shape=(0, tc), dtype=dt)
+    if mode == 'col':
+        return Empty(shape=(tr, 0), dtype=dt)
+    return Zero(shape=(tr, tc), dtype=dt)
 
 
 def _dsl2step_in_tile(x):
@@ -192,11 +209,11 @@ def _offchip_load_or_restream(graph, underlying, stride, out_shape_tiled,
     sm = Streamify(graph, buf, stride=scaled_stride, out_shape_tiled=extended_shape)
     rcol = Accum(graph, sm,
                   output_stream_dtype=_dsl2step_out_tile(sm, 'col', 1),
-                  fn=accum_fn.RetileCol(), init_fn=_dsl2step_init(sm),
+                  fn=accum_fn.RetileCol(), init_fn=_dsl2step_init(sm, 'col'),
                   accum_rank=1, write_back_mu=False, compute_bw=1)
     rrow = Accum(graph, rcol,
                   output_stream_dtype=_dsl2step_out_tile(rcol, 'row', 1),
-                  fn=accum_fn.RetileRow(), init_fn=_dsl2step_init(rcol),
+                  fn=accum_fn.RetileRow(), init_fn=_dsl2step_init(rcol, 'row'),
                   accum_rank=1, write_back_mu=False, compute_bw=1)
     # Prepend the leading (1,) that LinearOffChipLoad emits as the tensor batch
     # dim — without it, downstream ops sized for offchip_load's output (e.g.
@@ -972,7 +989,7 @@ def _make_accum(accum_class, mode):
         return _block(
             f"{target} = Accum(graph, {x}, "
             f"output_stream_dtype=_dsl2step_out_tile({x}, {mode!r}, {rank}), "
-            f"fn=accum_fn.{accum_class}(), init_fn=_dsl2step_init({x}), "
+            f"fn=accum_fn.{accum_class}(), init_fn=_dsl2step_init({x}, {mode!r}), "
             f"accum_rank={rank}, write_back_mu=False, compute_bw={compute_bw})\n"
         )
     return handler
@@ -987,7 +1004,7 @@ def _h_binary_map_accum(state, target, call):
     compute_bw = _arg_or_default(call, 4, "compute_bw", "1")
     return _block(
         f"{target} = BinaryMapAccum(graph, {a}, {b}, "
-        f"fn=map_accum_fn.Matmul({wt_s}), init_fn=_dsl2step_init({a}), "
+        f"fn=map_accum_fn.Matmul({wt_s}), init_fn=_dsl2step_init({a}, 'elem'), "
         f"rank={rank}, write_back_mu=False, compute_bw={compute_bw})\n"
     )
 
@@ -1093,11 +1110,11 @@ def _h_restream(state, target, call):
         f"out_shape_tiled=tuple({out_shape_tiled}))\n"
         f"{rcol} = Accum(graph, {sm}, "
         f"output_stream_dtype=_dsl2step_out_tile({sm}, 'col', 1), "
-        f"fn=accum_fn.RetileCol(), init_fn=_dsl2step_init({sm}), "
+        f"fn=accum_fn.RetileCol(), init_fn=_dsl2step_init({sm}, 'col'), "
         f"accum_rank=1, write_back_mu=False, compute_bw=1)\n"
         f"{target} = Accum(graph, {rcol}, "
         f"output_stream_dtype=_dsl2step_out_tile({rcol}, 'row', 1), "
-        f"fn=accum_fn.RetileRow(), init_fn=_dsl2step_init({rcol}), "
+        f"fn=accum_fn.RetileRow(), init_fn=_dsl2step_init({rcol}, 'row'), "
         f"accum_rank=1, write_back_mu=False, compute_bw=1)\n"
     )
 

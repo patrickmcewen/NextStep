@@ -164,19 +164,21 @@ def _pass1_judge_placeholders(*, is_leaf: bool, child_blackbox_block: str) -> di
     the renumbered Requirement 2 section)."""
     if is_leaf:
         return {
-            "requirement_count_phrase": "two",
+            "requirement_count_phrase": "three",
             "requirement_2_section": "",
             "out_shapes_req_number": "2",
+            "wrapper_req_number": "3",
             "out_shapes_call_sites_phrase": (
                 "at any DSL-op call sites that take ``out_shapes``"
             ),
         }
     return {
-        "requirement_count_phrase": "three",
+        "requirement_count_phrase": "four",
         "requirement_2_section": _NONLEAF_JUDGE_REQ2_SECTION.format(
             child_blackbox_block=child_blackbox_block
         ),
         "out_shapes_req_number": "3",
+        "wrapper_req_number": "4",
         "out_shapes_call_sites_phrase": (
             "both at child-blackbox call sites and any DSL-op call sites "
             "that take ``out_shapes``"
