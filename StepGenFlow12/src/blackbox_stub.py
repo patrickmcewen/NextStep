@@ -18,14 +18,18 @@ preserve their list-ness.
 Outputs are template-driven and always plural: the parent calls the stub
 with ``out_shapes=(<shape_0>, <shape_1>, ...)`` (and optionally
 ``out_perms=(<perm_0>, <perm_1>, ...)`` where each entry may be ``None``).
-For each output the stub applies permute (if any), reshape, and then
-wraps the result in a ``StepTensor`` so the parent's DSL ops can chain
-on the return without re-attaching the stream wrapper. The tile shape is
-the last two dims of the matching ``out_shape`` (each ``out_shape`` must
-therefore be rank >= 2); the remaining leading dims are stream dims. If
-the underlying reference returns a single Tensor (``len(out_shapes) ==
-1``) the stub returns a single ``StepTensor``; if it returns a tuple,
-the stub returns a tuple of ``StepTensor``s of the same length.
+For each output the stub first reshapes the reference's raw tensor to
+``out_shape`` (so the parent can declare the natural tile-stream shape
+even when it differs in rank from the reference's native output), then
+applies ``out_perm`` (whose length must match ``len(out_shape)``), and
+wraps the permuted result in a ``StepTensor``. ``out_perm`` must keep
+the trailing two indices in place — they are the tile dims and the
+tile-stream invariant requires they remain last. The tile shape is the
+last two dims of ``out_shape`` (each ``out_shape`` must therefore be
+rank >= 2); the remaining leading dims are stream dims. If the
+underlying reference returns a single Tensor (``len(out_shapes) == 1``)
+the stub returns a single ``StepTensor``; if it returns a tuple, the
+stub returns a tuple of ``StepTensor``s of the same length.
 
 The first call to a given stub records a ``Contract`` on the supplied
 ``ContractRecorder``; subsequent calls are pure passthrough. The
@@ -90,12 +94,12 @@ def _tiled_shape_of(value, spec: ArgSpec) -> tuple[int, ...]:
 def _unwrap_steptensor(v):
     """Recursively unwrap StepTensor → torch.Tensor through lists.
 
-    Top-level StepTensor → its underlying ``.tensor``. List → element-wise
+    Top-level StepTensor → its underlying ``.underlying_tensor``. List → element-wise
     unwrap (handles ``list[StepTensor]`` and ``list[Tensor]`` uniformly).
     Anything else (raw Tensor, int, list[int]) passes through untouched.
     """
     if isinstance(v, StepTensor):
-        return v.tensor
+        return v.underlying_tensor
     if isinstance(v, list):
         return [_unwrap_steptensor(x) for x in v]
     return v
@@ -154,9 +158,19 @@ def make_stub(*, ref_module: nn.Module,
 
         results = []
         for raw_out, out_shape, out_perm in zip(raw_outputs, out_shapes, out_perms):
+            shaped = raw_out.reshape(out_shape)
             if out_perm is not None:
-                raw_out = raw_out.permute(*out_perm)
-            results.append(raw_out.reshape(out_shape))
+                assert len(out_perm) == len(out_shape), (
+                    f"out_perm {out_perm} length must match out_shape "
+                    f"{out_shape} rank ({len(out_shape)})")
+                tile_axes = (len(out_shape) - 2, len(out_shape) - 1)
+                assert tuple(out_perm[-2:]) == tile_axes, (
+                    f"out_perm {out_perm} must keep the last two indices "
+                    f"in place ({tile_axes}); the trailing two dims are the "
+                    f"tile (tile_row, tile_col) and the tile-stream "
+                    f"invariant requires they remain last")
+                shaped = shaped.permute(*out_perm)
+            results.append(shaped)
 
         if recorder.contract is None:
             recorder.contract = Contract(

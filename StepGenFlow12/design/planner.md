@@ -169,18 +169,21 @@ same post-validator. The differences are:
   once at the root, even when the root's body is a pure orchestrator
   that threads tensors through child blackboxes — the orchestrator-style
   root must wrap its final value as `offchip_store(<final_stream>)`.
-  The `offchip_load` requirement, however, is dropped on the root because
-  the AST dataflow walk (`_check_dataflow_invariant`) subsumes it: a
-  function that consumes only intermediate args or blackbox returns
-  generates no violations even though it never calls `offchip_load`.
-- **Dataflow compliance** is the AST walk in
-  `_check_dataflow_invariant` (`orchestrator.py`): every DSL-consumer
-  call (`binary_*`, `unary_*`, `accum_*`, sinks, …) must take tensor
-  inputs sourced from a DSL producer (`offchip_load*`, `select_gen`,
-  …), another consumer, a blackbox-child return, or a positional
-  intermediate arg (parent contract). Raw `tensors[...]` reads flowing
-  into a consumer are flagged. Blackbox call sites are exempt — their
-  stubs accept either vanilla raw tensors or tiled streams.
+  The `offchip_load` requirement, however, is dropped at `refactor_final`
+  because a function that consumes only intermediate args (already
+  on-chip per the parent contract) or blackbox returns never needs to
+  call `offchip_load` itself.
+- **Dataflow compliance** lives at runtime inside `step_dsl.py`. Every
+  DSL consumer entry (`_step_meta` in `binary_*`, `unary_*`, `accum_*`,
+  sinks, …) asserts `isinstance(x, StepTensor)` on each tensor input,
+  so passing a raw `tensors[...]` read or a forwarded raw arg straight
+  into a consumer trips an `AssertionError` during the correctness
+  gate's `_exec_build_graph`. Symmetrically, every source op
+  (`offchip_load*`, `select_gen`, `metadata_gen`) calls `_assert_raw`
+  on its raw-tensor slot to reject an on-chip `StepTensor` being fed
+  back into a producer. Blackbox child stubs accept either raw tensors
+  or `StepTensor`s and reshape internally, so blackbox call sites are
+  exempt by construction.
 - **Pass-1 prompt additions**: the node's user prompt carries the
   parent-declared contract block (input shapes + values + output
   shape/permutation) and, for non-leaf nodes, the blackbox signatures

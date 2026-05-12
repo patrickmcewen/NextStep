@@ -378,7 +378,7 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     # to satisfy this boundary would be artificial — offchip_store is a sink.
     if isinstance(result, (tuple, list)):
         unwrapped = type(result)(
-            t.tensor if isinstance(t, StepTensor) else t for t in result
+            t.underlying_tensor if isinstance(t, StepTensor) else t for t in result
         )
         for i, t in enumerate(unwrapped):
             assert isinstance(t, torch.Tensor), (
@@ -389,7 +389,7 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
         result = unwrapped
     else:
         if isinstance(result, StepTensor):
-            result = result.tensor
+            result = result.underlying_tensor
         assert isinstance(result, torch.Tensor), (
             f"{entry_point} must return a torch.Tensor or StepTensor (or "
             f"tuple/list of those for tuple-returning planner nodes), "

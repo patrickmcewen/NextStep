@@ -236,14 +236,14 @@ def _safe_output_shape(out: Any) -> tuple:
     unexpected outputs surface immediately instead of producing empty shapes.
     """
     if isinstance(out, step_dsl.StepTensor):
-        return tuple(out.tensor.shape)
+        return tuple(out.underlying_tensor.shape)
     if isinstance(out, torch.Tensor):
         return tuple(out.shape)
     if isinstance(out, list):
         assert out and all(isinstance(x, step_dsl.StepTensor) for x in out), (
             f"_safe_output_shape: list output must be non-empty list of StepTensor, got {out!r}"
         )
-        return tuple(out[0].tensor.shape)
+        return tuple(out[0].underlying_tensor.shape)
     raise AssertionError(
         f"_safe_output_shape: unexpected output type {type(out).__name__}"
     )
@@ -312,12 +312,12 @@ METRIC_FNS["random_offchip_store"] = _metrics_random_offchip_store
 def _tensor_of(x):
     """Underlying torch.Tensor for shape/dtype lookup.
 
-    Accepts a StepTensor (unwrapped via .tensor — covers Tile, Buffer, Select,
+    Accepts a StepTensor (unwrapped via .underlying_tensor — covers Tile, Buffer, Select,
     and offset-carrying variants) or a raw torch.Tensor (e.g. `underlying` arg
     to random_offchip_store, or offchip_store's raw sink return).
     """
     if isinstance(x, step_dsl.StepTensor):
-        return x.tensor
+        return x.underlying_tensor
     assert isinstance(x, torch.Tensor), (
         f"_tensor_of: expected StepTensor or torch.Tensor, got {type(x).__name__}"
     )
@@ -515,7 +515,7 @@ def _metrics_streamify_family(args, kwargs, output, mock_bf16):
     assert isinstance(buf, step_dsl.StepTensor) and isinstance(
         buf.stream_dtype, step_dsl.Buffer
     ), f"streamify input must be StepTensor with Buffer stream_dtype, got {buf!r}"
-    tile_b = _tile_bytes(buf.tensor, mock_bf16)
+    tile_b = _tile_bytes(buf.underlying_tensor, mock_bf16)
     buffer_grid = buf.stream_dtype.shape
     n_buffer_tiles = 1
     for d in buffer_grid:

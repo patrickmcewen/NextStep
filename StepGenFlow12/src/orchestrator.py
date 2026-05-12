@@ -708,22 +708,11 @@ _DSL_CONSUMERS: frozenset[str] = frozenset({
     "offchip_store", "random_offchip_store",
 })
 
-# DSL producers that ingest a raw off-chip tensor in one of their slots; value
-# is ``(arg_name, positional_index)`` for that slot. Producers absent from this
-# map (``expert_addr_gen``, ``cache_read_addr_gen``, ``filter_last_tile``)
-# operate on on-chip streams or scalars and aren't subject to the corollary
-# check. ``offchip_load_ref.ref`` and ``random_offchip_load.raddr`` are on-chip
-# stream slots on those producers, so we point at the raw slot only.
-_PRODUCER_RAW_ARG_POS: dict[str, tuple[str, int]] = {
-    "offchip_load":         ("underlying", 0),
-    "offchip_load_ref":     ("underlying", 1),
-    "dyn_offchip_load":     ("underlying", 0),
-    "random_offchip_load":  ("underlying", 0),
-    "select_gen":           ("underlying", 0),
-    "metadata_gen":         ("tensor", 0),
-}
-
-# Source classifications for a Name's binding, used by the dataflow walk.
+# Source classifications for a Name's binding, used by the call-site rawness
+# extractor (``_extract_call_site_rawness``) that stamps ``arg_is_raw`` onto
+# each child contract during Pass-1 walk. The consumer/producer dataflow check
+# is enforced at runtime by ``StepTensor`` type assertions in ``step_dsl.py``
+# (``_step_meta`` for consumers, ``_assert_raw`` for producer raw slots).
 _SRC_PRODUCER = "producer"
 _SRC_CONSUMER = "consumer"
 _SRC_BLACKBOX = "blackbox"
@@ -737,12 +726,9 @@ _SRC_RAW_INTERMEDIATE_ARG = "raw_intermediate_arg"
 _SRC_NON_TENSOR = "non_tensor"
 _SRC_UNKNOWN = "unknown"
 
-_ONCHIP_SOURCES = frozenset({
-    _SRC_PRODUCER, _SRC_CONSUMER, _SRC_BLACKBOX, _SRC_INTERMEDIATE_ARG,
-})
-
-# Source classifications that flag a value as still-raw (off-chip) when fed
-# directly into a DSL consumer.
+# Source classifications that flag a value as still-raw (off-chip) at a child
+# call site. ``_extract_call_site_rawness`` uses this to stamp ``arg_is_raw``
+# onto each child contract.
 _RAW_SOURCES = frozenset({_SRC_RAW_TENSORS, _SRC_RAW_INTERMEDIATE_ARG})
 
 # Regex to find torch.XXX( and F.XXX( calls
@@ -858,79 +844,6 @@ def _bind_target(target: ast.AST, src: str,
             _bind_target(elt, src, name_to_source)
 
 
-def _subscript_key_repr(sub: ast.Subscript) -> str:
-    s = sub.slice
-    if isinstance(s, ast.Constant):
-        return repr(s.value)
-    return "..."
-
-
-def _check_consumer_arg(arg: ast.AST,
-                         name_to_source: dict[str, str],
-                         blackbox_set: frozenset[str],
-                         *, op: str) -> str | None:
-    """Return a violation message if ``arg`` is clearly an off-chip raw read
-    being fed into a DSL consumer; ``None`` otherwise.
-
-    Conservative: only flags ``tensors["X"]`` (direct or via a Name that was
-    bound to one). Unknown / non-tensor sources are accepted silently to
-    avoid false positives on scalars and host-side helpers.
-    """
-    if isinstance(arg, ast.Subscript):
-        if isinstance(arg.value, ast.Name) and arg.value.id == "tensors":
-            key = _subscript_key_repr(arg)
-            return (f"- `{op}` consumes a raw `tensors[{key}]` read; wrap it "
-                    f"in `offchip_load(tensors[{key}], ...)` (or another "
-                    f"source op) before passing to a DSL consumer")
-        return None
-    if isinstance(arg, ast.Name):
-        src = name_to_source.get(arg.id, _SRC_UNKNOWN)
-        if src in _ONCHIP_SOURCES:
-            return None
-        if src == _SRC_RAW_TENSORS:
-            return (f"- `{op}` consumes `{arg.id}` which holds a raw "
-                    f"`tensors[...]` read; load it via `offchip_load` (or "
-                    f"another source op) before passing to a DSL consumer")
-        if src == _SRC_RAW_INTERMEDIATE_ARG:
-            return (f"- `{op}` consumes `{arg.id}` which is a raw positional "
-                    f"arg (the parent's call site forwarded an off-chip "
-                    f"tensor); load it via `offchip_load` (or another source "
-                    f"op) before passing to a DSL consumer. (Raw args may "
-                    f"still be passed straight to a child blackbox.)")
-        return None
-    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
-        # Method-chain like ``tensors["x"].reshape(...)`` — recurse on the receiver.
-        return _check_consumer_arg(arg.func.value, name_to_source, blackbox_set, op=op)
-    return None
-
-
-def _check_producer_arg(arg: ast.AST,
-                         name_to_source: dict[str, str],
-                         blackbox_set: frozenset[str],
-                         *, op: str, arg_name: str) -> str | None:
-    """Return a violation message if ``arg`` is an on-chip stream being fed
-    into a DSL source op's raw-tensor slot; ``None`` otherwise.
-
-    Source ops (``offchip_load`` and friends) ingest a raw off-chip tensor.
-    Their raw-tensor argument must be ``tensors["X"]`` or a forwarded raw
-    intermediate. Passing an already-on-chip value (output of a DSL op or
-    blackbox child, or an intermediate arg the parent populated from a child
-    return) means the value isn't a raw tensor; at translation time this
-    surfaces deep inside STeP IR as
-    ``'<NodeClass>' object has no attribute 'dtype'``. Conservative: only
-    on-chip sources are flagged; raw / unknown / non-tensor sources pass.
-    """
-    src = _classify_value(arg, name_to_source, blackbox_set)
-    if src not in _ONCHIP_SOURCES:
-        return None
-    label = f"`{arg.id}`" if isinstance(arg, ast.Name) else "an on-chip expression"
-    return (f"- `{op}` receives {label} for {arg_name!r}, which is already "
-            f"on-chip (bound from a DSL op or blackbox child). Source ops "
-            f"require a raw off-chip tensor (`tensors[\"X\"]` or a forwarded "
-            f"raw intermediate arg). To re-tile an on-chip stream, use "
-            f"`bufferize` / `streamify` / `retile_streamify` / `restream` instead.")
-
-
 def _build_name_to_source(func: ast.FunctionDef,
                            blackbox_set: frozenset[str],
                            raw_arg_names: frozenset[str]) -> dict[str, str]:
@@ -966,129 +879,6 @@ def _build_name_to_source(func: ast.FunctionDef,
             _bind_target(node.target, src, name_to_source)
 
     return name_to_source
-
-
-def _check_func_dataflow(func: ast.FunctionDef,
-                          blackbox_set: frozenset[str],
-                          raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
-    """Per-function dataflow check; see ``_check_dataflow_invariant``.
-
-    Flow-sensitive: bindings are tracked as the body executes, so a parameter
-    that gets shadowed mid-function (e.g. ``w_gate = flatten(w_gate_tile, ...)``
-    after an earlier ``random_offchip_load(w_gate, addr, ...)``) is checked
-    against its incoming source at the earlier use site, not the post-shadow
-    one. Without this, a legitimate producer call on a still-raw parameter
-    would be flagged as on-chip after the rebind.
-
-    The classification dict is mutated in place across branches; if/else
-    branches don't fork the state, so a binding made in one branch leaks to
-    the other. That can mask a real consumer/producer violation in the
-    second branch (false negative) but never invents one (the bias matches
-    the existing ``conservative`` consumer check). Forking is left as
-    follow-up if real DSL output starts to need it.
-    """
-    name_to_source: dict[str, str] = {}
-    for arg in func.args.args:
-        if arg.arg in {"dims", "tensors", "self"}:
-            continue
-        name_to_source[arg.arg] = (
-            _SRC_RAW_INTERMEDIATE_ARG if arg.arg in raw_arg_names
-            else _SRC_INTERMEDIATE_ARG)
-    for arg in func.args.kwonlyargs:
-        name_to_source[arg.arg] = _SRC_NON_TENSOR
-
-    violations: list[str] = []
-
-    def check_call(call: ast.Call) -> None:
-        cname = _call_name(call)
-        if cname in _DSL_CONSUMERS:
-            for a in call.args:
-                v = _check_consumer_arg(a, name_to_source, blackbox_set, op=cname)
-                if v is not None:
-                    violations.append(v)
-            for kw in call.keywords:
-                if kw.arg is None:  # **kwargs unpacking — skip
-                    continue
-                v = _check_consumer_arg(kw.value, name_to_source, blackbox_set, op=cname)
-                if v is not None:
-                    violations.append(v)
-        elif cname in _PRODUCER_RAW_ARG_POS:
-            arg_name, pos = _PRODUCER_RAW_ARG_POS[cname]
-            kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
-            a = kwargs.get(arg_name)
-            if a is None and pos < len(call.args):
-                a = call.args[pos]
-            if a is not None:
-                v = _check_producer_arg(a, name_to_source, blackbox_set,
-                                         op=cname, arg_name=arg_name)
-                if v is not None:
-                    violations.append(v)
-
-    def scan(stmts: list) -> None:
-        for stmt in stmts:
-            # Nested defs are their own scope; the outer ``ast.walk`` in
-            # ``_check_dataflow_invariant`` visits each FunctionDef and calls
-            # this checker on it independently, so we skip them here.
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            # 1. Check every Call inside this statement against current bindings.
-            for sub in ast.walk(stmt):
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if isinstance(sub, ast.Call):
-                    check_call(sub)
-            # 2. Apply binding updates so subsequent statements see the new src.
-            if isinstance(stmt, ast.Assign):
-                src = _classify_value(stmt.value, name_to_source, blackbox_set)
-                for tgt in stmt.targets:
-                    _bind_target(tgt, src, name_to_source)
-            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-                src = _classify_value(stmt.value, name_to_source, blackbox_set)
-                _bind_target(stmt.target, src, name_to_source)
-            # 3. Recurse into control-flow bodies in execution order.
-            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                scan(stmt.body)
-                scan(stmt.orelse)
-            elif isinstance(stmt, ast.If):
-                scan(stmt.body)
-                scan(stmt.orelse)
-
-    scan(func.body)
-    return violations
-
-
-def _check_dataflow_invariant(code: str, *,
-                               blackbox_names: tuple[str, ...] = (),
-                               raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
-    """AST-level dataflow check for ``refactor_final`` output.
-
-    For every DSL consumer call (``binary_*``, ``unary_*``, ``offchip_store``,
-    …), each tensor-typed positional or keyword argument must trace back to a
-    valid on-chip source: a DSL producer (``offchip_load*``, ``select_gen``,
-    …), another consumer, a blackbox-child return, or a positional
-    intermediate function arg (one that isn't ``dims``/``tensors``/``self``).
-
-    Raw ``tensors["X"]`` reads being fed into a DSL consumer are flagged.
-    Blackbox-child call sites are exempt because their stubs accept either
-    raw or tiled inputs and reshape internally.
-
-    Subsumes the previous textual ``offchip_load`` requirement: a function
-    that consumes only intermediate args or blackbox returns generates no
-    violations even though it never calls ``offchip_load`` itself.
-    """
-    blackbox_set = frozenset(blackbox_names)
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return []  # exec'd elsewhere; don't double-flag here.
-
-    violations: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            violations.extend(_check_func_dataflow(
-                node, blackbox_set, raw_arg_names))
-    # Deduplicate while preserving order.
-    return list(dict.fromkeys(violations))
 
 
 def _extract_call_site_rawness(
@@ -1151,8 +941,7 @@ def _extract_call_site_rawness(
 
 def _check_banned_ops(code: str, pass_name: str, *,
                        is_root: bool = True,
-                       extra_required_ops: tuple[str, ...] = (),
-                       raw_arg_names: frozenset[str] = frozenset()) -> list[str]:
+                       extra_required_ops: tuple[str, ...] = ()) -> list[str]:
     """Check whether ``code`` complies with this pass's output constraints.
 
     Returns a list of violation messages; empty means compliant. Each pass's
@@ -1165,6 +954,12 @@ def _check_banned_ops(code: str, pass_name: str, *,
     from the required-ops set: only the root node writes results off-chip;
     intermediate nodes hand their tensors back to a parent rather than
     storing them.
+
+    Consumer-source and producer-raw-slot dataflow checks live in
+    ``step_dsl.py`` as runtime ``StepTensor`` type assertions (``_step_meta``
+    for consumers, ``_assert_raw`` for producer raw slots) — they surface as
+    AssertionErrors during the correctness gate's ``_exec_build_graph`` rather
+    than as an extra compliance-time AST walk.
     """
     rules = _PASS_RULES.get(pass_name)
     if rules is None:
@@ -1206,29 +1001,22 @@ def _check_banned_ops(code: str, pass_name: str, *,
     sink_ops = {"offchip_store", "OffChipStore", "random_offchip_store"}
     # ``extra_required_ops`` (the planner's child blackbox names) is intentionally
     # NOT required to appear textually: blackbox calls are tools the implementer
-    # may use, not a quota. They still flow into the dataflow walk below as
-    # ``blackbox_names`` so call sites are exempt from the consumer-source rule.
+    # may use, not a quota.
     required_ops = list(rules["required_ops"])
     if pass_name == "refactor_final":
-        # The AST dataflow walk subsumes the textual ``offchip_load`` check —
-        # a node consuming only intermediate args / blackbox returns never
-        # needs to call ``offchip_load`` itself. ``offchip_store`` is NOT
-        # dropped here: the kernel's externally-observable output goes
-        # off-chip via a single sink at the root, regardless of whether
-        # the root is a leaf or a blackbox-only orchestrator. Children are
-        # exempt (handled by the ``not is_root`` rule below).
+        # A node consuming only intermediate args / blackbox returns never
+        # needs to call ``offchip_load`` itself, so it's not strictly required
+        # at refactor_final. ``offchip_store`` is NOT dropped here: the
+        # kernel's externally-observable output goes off-chip via a single
+        # sink at the root, regardless of whether the root is a leaf or a
+        # blackbox-only orchestrator. Children are exempt (handled by the
+        # ``not is_root`` rule below).
         required_ops = [op for op in required_ops if op != "offchip_load"]
     for required in required_ops:
         if not is_root and required in sink_ops:
             continue
         if required not in code:
             violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
-
-    if pass_name == "refactor_final":
-        violations.extend(_check_dataflow_invariant(
-            code, blackbox_names=tuple(extra_required_ops),
-            raw_arg_names=raw_arg_names,
-        ))
 
     # Deduplicate while preserving order
     return list(dict.fromkeys(violations))
@@ -1534,7 +1322,6 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
                            *, correctness_verified: bool,
                            is_root: bool = True,
                            extra_required_ops: tuple[str, ...] = (),
-                           raw_arg_names: frozenset[str] = frozenset()
                            ) -> _GateResult:
     """Regex compliance check.
 
@@ -1547,8 +1334,7 @@ async def _gate_compliance(code, pass_name, compliance_override, judge_agent,
                                               is_root=is_root)
     else:
         violations = _check_banned_ops(code, pass_name, is_root=is_root,
-                                       extra_required_ops=extra_required_ops,
-                                       raw_arg_names=raw_arg_names)
+                                       extra_required_ops=extra_required_ops)
 
     if not violations:
         return _GateResult(None, "PASS", 0)
@@ -1700,7 +1486,6 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                          entry_point: str = "tiled_reference",
                          call_args: tuple | None = None,
                          call_kwargs: dict | None = None,
-                         raw_arg_names: frozenset[str] = frozenset(),
                          pre_turn_hook=None):
     """Run a single pass agent (lowering or translator).
 
@@ -1850,8 +1635,7 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
                         tensors, turn_dir, log,
                         correctness_verified=correctness_verified,
                         is_root=is_root,
-                        extra_required_ops=extra_required_ops,
-                        raw_arg_names=raw_arg_names)
+                        extra_required_ops=extra_required_ops)
                     if res.feedback is not None and inline_judge_eligible:
                         compliance_invoked_judge = True
                 elif gate_name == "judge":
@@ -2552,7 +2336,6 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         entry_point = "tiled_reference"
         call_args: tuple | None = None
         call_kwargs: dict | None = None
-        raw_arg_names_set: frozenset[str] = frozenset()
     else:
         entry_point = node.name
         # Wrap on-chip TensorArg inputs as StepTensors before invoking the
@@ -2561,6 +2344,14 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         # only holds in Pass-2 composition (where the parent's DSL produces
         # StepTensors) and not in Pass-1 isolation (where the framework
         # hands raw tensors). RAW args and list args pass through unchanged.
+        # Non-root nodes inherit per-arg rawness from the parent's recorded
+        # call site. The pass-1 walk stamps ``arg_is_raw`` onto every child
+        # contract before recursing, so its length must match arg_names here.
+        assert len(parent_contract.arg_is_raw) == len(parent_contract.arg_names), (
+            f"non-root node {node.path!r}: parent_contract.arg_is_raw "
+            f"({parent_contract.arg_is_raw}) length must match arg_names "
+            f"({parent_contract.arg_names}); the orchestrator should stamp "
+            f"rawness from the parent's verified code before this point")
         call_args = _wrap_on_chip_call_args(
             tuple(parent_contract.tiled_values),
             parent_contract.arg_specs,
@@ -2571,19 +2362,6 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
             "out_shapes": parent_contract.out_shapes,
             "out_perms": parent_contract.out_perms,
         }
-        # Non-root nodes inherit per-arg rawness from the parent's recorded
-        # call site. The pass-1 walk stamps ``arg_is_raw`` onto every child
-        # contract before recursing, so its length must match arg_names here.
-        assert len(parent_contract.arg_is_raw) == len(parent_contract.arg_names), (
-            f"non-root node {node.path!r}: parent_contract.arg_is_raw "
-            f"({parent_contract.arg_is_raw}) length must match arg_names "
-            f"({parent_contract.arg_names}); the orchestrator should stamp "
-            f"rawness from the parent's verified code before this point")
-        raw_arg_names_set = frozenset(
-            name for name, raw in zip(
-                parent_contract.arg_names, parent_contract.arg_is_raw)
-            if raw
-        )
 
     async def _one_attempt(attempt_idx: int) -> dict:
         attempt_dir = (
@@ -2636,7 +2414,6 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
             entry_point=entry_point,
             call_args=call_args,
             call_kwargs=call_kwargs,
-            raw_arg_names=raw_arg_names_set,
             pre_turn_hook=_reset_recorders,
         )
         # Attach this attempt's recorders so the harvester reads only the

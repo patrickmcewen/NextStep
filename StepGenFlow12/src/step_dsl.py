@@ -330,6 +330,21 @@ def _unwrap(x):
     return x
 
 
+def _assert_raw(x, op_name, slot):
+    """Source ops ingest a raw off-chip tensor. Passing a StepTensor here means
+    the value is already on-chip — load it via a source op, not by re-feeding a
+    stream into another source op. This replaces the orchestrator's static
+    producer-raw-slot dataflow check; the rawness lives in the value's type."""
+    assert isinstance(x, torch.Tensor) and not isinstance(x, StepTensor), (
+        f"{op_name}: argument {slot!r} must be a raw torch.Tensor (off-chip), "
+        f"got {type(x).__name__}. Source ops (offchip_load, dyn_offchip_load, "
+        f"offchip_load_ref, random_offchip_load, select_gen, metadata_gen) "
+        f"ingest off-chip memory; feeding a StepTensor (an on-chip stream) into "
+        f"a source op is a compile-time error. To re-tile an on-chip stream, "
+        f"use bufferize / streamify / retile_streamify / restream instead."
+    )
+
+
 def _step_meta(x, op_name):
     """Require a StepTensor and return (stream_dtype, dyn_mask, dyn_origins).
 
@@ -364,6 +379,7 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
 
 
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
+    _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     # out_shape_tiled enumerates the stream positions to read; an empty tuple
@@ -425,6 +441,7 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
 
 
 def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_dispatch=1):
+    _assert_raw(underlying, "dyn_offchip_load", "underlying")
     assert par_dispatch >= 1, f"dyn_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"dyn_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
@@ -455,6 +472,7 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
 
 
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
+    _assert_raw(underlying, "offchip_load_ref", "underlying")
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
@@ -478,7 +496,7 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     )
 
 def select_gen(underlying, is_multihot, n):
-    underlying = _unwrap(underlying)
+    _assert_raw(underlying, "select_gen", "underlying")
     _assert_int(underlying, "select_gen")
     assert isinstance(is_multihot, bool), (
         f"select_gen: is_multihot must be bool, got {type(is_multihot).__name__}"
@@ -498,7 +516,7 @@ def select_gen(underlying, is_multihot, n):
     )
 
 def metadata_gen(tensor):
-    tensor = _unwrap(tensor)
+    _assert_raw(tensor, "metadata_gen", "tensor")
     out = tensor.reshape(1, *tensor.shape, 1, 1)
     # IR MetadataGen always produces Tile(Uint64, (1,1)) regardless of the
     # eager-runtime torch dtype; the underlying tensor stores the metadata
@@ -603,6 +621,7 @@ def filter_last_tile(seq_len):
 
 
 def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False, *, par_dispatch=1):
+    _assert_raw(underlying, "random_offchip_load", "underlying")
     assert par_dispatch >= 1, f"random_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
@@ -1788,6 +1807,7 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
 
 
 def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0, *, par_dispatch=1):
+    _assert_raw(underlying, "random_offchip_store", "underlying")
     assert par_dispatch >= 1, f"random_offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_store: underlying dtype must be float16 or float32, got {underlying.dtype}"

@@ -1,6 +1,5 @@
 from src.orchestrator import (
     _check_banned_ops,
-    _check_dataflow_invariant,
     _extract_call_site_rawness,
 )
 
@@ -62,7 +61,10 @@ def tiled_reference(dims, tensors):
 
 # ---------------------------------------------------------------------------
 # offchip_store is required at root regardless of decomposition;
-# offchip_load is dropped (subsumed by the AST dataflow walk).
+# offchip_load is not required at refactor_final (a node consuming only
+# intermediate args / blackbox returns never needs it). Consumer-source
+# and producer-raw-slot rules are enforced at runtime by StepTensor type
+# assertions in step_dsl.py (_step_meta / _assert_raw), not here.
 # ---------------------------------------------------------------------------
 
 def test_orchestrator_root_with_blackbox_child_must_call_offchip_store():
@@ -148,51 +150,6 @@ def tiled_reference(dims, tensors):
     assert violations == []
 
 
-def test_dsl_consumer_on_raw_tensor_subscript_is_flagged():
-    """`binary_mul(tensors["x"], ...)` directly with no load is rejected."""
-    code = '''
-def tiled_reference(dims, tensors):
-    y = binary_mul(tensors["x"], tensors["x"])
-    return offchip_store(y)
-'''
-    violations = _check_dataflow_invariant(code)
-    assert any("binary_mul" in v and "tensors" in v for v in violations)
-
-
-def test_dsl_consumer_on_named_raw_tensor_is_flagged():
-    """Same but routed through a name binding."""
-    code = '''
-def tiled_reference(dims, tensors):
-    x = tensors["x"]
-    y = binary_mul(x, x)
-    return offchip_store(y)
-'''
-    violations = _check_dataflow_invariant(code)
-    assert any("binary_mul" in v for v in violations)
-    assert any("`x`" in v for v in violations)
-
-
-def test_offchip_store_on_raw_tensor_is_flagged():
-    """offchip_store is a sink (consumer); raw tensors[...] input must load first."""
-    code = '''
-def tiled_reference(dims, tensors):
-    return offchip_store(tensors["x"])
-'''
-    violations = _check_dataflow_invariant(code)
-    assert any("offchip_store" in v and "tensors" in v for v in violations)
-
-
-def test_method_chain_reshape_on_raw_is_flagged():
-    """Host-side reshape laundering must not slip past the dataflow check."""
-    code = '''
-def tiled_reference(dims, tensors):
-    y = binary_mul(tensors["x"].reshape(4, 8), tensors["x"].reshape(4, 8))
-    return offchip_store(y)
-'''
-    violations = _check_dataflow_invariant(code)
-    assert any("binary_mul" in v for v in violations)
-
-
 def test_nonroot_node_with_intermediate_args_passes():
     """The attention_path case: positional args are on-chip per parent contract,
     so no offchip_load is needed for DSL ops that consume them directly."""
@@ -229,33 +186,6 @@ def helper(x, *, out_shapes, out_perms=None):
     assert violations == []
 
 
-def test_dsl_chain_is_transitively_onchip():
-    code = '''
-def tiled_reference(dims, tensors):
-    x = offchip_load(tensors["x"], ...)
-    a = unary_square(x)
-    b = unary_rowwise_sum(a)
-    c = unary_rsqrt(b)
-    d = binary_mul(x, c)
-    return offchip_store(d)
-'''
-    violations = _check_dataflow_invariant(code)
-    assert violations == []
-
-
-def test_producer_op_arg_not_traced():
-    """A producer (offchip_load, select_gen, …) takes a raw tensor; we should
-    not flag its tensor arg even though it's a raw `tensors[...]` subscript."""
-    code = '''
-def tiled_reference(dims, tensors):
-    x = offchip_load(tensors["x"], ...)
-    sel = select_gen(is_multihot=True, tensor=tensors["mask"], n=4)
-    return offchip_store(x)
-'''
-    violations = _check_dataflow_invariant(code)
-    assert violations == []
-
-
 def test_blackbox_call_can_take_raw_subscript_directly():
     """Blackbox stubs accept either vanilla raw tensors or tiled streams; we
     must not flag a raw `tensors[...]` flowing into a blackbox."""
@@ -271,89 +201,9 @@ def tiled_reference(dims, tensors):
 
 
 # ---------------------------------------------------------------------------
-# Raw-positional-arg rule: a non-root function whose contract tags a positional
-# arg as raw must `offchip_load` (or another producer) it before feeding it to
-# any DSL consumer. Blackbox-child call sites remain exempt.
-# ---------------------------------------------------------------------------
-
-def test_raw_positional_arg_into_consumer_is_flagged():
-    """Forwarded raw weight fed straight into binary_matmul must be flagged."""
-    code = '''
-def attention_o_proj(Q, weight, *, out_shapes, out_perms=None):
-    out = binary_matmul(Q, weight)
-    return out
-'''
-    violations = _check_dataflow_invariant(
-        code,
-        blackbox_names=(),
-        raw_arg_names=frozenset({"weight"}),
-    )
-    assert any("weight" in v and "binary_matmul" in v for v in violations), violations
-
-
-def test_raw_positional_arg_loaded_first_is_ok():
-    """Same code with offchip_load on the raw weight must pass."""
-    code = '''
-def attention_o_proj(Q, weight, *, out_shapes, out_perms=None):
-    W = offchip_load(weight, ...)
-    out = binary_matmul(Q, W)
-    return out
-'''
-    violations = _check_dataflow_invariant(
-        code,
-        blackbox_names=(),
-        raw_arg_names=frozenset({"weight"}),
-    )
-    assert violations == []
-
-
-def test_raw_positional_arg_into_blackbox_is_ok():
-    """Raw arg may flow straight into a child blackbox without a load."""
-    code = '''
-def parent(x, weight, *, out_shapes, out_perms=None):
-    out = inner(x, weight, out_shapes=((4, 1, 8),))
-    return out
-'''
-    violations = _check_dataflow_invariant(
-        code,
-        blackbox_names=("inner",),
-        raw_arg_names=frozenset({"weight"}),
-    )
-    assert violations == []
-
-
-def test_onchip_positional_arg_no_load_required():
-    """An on-chip positional arg (parent fed in a streamed value) feeds
-    consumers directly — no load required."""
-    code = '''
-def proj(x_stream, *, out_shapes, out_perms=None):
-    return unary_square(x_stream)
-'''
-    violations = _check_dataflow_invariant(
-        code,
-        blackbox_names=(),
-        raw_arg_names=frozenset(),  # no raw args
-    )
-    assert violations == []
-
-
-def test_method_chain_on_raw_arg_into_consumer_is_flagged():
-    """``raw_arg.reshape(...)`` then into a consumer must still be flagged
-    because the receiver classification propagates via _classify_value."""
-    code = '''
-def proj(weight, *, out_shapes, out_perms=None):
-    return unary_square(weight.reshape(4, 8))
-'''
-    violations = _check_dataflow_invariant(
-        code,
-        blackbox_names=(),
-        raw_arg_names=frozenset({"weight"}),
-    )
-    assert any("weight" in v and "unary_square" in v for v in violations), violations
-
-
-# ---------------------------------------------------------------------------
-# Static rawness extractor over a parent's verified code.
+# Static rawness extractor over a parent's verified code — used by
+# _pass1_walk to (a) detect children that the parent inlined entirely and
+# (b) stamp ``arg_is_raw`` onto each surviving child contract.
 # ---------------------------------------------------------------------------
 
 def test_extractor_classifies_root_call_site():
