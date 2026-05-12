@@ -1,0 +1,26 @@
+test_name: gemm__large_4k
+# Derived from StepDB seed_kernels/matmul/gemm (preset: large_4k).
+# Preset values come from StepDB/bench_config.yaml; gold from
+# seed_kernels/matmul/gemm/reference.py:compute_gold.
+dims:
+  M: 4096
+  K: 4096
+  N: 4096
+
+inputs:
+  - name: A
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  - name: B
+    dtype: fp32
+    dims: [N, K]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [N, M]
+    data_transform:
+      - |
+        torch.matmul(input_data['A'], input_data['B'])

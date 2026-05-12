@@ -1,0 +1,66 @@
+test_name: moe_routed__large_d1k
+# Derived from StepDB seed_kernels/mlp/moe_routed (preset: large_d1k).
+# Preset values: B=64 tokens, D=1024 hidden, F=2048 intermediate,
+# n_experts=8, n_active=2.
+# Routed MoE: each token's top-k experts and their weights are given as
+# precomputed inputs — `expert_onehot` is a Multihot(fp32, n_experts)
+# stream that the body can load via step.SelectGen, and `expert_weights`
+# is a regular fp32 stream of the corresponding softmax weights. Per-
+# expert weight banks are stacked along axis 0 so `input_data[w][i]` is
+# the contiguous [D, F] (or [F, D] for down) view of expert i. Gold
+# from seed_kernels/mlp/moe_routed/reference.py:compute_gold, with
+# routing decoded from expert_onehot in the data_transform.
+dims:
+  B: 64
+  D: 1024
+  F: 2048
+  n_experts: 8
+  n_active: 2
+
+inputs:
+  - name: x
+    dtype: fp32
+    dims: [D, B]
+    data_gen: torch.randn
+  - name: gate_weights
+    dtype: fp32
+    dims: [F, D, n_experts]
+    data_gen: torch.randn
+  - name: up_weights
+    dtype: fp32
+    dims: [F, D, n_experts]
+    data_gen: torch.randn
+  - name: down_weights
+    dtype: fp32
+    dims: [D, F, n_experts]
+    data_gen: torch.randn
+  - name: expert_onehot
+    dtype: Multihot(fp32, n_experts)
+    dims: [n_active, B]
+    min: 1
+    max: 1
+  - name: expert_weights
+    dtype: fp32
+    dims: [n_active, B]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, B]
+    data_transform:
+      - |
+        B_dim = B_value
+        D_dim = D_value
+        n_e = n_experts_value
+        y = torch.zeros(B_dim, D_dim)
+        for i in range(n_e):
+            tok, top_pos = torch.where(input_data['expert_onehot'][:, :, i] == 1)
+            if len(tok) == 0:
+                continue
+            gate_out = input_data['x'][tok] @ input_data['gate_weights'][i]
+            up_out = input_data['x'][tok] @ input_data['up_weights'][i]
+            hidden = (gate_out * torch.sigmoid(gate_out)) * up_out
+            down_out = hidden @ input_data['down_weights'][i]
+            y[tok] = y[tok] + down_out * input_data['expert_weights'][tok, top_pos, None]
+        y

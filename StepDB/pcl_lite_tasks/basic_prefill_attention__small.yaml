@@ -1,0 +1,85 @@
+test_name: basic_prefill_attention__small
+# Derived from StepDB seed_kernels/attention/basic_prefill_attention
+# (preset: small, model_name=mixtral, is_small=true, seq_len=64).
+# Model config (from end_to_end.model_configs:SmallerMixtral8x7B):
+#   hidden_dim=512, head_dim=32, num_heads=16, num_kv_heads=4,
+#   query_per_kvhead=num_heads/num_kv_heads=4.
+# Pipeline:
+#   RMSNorm -> QKV + QK-RMSNorm + RoPE -> GQA full-seq attention
+#       (max-subtraction softmax, no 1/sqrt(d)) -> O-proj -> ResAdd.
+# Gold from seed_kernels/attention/basic_prefill_attention/reference.py.
+dims:
+  seq_len: 64
+  hidden_dim: 512
+  head_dim: 32
+  num_heads: 16
+  num_kv_heads: 4
+  query_per_kvhead: 4
+  num_heads_head_dim: 512
+  num_kv_heads_head_dim: 128
+
+inputs:
+  - name: input_tensor
+    dtype: fp32
+    dims: [hidden_dim, seq_len]
+    data_gen: torch.randn
+  - name: q_proj
+    dtype: fp32
+    dims: [num_heads_head_dim, hidden_dim]
+    data_gen: torch.randn
+  - name: k_proj
+    dtype: fp32
+    dims: [num_kv_heads_head_dim, hidden_dim]
+    data_gen: torch.randn
+  - name: v_proj
+    dtype: fp32
+    dims: [num_kv_heads_head_dim, hidden_dim]
+    data_gen: torch.randn
+  - name: cos
+    dtype: fp32
+    dims: [head_dim, 1, seq_len]
+    data_gen: torch.randn
+  - name: sin
+    dtype: fp32
+    dims: [head_dim, 1, seq_len]
+    data_gen: torch.randn
+  - name: o_proj_weight
+    dtype: fp32
+    dims: [hidden_dim, num_heads_head_dim]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [hidden_dim, seq_len]
+    data_transform:
+      - |
+        S_dim = seq_len_value
+        H_dim = head_dim_value
+        NQ = num_heads_value
+        NKV = num_kv_heads_value
+        QPKV = query_per_kvhead_value
+        def _rms_norm(x, eps=1e-6):
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        def _rotate_half(x):
+            half = x.shape[-1] // 2
+            return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+        normed = _rms_norm(input_data['input_tensor'])
+        Q = (normed @ input_data['q_proj']).view(S_dim, NQ, H_dim)
+        K = (normed @ input_data['k_proj']).view(S_dim, NKV, H_dim)
+        V = (normed @ input_data['v_proj']).view(S_dim, NKV, H_dim)
+        Q = _rms_norm(Q)
+        K = _rms_norm(K)
+        Q = Q * input_data['cos'] + _rotate_half(Q) * input_data['sin']
+        K = K * input_data['cos'] + _rotate_half(K) * input_data['sin']
+        Qh = Q.view(S_dim, NKV, QPKV, H_dim).permute(1, 2, 0, 3)
+        Kh = K.permute(1, 0, 2).unsqueeze(1)
+        Vh = V.permute(1, 0, 2).unsqueeze(1)
+        scores = Qh @ Kh.transpose(-1, -2)
+        row_max = scores.amax(dim=-1, keepdim=True)
+        e = torch.exp(scores - row_max)
+        attn = (e @ Vh) / e.sum(dim=-1, keepdim=True)
+        attn = attn.permute(2, 0, 1, 3).reshape(S_dim, NQ, H_dim)
+        attn_flat = attn.reshape(S_dim, NQ * H_dim)
+        o_proj_out = attn_flat @ input_data['o_proj_weight']
+        o_proj_out + input_data['input_tensor']

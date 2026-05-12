@@ -1,0 +1,37 @@
+test_name: sdpa_core_max__long_ctx_512
+# Derived from StepDB seed_kernels/attention/sdpa_core_max (preset: long_ctx_512).
+# Preset values: M=32 queries, N=512 keys/values, D=64 head_dim.
+# Numerically-stable softmax (row-max subtraction) attention over a single
+# (Q, K, V) tile, no scaling factor. Gold from
+# seed_kernels/attention/sdpa_core_max/reference.py:compute_gold.
+dims:
+  M: 32
+  N: 512
+  D: 64
+
+inputs:
+  - name: Q
+    dtype: fp32
+    dims: [D, M]
+    data_gen: torch.randn
+  - name: K
+    dtype: fp32
+    dims: [D, N]
+    data_gen: torch.randn
+  - name: V
+    dtype: fp32
+    dims: [D, N]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, M]
+    data_transform:
+      - |
+        scores = input_data['Q'] @ input_data['K'].T
+        row_max = scores.max(dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - row_max)
+        context = exp_scores @ input_data['V']
+        norm_attn = exp_scores.sum(dim=-1, keepdim=True)
+        context / norm_attn

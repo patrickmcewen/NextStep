@@ -1,0 +1,41 @@
+test_name: rope__qwen_b64
+# Derived from StepDB seed_kernels/pre_attention/rope (preset: qwen_b64).
+# Preset values: batch=64, num_q_heads=32, num_kv_heads=4, head_dim=64.
+# Q and K are concatenated along the heads axis into a single QK tensor
+# (matching StepDB precompute), since rotate_half + cos/sin multiply-add
+# is per-head and applies identically to Q and K rows.
+# num_total = num_q_heads + num_kv_heads;
+# total_q_kv = batch * num_total.
+# Gold from seed_kernels/pre_attention/rope/reference.py:compute_gold.
+dims:
+  batch: 64
+  num_q_heads: 32
+  num_kv_heads: 4
+  head_dim: 64
+  num_total: 36
+  total_q_kv: 2304
+
+inputs:
+  - name: QK
+    dtype: fp32
+    dims: [head_dim, num_total, batch]
+    data_gen: torch.randn
+  - name: cos
+    dtype: fp32
+    dims: [head_dim, 1, batch]
+    data_gen: torch.randn
+  - name: sin
+    dtype: fp32
+    dims: [head_dim, 1, batch]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [head_dim, total_q_kv]
+    data_transform:
+      - |
+        half = head_dim_value // 2
+        rh = torch.cat([-input_data['QK'][..., half:], input_data['QK'][..., :half]], dim=-1)
+        out_qk = input_data['QK'] * input_data['cos'] + rh * input_data['sin']
+        out_qk.reshape(-1, head_dim_value)
