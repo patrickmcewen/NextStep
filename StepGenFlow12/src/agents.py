@@ -42,13 +42,13 @@ _NONLEAF_CALL_SITE_RULES_SECTION = (
     "\n"
     "When passing a tensor to a child blackbox, **no tensor-method transform may appear "
     "between the tensor source and the call site** — the stub recovers vanilla shape "
-    "internally via ``flatten().reshape(vanilla_shape)`` and applies any requested "
-    "``out_perms`` / ``out_shapes`` itself. Specifically:\n"
+    "internally via ``flatten().reshape(vanilla_shape)`` and reshapes each raw reference "
+    "output to the parent-declared ``out_shapes`` entry. Specifically:\n"
     "\n"
     "- **Allowed (single-output child):** `result = child_name(x, ..., out_shapes="
-    "((S, T_R, T_C),), out_perms=(None,))`\n"
+    "((S, T_R, T_C),))`\n"
     "- **Allowed (multi-output child):** `q, k, v = child_name(x, ..., out_shapes="
-    "(s_q, s_k, s_v), out_perms=(p_q, p_k, p_v))`\n"
+    "(s_q, s_k, s_v))`\n"
     "- **Forbidden:** `.reshape(...)`, `.permute(...)`, `.transpose(...)`, any index "
     "expression `[...]`, arithmetic (`*`, `+`, etc.), `.squeeze()`, `.unsqueeze()`, "
     "`.expand()`, `.flatten()` (any dim form)\n"
@@ -58,10 +58,11 @@ _NONLEAF_CALL_SITE_RULES_SECTION = (
     "`reshape_pad_stream`, `streamify`, `flatten`, `bufferize`, `retile_streamify`, etc. "
     "Never use `tensor.reshape(...)` or any other ``torch.Tensor`` method.\n"
     "\n"
-    "Both ``out_shapes`` and ``out_perms`` are **always tuples of per-output entries**. "
-    "Even single-output children take a 1-tuple (e.g. ``out_shapes=((S, T_R, T_C),)``). "
-    "Output permutations go in ``out_perms`` (one entry per output, ``None`` = identity); "
-    "never apply ``permute``/``transpose`` to the input.\n"
+    "``out_shapes`` is **always a tuple of per-output entries**. Even single-output "
+    "children take a 1-tuple (e.g. ``out_shapes=((S, T_R, T_C),)``). The stub only "
+    "reshapes; if a child output needs a non-reshape layout change (e.g. moving the "
+    "seq axis to the front), apply the permutation explicitly on the return via "
+    "``bufferize`` + ``streamify``.\n"
     "\n"
 )
 
@@ -87,10 +88,10 @@ _NONLEAF_JUDGE_REQ2_SECTION = (
     "- `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()` (single-argument form that "
     "changes layout)\n"
     "\n"
-    "Output permutations must be expressed via the `out_perms` keyword argument (a tuple "
-    "parallel to ``out_shapes``, ``None`` entries = identity), not by transforming the "
-    "input before the call. For multi-output children, the call site must destructure "
-    "the returned tuple (e.g. ``q, k, v = preprocess_heads(x, out_shapes="
+    "Output permutations must be applied on the stub's return via DSL ops "
+    "(``bufferize`` + ``streamify`` with proper strides), not by transforming the "
+    "input before the call. For multi-output children, the call site must "
+    "destructure the returned tuple (e.g. ``q, k, v = preprocess_heads(x, out_shapes="
     "(s_q, s_k, s_v))``).\n"
     "\n"
 )
@@ -221,9 +222,9 @@ def _load_pass1_judge_prompt(
 
     ``function_signature`` is the *exact* signature line the orchestrator
     will invoke (e.g. ``def tiled_reference(dims, tensors):`` for the root
-    or ``def <node>(<arg_1>, ..., *, out_shapes, out_perms=None):`` for a
-    non-root node). The judge enforces a literal match against it, which
-    obviates a root/non-root branch in the template.
+    or ``def <node>(<arg_1>, ..., *, out_shapes):`` for a non-root node).
+    The judge enforces a literal match against it, which obviates a
+    root/non-root branch in the template.
     """
     template_path = _PROMPTS_DIR_AGENTS / _PASS1_JUDGE_TEMPLATE
     assert template_path.exists(), f"Pass-1 judge template not found: {template_path}"
@@ -446,7 +447,7 @@ def make_pass1_judge_agent(
     Same block parameters as ``make_pass1_agent``, plus ``function_signature``:
     the exact signature line the candidate function must match (root nodes get
     ``def tiled_reference(dims, tensors):``; non-root nodes get the
-    contract-derived ``def <node>(<arg_1>, ..., *, out_shapes, out_perms=None):``).
+    contract-derived ``def <node>(<arg_1>, ..., *, out_shapes):``).
     Leaves drop the call-site requirement entirely so the judge only checks
     signature and ``out_shapes`` rank.
     """

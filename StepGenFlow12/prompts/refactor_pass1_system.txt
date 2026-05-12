@@ -28,7 +28,7 @@ Every ``out_shapes`` entry — and every tile-stream tensor in your function —
 
 - **Allowed:** ``out_shapes=((S, T_R, T_C),)`` (one stream dim), ``out_shapes=((B, S, T_R, T_C),)`` (two stream dims), and so on. The trailing two dims are always the tile.
 - **Forbidden:** vanilla 2D shapes like ``out_shapes=((M, N),)`` or any 1D / 0D shape. Such a request cannot be a tile stream and the orchestrator will reject the contract loudly at the parent's call site.
-- ``out_perms[i]`` (when not ``None``) must be a permutation over ``range(len(out_shapes[i]))`` — same rank as the matching ``out_shapes[i]``.
+- The child blackbox stub only reshapes its underlying reference output to the requested ``out_shapes`` entry. If you need a stream layout that pure reshape can't reach (e.g. moving the seq axis to the front), apply the permutation on the stub's return via DSL ops (``bufferize`` + ``streamify`` with proper strides).
 
 If the parent reference's vanilla output is 2D, you still produce a stream by promoting it to >= 3D using a DSL op (e.g., ``streamify`` to attach a stream dim, or factor the vanilla axes into a stream-plus-tile decomposition consistent with how the rest of the kernel tiles its data).
 
@@ -71,11 +71,11 @@ def tiled_reference(dims: dict, tensors: dict) -> torch.Tensor:
 
 For every non-root node, the user prompt's "Required Function Signature" block gives the **exact** signature you must produce — copy it verbatim. It has the form:
 ```python
-def <node_name>(<arg_1>, <arg_2>, ..., *, out_shapes, out_perms=None):
+def <node_name>(<arg_1>, <arg_2>, ..., *, out_shapes):
 ```
-where the positional parameters are the named tiled inputs declared by the parent's call-site contract (also listed in the contract block above), and the keyword-only tail is the bare `*` separator followed by `out_shapes` and `out_perms=None`. Do **not** collapse the positional list into `*intermediate_args` — that is a syntax error in combination with the keyword-only tail.
+where the positional parameters are the named tiled inputs declared by the parent's call-site contract (also listed in the contract block above), and the keyword-only tail is the bare `*` separator followed by `out_shapes`. Do **not** collapse the positional list into `*intermediate_args` — that is a syntax error in combination with the keyword-only tail.
 
-If your node's PyTorch reference returns a single tensor, your function returns a single tensor. If it returns a tuple of N tensors (e.g. ``return Q, K, V``), your function must return a tuple of the same length. ``out_shapes`` always has length N (a 1-tuple for single-output nodes). ``out_perms`` is parallel to ``out_shapes``; ``None`` entries mean the matching output keeps its native layout.
+If your node's PyTorch reference returns a single tensor, your function returns a single tensor. If it returns a tuple of N tensors (e.g. ``return Q, K, V``), your function must return a tuple of the same length. ``out_shapes`` always has length N (a 1-tuple for single-output nodes).
 
 ## Off-Chip Sink (root only)
 

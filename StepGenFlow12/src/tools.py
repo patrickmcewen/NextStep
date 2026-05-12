@@ -326,11 +326,10 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     entry_point/call_args/call_kwargs: select which top-level function to
     invoke after exec'ing ``code``. Defaults invoke ``tiled_reference(dims,
     tensors)`` — the root-node convention. For non-root planner nodes the
-    LLM emits ``def <node_name>(<arg_1>, ..., *, out_shapes,
-    out_perms=None)`` (positional names from ``Contract.arg_names``);
-    callers pass ``entry_point=node_name``,
-    ``call_args=parent_contract.tiled_values``, and ``call_kwargs={
-    "out_shapes": ..., "out_perms": ...}`` to invoke that signature.
+    LLM emits ``def <node_name>(<arg_1>, ..., *, out_shapes)`` (positional
+    names from ``Contract.arg_names``); callers pass
+    ``entry_point=node_name``, ``call_args=parent_contract.tiled_values``,
+    and ``call_kwargs={"out_shapes": ...}`` to invoke that signature.
 
     Returns either a single ``torch.Tensor`` or a tuple/list of tensors.
     Intermediate planner nodes whose ``Model.forward`` returns a tuple

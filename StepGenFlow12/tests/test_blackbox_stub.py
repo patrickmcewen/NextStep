@@ -56,20 +56,6 @@ def test_stub_handles_tile_input_via_flatten_reshape():
     assert torch.equal(out, expected)
 
 
-def test_stub_applies_out_perm_then_reshape():
-    rec = ContractRecorder()
-    stub = make_stub(
-        ref_module=_Add(),
-        arg_names=("a", "b"),
-        arg_specs=_tensor_specs((1, 4, 8), (1, 4, 8)),
-        recorder=rec,
-    )
-    a = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8)
-    b = torch.zeros(1, 4, 8)
-    out = stub(a, b, out_shapes=((1, 8, 4),), out_perms=((0, 2, 1),))
-    assert torch.equal(out, a.permute(0, 2, 1))
-
-
 def test_recorder_captures_contract_on_first_call():
     rec = ContractRecorder()
     stub = make_stub(
@@ -87,7 +73,6 @@ def test_recorder_captures_contract_on_first_call():
     assert contract.tiled_shapes == ((2, 2, 4, 2), (2, 2, 4, 2))
     assert torch.equal(contract.tiled_values[0], a)
     assert contract.out_shapes == ((2, 2, 4, 2),)
-    assert contract.out_perms == (None,)
 
 
 def test_recorder_only_captures_first_call():
@@ -120,7 +105,6 @@ def test_stub_returns_tuple_for_multi_output_ref():
     assert torch.equal(k, x[..., 8:16])
     assert torch.equal(v, x[..., 16:24])
     assert rec.contract.out_shapes == ((1, 4, 8), (1, 4, 8), (1, 4, 8))
-    assert rec.contract.out_perms == (None, None, None)
 
 
 def test_stub_rejects_output_count_mismatch():
@@ -173,32 +157,13 @@ def test_recorder_captures_tiled_outputs_tuple():
         recorder=rec,
     )
     x = torch.arange(96, dtype=torch.float32).reshape(1, 4, 24)
-    q, k, v = stub(x, out_shapes=((1, 4, 8), (1, 8, 4), (1, 4, 8)),
-                   out_perms=(None, (0, 2, 1), None))
+    q, k, v = stub(x, out_shapes=((1, 4, 8), (1, 4, 8), (1, 4, 8)))
     contract = rec.contract
     assert contract.out_is_tuple is True
     assert len(contract.tiled_outputs) == 3
     assert torch.equal(contract.tiled_outputs[0], q)
     assert torch.equal(contract.tiled_outputs[1], k)
     assert torch.equal(contract.tiled_outputs[2], v)
-
-
-def test_stub_per_output_perm_for_multi_output():
-    """``out_perms`` is parallel to ``out_shapes``; ``None`` entries skip permute."""
-    rec = ContractRecorder()
-    stub = make_stub(
-        ref_module=_SplitQKV(),
-        arg_names=("x",),
-        arg_specs=_tensor_specs((1, 4, 24)),
-        recorder=rec,
-    )
-    x = torch.arange(96, dtype=torch.float32).reshape(1, 4, 24)
-    # Permute only the second output (K): swap the trailing two dims.
-    q, k, v = stub(x, out_shapes=((1, 4, 8), (1, 8, 4), (1, 4, 8)),
-                   out_perms=(None, (0, 2, 1), None))
-    assert torch.equal(q, x[..., :8])
-    assert torch.equal(k, x[..., 8:16].permute(0, 2, 1))
-    assert torch.equal(v, x[..., 16:24])
 
 
 # ---------------------------------------------------------------------------

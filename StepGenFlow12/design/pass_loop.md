@@ -86,16 +86,16 @@ described above:
 
 **Contract block.** For every non-root node, the prompt includes the
 parent-declared contract: the actual tiled input tensor shapes and values
-that the parent passed at the child's call site, and the `out_shape` /
-`out_perm` the parent requested back. This is the concrete tiled interface
-the child must satisfy — not abstract planner-level shapes.
+that the parent passed at the child's call site, and the `out_shapes` the
+parent requested back. This is the concrete tiled interface the child
+must satisfy — not abstract planner-level shapes.
 
 **Child-blackbox signature block.** For every non-leaf node, the prompt
 lists the auto-generated blackbox stubs available to call, one entry per
 planner child:
 
 ```
-<child_name>(*tiled_args, out_shapes, out_perms=None) -> Tensor | tuple
+<child_name>(*tiled_args, out_shapes) -> Tensor | tuple
 ```
 
 The model is told these names resolve to callable subroutines whose
@@ -118,8 +118,8 @@ deterministic, and invokes no LLM.
 the orchestrator builds a namespace where each blackbox name is bound to
 the verified child DSL function instead of the auto-generated stub.
 Because the verified child DSL has exactly the same call shape as the stub
-(positional tiled args followed by keyword-only `out_shapes`/`out_perms=None`),
-call sites resolve without any AST modification to the parent's source.
+(positional tiled args followed by keyword-only `out_shapes`), call sites
+resolve without any AST modification to the parent's source.
 
 **Re-execution against gold.** The parent's frozen Pass-1 source is
 exec'd with the rebound namespace against kernel-level gold

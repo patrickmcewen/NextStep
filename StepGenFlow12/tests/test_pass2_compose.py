@@ -10,7 +10,7 @@ def tiled_reference(dims, tensors):
 '''
     # Child's verified DSL implements "double" properly.
     child_dsl = '''
-def double(x, *, out_shapes, out_perms=None):
+def double(x, *, out_shapes):
     return (x * 2).reshape(out_shapes[0])
 '''
     ns = _pass2_compose_namespace(
@@ -28,11 +28,11 @@ def tiled_reference(dims, tensors):
     return outer(tensors["x"], out_shapes=(tuple(tensors["x"].shape),))
 '''
     middle_dsl = '''
-def outer(x, *, out_shapes, out_perms=None):
+def outer(x, *, out_shapes):
     return inner(x, out_shapes=out_shapes) + 1
 '''
     leaf_dsl = '''
-def inner(x, *, out_shapes, out_perms=None):
+def inner(x, *, out_shapes):
     return (x * 10).reshape(out_shapes[0])
 '''
     # Post-order: leaf (inner) before parent (outer).
@@ -55,13 +55,13 @@ def test_compose_handles_same_name_parent_and_leaf():
     silently dropped the leaf and produced ``NameError`` at parent-exec
     time."""
     leaf_dsl = '''
-def moe_dispatch(x, *, out_shapes, out_perms=None):
+def moe_dispatch(x, *, out_shapes):
     return (x * 100).reshape(out_shapes[0])
 '''
     # Parent shares the leaf's name and uses the capture-then-shadow trick.
     parent_dsl = '''
 _moe_dispatch_child = moe_dispatch
-def moe_dispatch(x, *, out_shapes, out_perms=None):
+def moe_dispatch(x, *, out_shapes):
     return _moe_dispatch_child(x, out_shapes=out_shapes) + 1
 '''
     root_dsl = '''
@@ -90,7 +90,7 @@ def tiled_reference(dims, tensors):
     return a + b * 2 + c * 3
 '''
     child_dsl = '''
-def split3(x, *, out_shapes, out_perms=None):
+def split3(x, *, out_shapes):
     return x.reshape(-1), (x * 2).reshape(-1), (x * 4).reshape(-1)
 '''
     ns = _pass2_compose_namespace(

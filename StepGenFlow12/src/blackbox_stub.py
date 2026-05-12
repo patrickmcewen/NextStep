@@ -16,20 +16,18 @@ expert weight stacks, per-batch sequence-length metadata) and must
 preserve their list-ness.
 
 Outputs are template-driven and always plural: the parent calls the stub
-with ``out_shapes=(<shape_0>, <shape_1>, ...)`` (and optionally
-``out_perms=(<perm_0>, <perm_1>, ...)`` where each entry may be ``None``).
-For each output the stub first reshapes the reference's raw tensor to
-``out_shape`` (so the parent can declare the natural tile-stream shape
-even when it differs in rank from the reference's native output), then
-applies ``out_perm`` (whose length must match ``len(out_shape)``), and
-wraps the permuted result in a ``StepTensor``. ``out_perm`` must keep
-the trailing two indices in place — they are the tile dims and the
-tile-stream invariant requires they remain last. The tile shape is the
-last two dims of ``out_shape`` (each ``out_shape`` must therefore be
-rank >= 2); the remaining leading dims are stream dims. If the
-underlying reference returns a single Tensor (``len(out_shapes) == 1``)
-the stub returns a single ``StepTensor``; if it returns a tuple, the
-stub returns a tuple of ``StepTensor``s of the same length.
+with ``out_shapes=(<shape_0>, <shape_1>, ...)``. For each output the
+stub reshapes the reference's raw tensor to ``out_shape`` and wraps the
+result in a ``StepTensor``. The tile shape is the last two dims of
+``out_shape`` (each ``out_shape`` must therefore be rank >= 2); the
+remaining leading dims are stream dims. If the underlying reference
+returns a single Tensor (``len(out_shapes) == 1``) the stub returns a
+single ``StepTensor``; if it returns a tuple, the stub returns a tuple
+of ``StepTensor``s of the same length. If the parent needs a layout
+that pure reshape cannot reach (e.g. moving the seq axis to the front),
+it must express that permutation explicitly via DSL ops
+(``bufferize`` + ``streamify`` with proper strides) on the stub's
+return; the stub itself does not permute.
 
 The first call to a given stub records a ``Contract`` on the supplied
 ``ContractRecorder``; subsequent calls are pure passthrough. The
@@ -123,7 +121,7 @@ def make_stub(*, ref_module: nn.Module,
         f"arg_names ({len(arg_names)}) and arg_specs "
         f"({len(arg_specs)}) length mismatch")
 
-    def stub(*tiled_args, out_shapes, out_perms=None):
+    def stub(*tiled_args, out_shapes):
         assert len(tiled_args) == len(arg_names), (
             f"stub expected {len(arg_names)} positional args "
             f"({arg_names}), got {len(tiled_args)}")
@@ -131,11 +129,6 @@ def make_stub(*, ref_module: nn.Module,
             isinstance(s, tuple) for s in out_shapes), (
             f"out_shapes must be a non-empty tuple of shape tuples, "
             f"got {out_shapes!r}")
-        if out_perms is None:
-            out_perms = (None,) * len(out_shapes)
-        assert isinstance(out_perms, tuple) and len(out_perms) == len(out_shapes), (
-            f"out_perms must be a tuple of length {len(out_shapes)} "
-            f"(or None for all-None), got {out_perms!r}")
 
         # Parent DSL ops may hand us StepTensor-wrapped inputs (chained stub
         # calls produce StepTensors; ``list(parallelize(...))`` produces a
@@ -156,21 +149,10 @@ def make_stub(*, ref_module: nn.Module,
             f"output count mismatch: ref_module returned {len(raw_outputs)} "
             f"tensor(s), but parent requested {len(out_shapes)} via out_shapes")
 
-        results = []
-        for raw_out, out_shape, out_perm in zip(raw_outputs, out_shapes, out_perms):
-            shaped = raw_out.reshape(out_shape)
-            if out_perm is not None:
-                assert len(out_perm) == len(out_shape), (
-                    f"out_perm {out_perm} length must match out_shape "
-                    f"{out_shape} rank ({len(out_shape)})")
-                tile_axes = (len(out_shape) - 2, len(out_shape) - 1)
-                assert tuple(out_perm[-2:]) == tile_axes, (
-                    f"out_perm {out_perm} must keep the last two indices "
-                    f"in place ({tile_axes}); the trailing two dims are the "
-                    f"tile (tile_row, tile_col) and the tile-stream "
-                    f"invariant requires they remain last")
-                shaped = shaped.permute(*out_perm)
-            results.append(shaped)
+        results = [
+            raw_out.reshape(out_shape)
+            for raw_out, out_shape in zip(raw_outputs, out_shapes)
+        ]
 
         if recorder.contract is None:
             recorder.contract = Contract(
@@ -185,8 +167,6 @@ def make_stub(*, ref_module: nn.Module,
                     _clone_value(v, spec)
                     for v, spec in zip(unwrapped_args, arg_specs)),
                 out_shapes=tuple(tuple(s) for s in out_shapes),
-                out_perms=tuple(
-                    None if p is None else tuple(p) for p in out_perms),
                 tiled_outputs=tuple(r.detach().clone() for r in results),
                 out_is_tuple=isinstance(raw, tuple),
                 arg_specs=arg_specs,

@@ -14,7 +14,7 @@ The function must be defined with **exactly** this signature:
 
 This is the signature the user prompt asked for and the orchestrator's executor will invoke. There is no other acceptable form — do not propose a "more idiomatic" or "more general" alternative.
 
-Flag any deviation: wrong function name, missing/added/renamed/reordered positional parameters, singular `out_shape`/`out_perm` instead of plural `out_shapes`/`out_perms`, or missing keyword parameters. Do **not** flag a function whose name and parameters match the signature above — those are required, not extra.
+Flag any deviation: wrong function name, missing/added/renamed/reordered positional parameters, singular `out_shape` instead of plural `out_shapes`, or missing keyword parameters. Do **not** flag a function whose name and parameters match the signature above — those are required, not extra.
 
 {requirement_2_section}## Requirement {out_shapes_req_number}: Stream-shape invariant on ``out_shapes``
 
@@ -22,9 +22,8 @@ Every entry in every ``out_shapes`` tuple — {out_shapes_call_sites_phrase} —
 
 - **Allowed:** ``out_shapes=((S, T_R, T_C),)`` (rank 3), ``out_shapes=((B, S, T_R, T_C),)`` (rank 4), and similar.
 - **Reject:** any ``out_shapes`` entry with rank < 3 — vanilla 2D shapes like ``out_shapes=((M, N),)`` or 1D / 0D shapes. Such a contract is not a stream and is rejected at construction by the orchestrator.
-- ``out_perms[i]`` (when not ``None``) must have the same length as ``out_shapes[i]`` — i.e., a permutation over ``range(len(out_shapes[i]))``.
 
-Flag any ``out_shapes`` literal in the function body whose entries you can statically determine to have rank < 3, or any ``out_perms`` whose tuple length does not match the corresponding ``out_shapes`` entry's rank.
+Flag any ``out_shapes`` literal in the function body whose entries you can statically determine to have rank < 3.
 
 ## Requirement {wrapper_req_number}: Wrapper integrity — no ``.tensor`` access or manual ``StepTensor(...)`` construction
 

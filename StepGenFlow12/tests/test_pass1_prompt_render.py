@@ -56,7 +56,6 @@ def test_nonroot_prompt_includes_contract():
         tiled_shapes=((2, 4, 2, 4, 4, 4),),
         tiled_values=(torch.randn(2, 4, 2, 4, 4, 4),),
         out_shapes=((2, 4, 2, 4, 4, 4),),
-        out_perms=(None,),
         arg_is_raw=(False,),
     )
     prompt = build_pass1_user_prompt(
@@ -67,7 +66,7 @@ def test_nonroot_prompt_includes_contract():
         tensors={},
         contract=contract,
         children_signatures=[],
-        function_signature="def attention(Q, *, out_shapes, out_perms=None):",
+        function_signature="def attention(Q, *, out_shapes):",
     )
     assert "(2, 4, 2, 4, 4, 4)" in prompt   # tiled shape rendered
     assert "(2, 4, 8, 16)" in prompt         # vanilla shape rendered
@@ -88,7 +87,6 @@ def test_nonroot_prompt_renders_multi_output_contract():
         tiled_shapes=((4, 96),),
         tiled_values=(torch.randn(4, 96),),
         out_shapes=((4, 4, 4, 8), (4, 4, 1, 8), (4, 4, 1, 8)),
-        out_perms=(None, (1, 0, 2, 3), None),
         arg_is_raw=(True,),
     )
     prompt = build_pass1_user_prompt(
@@ -99,16 +97,13 @@ def test_nonroot_prompt_renders_multi_output_contract():
         tensors={},
         contract=contract,
         children_signatures=[],
-        function_signature="def preprocess_heads(x, *, out_shapes, out_perms=None):",
+        function_signature="def preprocess_heads(x, *, out_shapes):",
     )
     # All three output shapes rendered
     assert "(4, 4, 4, 8)" in prompt
     assert "(4, 4, 1, 8)" in prompt
-    # Second output perm rendered
-    assert "(1, 0, 2, 3)" in prompt
-    # Plural convention everywhere
+    # Plural convention
     assert "out_shapes" in prompt
-    assert "out_perms" in prompt
     # Number-of-outputs indicator
     assert "Number of outputs: 3" in prompt
     # The single arg's row should carry the RAW tag.
@@ -126,7 +121,6 @@ def test_nonroot_prompt_mixes_raw_and_onchip_args():
         tiled_shapes=((4, 1, 16), (16, 16)),
         tiled_values=(torch.randn(4, 1, 16), torch.randn(16, 16)),
         out_shapes=((4, 1, 16),),
-        out_perms=(None,),
         arg_is_raw=(False, True),
     )
     prompt = build_pass1_user_prompt(
@@ -137,7 +131,7 @@ def test_nonroot_prompt_mixes_raw_and_onchip_args():
         tensors={},
         contract=contract,
         children_signatures=[],
-        function_signature="def proj(x_stream, weight, *, out_shapes, out_perms=None):",
+        function_signature="def proj(x_stream, weight, *, out_shapes):",
     )
     # Both tags rendered.
     assert "**on-chip**" in prompt

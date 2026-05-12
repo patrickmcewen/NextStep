@@ -75,7 +75,7 @@ def test_orchestrator_root_with_blackbox_child_must_call_offchip_store():
     bad = '''
 def tiled_reference(dims, tensors):
     x = tensors["x"]
-    return moe_path(x, out_shapes=((4, 8),), out_perms=(None,))
+    return moe_path(x, out_shapes=((4, 8),))
 '''
     violations = _check_banned_ops(
         bad, REFACTOR_PASS, is_root=True,
@@ -86,7 +86,7 @@ def tiled_reference(dims, tensors):
     good = '''
 def tiled_reference(dims, tensors):
     x = tensors["x"]
-    return offchip_store(moe_path(x, out_shapes=((4, 8),), out_perms=(None,)))
+    return offchip_store(moe_path(x, out_shapes=((4, 8),)))
 '''
     violations = _check_banned_ops(
         good, REFACTOR_PASS, is_root=True,
@@ -126,7 +126,7 @@ def test_nonroot_with_blackbox_child_does_not_need_offchip_store():
     """Non-root nodes hand a stream up to their parent — they never need
     offchip_store. The is_root=False carve-out remains."""
     code = '''
-def helper(x, *, out_shapes, out_perms=None):
+def helper(x, *, out_shapes):
     return moe_path(x, out_shapes=out_shapes)
 '''
     violations = _check_banned_ops(
@@ -154,15 +154,13 @@ def test_nonroot_node_with_intermediate_args_passes():
     """The attention_path case: positional args are on-chip per parent contract,
     so no offchip_load is needed for DSL ops that consume them directly."""
     code = '''
-def attention_path(input_tensor, q_proj, *, out_shapes, out_perms=None):
+def attention_path(input_tensor, q_proj, *, out_shapes):
     x_sq = binary_mul(input_tensor, input_tensor)
     sum_sq = unary_rowwise_sum(x_sq)
     inv = unary_rsqrt(sum_sq)
     Q, K, V = pre_attention(input_tensor, q_proj,
                              out_shapes=((4, 8), (4, 8), (4, 8)))
-    attn = attention(Q, K, V,
-                     out_shapes=out_shapes,
-                     out_perms=out_perms or (None,))
+    attn = attention(Q, K, V, out_shapes=out_shapes)
     return offchip_store(attn)
 '''
     violations = _check_banned_ops(
@@ -174,7 +172,7 @@ def attention_path(input_tensor, q_proj, *, out_shapes, out_perms=None):
 
 def test_tuple_unpack_from_blackbox_is_onchip():
     code = '''
-def helper(x, *, out_shapes, out_perms=None):
+def helper(x, *, out_shapes):
     Q, K, V = pre_attention(x, out_shapes=((4, 8), (4, 8), (4, 8)))
     s = binary_add(Q, K)
     return offchip_store(s)
@@ -231,7 +229,7 @@ def test_extractor_propagates_parent_raw_args():
     grandchild's call site — only when ``parent_raw_arg_names`` is fed in."""
     code = '''
 def pre_attention(input_tensor, q_proj, k_proj, v_proj, cos, sin,
-                   *, out_shapes, out_perms=None):
+                   *, out_shapes):
     Q, K, V = pre_attn_norm_and_proj(
         input_tensor, q_proj, k_proj, v_proj, cos,
         out_shapes=out_shapes,
@@ -261,7 +259,7 @@ def test_extractor_records_only_first_call():
     """Contracts are recorded on first stub invocation; the extractor must
     mirror that by classifying the first textual call site only."""
     code = '''
-def parent(x, weight, *, out_shapes, out_perms=None):
+def parent(x, weight, *, out_shapes):
     a = inner(x, out_shapes=((4,1,8),))
     b = inner(weight, out_shapes=((4,1,8),))
     return b

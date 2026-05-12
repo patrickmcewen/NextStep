@@ -456,8 +456,8 @@ def _run_dsl_correctness(code, kernel_name, dims, tensors, *,
     ``tiled_reference(dims, tensors)`` (root nodes); non-root nodes pass
     ``entry_point=<node_name>`` plus the contract-derived ``call_args`` and
     ``call_kwargs`` so the LLM-emitted
-    ``<node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)`` is
-    exercised against parent-recorded inputs.
+    ``<node_name>(<arg_1>, ..., *, out_shapes)`` is exercised against
+    parent-recorded inputs.
 
     For non-root nodes, ``call_kwargs["out_shapes"]`` is the contract the
     parent declared when calling this child's stub. We enforce it as a
@@ -857,7 +857,7 @@ def _build_name_to_source(func: ast.FunctionDef,
     # Positional args other than dims/tensors are intermediate. By default
     # they're on-chip (the parent contract guarantees that for non-raw args);
     # those listed in ``raw_arg_names`` were forwarded raw at the call site.
-    # Keyword-only args (out_shapes, out_perms) are scalars.
+    # Keyword-only args (out_shapes) are scalars.
     for arg in func.args.args:
         if arg.arg in {"dims", "tensors", "self"}:
             continue
@@ -1246,7 +1246,7 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
 
     ``entry_point``/``call_args``/``call_kwargs`` are only meaningful for the
     DSL executor (non-root pass1 invokes
-    ``<node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)``); the graph
+    ``<node_name>(<arg_1>, ..., *, out_shapes)``); the graph
     executor ignores them and stays on the canonical
     ``build_graph(dims, tensors)`` entry point.
     """
@@ -2138,7 +2138,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
     synth_name = _synth_kernel_name(root_kernel, node.path)
 
     # For non-root nodes, the LLM emits
-    # ``def <node_name>(<arg_1>, ..., *, out_shapes, out_perms=None)`` — its
+    # ``def <node_name>(<arg_1>, ..., *, out_shapes)`` — its
     # inputs are the parent's recorded ``tiled_values`` (positional, in
     # ``Contract.arg_names`` order) and its expected outputs are the parent's recorded
     # ``tiled_outputs`` (both captured by ``make_stub`` during the parent's
@@ -2188,7 +2188,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
     else:
         # Non-root: positional args are the tiled intermediate args from the contract
         sig_args = ", ".join(parent_contract.arg_names)
-        function_signature = f"def {node.name}({sig_args}, *, out_shapes, out_perms=None):"
+        function_signature = f"def {node.name}({sig_args}, *, out_shapes):"
 
     # children_signatures (path, sig) pairs are kept for prompt-shape compat.
     children_signatures = [(m[0], m[2]) for m in children_meta]
@@ -2207,7 +2207,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         for child_path, child_sig in children_signatures:
             child_name = child_path.rsplit("/", 1)[-1]
             sig_args = ", ".join(child_sig.arg_names)
-            lines.append(f"`{child_name}({sig_args}, *, out_shapes, out_perms=None)`")
+            lines.append(f"`{child_name}({sig_args}, *, out_shapes)`")
             for aname, spec in zip(child_sig.arg_names, child_sig.arg_specs):
                 lines.append(f"  - `{aname}` {_format_arg_spec(spec)}")
             if child_sig.out_is_tuple:
@@ -2264,10 +2264,6 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         lines.append(
             f"Required output shapes (one per produced tensor): "
             f"`{list(parent_contract.out_shapes)}`"
-        )
-        lines.append(
-            f"Output permutations (parallel to shapes; ``None`` = identity): "
-            f"`{list(parent_contract.out_perms)}`"
         )
         contract_block = "\n".join(lines)
 
@@ -2331,7 +2327,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
     # Entry-point dispatch: root keeps the canonical
     # ``tiled_reference(dims, tensors)`` convention; non-root invokes the
     # node's own function with the parent-recorded tiled inputs and the
-    # parent-declared out_shapes/out_perms.
+    # parent-declared out_shapes.
     if is_root:
         entry_point = "tiled_reference"
         call_args: tuple | None = None
@@ -2360,7 +2356,6 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         )
         call_kwargs = {
             "out_shapes": parent_contract.out_shapes,
-            "out_perms": parent_contract.out_perms,
         }
 
     async def _one_attempt(attempt_idx: int) -> dict:

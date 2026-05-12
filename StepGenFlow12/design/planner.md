@@ -86,18 +86,18 @@ each internal node's `refactored_code` via `node_signature.extract_signature`.
 These shapes are used to auto-generate the child blackbox stubs that
 Pass 1 presents to the parent LLM.
 
-**Multi-output children.** The contract is plural in both directions:
-`Contract.out_shapes` and `Contract.out_perms` are tuples — length 1 for
-single-output nodes, length N for nodes whose `forward` returns an
-N-tuple (e.g. `return Q, K, V`). `NodeSignature.out_is_tuple` records
-the underlying return type so the prompt can teach the LLM whether to
-destructure the call site (`q, k, v = preprocess_heads(...)`) or assign
-directly (`r = attention(...)`). Stubs return a Tensor when the
-underlying ref module returns a Tensor and a tuple when it returns a
-tuple — matching the LLM's natural call-site syntax. Non-root Pass-1
-function signatures use the parent contract's named positional args
-followed by a keyword-only tail with plural keyword args:
-`def <node_name>(<arg_1>, <arg_2>, ..., *, out_shapes, out_perms=None):`,
+**Multi-output children.** The contract is plural:
+`Contract.out_shapes` is a tuple — length 1 for single-output nodes,
+length N for nodes whose `forward` returns an N-tuple (e.g. `return Q,
+K, V`). `NodeSignature.out_is_tuple` records the underlying return type
+so the prompt can teach the LLM whether to destructure the call site
+(`q, k, v = preprocess_heads(...)`) or assign directly (`r =
+attention(...)`). Stubs return a Tensor when the underlying ref module
+returns a Tensor and a tuple when it returns a tuple — matching the
+LLM's natural call-site syntax. Non-root Pass-1 function signatures
+use the parent contract's named positional args followed by a
+keyword-only tail with a single keyword arg:
+`def <node_name>(<arg_1>, <arg_2>, ..., *, out_shapes):`,
 where the positional names come from `Contract.arg_names`. Collapsing
 the positionals into `*intermediate_args` together with the `*, ...`
 tail is a Python syntax error (`* argument may appear only once`) —
@@ -185,19 +185,19 @@ same post-validator. The differences are:
   or `StepTensor`s and reshape internally, so blackbox call sites are
   exempt by construction.
 - **Pass-1 prompt additions**: the node's user prompt carries the
-  parent-declared contract block (input shapes + values + output
-  shape/permutation) and, for non-leaf nodes, the blackbox signatures
-  for each child. The LLM picks the call-site contract; children
-  refactor under it. See [pass_loop.md](pass_loop.md) for details.
+  parent-declared contract block (input shapes + values + output shape)
+  and, for non-leaf nodes, the blackbox signatures for each child. The
+  LLM picks the call-site contract; children refactor under it. See
+  [pass_loop.md](pass_loop.md) for details.
 - **Reference shown to the LLM**: for non-leaf nodes the prompt shows the
   planner's `refactored_code` (parent rewritten to call its children as
   `self.<child_name>(args)`) rather than the original `reference_code`.
   The structural decomposition is already validated by `compose-equivalent`,
   so the LLM's job is to translate `self.<child_name>(args)` call sites
-  into `<child_name>(args, out_shapes=..., out_perms=...)` blackbox calls,
-  not to re-derive the split. Leaves still see their original
-  `reference_code`. Gold is always computed from `reference_code` — the
-  refactored form is a prompt-side aid only.
+  into `<child_name>(args, out_shapes=...)` blackbox calls, not to
+  re-derive the split. Leaves still see their original `reference_code`.
+  Gold is always computed from `reference_code` — the refactored form
+  is a prompt-side aid only.
 
 ## Replanning
 

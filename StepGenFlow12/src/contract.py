@@ -3,12 +3,12 @@
 A ``Contract`` is what ties a parent's Pass-1 verification to its child's
 Pass-1 problem statement: the child receives the actual tiled input
 values that flowed into its stub call site, plus the parent-declared
-output shapes and optional per-output permutations.
+output shapes.
 
 Outputs are always represented as tuples (length 1 for single-output
 forwards). The stub returns a Tensor when the underlying ref_module
 returns a Tensor and returns a tuple when it returns a tuple — but the
-parent-declared shapes/perms are always plural for uniform plumbing.
+parent-declared shapes are always plural for uniform plumbing.
 
 Stream-shape invariant
 ----------------------
@@ -56,13 +56,13 @@ class Contract:
     tiled_shapes: tuple[tuple[int, ...], ...]
     tiled_values: tuple[Any, ...]
     out_shapes: tuple[tuple[int, ...], ...]
-    out_perms: tuple[tuple[int, ...] | None, ...]
     arg_specs: tuple[ArgSpec, ...] = ()
-    # Stub outputs at this call site, post permute+reshape per ``out_perms`` /
-    # ``out_shapes``. Always stored as a tuple parallel to ``out_shapes`` even
-    # when the underlying ref returns a single Tensor; ``out_is_tuple`` records
-    # the original return form so the child's Pass-1 gold can be reconstructed
-    # in the same shape the LLM-emitted function will return.
+    # Stub outputs at this call site, the reshape of each raw ref output to
+    # the parent-declared ``out_shapes`` entry. Always stored as a tuple
+    # parallel to ``out_shapes`` even when the underlying ref returns a single
+    # Tensor; ``out_is_tuple`` records the original return form so the child's
+    # Pass-1 gold can be reconstructed in the same shape the LLM-emitted
+    # function will return.
     tiled_outputs: tuple[torch.Tensor, ...] = ()
     out_is_tuple: bool = False
     # Per-arg rawness flag, parallel to ``arg_names``. ``True`` = the parent's

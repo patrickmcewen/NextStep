@@ -639,7 +639,7 @@ def build_pass1_user_prompt(
         ``src.node_signature``. Empty for leaf nodes.
     function_signature:
         The exact signature string the LLM must produce (e.g.
-        ``"def attention(Q, *, out_shapes, out_perms=None):"``).
+        ``"def attention(Q, *, out_shapes):"``).
     """
     dims_json = json.dumps(dims, indent=2)
 
@@ -650,10 +650,10 @@ def build_pass1_user_prompt(
             "This is the planner's reference decomposition. Its "
             "`self.<child_name>(args)` call sites correspond 1:1 to the "
             "blackboxes listed below; replacing them with "
-            "`<child_name>(args, out_shapes=..., out_perms=...)` is the "
-            "expected default. Inlining a child's logic directly into your "
-            "DSL is also acceptable when it produces correct output — see "
-            "the 'Child Blackboxes Available' section. Do not change the "
+            "`<child_name>(args, out_shapes=...)` is the expected default. "
+            "Inlining a child's logic directly into your DSL is also "
+            "acceptable when it produces correct output — see the "
+            "'Child Blackboxes Available' section. Do not change the "
             "function signature."
         )
     else:
@@ -760,8 +760,6 @@ def build_pass1_user_prompt(
             "",
             f"  Required output shapes (one per produced tensor): "
             f"`{list(contract.out_shapes)}`",
-            f"  Output permutations (parallel; ``None`` = identity): "
-            f"`{list(contract.out_perms)}`",
             f"  Number of outputs: {len(contract.out_shapes)} "
             f"({'tuple' if len(contract.out_shapes) > 1 else 'single tensor'})",
         ])
@@ -780,15 +778,19 @@ def build_pass1_user_prompt(
             "correct DSL implementation without invoking a particular child, that's",
             "acceptable.",
             "",
-            "Each blackbox is invoked with plural keyword args ``out_shapes`` "
-            "(tuple of per-output shapes) and optional ``out_perms`` (tuple of "
-            "per-output permutations, parallel to ``out_shapes``). Every "
-            "``out_shapes`` entry must be a tile-stream shape with rank >= 3 "
-            "(at least 1 stream dim + 2 tile dims) — vanilla 2D shapes like "
-            "``(M, N)`` are not valid stream shapes. Single-output children "
-            "still take 1-tuples (e.g. ``out_shapes=((S, T_R, T_C),)``). "
-            "Multi-output children must be destructured at the call site "
-            "(e.g. ``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``).",
+            "Each blackbox is invoked with the keyword arg ``out_shapes`` "
+            "(tuple of per-output shapes). Every ``out_shapes`` entry must "
+            "be a tile-stream shape with rank >= 3 (at least 1 stream dim "
+            "+ 2 tile dims) — vanilla 2D shapes like ``(M, N)`` are not "
+            "valid stream shapes. Single-output children still take "
+            "1-tuples (e.g. ``out_shapes=((S, T_R, T_C),)``). Multi-output "
+            "children must be destructured at the call site (e.g. "
+            "``q, k, v = preprocess_heads(x, out_shapes=(s_q, s_k, s_v))``). "
+            "The stub reshapes the reference's raw output to ``out_shape`` "
+            "and returns. If you need a different stream layout (e.g. seq "
+            "axis at the front), express the permutation explicitly on the "
+            "stub's return via DSL ops (``bufferize`` + ``streamify`` with "
+            "proper strides).",
             "",
             "KEY (MUST-READ): If you find that the input or output tensors to a blackbox child",
             "will be dynamic at runtime, you should not use the blackbox child.",
@@ -798,7 +800,7 @@ def build_pass1_user_prompt(
         for entry in children_signatures:
             child_name, arg_names, arg_specs, out_shapes, out_is_tuple = entry
             sig_args = ", ".join(arg_names)
-            lines.append(f"  `{child_name}({sig_args}, *, out_shapes, out_perms=None)`")
+            lines.append(f"  `{child_name}({sig_args}, *, out_shapes)`")
             for arg_name, spec in zip(arg_names, arg_specs):
                 lines.append(f"    - `{arg_name}` {format_arg_spec(spec)}")
             if out_is_tuple:
@@ -815,9 +817,8 @@ def build_pass1_user_prompt(
             "**Call-site rule:** no tensor-method transform may appear between a tensor",
             "source and a blackbox call site — the stub recovers vanilla shape internally.",
             "Forbidden: `.reshape(...)`, `.permute(...)`, `.transpose(...)`, indexing,",
-            "arithmetic, `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()`. Output",
-            "permutations go in `out_perms` (one entry per output, ``None`` = identity).",
-            "If a stream's shape needs to change, use a DSL op (`reshape_stream`,",
+            "arithmetic, `.squeeze()`, `.unsqueeze()`, `.expand()`, `.flatten()`. If a",
+            "stream's shape needs to change, use a DSL op (`reshape_stream`,",
             "`reshape_pad_stream`, `streamify`, `flatten`, etc.), never `tensor.reshape(...)`.",
         ])
 

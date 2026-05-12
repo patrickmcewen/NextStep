@@ -33,17 +33,15 @@ def tiled_reference(dims, tensors):
 
 
 NONROOT_REF = '''
-def my_node(a, b, *, out_shapes, out_perms=None):
+def my_node(a, b, *, out_shapes):
     s = a + b
-    if out_perms is not None and out_perms[0] is not None:
-        s = s.permute(*out_perms[0])
     return s.reshape(*out_shapes[0])
 '''
 
 
 def test_exec_dsl_ref_non_root_entry_point():
     """Non-root entry: function named after the planner node, called with
-    contract-recorded tiled inputs and parent-declared out_shapes/out_perms."""
+    contract-recorded tiled inputs and parent-declared out_shapes."""
     a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     b = torch.ones(2, 4)
     out = _exec_dsl_ref(
@@ -52,9 +50,9 @@ def test_exec_dsl_ref_non_root_entry_point():
         tensors={},
         entry_point="my_node",
         call_args=(a, b),
-        call_kwargs={"out_shapes": ((4, 2),), "out_perms": ((1, 0),)},
+        call_kwargs={"out_shapes": ((4, 2),)},
     )
-    assert torch.equal(out, (a + b).permute(1, 0).reshape(4, 2))
+    assert torch.equal(out, (a + b).reshape(4, 2))
 
 
 def test_exec_dsl_ref_missing_entry_point_raises():
