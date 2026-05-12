@@ -78,22 +78,24 @@ class Model(nn.Module):
             k_cache[i, num_token_list[i]] = K[i]
             v_cache[i, num_token_list[i]] = V[i]
 
-        # [6] GQA attention (numerically-stable softmax, no 1/sqrt(d) scaling)
+        # [6] GQA attention (numerically-stable softmax, no 1/sqrt(d) scaling).
+        # Vectorize across kv-heads: view Q as [Hkv, qpkv, D] and permute the
+        # per-batch K/V slice to [Hkv, S, D] so the matmul broadcasts the qpkv
+        # query group across each kv-head.
         attn_output = torch.zeros(batch, num_heads, head_dim)
+        Q_grouped = Q.view(batch, num_kv_heads, query_per_kvhead, head_dim)
         for i in range(batch):
             seq_len = num_token_list[i] + 1
-            for h_kv in range(num_kv_heads):
-                q_lo = h_kv * query_per_kvhead
-                q_hi = q_lo + query_per_kvhead
-                q_group = Q[i, q_lo:q_hi, :]
-                k_seq = k_cache[i, :seq_len, h_kv, :]
-                v_seq = v_cache[i, :seq_len, h_kv, :]
+            q_i = Q_grouped[i]                                # [Hkv, qpkv, D]
+            k_i = k_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
+            v_i = v_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
 
-                scores = q_group @ k_seq.T
-                row_max = scores.amax(dim=-1, keepdim=True)
-                exp_scores = torch.exp(scores - row_max)
-                context = exp_scores @ v_seq
-                attn_output[i, q_lo:q_hi, :] = context / exp_scores.sum(dim=-1, keepdim=True)
+            scores = q_i @ k_i.transpose(-1, -2)              # [Hkv, qpkv, S]
+            row_max = scores.amax(dim=-1, keepdim=True)
+            exp_scores = torch.exp(scores - row_max)
+            context = exp_scores @ v_i                        # [Hkv, qpkv, D]
+            attn_output[i] = (context / exp_scores.sum(dim=-1, keepdim=True)) \
+                .reshape(num_heads, head_dim)
 
         # [7] O-projection
         attn_flat = attn_output.view(batch, num_heads * head_dim)

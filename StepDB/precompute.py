@@ -600,6 +600,71 @@ def _precompute_gqa_tiled_decode(dims):
     }
 
 
+@register("gqa_decode_e2e")
+def _precompute_gqa_decode_e2e(dims):
+    """Inputs for the ragged-batched GQA decode + O-proj kernel.
+
+    Mirrors the GQA + O-proj portion of end_to_end's reference (steps [6]+[7])
+    on a post-pipeline cache: Q is post-RoPE/RMSNorm and the KV cache already
+    has the new K/V appended (``seq_lens[i]`` here corresponds to
+    ``num_token_list[i] + 1`` in end_to_end). Each batch's seq length is
+    drawn uniformly from ``[seq_len_min, seq_len_max]`` constrained to be a
+    multiple of ``tile_seq`` so the step_impl can use a static tile size
+    while still reading variable per-batch lengths via DynN.
+    """
+    torch.manual_seed(SEED)
+    batch = dims["batch"]
+    num_heads = dims["num_heads"]
+    num_kv_heads = dims["num_kv_heads"]
+    head_dim = dims["head_dim"]
+    hidden_dim = dims["hidden_dim"]
+    seq_len_min = dims["seq_len_min"]
+    seq_len_max = dims["seq_len_max"]
+    tile_seq = dims["tile_seq"]
+    tile_hidden = dims["tile_hidden"]
+    assert num_heads % num_kv_heads == 0, (
+        f"num_heads={num_heads} must be divisible by num_kv_heads={num_kv_heads}"
+    )
+    assert seq_len_min % tile_seq == 0 and seq_len_max % tile_seq == 0, (
+        f"seq_len_min={seq_len_min} and seq_len_max={seq_len_max} must be "
+        f"multiples of tile_seq={tile_seq}"
+    )
+    assert 1 <= seq_len_min <= seq_len_max, (
+        f"need 1 <= seq_len_min={seq_len_min} <= seq_len_max={seq_len_max}"
+    )
+    assert hidden_dim % tile_hidden == 0, (
+        f"hidden_dim={hidden_dim} must be divisible by tile_hidden={tile_hidden}"
+    )
+
+    Q = torch.randn(batch, num_heads, head_dim)
+    k_cache = torch.randn(batch, seq_len_max, num_kv_heads, head_dim)
+    v_cache = torch.randn(batch, seq_len_max, num_kv_heads, head_dim)
+    o_proj_weight = torch.randn(num_heads * head_dim, hidden_dim)
+    n_min = seq_len_min // tile_seq
+    n_max = seq_len_max // tile_seq
+    seq_lens_tiles = torch.randint(
+        low=n_min, high=n_max + 1, size=(batch,), dtype=torch.int64
+    )
+    seq_lens = (seq_lens_tiles * tile_seq).tolist()
+
+    # tile_mask[b, t] = 1.0 if tile t is fully valid for batch b, else 0.0.
+    # Used by step_impl to zero out invalid tiles after exp() so the uniform-S
+    # graph reproduces the ragged reference's per-batch sum.
+    n_tiles = seq_len_max // tile_seq
+    tile_mask = torch.zeros(batch, n_tiles, dtype=torch.float32)
+    for b in range(batch):
+        tile_mask[b, : seq_lens_tiles[b]] = 1.0
+
+    return {
+        "Q": Q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "seq_lens": seq_lens,
+        "tile_mask": tile_mask,
+        "o_proj_weight": o_proj_weight,
+    }
+
+
 @register("kv_cache_tile_append")
 def _precompute_kv_cache_tile_append(dims):
     torch.manual_seed(SEED)
@@ -637,6 +702,7 @@ def _precompute_kv_cache_tile_append(dims):
 # ---------------------------------------------------------------------------
 
 @register("prefill_transformer_simple")
+@register("generated_prefill_transformer")
 def _precompute_prefill_transformer_simple(dims):
     """Precompute tensors for the simple prefill transformer kernel.
 

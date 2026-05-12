@@ -1823,6 +1823,23 @@ kv_cache_tile_append:
       max_seq_len_tiles: 128
       tile_N: 32
   origin: seed
+generated_prefill_transformer:
+  problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
+  step_impl: seed_kernels/transformer_layer/generated_prefill_transformer/step_impl.py
+  params:
+  - model_name
+  - seq_len
+  - is_small
+  presets:
+    tiny:
+      model_name: mixtral
+      seq_len: 8
+      is_small: true
+    small:
+      model_name: mixtral
+      seq_len: 64
+      is_small: true
+  origin: seed
 prefill_transformer_simple:
   problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
   step_impl: seed_kernels/transformer_layer/prefill_transformer_simple/step_impl.py
@@ -2172,4 +2189,49 @@ attn_layout_permute_4d:
       H: 8
       S: 16
       D: 32
+  origin: seed
+gqa_decode_e2e:
+  problem: seed_kernels/attention/gqa_decode_e2e/reference.py
+  step_impl: seed_kernels/attention/gqa_decode_e2e/step_impl.py
+  params:
+  - batch
+  - num_heads
+  - num_kv_heads
+  - head_dim
+  - hidden_dim
+  - seq_len_min
+  - seq_len_max
+  - tile_seq
+  - tile_hidden
+  presets:
+    tiny:
+      batch: 2
+      num_heads: 4
+      num_kv_heads: 2
+      head_dim: 16
+      hidden_dim: 32
+      seq_len_min: 8
+      seq_len_max: 16
+      tile_seq: 8
+      tile_hidden: 16
+    small:
+      batch: 4
+      num_heads: 8
+      num_kv_heads: 4
+      head_dim: 32
+      hidden_dim: 128
+      seq_len_min: 16
+      seq_len_max: 48
+      tile_seq: 16
+      tile_hidden: 64
+    mixtral_b32_ctx512:
+      batch: 32
+      num_heads: 32
+      num_kv_heads: 8
+      head_dim: 128
+      hidden_dim: 4096
+      seq_len_min: 128
+      seq_len_max: 512
+      tile_seq: 32
+      tile_hidden: 64
   origin: seed
