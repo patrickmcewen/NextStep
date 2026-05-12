@@ -1,1 +1,0 @@
-FAIL: AssertionError: expand_ref: leading stream dims must match: [1] vs []

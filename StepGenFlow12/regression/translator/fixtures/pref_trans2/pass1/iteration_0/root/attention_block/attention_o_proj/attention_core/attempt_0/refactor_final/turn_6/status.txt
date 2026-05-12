@@ -1,1 +1,0 @@
-FAIL: AssertionError: attention_core: output shape torch.Size([4, 256, 32]) does not match expected (1, 64, 16, 32)

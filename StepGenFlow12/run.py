@@ -39,7 +39,7 @@ def main():
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
-    parser.add_argument("--max-outer", type=int, default=3, help="Max outer loop iterations")
+    parser.add_argument("--max-outer", type=int, default=4, help="Max outer loop iterations")
     parser.add_argument("--max-turns", type=int, default=16, help="Max tool-call rounds per inner loop")
     parser.add_argument("--results-dir", default="/workspace/results", help="Directory for run logs")
     parser.add_argument("--experience-dir", default="experience", help="Directory for successful implementations")
@@ -115,7 +115,7 @@ def main():
         help="Global re-plan budget on Phase 1 failure. Default 3.",
     )
     parser.add_argument(
-        "--node-attempts", type=int, default=3,
+        "--node-attempts", type=int, default=4,
         help="Per-tree-node parallel refactor attempts. Default 1 (single "
              "attempt). Set higher to spawn N parallel refactor_final passes "
              "per node and use the first successful one — useful for nodes "

@@ -1,1 +1,0 @@
-FAIL: AssertionError: reshape_stream(rank=1): tensor (256, 1, 32) has 1 stream dims, max valid rank is 0.

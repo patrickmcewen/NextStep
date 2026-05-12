@@ -1,1 +1,0 @@
-SPLIT_OK: children=['pre_attention_and_qkv', 'per_head_norm']

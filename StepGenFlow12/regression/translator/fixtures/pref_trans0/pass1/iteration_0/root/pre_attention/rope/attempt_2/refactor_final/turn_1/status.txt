@@ -1,1 +1,0 @@
-FAIL: AssertionError: binary_set_offset: stream shape mismatch — a has stream (64,) (shape (64, 32, 16)) but b has stream () (shape (64,)). Both operands must have identical stream shapes.

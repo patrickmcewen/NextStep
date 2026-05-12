@@ -1,1 +1,0 @@
-GUARD_FAILED: compose check failed: refactored parent's forward() crashed when run on the original inputs: NameError: name '_rms_norm' is not defined. The children's input/output contracts do not compose with the parent.

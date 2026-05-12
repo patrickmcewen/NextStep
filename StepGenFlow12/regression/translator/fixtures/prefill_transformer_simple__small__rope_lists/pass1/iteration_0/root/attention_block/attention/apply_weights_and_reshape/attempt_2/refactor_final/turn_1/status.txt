@@ -1,1 +1,0 @@
-FAIL: AssertionError: promote_outer: input must have >=1 stream dim (>=3D total), got shape (1024, 32). If this is the output of a fully-collapsing accum (e.g. accum_retile_row(rank=stream_rank)), keep a stream dim — drop one rank from the accum or skip an upstream flatten that consumed the leading singleton.

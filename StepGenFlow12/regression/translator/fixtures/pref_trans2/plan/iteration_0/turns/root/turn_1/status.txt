@@ -1,1 +1,0 @@
-SPLIT_OK: children=['attention_block', 'moe_block']

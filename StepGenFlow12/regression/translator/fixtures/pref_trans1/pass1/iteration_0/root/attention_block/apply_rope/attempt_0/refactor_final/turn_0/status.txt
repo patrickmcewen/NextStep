@@ -1,1 +1,0 @@
-FAIL: AssertionError: flatten(min_rank=0, max_rank=1): tensor (2048, 1, 16) has 1 stream dims, so max valid rank is 0.

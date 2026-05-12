@@ -1,1 +1,0 @@
-SPLIT_OK: children=['prepare_qkv', 'attention_weights', 'apply_weights_and_reshape']

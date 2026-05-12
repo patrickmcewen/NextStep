@@ -1,1 +1,0 @@
-GUARD_FAILED: child 'moe': Model()(*get_inputs(dims)) crashed: TypeError: Model.forward() missing 1 required positional argument: 'expert_onehot'
