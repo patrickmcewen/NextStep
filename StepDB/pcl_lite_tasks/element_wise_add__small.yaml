@@ -5,6 +5,8 @@ test_name: element_wise_add__small
 dims:
   M: 32
   K: 48
+  tile_m: 16
+  tile_k: 16
 
 inputs:
   - name: A

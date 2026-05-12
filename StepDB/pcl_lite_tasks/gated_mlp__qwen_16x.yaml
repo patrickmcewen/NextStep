@@ -8,6 +8,8 @@ dims:
   B: 16
   D: 128
   F: 48
+  tile_b: 1
+  tile_f: 48
 
 inputs:
   - name: x

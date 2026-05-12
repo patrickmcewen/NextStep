@@ -307,6 +307,14 @@ def build_graph(dims, tensors):
     Q, K, V = pre_attention(input_tensor, q_proj, k_proj, v_proj, cos, sin, out_shapes=((64, 16, 32), (64, 4, 32), (64, 4, 32)))
     res_add_0 = attention_o_proj(Q, K, V, o_proj_weight, input_tensor, out_shapes=((64, 512, 1),))
     out = moe(res_add_0, w_gate, w_up, w_down, expert_weights, expert_onehot, out_shapes=((64, 512, 1),))
+    # Reshape stream/tile so the Rust accum's row-major reading matches gold's
+    # (token, embed) layout. The moe output is stream (64,) tile (512, 1) — a
+    # column-tile per token. Rust OffChipStore stores accum=(tile_row, last*tile_col)
+    # = (512, 64) = (embed, token), but gold is (token, embed). Inserting a
+    # Promote(rank=0) turns stream (64,) → (64, 1); then OffChipStore emits one
+    # ValStop per token (tile_row=512 rows each), accumulating vertically →
+    # accum (32768, 1) flat in (token, embed) row-major order.
+    out = Promote(graph, out, promote_rank=0)
     out = PromoteOuter(graph, out)
     _store9 = OffChipStore(graph, out, par_dispatch=4096)
     _seal_unused_branches(graph)

@@ -7,6 +7,8 @@ test_name: rms_norm__qwen_scale
 dims:
   M: 128
   K: 64
+  tile_m: 8
+  tile_k: 64
 
 inputs:
   - name: input

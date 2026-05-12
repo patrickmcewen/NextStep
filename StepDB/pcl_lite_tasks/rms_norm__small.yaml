@@ -7,6 +7,8 @@ test_name: rms_norm__small
 dims:
   M: 32
   K: 64
+  tile_m: 16
+  tile_k: 64
 
 inputs:
   - name: input

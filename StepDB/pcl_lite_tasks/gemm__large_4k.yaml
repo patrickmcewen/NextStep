@@ -6,6 +6,9 @@ dims:
   M: 4096
   K: 4096
   N: 4096
+  tile_m: 128
+  tile_k: 128
+  tile_n: 256
 
 inputs:
   - name: A

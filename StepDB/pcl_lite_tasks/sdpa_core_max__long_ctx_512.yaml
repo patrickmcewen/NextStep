@@ -8,6 +8,8 @@ dims:
   M: 32
   N: 512
   D: 64
+  tile_m: 16
+  tile_n: 64
 
 inputs:
   - name: Q
