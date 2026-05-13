@@ -1040,19 +1040,38 @@ def _check_banned_ops(code: str, pass_name: str, *,
     # may use, not a quota.
     required_ops = list(rules["required_ops"])
     if pass_name == "refactor_final":
-        # A node consuming only intermediate args / blackbox returns never
-        # needs to call ``offchip_load`` itself, so it's not strictly required
-        # at refactor_final. ``offchip_store`` is NOT dropped here: the
-        # kernel's externally-observable output goes off-chip via a single
-        # sink at the root, regardless of whether the root is a leaf or a
-        # blackbox-only orchestrator. Children are exempt (handled by the
-        # ``not is_root`` rule below).
-        required_ops = [op for op in required_ops if op != "offchip_load"]
+        # ``offchip_load`` / ``offchip_store`` get specialized checks below;
+        # drop them from the generic presence list so the count-based store
+        # rule is the single source of truth for sink semantics.
+        required_ops = [op for op in required_ops
+                        if op not in ("offchip_load", "offchip_store")]
     for required in required_ops:
         if not is_root and required in sink_ops:
             continue
         if required not in code:
             violations.append(f"- `{required}` missing — this pass must introduce {required} nodes")
+
+    if pass_name == "refactor_final":
+        # Single-store invariant: pass1 nodes write off-chip exactly at the
+        # root, exactly once. Non-root nodes hand stream tensors back to the
+        # parent (no sink). Multiple stores inside the root indicate a mid-
+        # program round-trip through off-chip memory (often followed by host-
+        # side python on the raw result), which breaks the streaming pipeline.
+        store_count = len(re.findall(r'\boffchip_store\s*\(', code))
+        if is_root and store_count != 1:
+            violations.append(
+                f"- `offchip_store` must appear exactly once at the root "
+                f"(found {store_count}). The kernel's externally-observable "
+                f"output goes off-chip via a single sink; intermediate values "
+                f"must stay on-chip as streams. If you need to combine "
+                f"multiple results, do it with DSL ops before the final store."
+            )
+        elif not is_root and store_count != 0:
+            violations.append(
+                f"- `offchip_store` is not allowed in non-root nodes "
+                f"(found {store_count}). Return the stream tensor(s) to the "
+                f"parent — only the root writes results off-chip."
+            )
 
     # Deduplicate while preserving order
     return list(dict.fromkeys(violations))

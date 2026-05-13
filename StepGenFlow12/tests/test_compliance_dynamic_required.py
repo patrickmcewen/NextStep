@@ -161,7 +161,7 @@ def attention_path(input_tensor, q_proj, *, out_shapes):
     Q, K, V = pre_attention(input_tensor, q_proj,
                              out_shapes=((4, 8), (4, 8), (4, 8)))
     attn = attention(Q, K, V, out_shapes=out_shapes)
-    return offchip_store(attn)
+    return attn
 '''
     violations = _check_banned_ops(
         code, REFACTOR_PASS, is_root=False,
@@ -175,7 +175,7 @@ def test_tuple_unpack_from_blackbox_is_onchip():
 def helper(x, *, out_shapes):
     Q, K, V = pre_attention(x, out_shapes=((4, 8), (4, 8), (4, 8)))
     s = binary_add(Q, K)
-    return offchip_store(s)
+    return s
 '''
     violations = _check_banned_ops(
         code, REFACTOR_PASS, is_root=False,
@@ -196,6 +196,47 @@ def tiled_reference(dims, tensors):
         extra_required_ops=("moe_path",),
     )
     assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# Single-store invariant: exactly one ``offchip_store`` at the root, zero
+# elsewhere. Catches the mid-program intermediate-store anti-pattern (which
+# forces a round-trip through off-chip memory + host-side python on the raw
+# result) and the non-root sink mistake.
+# ---------------------------------------------------------------------------
+
+def test_root_with_multiple_offchip_stores_violates():
+    code = '''
+def tiled_reference(dims, tensors):
+    x = offchip_load(tensors["x"], ...)
+    y = binary_mul(x, x)
+    down_raw = offchip_store(y)
+    return offchip_store(down_raw)
+'''
+    violations = _check_banned_ops(code, REFACTOR_PASS, is_root=True)
+    assert any("exactly once" in v for v in violations), violations
+
+
+def test_root_with_zero_offchip_stores_violates():
+    code = '''
+def tiled_reference(dims, tensors):
+    return moe_path(tensors["x"], out_shapes=((4, 8),))
+'''
+    violations = _check_banned_ops(
+        code, REFACTOR_PASS, is_root=True,
+        extra_required_ops=("moe_path",),
+    )
+    assert any("exactly once" in v for v in violations), violations
+
+
+def test_nonroot_with_offchip_store_violates():
+    code = '''
+def helper(x, *, out_shapes):
+    y = binary_mul(x, x)
+    return offchip_store(y)
+'''
+    violations = _check_banned_ops(code, REFACTOR_PASS, is_root=False)
+    assert any("not allowed in non-root" in v for v in violations), violations
 
 
 # ---------------------------------------------------------------------------
