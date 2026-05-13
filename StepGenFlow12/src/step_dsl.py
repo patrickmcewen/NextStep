@@ -1348,6 +1348,16 @@ def promote_outer(x):
         f"a stream dim — drop one rank from the accum or skip an upstream "
         f"flatten that consumed the leading singleton."
     )
+    # Forbid promote_outer over a dynamic-inner stream: the IR makes the
+    # prepended outer dim Piecewise(1 if dyn>=1 else 0), but the DSL would
+    # mark it as a literal-1 static dim, silently passing downstream mask
+    # checks (e.g. repeat_ref) that the IR/Rust simulator then rejects.
+    assert not any(mask), (
+        f"promote_outer: input has dynamic stream dim(s) (mask={mask}); IR "
+        f"emits a Piecewise outer in this case, which the DSL cannot model. "
+        f"Restructure upstream so the dyn dim is consumed (e.g. flat_partition "
+        f"+ load via offchip_load_ref(ref=...)) before adding an outer dim."
+    )
     return StepTensor(x.underlying_tensor.unsqueeze(0), stream_dtype=sd,
                       dyn_mask=(False,) + mask,
                       dyn_origins=(None,) + orig)

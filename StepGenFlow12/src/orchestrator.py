@@ -744,6 +744,39 @@ def _strip_annotations(code: str) -> str:
     )
 
 
+# Three alternatives, tried in order:
+#   1. Triple-quoted strings  → dropped (treat as docstring/multi-line note)
+#   2. Single/double-quoted strings → preserved (``str`` capture group)
+#   3. ``#`` line comments    → dropped
+# Triple-quoted forms come first so ``"""..."""`` isn't split into two empty
+# strings by the single-quote alternatives.
+_COMMENT_OR_STRING_RE = re.compile(
+    r'''
+    """[\s\S]*?"""
+    | \'\'\'[\s\S]*?\'\'\'
+    | (?P<str>
+        "(?:\\.|[^"\\\n])*"
+      | '(?:\\.|[^'\\\n])*'
+    )
+    | \#[^\n]*
+    ''',
+    re.VERBOSE,
+)
+
+
+def _strip_comments(code: str) -> str:
+    """Strip Python comments and docstrings so compliance regexes don't match them.
+
+    Backticked examples in docstrings/comments (e.g. ``# use ... instead of x.sum(...)``)
+    routinely contain the exact patterns we ban — stripping them before the
+    regex pass keeps those mentions from being flagged as real violations.
+    Triple-quoted strings (the docstring convention) are dropped wholesale;
+    single/double-quoted string literals are preserved so a literal ``#`` or
+    real data string stays put.
+    """
+    return _COMMENT_OR_STRING_RE.sub(lambda m: m.group('str') or '', code)
+
+
 def _extract_func_body(code: str) -> str:
     """Extract the body of build_graph or tiled_reference for compliance checking.
 
@@ -966,8 +999,11 @@ def _check_banned_ops(code: str, pass_name: str, *,
         return []
 
     # Strip annotation comments before checking — they contain STeP node names
-    # that would falsely satisfy required-op checks.
+    # that would falsely satisfy required-op checks. Also strip regular ``#``
+    # comments so backticked examples (``# replace x.sum(...) with ...``) don't
+    # trigger banned-pattern matches.
     code = _strip_annotations(code)
+    code = _strip_comments(code)
     if pass_name in _TRANSLATION_PASSES:
         code = _extract_func_body(code)
 
@@ -1035,6 +1071,7 @@ def _check_bundle_compliance(code: str, compliance: dict, *,
     ``*OffChipStore*``) from the required-ops set.
     """
     code = _strip_annotations(code)
+    code = _strip_comments(code)
     code = _extract_func_body(code)
 
     allowed = compliance.get("allowed_ops") or []
@@ -2110,6 +2147,7 @@ def _build_node_index(tree, tensors: dict):
 async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
                                     dims, root_kernel, ckpt_root,
                                     agent_factory, max_turns, log,
+                                    check_order: str,
                                     node_attempts: int = 1,
                                     non_root_sequential: bool = True,
                                     stateless: bool = False,
@@ -2399,7 +2437,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
             kernel_name=synth_name, dims=dims, max_turns=max_turns,
             ckpt_dir=attempt_dir, executor="dsl", tensors=node_tensors,
             log=attempt_log,
-            check_order="correctness-first",
+            check_order=check_order,
             prebuilt_user_prompt=user_prompt,
             judge_agent=judge_agent,
             is_root=is_root,
@@ -2460,7 +2498,8 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
 async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
                        dims, root_kernel, ckpt_root, agent_factory,
                        max_turns, log, node_attempts, non_root_sequential,
-                       stateless, tensors, plan_iter: int = 0):
+                       stateless, tensors, check_order: str,
+                       plan_iter: int = 0):
     """Pre-order Pass-1 walk.
 
     Refactors ``node`` first (using ``parent_contract`` as the call-site spec),
@@ -2492,6 +2531,7 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
         agent_factory=agent_factory,
         max_turns=max_turns,
         log=log,
+        check_order=check_order,
         node_attempts=node_attempts,
         non_root_sequential=non_root_sequential,
         stateless=stateless,
@@ -2589,6 +2629,7 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
                 non_root_sequential=non_root_sequential,
                 stateless=stateless,
                 tensors=tensors,
+                check_order=check_order,
                 plan_iter=plan_iter,
             )
             for child in live_children
@@ -2711,6 +2752,7 @@ def _pass2_compose(*, tree, pass1_dsls: dict[str, str],
 
 async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
                         agent_factory, max_turns, log,
+                        check_order: str = "correctness-first",
                         node_attempts: int = 1,
                         non_root_sequential: bool = True,
                         verified_cache: dict[str, str] | None = None,
@@ -2760,6 +2802,7 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
         node_attempts=node_attempts,
         non_root_sequential=non_root_sequential,
         stateless=stateless, tensors=tensors,
+        check_order=check_order,
         plan_iter=plan_iter,
     )
     failing = [(p, r) for p, r in pass1.items() if not r["success"]]
@@ -2831,6 +2874,7 @@ async def _replan(*, subtree_reference, dims, agent, node_path,
 
 async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
                              agent_factory, max_turns, log, max_replans,
+                             check_order: str = "correctness-first",
                              node_attempts: int = 1,
                              non_root_sequential: bool = True,
                              max_plan_depth: int | None = None,
@@ -2891,6 +2935,7 @@ async def _run_planner_phase(*, root_reference, dims, root_kernel, ckpt_root,
             tree=tree, dims=dims, root_kernel=root_kernel,
             ckpt_root=ckpt_root, agent_factory=agent_factory,
             max_turns=max_turns, log=log,
+            check_order=check_order,
             node_attempts=node_attempts,
             non_root_sequential=non_root_sequential,
             verified_cache=verified_cache,
@@ -3661,6 +3706,7 @@ async def _run_outer_iteration_body(
             root_kernel=kernel_name, ckpt_root=outer_dir,
             agent_factory=_agent_factory, max_turns=max_turns,
             log=log, max_replans=max_replans,
+            check_order=check_order,
             node_attempts=node_attempts,
             non_root_sequential=non_root_sequential,
             max_plan_depth=max_plan_depth,
