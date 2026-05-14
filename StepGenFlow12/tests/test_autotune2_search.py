@@ -655,6 +655,52 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
     assert (tmp_path / "tune" / "autotune2" / root.path / "variants.py").exists()
 
 
+def test_autotune_root_as_leaf_single_node_tree(tmp_path):
+    """A plan tree with a single node (root == leaf) — happens when pass-1
+    produces no sub-functions. The root has no parent_contract; the search
+    must skip the synthetic wrapper and use empty identity contracts."""
+    only = _leaf("only")
+    only = replace(only, path="root", name="only", is_leaf=True, children=())
+    tree = Tree(root=only)
+
+    pass1_dsls = {
+        only.path: (
+            "def tiled_reference(dims, tensors):\n"
+            "    return None\n"
+        ),
+    }
+    # pass1_contracts has no entry for the root — _load_pass1_state skips it.
+    contracts: dict = {}
+
+    async def agent(_conversation):
+        return "garbage"  # baseline-only library
+    async def verifier(_src):
+        return VerifyResult(passed=True)
+    def agent_factory(_sys):
+        return agent
+
+    prompt_inputs = {only.path: _stub_prompt_inputs("only")}
+    sys_prompts = {only.path: "sys-only"}
+
+    result = run(autotune(
+        plan_tree=tree,
+        pass1_dsls=pass1_dsls,
+        pass1_contracts=contracts,
+        ckpt_dir=tmp_path / "tune",
+        score_fn=lambda _src: (10, 10),
+        agent_factory=agent_factory,
+        verifier=verifier,
+        prompt_inputs=prompt_inputs,
+        system_prompts=sys_prompts,
+        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+    ))
+    assert set(result.libraries.keys()) == {only.path}
+    assert result.root_path == only.path
+    # The root-as-leaf library is keyed on empty contracts (root convention).
+    reg = library_to_variant_registry(result.libraries[only.path])
+    assert len(reg) == 1
+
+
 # --- write_library_snapshot --------------------------------------------------
 
 

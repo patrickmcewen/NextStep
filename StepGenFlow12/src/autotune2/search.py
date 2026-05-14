@@ -532,7 +532,7 @@ def _write_turn_artifacts(
 async def search_leaf(
     *,
     node: PlanNode,
-    parent_contract: Contract,
+    parent_contract: Contract | None,
     pass1_dsl: str,
     ckpt_dir: Path,
     score_fn: ScoreFn,
@@ -550,10 +550,16 @@ async def search_leaf(
     parse/verify feedback before giving up and starting fresh. Fresh
     attempts render a Pareto-front summary of already-accepted entries
     into the user prompt so the LLM targets gaps.
+
+    ``parent_contract`` is ``None`` only for the root-as-leaf case
+    (single-node plan tree): the pass-1 DSL is already
+    ``tiled_reference(dims, tensors)`` so no synthetic wrapper is
+    needed and the library uses empty identity contracts.
     """
     assert node.is_leaf, f"search_leaf called on non-leaf node {node.path!r}"
     lib: NodeLibrary = {}
-    wrapper = build_synthetic_wrapper_for_node(
+    is_root = parent_contract is None
+    wrapper = "" if is_root else build_synthetic_wrapper_for_node(
         node_name=node.name, parent_contract=parent_contract,
     )
 
@@ -561,15 +567,25 @@ async def search_leaf(
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         (ckpt_dir / "system_prompt.txt").write_text(system_prompt)
 
-    baseline = _seed_baseline(
-        lib=lib, node_name=node.name, parent_contract=parent_contract,
-        pass1_dsl=pass1_dsl, score_fn=score_fn,
-        wrapper_source=wrapper, descendant_dsls=[],
-        children_picks={},
-    )
+    if is_root:
+        baseline = _seed_root_baseline(
+            lib=lib, node_name=node.name, pass1_dsl=pass1_dsl,
+            score_fn=score_fn, descendant_dsls=[], children_picks={},
+        )
+    else:
+        baseline = _seed_baseline(
+            lib=lib, node_name=node.name, parent_contract=parent_contract,
+            pass1_dsl=pass1_dsl, score_fn=score_fn,
+            wrapper_source=wrapper, descendant_dsls=[],
+            children_picks={},
+        )
 
-    arg_vanilla_shapes = _on_chip_vanilla_shapes(parent_contract)
-    output_vanilla_shapes = _output_vanilla_shapes(parent_contract)
+    arg_vanilla_shapes = (
+        {} if is_root else _on_chip_vanilla_shapes(parent_contract)
+    )
+    output_vanilla_shapes = (
+        {} if is_root else _output_vanilla_shapes(parent_contract)
+    )
     accepted: list[DesignEntry] = [baseline]
 
     for attempt in range(config.max_attempts):
@@ -619,7 +635,7 @@ async def search_leaf(
                 continue
 
             composed = compose_source(
-                parent_dsl=wrapper + "\n" + parsed.dsl,
+                parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
                 descendant_dsls_postorder=[],
             )
             verify = await verifier(composed)
@@ -1041,7 +1057,10 @@ async def autotune(
         if node.is_leaf:
             lib = await search_leaf(
                 node=node,
-                parent_contract=pass1_contracts[node.path],
+                parent_contract=(
+                    None if node.path == root_path
+                    else pass1_contracts[node.path]
+                ),
                 pass1_dsl=pass1_dsls[node.path],
                 ckpt_dir=node_ckpt,
                 score_fn=score_fn,

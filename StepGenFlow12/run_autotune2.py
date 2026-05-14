@@ -379,7 +379,7 @@ def main() -> int:
              "timestamp dir (typically <repo>/checkpoints/).",
     )
     parser.add_argument(
-        "--max-turns-per-attempt", type=int, default=3,
+        "--max-turns-per-attempt", type=int, default=16,
         help="Max LLM turns within a single fresh-conversation attempt "
              "(default: 3). Each turn within an attempt accumulates "
              "gate-failure feedback.",

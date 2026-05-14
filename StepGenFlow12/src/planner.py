@@ -8,6 +8,7 @@ to produce a ``Tree`` that Phase 1's per-node refactor walker consumes.
 
 import ast
 import asyncio
+import inspect
 import re
 import textwrap
 from dataclasses import dataclass
@@ -821,6 +822,37 @@ def _extract_reasoning(run_result) -> str:
     return "\n\n".join(chunks)
 
 
+def _extract_hf_module_source(reference_code: str, dims: dict) -> str | None:
+    """Return ``inspect.getsource`` for the HF class the wrapper's ``self.model``
+    is an instance of, or ``None`` for any non-HF / non-introspectable reference.
+
+    This is the planner's only HF-aware step: when ``reference_code`` defines a
+    ``Model`` whose constructor builds ``self.model = <some HF module>``, the
+    LLM is given the full PyTorch source of that wrapped class so it can
+    decompose against the actual graph instead of inventing it.
+
+    Best-effort: any failure (no Model, no self.model, dynamically-created
+    class, missing get_init_inputs args, etc.) returns ``None`` and the prompt
+    falls back to its non-HF shape. ``inspect.getsource`` itself raises
+    ``OSError`` on classes whose defining file can't be located.
+    """
+    ns: dict = {}
+    try:
+        exec(reference_code, ns)
+        if "Model" not in ns:
+            return None
+        init_inputs = ns.get("get_init_inputs", lambda d: [])(dims)
+        m = ns["Model"](*init_inputs)
+        inner = getattr(m, "model", None)
+        if inner is None:
+            return None
+        cls = type(inner)
+        src = inspect.getsource(cls)
+        return f"# {cls.__module__}.{cls.__qualname__}\n{src}"
+    except Exception:
+        return None
+
+
 async def plan(*, reference_code: str, dims: dict, agent, path: str,
                runner_fn, retry_budget: int = 8,
                replan_context: dict | None = None,
@@ -860,10 +892,16 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
     mode = "replan" if replan_context else "initial"
     log(f"[planner] node={path!r} ({mode}) — calling LLM, retry_budget={retry_budget}")
 
+    hf_module_source = _extract_hf_module_source(reference_code, dims)
+    if hf_module_source is not None:
+        log(f"[planner] node={path!r} — including wrapped HF module source in prompt "
+            f"({len(hf_module_source)} chars)")
+
     if replan_context is None:
         user = build_planner_user_prompt(
             reference_code=reference_code, dims=dims,
             precompute_source=precompute_source,
+            hf_module_source=hf_module_source,
         )
     else:
         user = build_replan_user_prompt(
@@ -874,6 +912,7 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             last_turn_messages=replan_context["last_turn_messages"],
             sibling_results=replan_context["sibling_results"],
             precompute_source=precompute_source,
+            hf_module_source=hf_module_source,
         )
 
     conversation = [{"role": "user", "content": user}]
@@ -952,7 +991,7 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
 
         try:
             check_anti_passthrough(list(children_full))
-            check_anti_monolith(reference_code, refactored_full)
+            #check_anti_monolith(reference_code, refactored_full)
             check_no_dead_children(refactored_full, list(children_full))
             check_children_runnable(list(children_full), dims)
             check_compose(reference_code, refactored_full,

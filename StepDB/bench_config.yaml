@@ -2235,3 +2235,24 @@ gqa_decode_e2e:
       tile_seq: 32
       tile_hidden: 64
   origin: seed
+hf__gpt2:
+  problem: seed_kernels/hf_imported/gpt2/reference.py
+  step_impl: null
+  params:
+  - model_name
+  - batch_size
+  - seq_len
+  presets:
+    tiny:
+      model_name: gpt2
+      batch_size: 1
+      seq_len: 8
+    small:
+      model_name: gpt2
+      batch_size: 1
+      seq_len: 32
+    medium:
+      model_name: gpt2
+      batch_size: 1
+      seq_len: 128
+  origin: hf_import

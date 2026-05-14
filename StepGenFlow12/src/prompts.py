@@ -852,7 +852,8 @@ def build_planner_system_prompt() -> str:
 
 
 def build_planner_user_prompt(*, reference_code: str, dims: dict,
-                               precompute_source: str | None = None) -> str:
+                               precompute_source: str | None = None,
+                               hf_module_source: str | None = None) -> str:
     """Initial planner-call user prompt: reference + dims (+ precompute when known)."""
     dims_json = json.dumps(dims, indent=2)
     parts = [
@@ -872,6 +873,15 @@ def build_planner_user_prompt(*, reference_code: str, dims: dict,
             f"{precompute_source.rstrip()}\n"
             "```\n"
         )
+    if hf_module_source is not None:
+        parts.append(
+            "\n## Wrapped HF module source (the actual PyTorch graph "
+            "that `self.model` executes — read-only context, not part of "
+            "the reference)\n\n"
+            "```python\n"
+            f"{hf_module_source.rstrip()}\n"
+            "```\n"
+        )
     parts.append(
         "\nDecide whether to leaf this kernel or split it. "
         "Use the response format described in your system prompt."
@@ -885,7 +895,8 @@ def build_replan_user_prompt(*, reference_code: str, dims: dict,
                               failing_node: str,
                               last_turn_messages: list[str],
                               sibling_results: list[tuple[str, str]],
-                              precompute_source: str | None = None) -> str:
+                              precompute_source: str | None = None,
+                              hf_module_source: str | None = None) -> str:
     """Re-plan user prompt with failure context."""
     dims_json = json.dumps(dims, indent=2)
     last_turns = "\n".join(
@@ -907,6 +918,17 @@ def build_replan_user_prompt(*, reference_code: str, dims: dict,
             "\n## Precompute source (defines the `tensors` dict the reference receives)\n\n"
             "```python\n"
             f"{precompute_source.rstrip()}\n"
+            "```\n"
+        )
+
+    hf_block = ""
+    if hf_module_source is not None:
+        hf_block = (
+            "\n## Wrapped HF module source (the actual PyTorch graph "
+            "that `self.model` executes — read-only context, not part of "
+            "the reference)\n\n"
+            "```python\n"
+            f"{hf_module_source.rstrip()}\n"
             "```\n"
         )
 
@@ -934,5 +956,6 @@ def build_replan_user_prompt(*, reference_code: str, dims: dict,
         f"{dims_json}\n"
         "```\n"
         f"{precompute_block}"
+        f"{hf_block}"
         "\nRe-plan this subtree. Use the response format from your system prompt."
     )

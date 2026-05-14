@@ -909,6 +909,40 @@ def _precompute_sdpa_kv_read(dims):
     return {"x": torch.randn(1, hidden_dim), "W_q": torch.randn(hidden_dim, num_heads * head_dim), "W_k": torch.randn(hidden_dim, num_kv_heads * head_dim), "W_v": torch.randn(hidden_dim, num_kv_heads * head_dim), "K_cache": torch.randn(batch_size, seq_len+1, num_kv_heads, head_dim), "V_cache": torch.randn(batch_size, seq_len+1, num_kv_heads, head_dim), "batch_idx": batch_idx, "seq_len": seq_len}
 
 
+# ---------------------------------------------------------------------------
+# HuggingFace-imported kernels (full unmodified HF stack, randn-init weights)
+# ---------------------------------------------------------------------------
+
+@register("hf__gpt2")
+def _precompute_hf__gpt2(dims):
+    """Inputs + every named parameter for the HF gpt2 kernel.
+
+    Constructs the HF model under a seeded RNG via ``from_config``, then
+    extracts every ``named_parameters()`` entry into the precompute dict
+    as a raw detached tensor. ``input_ids`` is generated under a separate
+    seed so adding inputs later doesn't perturb weight RNG.
+
+    Returned dict layout:
+      "input_ids":                                  (B, S) int64
+      "<hf_param_name>":  e.g. "transformer.wte.weight", "transformer.h.0.attn.c_attn.weight", ...
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    cfg = AutoConfig.from_pretrained(dims["model_name"])
+    torch.manual_seed(SEED)
+    model = AutoModelForCausalLM.from_config(cfg)
+    # state_dict() (not named_parameters()) so that tied weights appear under
+    # every name HF uses (e.g. lm_head.weight aliasing transformer.wte.weight)
+    # and registered buffers (causal masks, etc.) come along too.
+    weights = {n: t.detach().clone() for n, t in model.state_dict().items()}
+
+    torch.manual_seed(SEED + 1)
+    input_ids = torch.randint(
+        0, cfg.vocab_size, (dims["batch_size"], dims["seq_len"])
+    )
+    return {"input_ids": input_ids, **weights}
+
+
 @register("qk_reshape_score")
 def _precompute_qk_reshape_score(dims):
     torch.manual_seed(SEED)
