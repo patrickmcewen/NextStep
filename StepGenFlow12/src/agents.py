@@ -292,10 +292,17 @@ class ReasoningAwareModel(OpenAIChatCompletionsModel):
 
 
 def make_client(llm_config: dict) -> AsyncOpenAI:
-    """Create an AsyncOpenAI client from config dict."""
+    """Create an AsyncOpenAI client from config dict.
+
+    ``api_key`` is optional: local endpoints (e.g. a self-hosted gpt-oss
+    server) don't require auth, and several configs omit the field
+    entirely. Falls back to the literal string ``"None"`` because the
+    AsyncOpenAI constructor rejects an empty/missing key but does not
+    actually validate the value against the endpoint.
+    """
     return AsyncOpenAI(
         base_url=llm_config["url"],
-        api_key=llm_config["api_key"],
+        api_key=llm_config.get("api_key") or "None",
         timeout=600,
     )
 
@@ -461,6 +468,28 @@ def make_pass1_judge_agent(
     )
     return Agent(
         name="StepJudge_pass1",
+        instructions=system_prompt,
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_autotune2_agent(llm_config: dict, system_prompt: str) -> Agent:
+    """Create an autotune2 agent with a caller-supplied system prompt.
+
+    Autotune2's system prompt is built externally by
+    ``src.autotune2.prompts.build_autotune2_system_prompt`` (self-contained,
+    no pass-1 dependency at the prompt-text level). This factory wires
+    that prompt into the same SDK ``Agent`` / model-settings shape that
+    pass-1 uses so the per-turn conversation loop (``Runner.run``),
+    feedback handling, token accounting, and gate cascade can all be
+    reused unchanged.
+    """
+    assert system_prompt, "make_autotune2_agent: system_prompt must be non-empty"
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepAutotune2",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),

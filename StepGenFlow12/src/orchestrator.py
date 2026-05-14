@@ -29,6 +29,7 @@ import dataclasses
 import io
 import json
 import os
+import pickle
 import re
 import shutil
 import sys
@@ -2617,7 +2618,18 @@ async def _pass1_walk(*, node, parent_contract, signatures, ref_modules,
             f"Parent {node.path!r}: rawness tuple for child {child.name!r} "
             f"has {len(rawness)} entries but contract.arg_names has "
             f"{len(c.arg_names)} — call-site arity drift")
-        child_contracts[child.path] = dataclasses.replace(c, arg_is_raw=rawness)
+        stamped = dataclasses.replace(c, arg_is_raw=rawness)
+        child_contracts[child.path] = stamped
+
+        # Persist the stamped Contract so downstream consumers (autotune2,
+        # resume tooling) can rehydrate the call-site shape/spec/value tuple
+        # without re-executing pass1. The Contract carries torch.Tensor /
+        # list[int] payloads in ``tiled_values``, so pickle is the simplest
+        # round-trippable format.
+        child_pass1_dir = ckpt_root / "pass1" / f"iteration_{plan_iter}" / child.path
+        child_pass1_dir.mkdir(parents=True, exist_ok=True)
+        with open(child_pass1_dir / "contract.pkl", "wb") as f:
+            pickle.dump(stamped, f)
 
     # Persist the inlined-children list so resume reads can reproduce the
     # decision without re-running the rawness extractor.
