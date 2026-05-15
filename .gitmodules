@@ -7,3 +7,6 @@
 [submodule "PCL-lite"]
 	path = PCL-lite
 	url = https://github.com/patrickmcewen/PCL-lite.git
+[submodule "openevolve"]
+	path = openevolve
+	url = https://github.com/algorithmicsuperintelligence/openevolve.git
