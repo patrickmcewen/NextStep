@@ -151,6 +151,17 @@ def main():
              "stable across turns. Off by default — accumulating chat history "
              "is the existing behavior.",
     )
+    parser.add_argument(
+        "--one-by-one", action="store_true",
+        help="Run pass-1 against step_dsl_1x1.py instead of step_dsl.py. The "
+             "1x1 variant adds assertions pinning every tile to (1, 1) — loads "
+             "must use tile_row=tile_col=1, accum_retile_*/restream are "
+             "forbidden, retile_streamify only accepts chunk=1, and the final "
+             "offchip_store input must already be 1x1. All structural variety "
+             "lives at the stream level so a downstream autotuner can promote "
+             "stream dims into tiles via local rewrites. Requires --no-plan "
+             "to be OFF and is incompatible with --bundle-dir.",
+    )
     args = parser.parse_args()
 
     _resume_modes_set = sum(
@@ -204,6 +215,7 @@ def main():
         resume_after_pass1=args.resume_after_pass1,
         stateless_refactor=args.stateless_refactor,
         judge_enabled=not args.no_judge,
+        one_by_one_mode=args.one_by_one,
     ))
 
     if result["success"]:

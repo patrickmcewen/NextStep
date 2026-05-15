@@ -30,6 +30,7 @@ _STEP_TL_PROTO = _STEP_TL_SRC / "proto"
 _FUNCTIONAL_PY = _STEP_TL_SRC / "timing_and_emulator" / "functional.py"
 _TIMING_PY = _STEP_TL_SRC / "timing_and_emulator" / "timing.py"
 _STEP_DSL_PY = _PROJECT_ROOT / "src" / "step_dsl.py"
+_STEP_DSL_1X1_PY = _PROJECT_ROOT / "src" / "step_dsl_1x1.py"
 _STEP_DSL_MEM_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
 
 for p in (_STEP_TL_SRC, _STEP_TL_PROTO):

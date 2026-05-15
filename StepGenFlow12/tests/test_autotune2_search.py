@@ -655,6 +655,117 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
     assert (tmp_path / "tune" / "autotune2" / root.path / "variants.py").exists()
 
 
+def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
+    """Two leaves under one parent: their agent calls must interleave
+    (i.e. both leaves start before either finishes) because the bottom-up
+    driver schedules every node as its own task. The parent must still
+    wait for both leaves before running.
+    """
+    leaf_a = _leaf("leaf_a")
+    leaf_b = _leaf("leaf_b")
+    leaf_a = replace(leaf_a, path="root/leaf_a", name="leaf_a")
+    leaf_b = replace(leaf_b, path="root/leaf_b", name="leaf_b")
+    root = _parent("outer", children=(leaf_a, leaf_b))
+    root = replace(root, path="root", name="outer", children=(leaf_a, leaf_b))
+    tree = Tree(root=root)
+
+    leaf_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
+    pass1_dsls = {
+        leaf_a.path: "def leaf_a(x, *, out_shapes):\n    return None\n",
+        leaf_b.path: "def leaf_b(x, *, out_shapes):\n    return None\n",
+        root.path: ("def tiled_reference(dims, tensors):\n"
+                    "    return leaf_a(tensors['x'], out_shapes=((1, 4, 8),))\n"),
+    }
+    contracts = {
+        leaf_a.path: leaf_contract,
+        leaf_b.path: leaf_contract,
+        root.path: leaf_contract,
+    }
+
+    # Order tracker: each agent appends "<node>:start" on entry, awaits a
+    # short sleep to yield the event loop, then "<node>:end". If the two
+    # leaves run in parallel both starts appear before either end.
+    order: list[str] = []
+    barrier = asyncio.Event()
+    started: set[str] = set()
+
+    def _node_name_from_convo(conversation: list[dict]) -> str:
+        # Parent prompts embed child variant tables that contain the
+        # child names as substrings, so match against the user prompt's
+        # explicit "## Node: <name>" header instead of bare substring.
+        first_user = next(
+            (m["content"] for m in conversation if m["role"] == "user"), "",
+        )
+        for cand in ("leaf_a", "leaf_b", "outer"):
+            if f"## Node: {cand}" in first_user:
+                return cand
+        return "?"
+
+    async def agent(conversation):
+        nm = _node_name_from_convo(conversation)
+        order.append(f"{nm}:start")
+        # Release the barrier only once both leaves have entered. The
+        # parent (``outer``) doesn't gate the barrier — it only runs
+        # after the leaves resolve, and asserting "outer:start" comes
+        # after both leaf ends is the actual parent-after-children
+        # invariant.
+        if nm in ("leaf_a", "leaf_b"):
+            started.add(nm)
+            if {"leaf_a", "leaf_b"}.issubset(started):
+                barrier.set()
+            await barrier.wait()
+        order.append(f"{nm}:end")
+        return "garbage"
+
+    async def verifier(_src):
+        return VerifyResult(passed=True)
+
+    def agent_factory(_system_prompt: str):
+        return agent
+
+    prompt_inputs = {
+        leaf_a.path: _stub_prompt_inputs("leaf_a"),
+        leaf_b.path: _stub_prompt_inputs("leaf_b"),
+        root.path: _stub_prompt_inputs("outer"),
+    }
+    sys_prompts = {
+        leaf_a.path: "sys-leaf-a",
+        leaf_b.path: "sys-leaf-b",
+        root.path: "sys-root",
+    }
+
+    result = run(autotune(
+        plan_tree=tree,
+        pass1_dsls=pass1_dsls,
+        pass1_contracts=contracts,
+        ckpt_dir=tmp_path / "tune",
+        score_fn=lambda _src: (10, 10),
+        agent_factory=agent_factory,
+        verifier=verifier,
+        prompt_inputs=prompt_inputs,
+        system_prompts=sys_prompts,
+        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+    ))
+
+    # All three libraries populated
+    assert set(result.libraries.keys()) == {leaf_a.path, leaf_b.path, root.path}
+
+    # Both leaves started before either finished → interleaved execution.
+    leaf_starts = [i for i, e in enumerate(order)
+                   if e in ("leaf_a:start", "leaf_b:start")]
+    leaf_ends = [i for i, e in enumerate(order)
+                 if e in ("leaf_a:end", "leaf_b:end")]
+    assert len(leaf_starts) == 2 and len(leaf_ends) == 2
+    assert max(leaf_starts) < min(leaf_ends), (
+        f"sibling leaves did not interleave: {order!r}"
+    )
+
+    # Parent (outer) must start after both leaves finish — child-before-parent
+    # invariant is preserved.
+    outer_start = order.index("outer:start")
+    assert outer_start > max(leaf_ends)
+
+
 def test_autotune_root_as_leaf_single_node_tree(tmp_path):
     """A plan tree with a single node (root == leaf) — happens when pass-1
     produces no sub-functions. The root has no parent_contract; the search

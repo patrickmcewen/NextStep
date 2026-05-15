@@ -29,6 +29,66 @@ _PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
 _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
 
 
+# Addendum injected into the pass-1 system prompt when 1x1-tile mode is on.
+# Mirrors the assertion surface of src/step_dsl_1x1.py so the model knows up
+# front which knobs it cannot use, instead of finding out by assertion failure.
+_ONE_BY_ONE_ADDENDUM = """
+## 1x1-TILE MODE — READ THIS BEFORE ANY DSL CALL
+
+This pass runs against ``step_dsl_1x1.py`` rather than ``step_dsl.py``. The two
+files are identical except that ``step_dsl_1x1.py`` adds assertions pinning
+every tile to shape ``(1, 1)``. The intent: keep all structural variety at the
+**stream** level so a downstream autotuner can promote stream dims into tiles
+via local rewrites without restructuring your graph. Violating any rule below
+fails the run loud with an ``AssertionError``.
+
+**Loads — must use ``tile_row=1, tile_col=1``:**
+``offchip_load``, ``offchip_load_ref``, ``dyn_offchip_load``,
+``random_offchip_load``. Express every other dimension via ``out_shape_tiled``
+(static loads) or ``tensor_shape_tiled`` (``dyn_offchip_load``). For example,
+a ``(M, N)`` weight that you previously loaded as one big tile with
+``out_shape_tiled=(1,)`` now becomes ``out_shape_tiled=(M, N)`` with
+``tile_row=tile_col=1``.
+
+**Stores — input tile must already be ``(1, 1)``:**
+``offchip_store``, ``random_offchip_store``. Do not try to merge a stream
+dim into the tile right before the store; finish the kernel at 1x1.
+
+**Forbidden ops (assert False in 1x1 mode):**
+``accum_retile_row``, ``accum_retile_col``, ``restream``. These would grow the
+tile past 1x1. If you need to reduce a stream dim, use ``accum_add`` /
+``accum_max`` / ``accum_mul``. If you need a layout permutation, use
+``bufferize`` + ``streamify``.
+
+**``retile_streamify`` — only the no-op form (``chunk=1``) is permitted.**
+At 1x1 tiles there is no tile dim left to split. To split a stream dim use
+``reshape_stream`` directly.
+
+**Matmul at 1x1.** ``binary_matmul(a, b)`` on ``(1,1)`` tiles is just a scalar
+multiplication; the inner-product dimension you used to get from ``tile_col``
+must now come from a stream dim reduced with ``accum_add`` (or expressed in
+one shot via ``binary_map_accum`` with ``rank=`` set to the reduction
+dimension's stream rank). The seed_kernels GEMM pattern — load A and B both
+with ``out_shape_tiled=(M//1, N//1, K//1) == (M, N, K)`` and appropriate
+broadcast strides, then ``binary_map_accum(A, B, rank=1)`` — is the canonical
+1x1 shape.
+
+**Reshape ops you should reach for.** ``reshape_stream`` to split / pad stream
+dims, ``flatten`` to merge them, ``promote`` / ``promote_outer`` to insert a
+singleton, ``expand_ref`` / ``repeat_static`` / ``repeat_ref`` to broadcast
+over a stream dim, ``parallelize`` / ``static_reassemble`` to interleave.
+These are all stream-level and tile-shape invariant; rely on them.
+
+**Why 1x1.** Mixing tile and stream representations forces the
+implementation to bake tile choices into the graph structure (different
+``retile_streamify`` placements, different matmul forms for tiled vs
+single-tile inputs). Pinning the tile to 1x1 collapses that decision space
+and lets the autotuner be the only thing that picks tile sizes — by
+*absorbing* stream dims into tiles via ``accum_retile_*``, which is a local
+rewrite that does not require restructuring the kernel.
+"""
+
+
 _LEAF_NOTICE_BLOCK = (
     "## This Node Is a Leaf — No Child Blackboxes\n"
     "\n"
@@ -194,8 +254,16 @@ def _load_pass1_system_prompt(
     contract_block: str,
     dsl_code: str,
     few_shot_examples=None,
+    one_by_one_mode: bool = False,
 ) -> str:
-    """Render the Pass-1 system prompt template with caller-supplied blocks."""
+    """Render the Pass-1 system prompt template with caller-supplied blocks.
+
+    ``one_by_one_mode`` selects the 1x1-tile DSL variant: when True, the
+    rendered ``dsl_code`` block should already be the ``step_dsl_1x1.py``
+    source (caller's responsibility), and the prompt also gets the
+    ``_ONE_BY_ONE_ADDENDUM`` injected up front so the model knows the
+    constraint before reading the (assertion-heavy) DSL surface.
+    """
     from src.prompts import _format_few_shot_examples
     template_path = _PROMPTS_DIR_AGENTS / _PASS1_SYSTEM_TEMPLATE
     assert template_path.exists(), f"Pass-1 system template not found: {template_path}"
@@ -207,6 +275,7 @@ def _load_pass1_system_prompt(
         contract_block=contract_block,
         dsl_code=dsl_code,
         few_shot_examples=_format_few_shot_examples(few_shot_examples or []),
+        one_by_one_addendum=(_ONE_BY_ONE_ADDENDUM if one_by_one_mode else ""),
         **placeholders,
     )
 
@@ -406,6 +475,7 @@ def make_pass1_agent(
     child_blackbox_block: str,
     contract_block: str,
     few_shot_examples=None,
+    one_by_one_mode: bool = False,
 ) -> Agent:
     """Create a Pass-1 refactor agent for a single planner node.
 
@@ -419,10 +489,16 @@ def make_pass1_agent(
     for the root node).
     ``few_shot_examples`` is an optional list of resolved example dicts (see
     ``resolve_few_shot_examples``).
+    ``one_by_one_mode`` runs pass-1 against ``step_dsl_1x1.py`` (the variant
+    that pins every tile to 1x1 via assertions) and injects the matching
+    addendum at the top of the prompt. Callers that enable this **must** also
+    register ``step_dsl_1x1`` as ``sys.modules['step_dsl']`` before invoking
+    the executor; see ``orchestrator._refactor_one_node_pass1``.
     """
-    from src.prompts import _STEP_DSL_PY
-    assert _STEP_DSL_PY.exists(), f"step_dsl.py not found: {_STEP_DSL_PY}"
-    dsl_code = _STEP_DSL_PY.read_text()
+    from src.prompts import _STEP_DSL_PY, _STEP_DSL_1X1_PY
+    dsl_path = _STEP_DSL_1X1_PY if one_by_one_mode else _STEP_DSL_PY
+    assert dsl_path.exists(), f"DSL source not found: {dsl_path}"
+    dsl_code = dsl_path.read_text()
 
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
@@ -432,6 +508,7 @@ def make_pass1_agent(
         contract_block=contract_block,
         dsl_code=dsl_code,
         few_shot_examples=few_shot_examples,
+        one_by_one_mode=one_by_one_mode,
     )
     return Agent(
         name="StepPass_pass1",

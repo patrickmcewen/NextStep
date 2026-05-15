@@ -58,6 +58,7 @@ Locked Phase-5 design decisions
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1028,7 +1029,16 @@ async def autotune(
     system_prompts: dict[str, str],
     config: SearchConfig = SearchConfig(),
 ) -> AutotuneResult:
-    """Walk plan_tree post-order and search each node.
+    """Walk plan_tree bottom-up and search each node — in parallel where
+    the tree shape allows.
+
+    Each node becomes its own ``asyncio.Task`` that first ``await``s its
+    children's tasks (yielding the event loop so siblings progress) and
+    then runs ``search_leaf`` / ``search_parent``. All leaves start
+    concurrently; a parent fires as soon as every node in its subtree
+    has completed. This mirrors pass-1's top-down parallel walk in
+    reverse — the only sequencing constraint here is "children before
+    parent" (a parent's prompt embeds the children's Pareto libraries).
 
     Inputs (keyed by node path):
       - ``pass1_dsls``: verified pass-1 DSL function per node.
@@ -1048,14 +1058,28 @@ async def autotune(
 
     Returns the full ``{node_path: NodeLibrary}`` map plus the root path.
     """
-    libraries: dict[str, NodeLibrary] = {}
     root_path = plan_tree.root.path
-    for node in plan_tree.iter_topological():
+    tasks: dict[str, asyncio.Task] = {}
+
+    async def _search_node(node: PlanNode) -> NodeLibrary:
+        # Wait for every child's task before doing any work on this node.
+        # ``asyncio.gather`` yields the loop while children are pending,
+        # letting unrelated subtrees (e.g. other leaves) run in parallel.
+        if node.children:
+            child_libs_list = await asyncio.gather(
+                *[tasks[c.path] for c in node.children]
+            )
+            child_libs = {
+                c.path: lib for c, lib in zip(node.children, child_libs_list)
+            }
+        else:
+            child_libs = {}
+
         node_ckpt = ckpt_dir / "autotune2" / node.path
         node_system_prompt = system_prompts[node.path]
         node_agent = agent_factory(node_system_prompt)
         if node.is_leaf:
-            lib = await search_leaf(
+            return await search_leaf(
                 node=node,
                 parent_contract=(
                     None if node.path == root_path
@@ -1070,39 +1094,46 @@ async def autotune(
                 config=config,
                 system_prompt=node_system_prompt,
             )
-        else:
-            # Gather each child's baseline entry (the Pareto-best of the
-            # baseline cell). The baseline cell of a child is the one
-            # keyed by the child's pass-1 identity contracts.
-            baseline_picks: dict[str, DesignEntry] = {}
-            for child in node.children:
-                child_lib = libraries[child.path]
-                # First cell (lowest variant index) is the pass-1 baseline by
-                # construction in _seed_baseline.
-                first_cell = next(iter(next(iter(child_lib.values())).values()))
-                baseline_picks[child.path] = min(
-                    first_cell, key=lambda e: (e.cycles, e.on_chip)
-                )
-            lib = await search_parent(
-                node=node,
-                parent_contract=(
-                    None if node.path == root_path
-                    else pass1_contracts[node.path]
-                ),
-                pass1_dsl=pass1_dsls[node.path],
-                children_libraries={
-                    c.path: libraries[c.path] for c in node.children
-                },
-                children_picks_baseline=baseline_picks,
-                ckpt_dir=node_ckpt,
-                score_fn=score_fn,
-                agent=node_agent,
-                verifier=verifier,
-                prompt_inputs=prompt_inputs[node.path],
-                config=config,
-                system_prompt=node_system_prompt,
+
+        # Parent: gather each child's baseline entry (the Pareto-best of
+        # the baseline cell, i.e. the first cell by construction in
+        # ``_seed_baseline``).
+        baseline_picks: dict[str, DesignEntry] = {}
+        for child in node.children:
+            first_cell = next(iter(next(iter(child_libs[child.path].values())).values()))
+            baseline_picks[child.path] = min(
+                first_cell, key=lambda e: (e.cycles, e.on_chip)
             )
-        libraries[node.path] = lib
+        return await search_parent(
+            node=node,
+            parent_contract=(
+                None if node.path == root_path
+                else pass1_contracts[node.path]
+            ),
+            pass1_dsl=pass1_dsls[node.path],
+            children_libraries=child_libs,
+            children_picks_baseline=baseline_picks,
+            ckpt_dir=node_ckpt,
+            score_fn=score_fn,
+            agent=node_agent,
+            verifier=verifier,
+            prompt_inputs=prompt_inputs[node.path],
+            config=config,
+            system_prompt=node_system_prompt,
+        )
+
+    # Schedule every node's task. ``iter_topological`` is post-order, so
+    # child tasks are created before any parent task that references them.
+    for node in plan_tree.iter_topological():
+        tasks[node.path] = asyncio.create_task(
+            _search_node(node), name=f"autotune2:{node.path}",
+        )
+
+    # ``gather`` lets the first failure cancel the rest — fail-fast is the
+    # right default here because a child failure means the parent can't
+    # be composed anyway.
+    results = await asyncio.gather(*tasks.values())
+    libraries = {path: lib for path, lib in zip(tasks.keys(), results)}
     return AutotuneResult(libraries=libraries, root_path=root_path)
 
 

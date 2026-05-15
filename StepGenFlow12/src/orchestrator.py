@@ -2362,12 +2362,24 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         "wrap your factory so it sets agent_factory.__llm_config__ = llm_config")
     is_leaf = not children_signatures
     few_shot_examples = getattr(agent_factory, "__few_shot_examples__", None)
+    one_by_one_mode = bool(getattr(agent_factory, "__one_by_one_mode__", False))
+    if one_by_one_mode:
+        # Mirror the bundle-mode pattern at orchestrator.py:3305: re-register
+        # ``step_dsl`` so the exec scaffold's ``from step_dsl import *`` resolves
+        # to the 1x1 variant. Done eagerly here (idempotent if already pointing
+        # at step_dsl_1x1) so every executor invocation in this pass-1 walk sees
+        # the assertion-heavy module, including the recursive child walks.
+        import importlib
+        from src import step_dsl_1x1 as _step_dsl_1x1_mod
+        if sys.modules.get("step_dsl") is not _step_dsl_1x1_mod:
+            sys.modules["step_dsl"] = _step_dsl_1x1_mod
     agent = make_pass1_agent(
         llm_config,
         is_leaf=is_leaf,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
         few_shot_examples=few_shot_examples,
+        one_by_one_mode=one_by_one_mode,
     )
     judge_agent = make_pass1_judge_agent(
         llm_config,
@@ -3238,6 +3250,7 @@ async def run_kernel(
     resume_after_pass1: str | None = None,
     stateless_refactor: bool = False,
     judge_enabled: bool = True,
+    one_by_one_mode: bool = False,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -3270,6 +3283,21 @@ async def run_kernel(
         )
         assert resume_from is None, (
             "plan_enabled=True is incompatible with --resume-from"
+        )
+
+    if one_by_one_mode:
+        # 1x1 mode flips pass-1's DSL source to step_dsl_1x1.py and registers it
+        # as sys.modules["step_dsl"]; both hooks live exclusively in the planner
+        # pass-1 path (orchestrator._refactor_one_node_pass1), so it's only
+        # meaningful when plan_enabled is on. Bundle mode runs its own DSL
+        # surface and would silently overwrite the registration.
+        assert plan_enabled, (
+            "one_by_one_mode=True requires plan_enabled=True (the 1x1 hook "
+            "lives in the planner pass-1 path)."
+        )
+        assert bundle_dir is None, (
+            "one_by_one_mode=True is incompatible with --bundle-dir (bundle "
+            "mode registers its own `step_dsl` module)."
         )
 
     # --- Step 1: bundle-dir path resolution ---
@@ -3728,6 +3756,7 @@ async def _run_outer_iteration_body(
         _agent_factory.__refactor_judge_agent__ = judge_agents.get("refactor_final")
         _agent_factory.__llm_config__ = llm_config
         _agent_factory.__few_shot_examples__ = few_shot_examples
+        _agent_factory.__one_by_one_mode__ = False # todo fix
 
         log(f"  Planner phase (plan + per-node refactor)")
         print(f"{tag} Planner phase starting")
