@@ -331,6 +331,56 @@ def tiled_reference(dims, tensors):
     assert rawness["child"] == (False,)
 
 
+def test_extractor_is_flow_sensitive_for_rebound_raw_arg():
+    """A raw input that is rebound by the call's own LHS must still be
+    classified raw at the call site.
+
+    Regression test: a flow-insensitive ``name_to_source`` would let the
+    post-call rebind to a blackbox return overwrite the pre-call raw
+    binding, so the call-site lookup would (wrongly) see the arg as
+    on-chip. The patterns ``k_cache = tensors["k_cache"]; k_cache, _ =
+    kv_update(K, k_cache, ...)`` and the AnnAssign variant both showed up
+    in real planner output and silently propagated incorrect
+    ``arg_is_raw`` flags into child contracts, surfacing only at pass2
+    composition as ``input must be a StepTensor (typed). Got Tensor.``.
+    """
+    code = '''
+def tiled_reference(dims, tensors):
+    k_cache = tensors["k_cache"]
+    v_cache = tensors["v_cache"]
+    K, V = pre(out_shapes=((4,1,8),(4,1,8)))
+    k_cache, v_cache = kv_update(
+        K, V, k_cache, v_cache, out_shapes=((4,1,8),(4,1,8)),
+    )
+    return offchip_store(k_cache)
+'''
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("pre", "kv_update"),
+        blackbox_names=("pre", "kv_update"),
+    )
+    # K, V come from a prior blackbox (on-chip); k_cache, v_cache were
+    # bound from ``tensors[...]`` and are still raw at the kv_update call
+    # site, even though the same statement rebinds them.
+    assert rawness["kv_update"] == (False, False, True, True)
+
+
+def test_extractor_is_flow_sensitive_for_anns_rebind():
+    """AnnAssign variant of the rebind-after-raw pattern."""
+    code = '''
+def tiled_reference(dims, tensors):
+    x: object = tensors["x"]
+    x: object = child(x, out_shapes=((4,1,8),))
+    return offchip_store(x)
+'''
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("child",),
+        blackbox_names=("child",),
+    )
+    assert rawness["child"] == (True,)
+
+
 def test_compliance_allows_torch_tensor_for_list_int_conversion():
     """``torch.tensor(<list_of_ints>)`` is the sole permitted ``torch.*``
     constructor — required to feed list[int] inputs into ``metadata_gen``

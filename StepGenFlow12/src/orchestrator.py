@@ -599,6 +599,9 @@ _PASS_RULES: dict[str, dict] = {
              "compute. Entry-point on-chip args are already wrapped by the "
              "framework — no `if not isinstance(x, StepTensor): x = "
              "StepTensor(...)` workaround is needed."),
+            ("torch.nn.functional.silu", "use unary_silu(x)"),
+            ("@", "no pytorch matrix multiplication allowed. must use step binary_matmul or binary_map_accum"),
+            ("exec(", "no mid-function execution allowed."),
             #("out_shape_tiled=(1,)",
             # "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
         ],
@@ -878,43 +881,6 @@ def _bind_target(target: ast.AST, src: str,
             _bind_target(elt, src, name_to_source)
 
 
-def _build_name_to_source(func: ast.FunctionDef,
-                           blackbox_set: frozenset[str],
-                           raw_arg_names: frozenset[str]) -> dict[str, str]:
-    """Build the per-function name → source classification map.
-
-    Positional args in ``raw_arg_names`` bind to ``_SRC_RAW_INTERMEDIATE_ARG``
-    instead of ``_SRC_INTERMEDIATE_ARG``; this is how the parent's static
-    call-site classification flows into the child's dataflow check.
-    """
-    name_to_source: dict[str, str] = {}
-    # Positional args other than dims/tensors are intermediate. By default
-    # they're on-chip (the parent contract guarantees that for non-raw args);
-    # those listed in ``raw_arg_names`` were forwarded raw at the call site.
-    # Keyword-only args (out_shapes) are scalars.
-    for arg in func.args.args:
-        if arg.arg in {"dims", "tensors", "self"}:
-            continue
-        if arg.arg in raw_arg_names:
-            name_to_source[arg.arg] = _SRC_RAW_INTERMEDIATE_ARG
-        else:
-            name_to_source[arg.arg] = _SRC_INTERMEDIATE_ARG
-    for arg in func.args.kwonlyargs:
-        name_to_source[arg.arg] = _SRC_NON_TENSOR
-
-    # Bind every assignment target to the source of its RHS.
-    for node in _walk_no_nested_def(func):
-        if isinstance(node, ast.Assign):
-            src = _classify_value(node.value, name_to_source, blackbox_set)
-            for tgt in node.targets:
-                _bind_target(tgt, src, name_to_source)
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            src = _classify_value(node.value, name_to_source, blackbox_set)
-            _bind_target(node.target, src, name_to_source)
-
-    return name_to_source
-
-
 def _extract_call_site_rawness(
     code: str,
     *,
@@ -941,6 +907,13 @@ def _extract_call_site_rawness(
     A child name absent from the returned dict means no call site was found
     in the parent code; callers should fail loudly in that case (the parent's
     compliance gate already requires that each stub it returned be tracked).
+
+    Flow-sensitive: each call site's args are classified against the
+    ``name_to_source`` snapshot in effect *at that call site*, not the
+    function's final post-walk bindings. This matters for patterns like
+    ``k_cache = tensors["k_cache"]; k_cache, _ = child(K, k_cache)`` where
+    a flow-insensitive pass would see the post-call rebind to a blackbox
+    return and wrongly mark the call-site ``k_cache`` arg as on-chip.
     """
     blackbox_set = frozenset(blackbox_names)
     try:
@@ -950,26 +923,64 @@ def _extract_call_site_rawness(
 
     targets = set(child_names)
     found: dict[str, tuple[bool, ...]] = {}
+
+    def _record_target_calls_in(expr: ast.AST,
+                                 name_to_source: dict[str, str]) -> None:
+        """Record arg_is_raw for any target Call found inside ``expr``."""
+        for sub in ast.walk(expr):
+            if not isinstance(sub, ast.Call):
+                continue
+            cname = _call_name(sub)
+            if cname not in targets or cname in found:
+                continue
+            found[cname] = tuple(
+                _classify_value(arg, name_to_source, blackbox_set) in _RAW_SOURCES
+                for arg in sub.args
+            )
+
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef):
             continue
-        # Build the per-function name_to_source the same way the dataflow
-        # check does, so rawness conclusions stay aligned with what the check
-        # would enforce. Feed in the parent's own raw arg names so a forwarded
-        # raw arg stays raw at the grandchild's call site.
-        name_to_source = _build_name_to_source(
-            func, blackbox_set, raw_arg_names=parent_raw_arg_names)
+
+        # Seed bindings from parameters. ``dims``/``tensors``/``self`` are
+        # framework slots, not data; other positional args default to on-chip
+        # except those in ``parent_raw_arg_names`` (forwarded raw from above).
+        # Keyword-only args (``out_shapes``) are scalars.
+        name_to_source: dict[str, str] = {}
+        for arg in func.args.args:
+            if arg.arg in {"dims", "tensors", "self"}:
+                continue
+            name_to_source[arg.arg] = (
+                _SRC_RAW_INTERMEDIATE_ARG
+                if arg.arg in parent_raw_arg_names
+                else _SRC_INTERMEDIATE_ARG
+            )
+        for arg in func.args.kwonlyargs:
+            name_to_source[arg.arg] = _SRC_NON_TENSOR
+
+        # ``_walk_no_nested_def`` is DFS pre-order: each Assign is yielded
+        # before its RHS sub-expressions. We classify any target Call inside
+        # the RHS *before* updating bindings, so a rebinding assignment
+        # (``x, _ = child(..., x, ...)``) sees ``x``'s pre-assign source. The
+        # same Call node yielded later as a standalone visit short-circuits
+        # against ``found`` (Contract-on-first-call semantics).
         for node in _walk_no_nested_def(func):
-            if not isinstance(node, ast.Call):
-                continue
-            cname = _call_name(node)
-            if cname not in targets or cname in found:
-                continue
-            arg_is_raw: list[bool] = []
-            for arg in node.args:
-                src = _classify_value(arg, name_to_source, blackbox_set)
-                arg_is_raw.append(src in _RAW_SOURCES)
-            found[cname] = tuple(arg_is_raw)
+            if isinstance(node, ast.Assign):
+                _record_target_calls_in(node.value, name_to_source)
+                src = _classify_value(node.value, name_to_source, blackbox_set)
+                for tgt in node.targets:
+                    _bind_target(tgt, src, name_to_source)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                _record_target_calls_in(node.value, name_to_source)
+                src = _classify_value(node.value, name_to_source, blackbox_set)
+                _bind_target(node.target, src, name_to_source)
+            elif isinstance(node, ast.Call):
+                cname = _call_name(node)
+                if cname in targets and cname not in found:
+                    found[cname] = tuple(
+                        _classify_value(arg, name_to_source, blackbox_set) in _RAW_SOURCES
+                        for arg in node.args
+                    )
     return found
 
 
@@ -3497,6 +3508,7 @@ async def run_kernel(
             resume_after_pass1_dir=Path(resume_after_pass1) if resume_after_pass1 else None,
             stateless_refactor=stateless_refactor,
             few_shot_examples=few_shot_examples,
+            one_by_one_mode=one_by_one_mode,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3637,6 +3649,7 @@ async def _run_outer_iteration_body(
     resume_after_pass1_dir: Path | None = None,
     stateless_refactor: bool = False,
     few_shot_examples: list | None = None,
+    one_by_one_mode: bool = False,
     _log=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
@@ -3756,7 +3769,7 @@ async def _run_outer_iteration_body(
         _agent_factory.__refactor_judge_agent__ = judge_agents.get("refactor_final")
         _agent_factory.__llm_config__ = llm_config
         _agent_factory.__few_shot_examples__ = few_shot_examples
-        _agent_factory.__one_by_one_mode__ = False # todo fix
+        _agent_factory.__one_by_one_mode__ = one_by_one_mode
 
         log(f"  Planner phase (plan + per-node refactor)")
         print(f"{tag} Planner phase starting")

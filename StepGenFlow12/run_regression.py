@@ -93,6 +93,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "subprocess invocation. Default True (sequential attempts for "
              "non-root nodes when --node-attempts > 1).",
     )
+    p.add_argument(
+        "--one-by-one", action="store_true",
+        help="Forward --one-by-one to each subprocess invocation.",
+    )
     return p.parse_args(argv)
 
 
@@ -191,6 +195,7 @@ async def _amain(args: argparse.Namespace) -> int:
             node_attempts=args.node_attempts,
             non_root_sequential=args.non_root_sequential,
             max_plan_depth=args.max_plan_depth,
+            one_by_one_mode=args.one_by_one,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)

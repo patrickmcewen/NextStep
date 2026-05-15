@@ -370,30 +370,54 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     finally:
         _builtins.isinstance = _saved_isinstance
         torch.Tensor = _saved_torch_tensor
-    # Unwrap StepTensor returns to raw torch.Tensor for downstream consumers
-    # (gold comparison uses ``result.reshape(-1)``, which only works on raw
-    # tensors). A non-root planner node naturally ends with a DSL op that
-    # produces a StepTensor; requiring callers to append offchip_store just
-    # to satisfy this boundary would be artificial — offchip_store is a sink.
-    if isinstance(result, (tuple, list)):
-        unwrapped = type(result)(
-            t.underlying_tensor if isinstance(t, StepTensor) else t for t in result
-        )
-        for i, t in enumerate(unwrapped):
-            assert isinstance(t, torch.Tensor), (
-                f"{entry_point} returned a {type(result).__name__}; element "
-                f"[{i}] must be a torch.Tensor or StepTensor, got "
-                f"{type(result[i]).__name__}"
+    # Validate return type, then unwrap StepTensor → torch.Tensor for downstream
+    # consumers (gold comparison uses ``result.reshape(-1)`` which only works
+    # on raw tensors).
+    #
+    # Root (``tiled_reference``) ends with ``offchip_store`` — a sink that
+    # returns a raw torch.Tensor — so raw returns are legal at the root.
+    #
+    # Non-root planner nodes hand their results to a parent for further DSL
+    # chaining. The parent's pass1 stub wraps any return as a StepTensor (see
+    # ``blackbox_stub.make_stub``), so pass2 composition assumes the real
+    # child does the same. A raw torch.Tensor return silently passes the
+    # correctness gate (values compare equal) but blows up at pass2 the first
+    # time a parent DSL op meets a ``Tensor`` where a ``StepTensor`` is
+    # required — e.g. ``random_offchip_store(k_cache, ...)`` followed by
+    # ``return k_cache, v_cache`` would crash a downstream
+    # ``accum_retile_row`` / ``.underlying_tensor`` access. Enforce here so
+    # pass1 surfaces the type error against the offending child.
+    is_root_entry = (entry_point == "tiled_reference")
+
+    def _check_element(t, *, where: str) -> torch.Tensor:
+        if isinstance(t, StepTensor):
+            return t.underlying_tensor
+        if is_root_entry and isinstance(t, torch.Tensor):
+            return t
+        if is_root_entry:
+            raise AssertionError(
+                f"{entry_point} must return a torch.Tensor or StepTensor "
+                f"(or tuple/list of those for tuple-returning planner nodes), "
+                f"got {type(t).__name__} at {where}"
             )
-        result = unwrapped
-    else:
-        if isinstance(result, StepTensor):
-            result = result.underlying_tensor
-        assert isinstance(result, torch.Tensor), (
-            f"{entry_point} must return a torch.Tensor or StepTensor (or "
-            f"tuple/list of those for tuple-returning planner nodes), "
-            f"got {type(result).__name__}"
+        raise AssertionError(
+            f"{entry_point} (non-root planner node) must return a "
+            f"StepTensor (or tuple/list of StepTensors) at {where}; "
+            f"got {type(t).__name__}. The parent's pass1 stub wraps "
+            f"non-root returns as StepTensor, so pass2 composition will "
+            f"fail when a parent DSL op meets a raw torch.Tensor. If the "
+            f"node wrote into a raw input via random_offchip_store, "
+            f"re-load the updated buffer (e.g. offchip_load) and return "
+            f"the on-chip stream rather than the raw input."
         )
+
+    if isinstance(result, (tuple, list)):
+        result = type(result)(
+            _check_element(t, where=f"element [{i}]")
+            for i, t in enumerate(result)
+        )
+    else:
+        result = _check_element(result, where="single return")
     return result
 
 

@@ -9,6 +9,14 @@ Each proposal is run through a deterministic translator (DSL ->
 `build_graph`) so the analytical timing model can score it; you do not write
 `build_graph` directly.
 
+## DSL value types (step_dsl_types.py)
+
+`StepTensor`, the `Tile`/`DynTile`/`Buffer` stream dtypes, the element-dtype tags (`Float16`, `Float32`, `Uint32`, `Uint64`, `Bool`), and the `MultiHot`/`Index` selectors live here. The ops in `step_dsl.py` assert on these wrappers — reading the type defs first makes the op contracts legible.
+
+```python
+{step_dsl_types_code}
+```
+
 ## DSL surface (step_dsl.py)
 ```python
 {step_dsl_code}

@@ -253,6 +253,7 @@ def _load_pass1_system_prompt(
     child_blackbox_block: str,
     contract_block: str,
     dsl_code: str,
+    dsl_types_code: str,
     few_shot_examples=None,
     one_by_one_mode: bool = False,
 ) -> str:
@@ -263,6 +264,11 @@ def _load_pass1_system_prompt(
     source (caller's responsibility), and the prompt also gets the
     ``_ONE_BY_ONE_ADDENDUM`` injected up front so the model knows the
     constraint before reading the (assertion-heavy) DSL surface.
+
+    ``dsl_types_code`` is the source of ``src/step_dsl_types.py`` — the
+    shared StepTensor/Tile/dtype-tag definitions that the ops module
+    references. Rendered alongside ``dsl_code`` so the LLM sees the types,
+    not just the ops that use them.
     """
     from src.prompts import _format_few_shot_examples
     template_path = _PROMPTS_DIR_AGENTS / _PASS1_SYSTEM_TEMPLATE
@@ -274,6 +280,7 @@ def _load_pass1_system_prompt(
     return template.format(
         contract_block=contract_block,
         dsl_code=dsl_code,
+        dsl_types_code=dsl_types_code,
         few_shot_examples=_format_few_shot_examples(few_shot_examples or []),
         one_by_one_addendum=(_ONE_BY_ONE_ADDENDUM if one_by_one_mode else ""),
         **placeholders,
@@ -495,10 +502,13 @@ def make_pass1_agent(
     register ``step_dsl_1x1`` as ``sys.modules['step_dsl']`` before invoking
     the executor; see ``orchestrator._refactor_one_node_pass1``.
     """
-    from src.prompts import _STEP_DSL_PY, _STEP_DSL_1X1_PY
+    from src.prompts import _STEP_DSL_PY, _STEP_DSL_1X1_PY, _STEP_DSL_TYPES_PY
     dsl_path = _STEP_DSL_1X1_PY if one_by_one_mode else _STEP_DSL_PY
     assert dsl_path.exists(), f"DSL source not found: {dsl_path}"
+    assert _STEP_DSL_TYPES_PY.exists(), (
+        f"DSL types source not found: {_STEP_DSL_TYPES_PY}")
     dsl_code = dsl_path.read_text()
+    dsl_types_code = _STEP_DSL_TYPES_PY.read_text()
 
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
@@ -507,6 +517,7 @@ def make_pass1_agent(
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
         dsl_code=dsl_code,
+        dsl_types_code=dsl_types_code,
         few_shot_examples=few_shot_examples,
         one_by_one_mode=one_by_one_mode,
     )

@@ -32,6 +32,7 @@ _TIMING_PY = _STEP_TL_SRC / "timing_and_emulator" / "timing.py"
 _STEP_DSL_PY = _PROJECT_ROOT / "src" / "step_dsl.py"
 _STEP_DSL_1X1_PY = _PROJECT_ROOT / "src" / "step_dsl_1x1.py"
 _STEP_DSL_MEM_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
+_STEP_DSL_TYPES_PY = _PROJECT_ROOT / "src" / "step_dsl_types.py"
 
 for p in (_STEP_TL_SRC, _STEP_TL_PROTO):
     sp = str(p)
@@ -282,6 +283,10 @@ def build_pass_system_prompt(pass_name: str, few_shot_examples=None) -> str:
         dsl_path = _PROJECT_ROOT / "src" / "step_dsl.py"
         assert dsl_path.exists(), f"step_dsl.py not found: {dsl_path}"
         replacements["dsl_code"] = dsl_path.read_text()
+    if "{dsl_types_code}" in template:
+        assert _STEP_DSL_TYPES_PY.exists(), (
+            f"step_dsl_types.py not found: {_STEP_DSL_TYPES_PY}")
+        replacements["dsl_types_code"] = _STEP_DSL_TYPES_PY.read_text()
     if "{few_shot_examples}" in template:
         replacements["few_shot_examples"] = _format_few_shot_examples(
             few_shot_examples or [])
@@ -325,6 +330,10 @@ def build_autotune_system_prompt(hw_constraints: dict,
     replacements = {}
     if "{step_dsl_code}" in template:
         replacements["step_dsl_code"] = _STEP_DSL_PY.read_text()
+    if "{step_dsl_types_code}" in template:
+        assert _STEP_DSL_TYPES_PY.exists(), (
+            f"step_dsl_types.py not found: {_STEP_DSL_TYPES_PY}")
+        replacements["step_dsl_types_code"] = _STEP_DSL_TYPES_PY.read_text()
     if "{step_dsl_memory_code}" in template:
         replacements["step_dsl_memory_code"] = _STEP_DSL_MEM_PY.read_text()
     if "{timing_code}" in template:

@@ -15,6 +15,14 @@ If the code is already fully in DSL form, output it unchanged.
 
 {contract_block}
 
+## DSL Value Types
+
+The DSL ops below operate on `StepTensor` (a composition wrapper over `torch.Tensor` that carries a stream dtype and a per-stream-dim dynamism mask), `Tile`/`DynTile`/`Buffer` stream dtypes, element-dtype tags (`Float16`, `Float32`, `Uint32`, `Uint64`, `Bool`), and `MultiHot`/`Index` selector dtypes. Every op asserts on these wrappers (e.g. `isinstance(x.stream_dtype, Tile)`), so reading the type definitions is necessary to understand which ops are legal where.
+
+```python
+{dsl_types_code}
+```
+
 ## DSL Functions for This Pass
 
 These functions are pre-imported and available at runtime. Here are their exact implementations:
