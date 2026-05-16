@@ -49,11 +49,22 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable
 
 import yaml
 
 from src.autotune2.contracts import TensorContract, vanilla_contract_for
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PROMPTS_DIR = _PROJECT_ROOT / "prompts"
+_SYSTEM_PROMPT_PATH = _PROMPTS_DIR / "autotune2_system.txt"
+_MEMORY_NOTES_PATH = _PROMPTS_DIR / "dsl_memory_notes.txt"
+_STEP_DSL_MEMORY_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
+_OUTPUT_PROTOCOL_PATHS = {
+    True: _PROMPTS_DIR / "autotune2_output_protocol_leaf.txt",
+    False: _PROMPTS_DIR / "autotune2_output_protocol_parent.txt",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -186,107 +197,32 @@ def render_variant_block(
 # ---------------------------------------------------------------------------
 
 
-_SYSTEM_PROMPT_TEMPLATE = """\
-You are an expert performance engineer producing STeP DSL implementations
-for an accelerator simulator. Your task is **variant generation**: given a
-node from a planner tree, an already-verified pass-1 DSL implementation,
-and (for parents) a library of Pareto-optimal child variants, propose a
-*structurally different* DSL design that explores a new point in the
-(cycles, on_chip_memory) tradeoff space.
-
-The autotuner samples your proposals across many turns and admits each
-Pareto-non-dominated variant to a library used by upstream parents.
-Duplicate designs (identical structure to one already in the library) are
-wasted budget — aim for distinct choices of:
-
-  - tile sizes and parallelism (Parallelize / StaticReassemble factors)
-  - on-chip vs streaming layout (which tensors materialize, which stay
-    in streams)
-  - boundary contracts (reshape + permutation of inputs/outputs)
-  - for parents: which child variant index to pick per child
-
-You will be given a verified pass-1 DSL design as a reference; treat it
-as one valid point in the design space, not as ground truth.
-
-## DSL reference
-
-The full DSL surface lives in ``step_dsl.py``:
-
-```python
-{step_dsl_code}
-```
-
-{output_protocol}
-"""
-
-
-_OUTPUT_PROTOCOL_LEAF = """\
-## Output protocol (leaf node)
-
-Your response MUST contain two fenced blocks in order: a ``yaml`` block
-declaring the boundary contracts this node exposes, followed by a
-``python`` block with the DSL function. Surrounding prose is ignored.
-
-```yaml
-parent_input_contracts:        # on-chip inputs only; empty mapping if none
-  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
-parent_output_contracts:       # every output requires a contract
-  out_0: {reshape: [<vanilla_dim_0>, ...], permutation: [0, 1, ...]}
-```
-
-```python
-def <node_name>(<args>, *, out_shapes):
-    ...
-```
-
-A contract is ``{reshape: <shape>, permutation: [...]}`` applied to the
-vanilla PyTorch tensor (`x_in = x_vanilla.reshape(reshape).permute(*permutation)`).
-RAW args have no input contract (they always arrive vanilla). Identity
-contracts (``reshape == vanilla_shape`` with identity permutation) mean
-"no rearrangement"."""
-
-
-_OUTPUT_PROTOCOL_PARENT = """\
-## Output protocol (parent node)
-
-Your response MUST contain two fenced blocks in order: a ``yaml`` block
-with the three required keys, followed by a ``python`` block with the
-DSL function. Surrounding prose is ignored.
-
-```yaml
-child_picks:                   # exactly one variant index per child
-  attention_block: 3
-parent_input_contracts:        # on-chip inputs only; empty mapping if none
-  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
-parent_output_contracts:       # every output requires a contract
-  out_0: {reshape: [<vanilla_dim_0>, ...], permutation: [0, 1, ...]}
-```
-
-```python
-def <node_name>(<args>, *, out_shapes):
-    ...
-```
-
-A contract is ``{reshape: <shape>, permutation: [...]}`` applied to the
-vanilla PyTorch tensor. RAW args have no input contract. Identity
-contracts (``reshape == vanilla_shape`` with identity permutation) mean
-"no rearrangement". Inside the DSL body, call each child by its natural
-name (e.g. ``attention_block(...)``); the autotuner binds the call to
-the picked variant at exec time. The child variant tables show
-declarative contract metadata only — the variant DSL bodies are hidden."""
-
-
 def build_autotune2_system_prompt(*, is_leaf: bool, dsl_code: str) -> str:
     """Self-contained autotune2 system prompt.
 
-    Shares only the ``step_dsl.py`` body with pass-1 (passed via
-    ``dsl_code``); the framing and output protocol are autotune2-specific.
+    Template body lives in ``prompts/autotune2_system.txt`` with three
+    placeholders: ``{step_dsl_code}`` (the DSL surface, passed in),
+    ``{memory_notes}`` (loaded from ``prompts/dsl_memory_notes.txt`` and
+    shared with ``autotune_memory_system.txt``), and ``{output_protocol}``
+    (loaded from ``prompts/autotune2_output_protocol_{leaf,parent}.txt``
+    based on ``is_leaf``). ``str.replace`` is used instead of ``str.format``
+    because the protocol fragments contain literal YAML braces.
     """
     assert dsl_code, "build_autotune2_system_prompt: dsl_code must be non-empty"
-    protocol = _OUTPUT_PROTOCOL_LEAF if is_leaf else _OUTPUT_PROTOCOL_PARENT
-    return _SYSTEM_PROMPT_TEMPLATE.format(
-        step_dsl_code=dsl_code,
-        output_protocol=protocol,
+    protocol_path = _OUTPUT_PROTOCOL_PATHS[is_leaf]
+    for path in (_SYSTEM_PROMPT_PATH, protocol_path,
+                 _MEMORY_NOTES_PATH, _STEP_DSL_MEMORY_PY):
+        assert path.exists(), (
+            f"build_autotune2_system_prompt: required file not found at {path}"
+        )
+    memory_notes = _MEMORY_NOTES_PATH.read_text().replace(
+        "{step_dsl_memory_code}", _STEP_DSL_MEMORY_PY.read_text()
+    ).rstrip()
+    return (
+        _SYSTEM_PROMPT_PATH.read_text()
+        .replace("{step_dsl_code}", dsl_code)
+        .replace("{memory_notes}", memory_notes)
+        .replace("{output_protocol}", protocol_path.read_text().rstrip())
     )
 
 

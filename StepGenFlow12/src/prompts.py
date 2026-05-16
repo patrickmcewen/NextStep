@@ -336,6 +336,13 @@ def build_autotune_system_prompt(hw_constraints: dict,
         replacements["step_dsl_types_code"] = _STEP_DSL_TYPES_PY.read_text()
     if "{step_dsl_memory_code}" in template:
         replacements["step_dsl_memory_code"] = _STEP_DSL_MEM_PY.read_text()
+    if "{memory_notes}" in template:
+        memory_notes_path = _PROMPTS_DIR / "dsl_memory_notes.txt"
+        assert memory_notes_path.exists(), (
+            f"dsl_memory_notes.txt not found: {memory_notes_path}")
+        replacements["memory_notes"] = memory_notes_path.read_text().replace(
+            "{step_dsl_memory_code}", _STEP_DSL_MEM_PY.read_text()
+        ).rstrip()
     if "{timing_code}" in template:
         replacements["timing_code"] = _TIMING_PY.read_text()
     if "{hw_constraints}" in template:
