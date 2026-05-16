@@ -152,15 +152,17 @@ def main():
              "is the existing behavior.",
     )
     parser.add_argument(
-        "--one-by-one", action="store_true",
-        help="Run pass-1 against step_dsl_1x1.py instead of step_dsl.py. The "
-             "1x1 variant adds assertions pinning every tile to (1, 1) — loads "
-             "must use tile_row=tile_col=1, accum_retile_*/restream are "
-             "forbidden, retile_streamify only accepts chunk=1, and the final "
-             "offchip_store input must already be 1x1. All structural variety "
-             "lives at the stream level so a downstream autotuner can promote "
-             "stream dims into tiles via local rewrites. Requires --no-plan "
-             "to be OFF and is incompatible with --bundle-dir.",
+        "--max-tile", type=int, default=None, metavar="N",
+        help="Run pass-1 against step_dsl_max_tile.py with both MAX_TILE_ROW "
+             "and MAX_TILE_COL set to N. Every load asserts tile_row,tile_col "
+             "<= N; tile-growing reshapes (accum_retile_row/col, restream) "
+             "assert the output tile stays <= (N, N); the final offchip_store "
+             "input tile must satisfy the same bound. N=1 recovers strict 1x1 "
+             "mode (everything at the stream level). Larger N gives the model "
+             "more room while still letting the autotuner pick the final "
+             "tile size via accum_retile_*. Off by default (uses stock "
+             "step_dsl.py). Requires --no-plan to be OFF and is incompatible "
+             "with --bundle-dir.",
     )
     args = parser.parse_args()
 
@@ -215,7 +217,7 @@ def main():
         resume_after_pass1=args.resume_after_pass1,
         stateless_refactor=args.stateless_refactor,
         judge_enabled=not args.no_judge,
-        one_by_one_mode=args.one_by_one,
+        max_tile=args.max_tile,
     ))
 
     if result["success"]:

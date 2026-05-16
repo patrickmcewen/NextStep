@@ -94,8 +94,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "non-root nodes when --node-attempts > 1).",
     )
     p.add_argument(
-        "--one-by-one", action="store_true",
-        help="Forward --one-by-one to each subprocess invocation.",
+        "--max-tile", type=int, default=None, metavar="N",
+        help="Forward --max-tile N to each subprocess invocation. N=1 recovers "
+             "strict 1x1 mode; larger N caps each tile dim at N. Off by default.",
     )
     return p.parse_args(argv)
 
@@ -195,7 +196,7 @@ async def _amain(args: argparse.Namespace) -> int:
             node_attempts=args.node_attempts,
             non_root_sequential=args.non_root_sequential,
             max_plan_depth=args.max_plan_depth,
-            one_by_one_mode=args.one_by_one,
+            max_tile=args.max_tile,
         )
         exit_code, duration = await run_subprocess(cmd, log_path, cwd=REPO_ROOT)
         outer_passed, outer_total = read_per_outer(job_ckpt_dir)
