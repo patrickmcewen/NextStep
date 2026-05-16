@@ -256,6 +256,29 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         Path(args.checkpoint_dir).resolve()
         if args.checkpoint_dir else None
     )
+
+    # Derive --kernel / --preset from the source checkpoint's config.json
+    # (the same one _load_pass1_state reads for `dims`) when not provided
+    # on the CLI. The original run.py invocation stamps both fields, so
+    # they are authoritative for this checkpoint.
+    if args.kernel is None or args.preset is None:
+        src_config_path = src_outer_dir.parent.parent / "config.json"
+        assert src_config_path.exists(), (
+            f"cannot default --kernel/--preset: expected config.json at "
+            f"{src_config_path}"
+        )
+        src_config = json.loads(src_config_path.read_text())
+        if args.kernel is None:
+            assert "kernel" in src_config, (
+                f"{src_config_path}: missing 'kernel' — pass --kernel"
+            )
+            args.kernel = src_config["kernel"]
+        if args.preset is None:
+            assert "preset" in src_config, (
+                f"{src_config_path}: missing 'preset' — pass --preset"
+            )
+            args.preset = src_config["preset"]
+
     # Snapshot the source checkpoint into a fresh timestamped dir; all
     # autotune2 artifacts (per-turn logs, variants.py, rust _work_dir,
     # summary JSON) are written under this copy so the original
@@ -347,17 +370,21 @@ def main() -> int:
              "from a previous run.py invocation).",
     )
     parser.add_argument(
-        "--kernel", required=True,
-        help="Kernel name (StepDB) — needed for rust simulator wiring.",
+        "--kernel", default=None,
+        help="Kernel name (StepDB) — needed for rust simulator wiring. "
+             "Defaults to the 'kernel' field in <outer_dir>/../config.json.",
     )
     parser.add_argument(
-        "--preset", required=True,
-        help="Preset name (StepDB) — needed for rust simulator wiring.",
+        "--preset", default=None,
+        help="Preset name (StepDB) — needed for rust simulator wiring. "
+             "Defaults to the 'preset' field in <outer_dir>/../config.json.",
     )
     parser.add_argument(
-        "--autotune-config", required=True,
+        "--autotune-config",
+        default="/workspace/NextStep/StepGenFlow12/autotune_config_2.json",
         help="Path to autotune_config.json carrying the 'hw_config' block "
-             "(same JSON run.py's --autotune-config consumes).",
+             "(same JSON run.py's --autotune-config consumes). Default: "
+             "/workspace/NextStep/StepGenFlow12/autotune_config_2.json.",
     )
     parser.add_argument(
         "--model", default="gpt-oss-120b",
