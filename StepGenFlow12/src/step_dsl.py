@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 
 # Shared type wrappers live in src/step_dsl_types so that step_dsl.py and
-# step_dsl_1x1.py expose the *same* class objects. tools.py, blackbox_stub.py,
+# step_dsl_max_tile.py expose the *same* class objects. tools.py, blackbox_stub.py,
 # and autotune2/stubs.py all import StepTensor/Tile from src.step_dsl
 # statically — if the variants defined their own classes, those imports would
 # bind to one class while the active DSL module (chosen via sys.modules

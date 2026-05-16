@@ -29,63 +29,68 @@ _PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
 _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
 
 
-# Addendum injected into the pass-1 system prompt when 1x1-tile mode is on.
-# Mirrors the assertion surface of src/step_dsl_1x1.py so the model knows up
-# front which knobs it cannot use, instead of finding out by assertion failure.
-_ONE_BY_ONE_ADDENDUM = """
-## 1x1-TILE MODE — READ THIS BEFORE ANY DSL CALL
+# Addendum injected into the pass-1 system prompt when max-tile mode is on.
+# Mirrors the assertion surface of src/step_dsl_max_tile.py so the model knows
+# up front which dimensions are bounded, instead of finding out by assertion
+# failure. The ``{max_tile}`` placeholders are filled with the active bound.
+_MAX_TILE_ADDENDUM_TEMPLATE = """
+## MAX-TILE MODE (max = {max_tile} per dim) — READ THIS BEFORE ANY DSL CALL
 
-This pass runs against ``step_dsl_1x1.py`` rather than ``step_dsl.py``. The two
-files are identical except that ``step_dsl_1x1.py`` adds assertions pinning
-every tile to shape ``(1, 1)``. The intent: keep all structural variety at the
-**stream** level so a downstream autotuner can promote stream dims into tiles
-via local rewrites without restructuring your graph. Violating any rule below
-fails the run loud with an ``AssertionError``.
+This pass runs against ``step_dsl_max_tile.py`` rather than ``step_dsl.py``.
+The two files are identical except that ``step_dsl_max_tile.py`` adds
+assertions capping every tile dim at ``MAX_TILE_ROW = {max_tile}`` and
+``MAX_TILE_COL = {max_tile}``. The intent: keep tile sizes small so a
+downstream autotuner can absorb stream dims into tiles via local rewrites
+without restructuring your graph. Violating any bound fails loud with an
+``AssertionError``.
 
-**Loads — must use ``tile_row=1, tile_col=1``:**
+**Loads — ``tile_row <= {max_tile}`` and ``tile_col <= {max_tile}``:**
 ``offchip_load``, ``offchip_load_ref``, ``dyn_offchip_load``,
-``random_offchip_load``. Express every other dimension via ``out_shape_tiled``
-(static loads) or ``tensor_shape_tiled`` (``dyn_offchip_load``). For example,
-a ``(M, N)`` weight that you previously loaded as one big tile with
-``out_shape_tiled=(1,)`` now becomes ``out_shape_tiled=(M, N)`` with
-``tile_row=tile_col=1``.
+``random_offchip_load``. Push every dimension beyond the cap into
+``out_shape_tiled`` (or ``tensor_shape_tiled`` for ``dyn_offchip_load``). For
+example, a ``(M, N)`` weight that you previously loaded as one big tile with
+``out_shape_tiled=(1,)`` becomes ``out_shape_tiled=(M // {max_tile}, N // {max_tile})``
+with ``tile_row=tile_col={max_tile}`` (or anything smaller).
 
-**Stores — input tile must already be ``(1, 1)``:**
-``offchip_store``, ``random_offchip_store``. Do not try to merge a stream
-dim into the tile right before the store; finish the kernel at 1x1.
+**Stores — input tile must satisfy ``(tile_r, tile_c) <= ({max_tile}, {max_tile})``:**
+``offchip_store``, ``random_offchip_store``. Do not merge stream dims past
+the bound right before the store.
 
-**Forbidden ops (assert False in 1x1 mode):**
-``accum_retile_row``, ``accum_retile_col``, ``restream``. These would grow the
-tile past 1x1. If you need to reduce a stream dim, use ``accum_add`` /
-``accum_max`` / ``accum_mul``. If you need a layout permutation, use
-``bufferize`` + ``streamify``.
+**Tile-growing reshapes — output tile dim must stay within bounds:**
+``accum_retile_row`` (asserts ``final tile_row <= {max_tile}``),
+``accum_retile_col`` (asserts ``final tile_col <= {max_tile}``),
+``restream`` (asserts ``out_shape_tiled[-2:] within ({max_tile}, {max_tile})``).
+If a reduction would grow a tile past the bound, either reduce ``rank``,
+shrink the upstream stream dim, or use a non-tile-growing reduction
+(``accum_add`` / ``accum_max`` / ``accum_mul``) which leaves the tile shape
+alone.
 
-**``retile_streamify`` — only the no-op form (``chunk=1``) is permitted.**
-At 1x1 tiles there is no tile dim left to split. To split a stream dim use
-``reshape_stream`` directly.
+**``retile_streamify`` — unconstrained.** It can only shrink a tile dim, so
+the output stays within bounds whenever the input does.
 
-**Matmul at 1x1.** ``binary_matmul(a, b)`` on ``(1,1)`` tiles is just a scalar
-multiplication; the inner-product dimension you used to get from ``tile_col``
-must now come from a stream dim reduced with ``accum_add`` (or expressed in
-one shot via ``binary_map_accum`` with ``rank=`` set to the reduction
-dimension's stream rank). The seed_kernels GEMM pattern — load A and B both
-with ``out_shape_tiled=(M//1, N//1, K//1) == (M, N, K)`` and appropriate
-broadcast strides, then ``binary_map_accum(A, B, rank=1)`` — is the canonical
-1x1 shape.
+**Matmul at small tiles.** ``binary_matmul`` on small tiles gives a small
+output tile (output tile = ``(a_tile_r, b_tile_c)``); the cross-tile
+reduction over the K dimension must come from a stream dim reduced with
+``accum_add`` (or in one shot via ``binary_map_accum`` with ``rank=`` set to
+the K stream rank). The seed_kernels GEMM pattern — load A and B with
+matched K stream dims and broadcast strides, then ``binary_map_accum(A, B,
+rank=1)`` — is the canonical max-tile shape; pick any tile sizes you like
+within the cap.
 
-**Reshape ops you should reach for.** ``reshape_stream`` to split / pad stream
-dims, ``flatten`` to merge them, ``promote`` / ``promote_outer`` to insert a
-singleton, ``expand_ref`` / ``repeat_static`` / ``repeat_ref`` to broadcast
-over a stream dim, ``parallelize`` / ``static_reassemble`` to interleave.
-These are all stream-level and tile-shape invariant; rely on them.
+**Reshape ops you should reach for.** ``reshape_stream`` to split / pad
+stream dims, ``flatten`` to merge them, ``promote`` / ``promote_outer`` to
+insert a singleton, ``expand_ref`` / ``repeat_static`` / ``repeat_ref`` to
+broadcast over a stream dim, ``parallelize`` / ``static_reassemble`` to
+interleave. These are all stream-level and unaffected by tile bounds; rely
+on them.
 
-**Why 1x1.** Mixing tile and stream representations forces the
+**Why this constraint.** Mixing tile and stream representations forces the
 implementation to bake tile choices into the graph structure (different
 ``retile_streamify`` placements, different matmul forms for tiled vs
-single-tile inputs). Pinning the tile to 1x1 collapses that decision space
-and lets the autotuner be the only thing that picks tile sizes — by
-*absorbing* stream dims into tiles via ``accum_retile_*``, which is a local
-rewrite that does not require restructuring the kernel.
+single-tile inputs). Capping the tile collapses that decision space and lets
+the autotuner be the thing that picks tile sizes — by *absorbing* stream
+dims into tiles via ``accum_retile_*``, which is a local rewrite that does
+not require restructuring the kernel.
 """
 
 
@@ -255,15 +260,17 @@ def _load_pass1_system_prompt(
     dsl_code: str,
     dsl_types_code: str,
     few_shot_examples=None,
-    one_by_one_mode: bool = False,
+    max_tile: int | None = None,
 ) -> str:
     """Render the Pass-1 system prompt template with caller-supplied blocks.
 
-    ``one_by_one_mode`` selects the 1x1-tile DSL variant: when True, the
-    rendered ``dsl_code`` block should already be the ``step_dsl_1x1.py``
-    source (caller's responsibility), and the prompt also gets the
-    ``_ONE_BY_ONE_ADDENDUM`` injected up front so the model knows the
-    constraint before reading the (assertion-heavy) DSL surface.
+    ``max_tile`` selects the max-tile DSL variant: when not None, the rendered
+    ``dsl_code`` block should already be the ``step_dsl_max_tile.py`` source
+    with its ``MAX_TILE_ROW`` / ``MAX_TILE_COL`` constants substituted to the
+    chosen bound (caller's responsibility — see ``make_pass1_agent``). The
+    prompt also gets the matching addendum injected up front so the model
+    sees the bound stated explicitly before reading the assertion-heavy DSL.
+    ``max_tile = 1`` recovers the strict 1x1 behavior; ``None`` means no bound.
 
     ``dsl_types_code`` is the source of ``src/step_dsl_types.py`` — the
     shared StepTensor/Tile/dtype-tag definitions that the ops module
@@ -277,12 +284,16 @@ def _load_pass1_system_prompt(
     placeholders = _pass1_leaf_placeholders(
         is_leaf=is_leaf, child_blackbox_block=child_blackbox_block
     )
+    addendum = (
+        _MAX_TILE_ADDENDUM_TEMPLATE.format(max_tile=int(max_tile))
+        if max_tile is not None else ""
+    )
     return template.format(
         contract_block=contract_block,
         dsl_code=dsl_code,
         dsl_types_code=dsl_types_code,
         few_shot_examples=_format_few_shot_examples(few_shot_examples or []),
-        one_by_one_addendum=(_ONE_BY_ONE_ADDENDUM if one_by_one_mode else ""),
+        max_tile_addendum=addendum,
         **placeholders,
     )
 
@@ -482,7 +493,7 @@ def make_pass1_agent(
     child_blackbox_block: str,
     contract_block: str,
     few_shot_examples=None,
-    one_by_one_mode: bool = False,
+    max_tile: int | None = None,
 ) -> Agent:
     """Create a Pass-1 refactor agent for a single planner node.
 
@@ -496,18 +507,38 @@ def make_pass1_agent(
     for the root node).
     ``few_shot_examples`` is an optional list of resolved example dicts (see
     ``resolve_few_shot_examples``).
-    ``one_by_one_mode`` runs pass-1 against ``step_dsl_1x1.py`` (the variant
-    that pins every tile to 1x1 via assertions) and injects the matching
-    addendum at the top of the prompt. Callers that enable this **must** also
-    register ``step_dsl_1x1`` as ``sys.modules['step_dsl']`` before invoking
-    the executor; see ``orchestrator._refactor_one_node_pass1``.
+    ``max_tile`` (when set) runs pass-1 against ``step_dsl_max_tile.py`` with
+    its ``MAX_TILE_ROW`` / ``MAX_TILE_COL`` substituted to this value in the
+    displayed source, and injects the matching addendum. Callers that enable
+    this **must** also assign the constants on the live module and register
+    it as ``sys.modules['step_dsl']`` before invoking the executor; see
+    ``orchestrator._refactor_one_node_pass1``. ``max_tile = 1`` recovers the
+    strict 1x1 behavior; ``None`` (default) uses stock ``step_dsl.py``.
     """
-    from src.prompts import _STEP_DSL_PY, _STEP_DSL_1X1_PY, _STEP_DSL_TYPES_PY
-    dsl_path = _STEP_DSL_1X1_PY if one_by_one_mode else _STEP_DSL_PY
+    from src.prompts import _STEP_DSL_PY, _STEP_DSL_MAX_TILE_PY, _STEP_DSL_TYPES_PY
+    if max_tile is not None:
+        assert isinstance(max_tile, int) and max_tile >= 1, (
+            f"max_tile must be a positive int, got {max_tile!r}")
+        dsl_path = _STEP_DSL_MAX_TILE_PY
+    else:
+        dsl_path = _STEP_DSL_PY
     assert dsl_path.exists(), f"DSL source not found: {dsl_path}"
     assert _STEP_DSL_TYPES_PY.exists(), (
         f"DSL types source not found: {_STEP_DSL_TYPES_PY}")
     dsl_code = dsl_path.read_text()
+    if max_tile is not None:
+        # Substitute the live MAX_TILE_ROW / MAX_TILE_COL values into the
+        # source the LLM sees, so what it reads is what the runtime enforces.
+        # Use rstrip+re-add of the trailing newline to make replacement robust
+        # against future formatting drift.
+        dsl_code = dsl_code.replace(
+            "MAX_TILE_ROW = 1\n", f"MAX_TILE_ROW = {int(max_tile)}\n", 1
+        ).replace(
+            "MAX_TILE_COL = 1\n", f"MAX_TILE_COL = {int(max_tile)}\n", 1
+        )
+        assert f"MAX_TILE_ROW = {int(max_tile)}" in dsl_code, (
+            "max_tile substitution failed: literal 'MAX_TILE_ROW = 1\\n' not "
+            "found in step_dsl_max_tile.py source. Did the default change?")
     dsl_types_code = _STEP_DSL_TYPES_PY.read_text()
 
     client = make_client(llm_config)
@@ -519,7 +550,7 @@ def make_pass1_agent(
         dsl_code=dsl_code,
         dsl_types_code=dsl_types_code,
         few_shot_examples=few_shot_examples,
-        one_by_one_mode=one_by_one_mode,
+        max_tile=max_tile,
     )
     return Agent(
         name="StepPass_pass1",

@@ -1,6 +1,6 @@
 """Shared type wrappers for the STeP DSL variants.
 
-`step_dsl.py` (general) and `step_dsl_1x1.py` (tile-pinned) both define ops
+`step_dsl.py` (general) and `step_dsl_max_tile.py` (tile-bounded) both define ops
 that operate on the same value types: element-dtype tags, tile/dyn-tile/buffer
 stream dtypes, the guarded shape view, and the `StepTensor` wrapper. Hosting
 those definitions here — and importing them into each ops module — guarantees
@@ -12,7 +12,7 @@ rebinds `sys.modules["step_dsl"]` between variants, statically-imported names
 do *not* re-resolve, so producing a `StepTensor` in one helper and checking
 `isinstance(x, StepTensor)` in another would silently see two different
 classes. Centralizing the wrapper here keeps `step_dsl.StepTensor is
-step_dsl_1x1.StepTensor`.
+step_dsl_max_tile.StepTensor`.
 
 Mirrors the IR's stream-dtype taxonomy (step_py/datatype.py) at the DSL
 eager-runtime layer so that ops can gate on element type / tile kind the

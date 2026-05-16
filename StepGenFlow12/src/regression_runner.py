@@ -54,7 +54,7 @@ def build_run_py_command(
     node_attempts: int | None = None,
     non_root_sequential: bool = True,
     max_plan_depth: int | None = None,
-    one_by_one_mode: bool = False,
+    max_tile: int | None = None,
 ) -> list[str]:
     cmd = [python_exe, str(run_py_path), job.kernel, job.preset, "--model", model]
     if config is not None:
@@ -90,8 +90,8 @@ def build_run_py_command(
     if max_plan_depth is not None:
         cmd += ["--max-plan-depth", str(max_plan_depth)]
     cmd += ["--non-root-sequential"] if non_root_sequential else ["--no-non-root-sequential"]
-    if one_by_one_mode:
-        cmd += ["--one-by-one"]
+    if max_tile is not None:
+        cmd += ["--max-tile", str(int(max_tile))]
     return cmd
 
 

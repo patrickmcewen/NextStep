@@ -2373,24 +2373,28 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         "wrap your factory so it sets agent_factory.__llm_config__ = llm_config")
     is_leaf = not children_signatures
     few_shot_examples = getattr(agent_factory, "__few_shot_examples__", None)
-    one_by_one_mode = bool(getattr(agent_factory, "__one_by_one_mode__", False))
-    if one_by_one_mode:
+    max_tile = getattr(agent_factory, "__max_tile__", None)
+    if max_tile is not None:
         # Mirror the bundle-mode pattern at orchestrator.py:3305: re-register
         # ``step_dsl`` so the exec scaffold's ``from step_dsl import *`` resolves
-        # to the 1x1 variant. Done eagerly here (idempotent if already pointing
-        # at step_dsl_1x1) so every executor invocation in this pass-1 walk sees
-        # the assertion-heavy module, including the recursive child walks.
-        import importlib
-        from src import step_dsl_1x1 as _step_dsl_1x1_mod
-        if sys.modules.get("step_dsl") is not _step_dsl_1x1_mod:
-            sys.modules["step_dsl"] = _step_dsl_1x1_mod
+        # to the max-tile variant, AND assign the live MAX_TILE_ROW/COL bounds
+        # before any pass-1 executor invocation runs. Idempotent if already
+        # pointing at step_dsl_max_tile with the same bounds.
+        assert isinstance(max_tile, int) and max_tile >= 1, (
+            f"agent_factory.__max_tile__ must be a positive int or None, "
+            f"got {max_tile!r}")
+        from src import step_dsl_max_tile as _step_dsl_max_tile_mod
+        _step_dsl_max_tile_mod.MAX_TILE_ROW = int(max_tile)
+        _step_dsl_max_tile_mod.MAX_TILE_COL = int(max_tile)
+        if sys.modules.get("step_dsl") is not _step_dsl_max_tile_mod:
+            sys.modules["step_dsl"] = _step_dsl_max_tile_mod
     agent = make_pass1_agent(
         llm_config,
         is_leaf=is_leaf,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
         few_shot_examples=few_shot_examples,
-        one_by_one_mode=one_by_one_mode,
+        max_tile=max_tile,
     )
     judge_agent = make_pass1_judge_agent(
         llm_config,
@@ -3261,7 +3265,7 @@ async def run_kernel(
     resume_after_pass1: str | None = None,
     stateless_refactor: bool = False,
     judge_enabled: bool = True,
-    one_by_one_mode: bool = False,
+    max_tile: int | None = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -3296,19 +3300,21 @@ async def run_kernel(
             "plan_enabled=True is incompatible with --resume-from"
         )
 
-    if one_by_one_mode:
-        # 1x1 mode flips pass-1's DSL source to step_dsl_1x1.py and registers it
-        # as sys.modules["step_dsl"]; both hooks live exclusively in the planner
-        # pass-1 path (orchestrator._refactor_one_node_pass1), so it's only
-        # meaningful when plan_enabled is on. Bundle mode runs its own DSL
-        # surface and would silently overwrite the registration.
+    if max_tile is not None:
+        # max-tile mode flips pass-1's DSL source to step_dsl_max_tile.py and
+        # registers it as sys.modules["step_dsl"]; both hooks live exclusively
+        # in the planner pass-1 path (orchestrator._refactor_one_node_pass1),
+        # so it's only meaningful when plan_enabled is on. Bundle mode runs
+        # its own DSL surface and would silently overwrite the registration.
+        assert isinstance(max_tile, int) and max_tile >= 1, (
+            f"--max-tile must be a positive int, got {max_tile!r}")
         assert plan_enabled, (
-            "one_by_one_mode=True requires plan_enabled=True (the 1x1 hook "
-            "lives in the planner pass-1 path)."
+            "--max-tile requires plan_enabled=True (the max-tile hook lives "
+            "in the planner pass-1 path)."
         )
         assert bundle_dir is None, (
-            "one_by_one_mode=True is incompatible with --bundle-dir (bundle "
-            "mode registers its own `step_dsl` module)."
+            "--max-tile is incompatible with --bundle-dir (bundle mode "
+            "registers its own `step_dsl` module)."
         )
 
     # --- Step 1: bundle-dir path resolution ---
@@ -3508,7 +3514,7 @@ async def run_kernel(
             resume_after_pass1_dir=Path(resume_after_pass1) if resume_after_pass1 else None,
             stateless_refactor=stateless_refactor,
             few_shot_examples=few_shot_examples,
-            one_by_one_mode=one_by_one_mode,
+            max_tile=max_tile,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3649,7 +3655,7 @@ async def _run_outer_iteration_body(
     resume_after_pass1_dir: Path | None = None,
     stateless_refactor: bool = False,
     few_shot_examples: list | None = None,
-    one_by_one_mode: bool = False,
+    max_tile: int | None = None,
     _log=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
@@ -3769,7 +3775,7 @@ async def _run_outer_iteration_body(
         _agent_factory.__refactor_judge_agent__ = judge_agents.get("refactor_final")
         _agent_factory.__llm_config__ = llm_config
         _agent_factory.__few_shot_examples__ = few_shot_examples
-        _agent_factory.__one_by_one_mode__ = one_by_one_mode
+        _agent_factory.__max_tile__ = max_tile
 
         log(f"  Planner phase (plan + per-node refactor)")
         print(f"{tag} Planner phase starting")

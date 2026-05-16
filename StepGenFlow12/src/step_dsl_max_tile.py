@@ -1,24 +1,26 @@
-"""STeP DSL — 1x1-tile variant.
+"""STeP DSL — max-tile variant.
 
 Mirrors ``step_dsl.py`` exactly, except that tile-shape-bearing ops carry
-extra assertions pinning every tile to shape (1, 1). All structural variety
-must therefore live at the **stream** level: this lets a downstream
-autotuner promote stream dims into tiles via local rewrites (insert
-``accum_retile_*`` near consumers) without restructuring the graph the
-implementer wrote.
+extra assertions capping every tile dim at ``MAX_TILE_ROW`` / ``MAX_TILE_COL``
+(set near the top of this file; default 1, i.e. strict 1x1 mode). At
+``MAX_TILE_ROW == MAX_TILE_COL == 1`` this collapses to the original 1x1
+variant; larger caps relax progressively. The orchestrator overwrites the
+two constants at pass-1 setup time (see ``_refactor_one_node_pass1``).
 
-Concretely the 1x1-only assertions are:
+Concretely the bounds are:
 
-  Producers — ``tile_row == tile_col == 1``:
+  Producers — ``tile_row <= MAX_TILE_ROW`` and ``tile_col <= MAX_TILE_COL``:
     offchip_load, offchip_load_ref, dyn_offchip_load, random_offchip_load
 
-  Stores — input tile shape == (1, 1):
+  Stores — input tile ``(tile_r, tile_c) <= (MAX_TILE_ROW, MAX_TILE_COL)``:
     offchip_store, random_offchip_store
 
-  Tile-modifying reshapes — forbidden (would grow tile past 1x1):
-    accum_retile_row, accum_retile_col, restream
+  Tile-growing reshapes — output tile dim must stay within bounds:
+    accum_retile_row  (final tile_r <= MAX_TILE_ROW)
+    accum_retile_col  (final tile_c <= MAX_TILE_COL)
+    restream          (out_shape_tiled[-2:] <= (MAX_TILE_ROW, MAX_TILE_COL))
 
-  retile_streamify — permitted only when chunk == 1 (a no-op at 1x1 tiles).
+  retile_streamify — unconstrained (it only shrinks an already-in-bounds tile).
 
 All other ops are byte-for-byte identical to ``step_dsl.py``.
 
@@ -41,8 +43,19 @@ import torch
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Max-tile bounds. Asserted against by every load / store / tile-growing
+# reshape below. The orchestrator overwrites these to the user-supplied
+# ``--max-tile N`` value before pass-1 runs; the prompt rendering substitutes
+# the live values into the source it shows the LLM so what the model reads
+# is what the runtime enforces. Default 1 = strict 1x1 mode.
+# ---------------------------------------------------------------------------
+MAX_TILE_ROW = 1
+MAX_TILE_COL = 1
+
+
 # Shared type wrappers live in src/step_dsl_types so that step_dsl.py and
-# step_dsl_1x1.py expose the *same* class objects. tools.py, blackbox_stub.py,
+# step_dsl_max_tile.py expose the *same* class objects. tools.py, blackbox_stub.py,
 # and autotune2/stubs.py all import StepTensor/Tile from src.step_dsl
 # statically — if the variants defined their own classes, those imports would
 # bind to one class while the active DSL module (chosen via sys.modules
@@ -125,12 +138,12 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert tile_row == 1 and tile_col == 1, (
-        f"offchip_load: 1x1-mode requires tile_row == tile_col == 1, got "
-        f"tile_row={tile_row}, tile_col={tile_col}. In 1x1 mode every load "
-        f"emits 1x1 tiles so all shape structure lives at the stream level — "
-        f"set out_shape_tiled to enumerate every tile position instead of "
-        f"making the tile bigger."
+    assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
+        f"offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} and "
+        f"tile_col <= {MAX_TILE_COL}, got tile_row={tile_row}, tile_col={tile_col}. "
+        f"Make the tile smaller (and push the rest of the structure into "
+        f"out_shape_tiled) so the downstream autotuner has room to absorb "
+        f"stream dims into tiles via accum_retile_*."
     )
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     # out_shape_tiled enumerates the stream positions to read; an empty tuple
@@ -194,9 +207,10 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
 def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_dispatch=1):
     _assert_raw(underlying, "dyn_offchip_load", "underlying")
     assert par_dispatch >= 1, f"dyn_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert tile_row == 1 and tile_col == 1, (
-        f"dyn_offchip_load: 1x1-mode requires tile_row == tile_col == 1, got "
-        f"tile_row={tile_row}, tile_col={tile_col}."
+    assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
+        f"dyn_offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
+        f"and tile_col <= {MAX_TILE_COL}, got tile_row={tile_row}, "
+        f"tile_col={tile_col}."
     )
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"dyn_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
@@ -229,9 +243,10 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     _assert_raw(underlying, "offchip_load_ref", "underlying")
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
-    assert tile_row == 1 and tile_col == 1, (
-        f"offchip_load_ref: 1x1-mode requires tile_row == tile_col == 1, got "
-        f"tile_row={tile_row}, tile_col={tile_col}."
+    assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
+        f"offchip_load_ref: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
+        f"and tile_col <= {MAX_TILE_COL}, got tile_row={tile_row}, "
+        f"tile_col={tile_col}."
     )
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
@@ -382,9 +397,10 @@ def filter_last_tile(seq_len):
 def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     _assert_raw(underlying, "random_offchip_load", "underlying")
     assert par_dispatch >= 1, f"random_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert tile_row == 1 and tile_col == 1, (
-        f"random_offchip_load: 1x1-mode requires tile_row == tile_col == 1, got "
-        f"tile_row={tile_row}, tile_col={tile_col}."
+    assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
+        f"random_offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
+        f"and tile_col <= {MAX_TILE_COL}, got tile_row={tile_row}, "
+        f"tile_col={tile_col}."
     )
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
@@ -761,19 +777,27 @@ def accum_retile_row(x, rank=1, *, compute_bw=1):
     which the IR doesn't allow on a Tile (would need DynTile, and there's
     no clean DSL path to that).
     """
-    assert False, (
-        "accum_retile_row: forbidden in 1x1-mode — would grow tile_row past 1. "
-        "All tile-promotion belongs to the downstream autotuner pass; the pass1 "
-        "implementer must keep tiles at 1x1 and express structure as stream dims. "
-        "If you need to reduce a stream dim, use accum_add/accum_max/accum_mul; "
-        "if you need to flatten or split a stream dim, use flatten/reshape_stream."
-    )
     assert compute_bw >= 1, f"accum_retile_row: compute_bw must be >= 1, got {compute_bw}"
     sd, mask, orig = _step_meta(x, "accum_retile_row")
     _assert_tile_kind(sd, "accum_retile_row")
     assert rank > 0, f"accum_retile_row: rank must be > 0, got {rank}"
     assert rank <= len(mask), (
         f"accum_retile_row: rank {rank} exceeds input stream rank {len(mask)}"
+    )
+    # Max-tile bound check: the absorbed innermost `rank` stream dims will
+    # multiply tile_r. Reject early if the resulting tile_r would exceed
+    # MAX_TILE_ROW so the implementer sees a clear error rather than a
+    # downstream simulator panic.
+    _absorbed_shape = tuple(int(d) for d in x.underlying_tensor.shape[-2 - rank:-2])
+    _final_tile_r = int(sd.shape[0])
+    for _d in _absorbed_shape:
+        _final_tile_r *= _d
+    assert _final_tile_r <= MAX_TILE_ROW, (
+        f"accum_retile_row: max-tile mode requires output tile_row "
+        f"<= {MAX_TILE_ROW}, but absorbing stream dims {_absorbed_shape} into "
+        f"input tile_row={int(sd.shape[0])} would produce tile_row="
+        f"{_final_tile_r}. Either reduce `rank`, shrink an upstream stream "
+        f"dim, or raise --max-tile."
     )
     for i in range(rank):
         slot = len(mask) - 1 - i
@@ -800,16 +824,24 @@ def accum_retile_col(x, rank=1, *, compute_bw=1):
 
     See accum_retile_row for the dynamism caveat.
     """
-    assert False, (
-        "accum_retile_col: forbidden in 1x1-mode — would grow tile_col past 1. "
-        "See accum_retile_row's 1x1 message for the rationale and alternatives."
-    )
     assert compute_bw >= 1, f"accum_retile_col: compute_bw must be >= 1, got {compute_bw}"
     sd, mask, orig = _step_meta(x, "accum_retile_col")
     _assert_tile_kind(sd, "accum_retile_col")
     assert rank > 0, f"accum_retile_col: rank must be > 0, got {rank}"
     assert rank <= len(mask), (
         f"accum_retile_col: rank {rank} exceeds input stream rank {len(mask)}"
+    )
+    # Max-tile bound check: see accum_retile_row for the indexing rationale.
+    _absorbed_shape = tuple(int(d) for d in x.underlying_tensor.shape[-2 - rank:-2])
+    _final_tile_c = int(sd.shape[1])
+    for _d in _absorbed_shape:
+        _final_tile_c *= _d
+    assert _final_tile_c <= MAX_TILE_COL, (
+        f"accum_retile_col: max-tile mode requires output tile_col "
+        f"<= {MAX_TILE_COL}, but absorbing stream dims {_absorbed_shape} into "
+        f"input tile_col={int(sd.shape[1])} would produce tile_col="
+        f"{_final_tile_c}. Either reduce `rank`, shrink an upstream stream "
+        f"dim, or raise --max-tile."
     )
     for i in range(rank):
         slot = len(mask) - 1 - i
@@ -1306,13 +1338,11 @@ def reshape_pad_stream(x, chunk_size, reshape_rank=0):
 def retile_streamify(x, chunk, split_row=True):
     """Replace last stream dim D with D*num_chunks, shrinking the corresponding
     tile dim from (tile_r,tile_c) → (chunk, tile_c) [row] or (tile_r, chunk) [col].
-    The last stream slot's dyn-ness is preserved (D * static_int stays dyn iff D was)."""
-    assert chunk == 1, (
-        f"retile_streamify: 1x1-mode only permits chunk == 1 (the no-op form), "
-        f"got chunk={chunk}. Tiles are already at the minimum 1x1 in this mode; "
-        f"there is no tile dim left to split into a stream dim. To split a "
-        f"stream dim, use reshape_stream."
-    )
+    The last stream slot's dyn-ness is preserved (D * static_int stays dyn iff D was).
+
+    Unconstrained under max-tile mode: this op can only *shrink* a tile dim,
+    so if the input was already within bounds the output stays within bounds.
+    """
     sd, mask, orig = _step_meta(x, "retile_streamify")
     _assert_tile_kind(sd, "retile_streamify")
     assert len(mask) >= 1, (
@@ -1455,10 +1485,20 @@ def restream(x, stride, out_shape_tiled):
     """Composite: promote → retile (split both dims) → bufferize → streamify
     → accum_retile (col then row). Each primitive is typed, so dyn_mask flows
     through naturally."""
-    assert False, (
-        "restream: forbidden in 1x1-mode (it composes accum_retile_col + "
-        "accum_retile_row internally, both of which would grow the tile past "
-        "1x1). Express the permutation directly with bufferize + streamify."
+    # Max-tile bound check: the trailing two entries of out_shape_tiled become
+    # the output tile (the inner accum_retile_col + accum_retile_row absorb
+    # them). Gate them against the bounds up front so the failure message is
+    # readable instead of a cryptic accum_retile error.
+    assert len(out_shape_tiled) >= 2, (
+        f"restream: out_shape_tiled must end in (out_tile_r, out_tile_c), "
+        f"got {tuple(out_shape_tiled)}"
+    )
+    _out_tile_r, _out_tile_c = int(out_shape_tiled[-2]), int(out_shape_tiled[-1])
+    assert _out_tile_r <= MAX_TILE_ROW and _out_tile_c <= MAX_TILE_COL, (
+        f"restream: max-tile mode requires out_shape_tiled[-2:] within "
+        f"({MAX_TILE_ROW}, {MAX_TILE_COL}), got ({_out_tile_r}, {_out_tile_c}). "
+        f"These two entries become the output tile after the internal "
+        f"accum_retile_col + accum_retile_row."
     )
     sd, _, _ = _step_meta(x, "restream")
     _assert_tile_kind(sd, "restream")
@@ -1604,9 +1644,10 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
 def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0, *, par_dispatch=1):
     _assert_raw(underlying, "random_offchip_store", "underlying")
     assert par_dispatch >= 1, f"random_offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
-    assert tile_row == 1 and tile_col == 1, (
-        f"random_offchip_store: 1x1-mode requires tile_row == tile_col == 1, got "
-        f"tile_row={tile_row}, tile_col={tile_col}."
+    assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
+        f"random_offchip_store: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
+        f"and tile_col <= {MAX_TILE_COL}, got tile_row={tile_row}, "
+        f"tile_col={tile_col}."
     )
     assert underlying.dtype in [torch.float32, torch.float16], (
         f"random_offchip_store: underlying dtype must be float16 or float32, got {underlying.dtype}"
@@ -1668,11 +1709,12 @@ def offchip_store(x, *, par_dispatch=1):
     assert par_dispatch >= 1, f"offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
     sd, _, _ = _step_meta(x, "offchip_store")
     _assert_tile_kind(sd, "offchip_store")
-    assert x.underlying_tensor.shape[-2:] == (1, 1), (
-        f"offchip_store: 1x1-mode requires input tile shape (1, 1), got "
-        f"tile {tuple(x.underlying_tensor.shape[-2:])}. All 1x1 kernels must "
-        f"hand a 1x1-tile stream to the final store; the autotuner is the only "
-        f"thing allowed to promote tiles past 1x1, and it does so after pass1."
+    _tile = tuple(int(d) for d in x.underlying_tensor.shape[-2:])
+    assert _tile[0] <= MAX_TILE_ROW and _tile[1] <= MAX_TILE_COL, (
+        f"offchip_store: max-tile mode requires input tile within "
+        f"({MAX_TILE_ROW}, {MAX_TILE_COL}), got tile {_tile}. The implementer "
+        f"must finish the kernel within bounds; the autotuner is the only "
+        f"thing allowed to promote tiles further, and it does so after pass1."
     )
     # Note: the Rust IR also has a DynOffChipStore whose runtime body is byte-for-byte
     # identical to OffChipStore — they only differ at construction (DynOffChipStore reads
