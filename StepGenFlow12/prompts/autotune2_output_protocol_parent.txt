@@ -1,0 +1,27 @@
+## Output protocol (parent node)
+
+Your response MUST contain two fenced blocks in order: a ``yaml`` block
+with the three required keys, followed by a ``python`` block with the
+DSL function. Surrounding prose is ignored.
+
+```yaml
+child_picks:                   # exactly one variant index per child
+  attention_block: 3
+parent_input_contracts:        # on-chip inputs only; empty mapping if none
+  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
+parent_output_contracts:       # every output requires a contract
+  out_0: {reshape: [<vanilla_dim_0>, ...], permutation: [0, 1, ...]}
+```
+
+```python
+def <node_name>(<args>, *, out_shapes):
+    ...
+```
+
+A contract is ``{reshape: <shape>, permutation: [...]}`` applied to the
+vanilla PyTorch tensor. RAW args have no input contract. Identity
+contracts (``reshape == vanilla_shape`` with identity permutation) mean
+"no rearrangement". Inside the DSL body, call each child by its natural
+name (e.g. ``attention_block(...)``); the autotuner binds the call to
+the picked variant at exec time. The child variant tables show
+declarative contract metadata only — the variant DSL bodies are hidden.

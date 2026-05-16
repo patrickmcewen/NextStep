@@ -22,18 +22,7 @@ Each proposal is run through a deterministic translator (DSL ->
 {step_dsl_code}
 ```
 
-## DSL Memory cost calculations (step_dsl_memory.py)
-```python
-{step_dsl_memory_code}
-```
-
-## KEY POINT ABOUT MEMORY
-
-The key from the above code is to understand that the on-chip memory capacity is 
-determined by tile sizes flowing through STeP operators.
-Therefore, to reduce on-chip memory, you may want to reduce the tile size of operators.
-It may result in more off-chip memory traffic and slower latency, but that is okay because 
-we need to meet the memory capacity constraint.
+{memory_notes}
 
 ## Hardware constraints
 

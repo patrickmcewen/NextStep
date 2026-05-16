@@ -1,0 +1,23 @@
+## Output protocol (leaf node)
+
+Your response MUST contain two fenced blocks in order: a ``yaml`` block
+declaring the boundary contracts this node exposes, followed by a
+``python`` block with the DSL function. Surrounding prose is ignored.
+
+```yaml
+parent_input_contracts:        # on-chip inputs only; empty mapping if none
+  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
+parent_output_contracts:       # every output requires a contract
+  out_0: {reshape: [<vanilla_dim_0>, ...], permutation: [0, 1, ...]}
+```
+
+```python
+def <node_name>(<args>, *, out_shapes):
+    ...
+```
+
+A contract is ``{reshape: <shape>, permutation: [...]}`` applied to the
+vanilla PyTorch tensor (`x_in = x_vanilla.reshape(reshape).permute(*permutation)`).
+RAW args have no input contract (they always arrive vanilla). Identity
+contracts (``reshape == vanilla_shape`` with identity permutation) mean
+"no rearrangement".
