@@ -582,6 +582,16 @@ def build_pass_user_prompt(pass_name: str, kernel_name: str, dims: dict,
             "",
             "**You MUST NOT call `torch.manual_seed`, `torch.randn`, `torch.rand`, or use the `@` operator.**",
             "All tensors are pre-created. Access them via `tensors[\"key\"]`.",
+            "",
+            "Each `tensors[\"...\"]` entry is **already wrapped** by the "
+            "framework as a `StepRawTensor`. Pass it directly into a DSL "
+            "source op (`offchip_load`, `offchip_load_ref`, "
+            "`dyn_offchip_load`, `random_offchip_load`, `select_gen`, "
+            "`metadata_gen`). **Do NOT call `StepRawTensor(...)` yourself** "
+            "— wrapping an already-wrapped value is a runtime error. "
+            "Static integer indexing (e.g. `tensors[\"W\"][i]`) and "
+            "reading `.shape` / `.dtype` are the only operations the "
+            "wrapper supports.",
         ])
 
     if prev_code is not None:
@@ -705,6 +715,20 @@ def build_pass1_user_prompt(
             "```",
             _format_tensors_description(tensors),
             "```",
+            "",
+            "Each `tensors[\"...\"]` entry is **already wrapped** by the "
+            "framework as a `StepRawTensor`. Pass it directly into a DSL "
+            "source op (`offchip_load`, `offchip_load_ref`, "
+            "`dyn_offchip_load`, `random_offchip_load`, `select_gen`, "
+            "`metadata_gen`). **Do NOT call `StepRawTensor(...)` yourself** "
+            "— constructing a wrapper around an already-wrapped value is a "
+            "runtime error. Static integer indexing into a stacked input "
+            "(e.g. `tensors[\"gate_weights\"][i]` inside "
+            "`for i in range(n_experts):`) and reading `.shape` / `.dtype` "
+            "are the only operations the wrapper supports — anything else "
+            "(arithmetic, `.item()`, `torch.*` ops, dynamic gathers) must "
+            "happen on a stream produced by a DSL source op, not on the "
+            "raw input.",
         ])
 
     # Contract block — non-root only

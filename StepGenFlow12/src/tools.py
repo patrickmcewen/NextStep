@@ -42,8 +42,8 @@ IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 
 from step_py.ops import StepOps
 
-from src.step_dsl import StepTensor, Tile, _elem_from_torch
-from src.node_signature import TensorArg
+from src.step_dsl import StepTensor, StepRawTensor, Tile, _elem_from_torch
+from src.node_signature import TensorArg, ListOfTensorArg
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +278,19 @@ def _wrap_on_chip_call_args(
     true in Pass-1 so the two passes share a calling convention and the
     LLM does not need an ``isinstance(x, StepTensor)`` guard at every leaf.
 
-    RAW args stay raw (the LLM is told to load them with ``offchip_load``
-    before any DSL consumer). List args also pass through unchanged — the
-    contract block instructs the LLM to iterate at host time and load each
-    element separately, so their elements are not wrapped here.
+    RAW tensor args are wrapped as ``StepRawTensor`` so the LLM-emitted child
+    can only feed them into DSL source ops (``offchip_load`` etc.); arithmetic
+    / torch.* / dynamic indexing on the raw input fail at the wrapper boundary
+    instead of silently sneaking past the DSL.
+
+    RAW ``ListOfTensorArg`` entries (e.g. a forwarded ``list[Tensor]`` of per-
+    expert weights) get each element wrapped as ``StepRawTensor`` — the
+    contract block instructs the LLM to do ``offchip_load(arg[i], ...)`` per
+    element, so each ``arg[i]`` must satisfy ``_assert_raw``. On-chip
+    ``ListOfTensorArg`` is rare (no DSL op produces a list of streams in
+    practice today) and currently passes through unchanged. ``ListOfIntArg``
+    is unchanged — the LLM converts it via ``torch.tensor(...)`` and feeds
+    the result into ``metadata_gen``.
     """
     assert len(call_args) == len(arg_specs) == len(arg_is_raw) == len(tiled_shapes), (
         f"length mismatch: call_args={len(call_args)} arg_specs={len(arg_specs)} "
@@ -291,19 +300,63 @@ def _wrap_on_chip_call_args(
     for value, spec, raw, tshape in zip(
         call_args, arg_specs, arg_is_raw, tiled_shapes
     ):
-        if raw or not isinstance(spec, TensorArg):
-            wrapped.append(value)
+        if isinstance(spec, TensorArg):
+            assert isinstance(value, torch.Tensor), (
+                f"TensorArg must be a torch.Tensor, got {type(value).__name__}")
+            if raw:
+                wrapped.append(StepRawTensor(value))
+                continue
+            assert len(tshape) >= 2, (
+                f"on-chip TensorArg tiled shape {tshape} must be rank >= 2 "
+                f"(last two dims are the tile)")
+            tile_shape = (int(tshape[-2]), int(tshape[-1]))
+            stream_dtype = Tile(_elem_from_torch(value.dtype), tile_shape)
+            wrapped.append(StepTensor(value, stream_dtype=stream_dtype))
             continue
-        assert isinstance(value, torch.Tensor), (
-            f"on-chip TensorArg must be a torch.Tensor, "
-            f"got {type(value).__name__}")
-        assert len(tshape) >= 2, (
-            f"on-chip TensorArg tiled shape {tshape} must be rank >= 2 "
-            f"(last two dims are the tile)")
-        tile_shape = (int(tshape[-2]), int(tshape[-1]))
-        stream_dtype = Tile(_elem_from_torch(value.dtype), tile_shape)
-        wrapped.append(StepTensor(value, stream_dtype=stream_dtype))
+        if isinstance(spec, ListOfTensorArg) and raw:
+            # Match the contract-block instruction `offchip_load(arg[i], ...)`:
+            # each list element must be a StepRawTensor so the source op's
+            # _assert_raw is satisfied. The contract stores raw torch.Tensors
+            # in tiled_values (the blackbox stub unwraps before recording), so
+            # we wrap each element here.
+            assert isinstance(value, list), (
+                f"ListOfTensorArg must hand a list, got {type(value).__name__}")
+            for i, elem in enumerate(value):
+                assert isinstance(elem, torch.Tensor), (
+                    f"ListOfTensorArg[{i}] must be a torch.Tensor, got "
+                    f"{type(elem).__name__}")
+            wrapped.append([StepRawTensor(elem) for elem in value])
+            continue
+        # ListOfTensorArg + on-chip, ListOfIntArg, and anything unknown:
+        # pass through unchanged.
+        wrapped.append(value)
     return tuple(wrapped)
+
+
+def _wrap_input_tensors(tensors: dict) -> dict:
+    """Wrap a ``tensors[...]`` input dict for LLM DSL exec.
+
+    Every ``torch.Tensor`` value becomes a ``StepRawTensor`` so the LLM can
+    only flow it into a DSL source op. 0-d scalar tensors auto-unwrap to
+    Python floats/ints: ``unary_add_imm(x, tensors["eps"])`` lowers to
+    ``AddImmediate(<scalar>)`` and expects a Python scalar at IR build time.
+    Nested ``list[Tensor]`` (e.g. ``tensors["W_per_expert"] = [W0, W1, ...]``)
+    is recursed element-wise so ``tensors["W_per_expert"][i]`` still yields a
+    ``StepRawTensor``.
+
+    Non-tensor, non-list values (ints, strings, etc.) pass through unchanged.
+    """
+    def _wrap(v):
+        if isinstance(v, torch.Tensor):
+            if v.dim() == 0:
+                return v.item()
+            return StepRawTensor(v)
+        if isinstance(v, list):
+            return [_wrap(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(_wrap(x) for x in v)
+        return v
+    return {k: _wrap(v) for k, v in tensors.items()}
 
 
 def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
@@ -348,7 +401,14 @@ def _exec_dsl_ref(code: str, dims: dict, tensors: dict, *,
     """
     import builtins as _builtins
     if call_args is None:
-        call_args = (dims, tensors)
+        # Root entry: wrap each raw input tensor as StepRawTensor so the
+        # LLM-emitted ``tiled_reference`` body can only feed `tensors[...]`
+        # into a DSL source op. Bare ``tensors["x"] * 0.0`` /
+        # ``torch.nn.functional.linear(tensors["x"], ...)`` / dynamic gathers
+        # all fail at the wrapper boundary instead of silently sneaking past
+        # the DSL. Non-root entry points get their args pre-wrapped by
+        # ``_wrap_on_chip_call_args``, so we only wrap on the default path.
+        call_args = (dims, _wrap_input_tensors(tensors))
     if call_kwargs is None:
         call_kwargs = {}
     scaffold = _build_dsl_scaffold()

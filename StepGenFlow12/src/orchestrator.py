@@ -599,9 +599,73 @@ _PASS_RULES: dict[str, dict] = {
              "compute. Entry-point on-chip args are already wrapped by the "
              "framework — no `if not isinstance(x, StepTensor): x = "
              "StepTensor(...)` workaround is needed."),
+            ("StepRawTensor(",
+             "do not construct `StepRawTensor` manually. Raw `tensors[...]` "
+             "entries are pre-wrapped by the framework; you only need to "
+             "feed them to a DSL source op (offchip_load, dyn_offchip_load, "
+             "offchip_load_ref, random_offchip_load, select_gen, "
+             "metadata_gen). Manually constructing a StepRawTensor around a "
+             "fresh `torch.tensor(...)` is an attempt to smuggle a non-DSL "
+             "value into a producer — there is no corresponding STeP IR "
+             "node behind it."),
             ("torch.nn.functional.silu", "use unary_silu(x)"),
             ("@", "no pytorch matrix multiplication allowed. must use step binary_matmul or binary_map_accum"),
             ("exec(", "no mid-function execution allowed."),
+            # Introspection / indirect-dispatch escapes. None of these has a
+            # legitimate use in DSL code. They are the standard chain for
+            # smuggling raw torch compute past the static-substring bans and
+            # the StepTensor/StepRawTensor type defenses:
+            #   - `unary_silu.__globals__['_identity_unary']` reaches a private
+            #     helper that applies a user-supplied callable to a
+            #     StepTensor's underlying tensor — the LLM gets to run any
+            #     torch op and re-wrap the result.
+            #   - `getattr(torch, "cat")` / `getattr(F, "linear")` bypass the
+            #     `torch.X` / `F.X` substring bans.
+            #   - `vars(unary_silu)`, `unary_silu.__dict__`, `__module__`,
+            #     `__class__.__bases__` give equivalent reflection paths.
+            # `lambda` is banned because the only reason DSL code needs one is
+            # to feed it into a private helper like `_identity_unary`; DSL ops
+            # take fixed signatures, never a user-supplied callable.
+            ("__globals__",
+             "no module-globals introspection. `<fn>.__globals__` reaches "
+             "private DSL helpers (e.g. `_identity_unary`) that apply "
+             "user-supplied torch callables to a StepTensor's underlying "
+             "tensor, bypassing every DSL type defense. Use only the "
+             "DSL functions exposed by name."),
+            ("__dict__",
+             "no `.__dict__` reflection in DSL code. Reaches the same "
+             "private helpers `__globals__` does."),
+            ("__module__",
+             "no `.__module__` reflection in DSL code. Reaches the same "
+             "private helpers `__globals__` does."),
+            ("__class__",
+             "no `.__class__` reflection in DSL code. Reaches the same "
+             "private helpers `__globals__` does."),
+            ("getattr(",
+             "no `getattr()` in DSL code. The standard misuse is "
+             "`getattr(torch, \"cat\")` / `getattr(F, \"linear\")` to "
+             "bypass the substring ban on `torch.X` / `F.X`. Use the named "
+             "DSL operator (`binary_add`, `unary_silu`, ...) instead."),
+            ("setattr(",
+             "no `setattr()` in DSL code — same family as `getattr()` above."),
+            ("vars(",
+             "no `vars()` in DSL code. Reaches a function's `__globals__`."),
+            ("globals(",
+             "no `globals()` in DSL code — reaches private DSL helpers."),
+            ("lambda",
+             "no `lambda` in DSL code. DSL ops have fixed signatures and "
+             "never accept a user-supplied callable; the only path that "
+             "does is the private `_identity_unary` helper, which is an "
+             "internal implementation detail and not part of the DSL "
+             "surface. Use named DSL ops (`unary_silu`, `binary_mul`, "
+             "`accum_add`, ...) for any per-tile compute."),
+            ("_identity_unary",
+             "`_identity_unary` is a private DSL implementation helper, not "
+             "part of the public DSL surface. It exists to factor common "
+             "logic across `unary_silu` / `unary_square` / etc.; calling "
+             "it directly with your own callable bypasses every DSL type "
+             "defense. Use the named unary op that matches the math you "
+             "need."),
             #("out_shape_tiled=(1,)",
             # "NEVER load as one giant tile — use proper streaming: out_shape_tiled=(B//tile_n,) or similar"),
         ],
@@ -2419,12 +2483,16 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         call_kwargs: dict | None = None
     else:
         entry_point = node.name
-        # Wrap on-chip TensorArg inputs as StepTensors before invoking the
-        # child. The contract block tells the LLM that on-chip args "may be
-        # passed directly to DSL consumers"; without wrapping, that promise
-        # only holds in Pass-2 composition (where the parent's DSL produces
-        # StepTensors) and not in Pass-1 isolation (where the framework
-        # hands raw tensors). RAW args and list args pass through unchanged.
+        # Wrap each TensorArg input before invoking the child:
+        #   - on-chip TensorArg  → StepTensor (the parent's DSL would produce
+        #     a StepTensor in Pass-2 composition; this matches the calling
+        #     convention so Pass-1 isolation works the same way)
+        #   - raw TensorArg       → StepRawTensor (the child's `offchip_load`
+        #     etc. require StepRawTensor — type-level guarantee that raw
+        #     inputs cannot leak into non-DSL torch compute)
+        #   - raw ListOfTensorArg → list of StepRawTensors (the contract
+        #     instructs `offchip_load(arg[i], ...)` per element)
+        #   - on-chip ListOfTensorArg / ListOfIntArg / unknown → pass-through
         # Non-root nodes inherit per-arg rawness from the parent's recorded
         # call site. The pass-1 walk stamps ``arg_is_raw`` onto every child
         # contract before recursing, so its length must match arg_names here.

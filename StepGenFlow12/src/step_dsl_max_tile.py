@@ -69,7 +69,7 @@ from src.step_dsl_types import (
     _SelectBase, MultiHot, Index,
     _GuardedShape,
     _elem_dims, _stream_rank,
-    StepTensor,
+    StepTensor, StepRawTensor,
 )
 
 
@@ -79,27 +79,33 @@ from src.step_dsl_types import (
 
 
 def _unwrap(x):
-    """Return the underlying torch.Tensor for either a raw tensor or StepTensor."""
-    if isinstance(x, StepTensor):
+    """Return the underlying torch.Tensor for StepTensor, StepRawTensor, or raw."""
+    if isinstance(x, (StepTensor, StepRawTensor)):
         return x.underlying_tensor
     assert isinstance(x, torch.Tensor), \
-        f"expected torch.Tensor or StepTensor, got {type(x).__name__}"
+        f"expected torch.Tensor, StepTensor, or StepRawTensor, got {type(x).__name__}"
     return x
 
 
 def _assert_raw(x, op_name, slot):
-    """Source ops ingest a raw off-chip tensor. Passing a StepTensor here means
-    the value is already on-chip — load it via a source op, not by re-feeding a
-    stream into another source op. This replaces the orchestrator's static
-    producer-raw-slot dataflow check; the rawness lives in the value's type."""
-    assert isinstance(x, torch.Tensor) and not isinstance(x, StepTensor), (
-        f"{op_name}: argument {slot!r} must be a raw torch.Tensor (off-chip), "
+    """Source ops ingest a raw off-chip tensor (wrapped as StepRawTensor).
+
+    Returns the underlying torch.Tensor so callers can bind it directly:
+
+        underlying = _assert_raw(underlying, "offchip_load", "underlying")
+
+    See src/step_dsl.py for the full contract.
+    """
+    assert isinstance(x, StepRawTensor), (
+        f"{op_name}: argument {slot!r} must be a StepRawTensor (raw off-chip), "
         f"got {type(x).__name__}. Source ops (offchip_load, dyn_offchip_load, "
         f"offchip_load_ref, random_offchip_load, select_gen, metadata_gen) "
-        f"ingest off-chip memory; feeding a StepTensor (an on-chip stream) into "
-        f"a source op is a compile-time error. To re-tile an on-chip stream, "
-        f"use bufferize / streamify / retile_streamify / restream instead."
+        f"ingest off-chip memory; feeding a StepTensor (an on-chip stream) or "
+        f"a manually-constructed torch.Tensor into a source op is a "
+        f"compile-time error. To re-tile an on-chip stream, use "
+        f"bufferize / streamify / retile_streamify / restream instead."
     )
+    return x.underlying_tensor
 
 
 def _step_meta(x, op_name):
@@ -136,7 +142,7 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
 
 
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
-    _assert_raw(underlying, "offchip_load", "underlying")
+    underlying = _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
         f"offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} and "
@@ -205,7 +211,7 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
 
 
 def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_dispatch=1):
-    _assert_raw(underlying, "dyn_offchip_load", "underlying")
+    underlying = _assert_raw(underlying, "dyn_offchip_load", "underlying")
     assert par_dispatch >= 1, f"dyn_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
         f"dyn_offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
@@ -241,7 +247,7 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
 
 
 def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
-    _assert_raw(underlying, "offchip_load_ref", "underlying")
+    underlying = _assert_raw(underlying, "offchip_load_ref", "underlying")
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
     assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
         f"offchip_load_ref: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
@@ -251,7 +257,11 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
     _assert_tile_kind(sd_ref, "offchip_load_ref (ref)")
-    loaded = offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed).underlying_tensor
+    # Re-wrap as StepRawTensor for the recursive call: offchip_load's
+    # _assert_raw insists on the wrapper type even when invoked from inside
+    # the DSL implementation. The wrap is a no-op semantically (same
+    # underlying tensor) — it just satisfies the source-op type gate.
+    loaded = offchip_load(StepRawTensor(underlying), stride, out_shape_tiled, tile_row, tile_col, transposed).underlying_tensor
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
     ref_stream = list(ref.underlying_tensor.shape[:-2])
@@ -270,7 +280,7 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     )
 
 def select_gen(underlying, is_multihot, n):
-    _assert_raw(underlying, "select_gen", "underlying")
+    underlying = _assert_raw(underlying, "select_gen", "underlying")
     _assert_int(underlying, "select_gen")
     assert isinstance(is_multihot, bool), (
         f"select_gen: is_multihot must be bool, got {type(is_multihot).__name__}"
@@ -290,7 +300,7 @@ def select_gen(underlying, is_multihot, n):
     )
 
 def metadata_gen(tensor):
-    _assert_raw(tensor, "metadata_gen", "tensor")
+    tensor = _assert_raw(tensor, "metadata_gen", "tensor")
     out = tensor.reshape(1, *tensor.shape, 1, 1)
     # IR MetadataGen always produces Tile(Uint64, (1,1)) regardless of the
     # eager-runtime torch dtype; the underlying tensor stores the metadata
@@ -395,7 +405,7 @@ def filter_last_tile(seq_len):
 
 
 def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False, *, par_dispatch=1):
-    _assert_raw(underlying, "random_offchip_load", "underlying")
+    underlying = _assert_raw(underlying, "random_offchip_load", "underlying")
     assert par_dispatch >= 1, f"random_offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
     assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
         f"random_offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} "
@@ -1261,12 +1271,15 @@ def repeat_static(x, factor):
                       dyn_origins=orig + (None,))
 
 
-def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
+def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False, _allow_dyn=False):
     """Split stream dim at position rank into (new_count, chunk_size).
 
     If the original dim is dynamic, the resulting `new_count` slot inherits
     that dynamism (chunk_size is a static int). Optional add_outer_dim
     prepends a static 1 to the stream shape.
+
+    `_allow_dyn` is an internal escape hatch used by `reshape_pad_stream`,
+    which lowers to STeP's `ReshapePadStream` op (accepts DynDim).
     """
     sd, mask, orig = _step_meta(x, "reshape_stream")
     _assert_tile_kind(sd, "reshape_stream")
@@ -1295,6 +1308,21 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
         f"reshape_stream: shape[{rank_pos}]={D} not divisible by chunk_size={chunk_size}. "
         f"Automatic padding is only allowed when rank==0, got rank={rank}."
     )
+    # STeP's `Reshape` requires either a static-int divisor at the reshape
+    # rank, or (rank==0 AND chunk_size==1) — the DSL-to-STeP translator never
+    # emits a `pad_fn`, so a dynamic stream dim is rejected at IR-build time.
+    # Catch it here so the failure surfaces during DSL execution, with a
+    # pointer at the right escape hatch.
+    if not add_outer_dim:
+        assert _allow_dyn or not mask[rank_pos] or (rank == 0 and chunk_size == 1), (
+            f"reshape_stream(rank={rank}, chunk_size={chunk_size}): stream dim "
+            f"at rank {rank} is dynamic (dyn_mask[{rank_pos}]=True — typically "
+            f"from flat_partition/select_gen, or retile_streamify of a dyn "
+            f"dim). STeP's Reshape op rejects chunk_size>1 splits of a DynDim. "
+            f"Use reshape_pad_stream(x, chunk_size={chunk_size}, "
+            f"reshape_rank={rank}) instead — it lowers to ReshapePadStream "
+            f"which accepts a DynDim."
+        )
     padded_D = ((D + chunk_size - 1) // chunk_size) * chunk_size
 
     if padded_D != D:
@@ -1332,7 +1360,8 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False):
 
 
 def reshape_pad_stream(x, chunk_size, reshape_rank=0):
-    return reshape_stream(x, chunk_size=chunk_size, rank=reshape_rank)
+    return reshape_stream(x, chunk_size=chunk_size, rank=reshape_rank,
+                          _allow_dyn=True)
 
 
 def retile_streamify(x, chunk, split_row=True):
@@ -1642,7 +1671,7 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
 
 
 def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr_byte=0, *, par_dispatch=1):
-    _assert_raw(underlying, "random_offchip_store", "underlying")
+    underlying = _assert_raw(underlying, "random_offchip_store", "underlying")
     assert par_dispatch >= 1, f"random_offchip_store: par_dispatch must be >= 1, got {par_dispatch}"
     assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
         f"random_offchip_store: max-tile mode requires tile_row <= {MAX_TILE_ROW} "

@@ -46,7 +46,7 @@ import torch.nn as nn
 
 from src.contract import Contract
 from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
-from src.step_dsl import StepTensor, Tile, _elem_from_torch
+from src.step_dsl import StepTensor, StepRawTensor, Tile, _elem_from_torch
 
 
 @dataclass
@@ -90,13 +90,14 @@ def _tiled_shape_of(value, spec: ArgSpec) -> tuple[int, ...]:
 
 
 def _unwrap_steptensor(v):
-    """Recursively unwrap StepTensor → torch.Tensor through lists.
+    """Recursively unwrap StepTensor / StepRawTensor → torch.Tensor through lists.
 
-    Top-level StepTensor → its underlying ``.underlying_tensor``. List → element-wise
-    unwrap (handles ``list[StepTensor]`` and ``list[Tensor]`` uniformly).
-    Anything else (raw Tensor, int, list[int]) passes through untouched.
+    Top-level wrapper → its underlying ``.underlying_tensor``. List → element-
+    wise unwrap (handles mixed ``list[StepTensor]``, ``list[StepRawTensor]``,
+    ``list[Tensor]`` uniformly). Anything else (raw Tensor, int, list[int])
+    passes through untouched.
     """
-    if isinstance(v, StepTensor):
+    if isinstance(v, (StepTensor, StepRawTensor)):
         return v.underlying_tensor
     if isinstance(v, list):
         return [_unwrap_steptensor(x) for x in v]

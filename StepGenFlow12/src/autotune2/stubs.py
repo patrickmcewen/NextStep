@@ -68,7 +68,7 @@ import torch.nn as nn
 
 from src.autotune2.contracts import TensorContract
 from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
-from src.step_dsl import StepTensor, Tile, _elem_from_torch
+from src.step_dsl import StepTensor, StepRawTensor, Tile, _elem_from_torch
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ def apply_output_contract(
 
 
 def _unwrap_steptensor(v):
-    if isinstance(v, StepTensor):
+    if isinstance(v, (StepTensor, StepRawTensor)):
         return v.underlying_tensor
     if isinstance(v, list):
         return [_unwrap_steptensor(x) for x in v]

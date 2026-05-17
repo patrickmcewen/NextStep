@@ -249,26 +249,49 @@ def build_rust_evaluate_fn(
     """
 
     def evaluate(composed_source: str) -> tuple[int, float]:
-        from StepDB.evaluate import evaluate_kernel  # type: ignore
+        import sys
+        import time
+        from pathlib import Path as _Path
+
+        # StepDB and step_tl ship as flat directories (not pip-installed
+        # packages); mirror orchestrator.py's path setup so `from evaluate
+        # import ...` resolves and StepDB's own bare imports (`from loader
+        # import ...`, `from sim import ...`) work inside evaluate_kernel.
+        _deio_root = _Path(__file__).resolve().parents[3]  # NextStep/
+        for p in (
+            _deio_root / "StepDB",
+            _deio_root / "step_tl" / "src",
+            _deio_root / "step_tl" / "src" / "proto",
+        ):
+            sp = str(p)
+            if sp not in sys.path:
+                sys.path.insert(0, sp)
+
+        from evaluate import evaluate_kernel  # type: ignore  # StepDB/evaluate.py
 
         work_dir.mkdir(parents=True, exist_ok=True)
         (work_dir / "step_impl.py").write_text(composed_source)
+        t0 = time.perf_counter()
         result = evaluate_kernel(
             kernel_name=kernel_name,
             preset=preset,
             work_dir=str(work_dir),
             timing_only=timing_only,
+            step_impl_source=composed_source,
         )
-        # EvalResult exposes .cycles and .duration_ms; fall back to the
-        # raw run_graph tuple if the fields differ in this StepDB build.
-        cycles = int(getattr(result, "cycles", 0))
-        dur_ms = float(getattr(result, "duration_ms", 0.0))
-        assert cycles > 0, (
-            f"build_rust_evaluate_fn: rust evaluator returned cycles={cycles} "
-            f"for kernel={kernel_name} preset={preset}; expected positive "
-            f"cycle count. EvalResult={result!r}"
+        dur_ms = (time.perf_counter() - t0) * 1000.0
+
+        assert result.success, (
+            f"build_rust_evaluate_fn: evaluate_kernel failed at stage "
+            f"{result.stage!r} for kernel={kernel_name} preset={preset}: "
+            f"{result.error_message}"
         )
-        return cycles, dur_ms
+        assert result.cycle_time is not None and result.cycle_time > 0, (
+            f"build_rust_evaluate_fn: evaluate_kernel returned "
+            f"cycle_time={result.cycle_time!r} for kernel={kernel_name} "
+            f"preset={preset}; expected a positive cycle count."
+        )
+        return int(result.cycle_time), dur_ms
 
     return evaluate
 

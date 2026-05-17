@@ -253,6 +253,106 @@ def _stream_rank(tensor, stream_dtype):
     return tensor.ndim - _elem_dims(stream_dtype)
 
 
+class StepRawTensor:
+    """Framework wrapper around raw off-chip input tensors.
+
+    *** DO NOT CONSTRUCT MANUALLY. ***
+
+    Every entry in the `tensors` dict that your `tiled_reference(dims, tensors)`
+    receives is already a StepRawTensor — the framework wraps each raw input
+    before exec'ing your code. To use an input you simply pass it through:
+
+        x = offchip_load(tensors["x"], stride=..., out_shape_tiled=..., ...)
+        sel = select_gen(tensors["expert_onehot"], ...)
+        # static integer indexing into a stacked-tensor input is allowed:
+        w_i = tensors["gate_weights"][i]   # still a StepRawTensor
+
+    The wrapper exposes only what legitimate DSL code needs:
+      - `.shape` (plain tuple — for tile-size derivations like
+        `tile_row=tensors["W"][i].shape[0]`)
+      - `.dtype`
+      - `x[i]` / `x[i, j]` for static int indexing
+      - `repr(x)`
+
+    Arithmetic, `torch.*` dispatch, `.item()`, `.t()`, `.transpose`, iteration,
+    and dynamic gathers (`x[idx_tensor]`) all raise — they would each be a
+    way to execute compute outside the DSL on a raw input, which has no
+    corresponding STeP IR node. Use DSL ops (`offchip_load`, `binary_*`,
+    `unary_*`, `random_offchip_load`, `expert_addr_gen` + ref-load, etc.)
+    instead.
+
+    Internal access for DSL source ops is `.underlying_tensor` — the same
+    escape hatch `StepTensor` uses. DSL code is statically prevented from
+    typing that string by orchestrator.py's banned_patterns.
+    """
+
+    __slots__ = ("underlying_tensor",)
+
+    def __init__(self, underlying_tensor):
+        # The most common error here is a double-wrap from DSL code that
+        # tried to "convert" `tensors["x"]` into a StepRawTensor — but
+        # tensors[...] entries arrive pre-wrapped. Detect it specifically and
+        # spell out the fix.
+        assert not isinstance(underlying_tensor, StepRawTensor), (
+            "StepRawTensor: refusing to wrap a value that is already a "
+            "StepRawTensor. Inputs in the `tensors` dict are wrapped by the "
+            "framework before your `tiled_reference` runs; you must NOT "
+            "construct a StepRawTensor manually. Pass `tensors[\"...\"]` "
+            "directly into the DSL source op:\n"
+            "    BAD:  offchip_load(StepRawTensor(tensors[\"x\"]), ...)\n"
+            "    GOOD: offchip_load(tensors[\"x\"], ...)"
+        )
+        assert isinstance(underlying_tensor, torch.Tensor), (
+            f"StepRawTensor: expected torch.Tensor, got "
+            f"{type(underlying_tensor).__name__}. Inputs in the `tensors` "
+            f"dict are wrapped by the framework — never construct a "
+            f"StepRawTensor manually; pass `tensors[\"...\"]` directly into "
+            f"the DSL source op."
+        )
+        self.underlying_tensor = underlying_tensor
+
+    @property
+    def shape(self):
+        return tuple(self.underlying_tensor.shape)
+
+    @property
+    def dtype(self):
+        return self.underlying_tensor.dtype
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            assert all(isinstance(i, int) for i in idx), (
+                f"StepRawTensor: tuple index must be all ints, got {idx!r}. "
+                f"Dynamic gathers must go through random_offchip_load or "
+                f"expert_addr_gen + linear_offchip_load_ref."
+            )
+        else:
+            assert isinstance(idx, int), (
+                f"StepRawTensor: only static int indexing allowed "
+                f"(got {type(idx).__name__}). Dynamic gathers must go through "
+                f"random_offchip_load or expert_addr_gen + linear_offchip_load_ref."
+            )
+        return StepRawTensor(self.underlying_tensor[idx])
+
+    # Block torch.* dispatch (F.linear, F.sigmoid, torch.matmul, …) on this
+    # type. NumPy-style "I'm not a torch.Tensor" — any registered torch
+    # op called with a StepRawTensor argument raises TypeError.
+    __torch_function__ = None
+
+    def __iter__(self):
+        # Python would otherwise fall back to __getitem__(0), __getitem__(1), …
+        # which our __getitem__ happily accepts. Block iteration explicitly so
+        # `for row in tensors["x"]:` fails loud.
+        raise AssertionError(
+            "StepRawTensor: iteration forbidden. Load with offchip_load and "
+            "stream-process with DSL ops."
+        )
+
+    def __repr__(self):
+        return (f"StepRawTensor(shape={tuple(self.underlying_tensor.shape)}, "
+                f"dtype={self.underlying_tensor.dtype})")
+
+
 class StepTensor:
     """torch.Tensor + stream_dtype + dyn-stream-dim mask.
 
