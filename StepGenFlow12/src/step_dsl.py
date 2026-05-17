@@ -935,23 +935,58 @@ def flat_partition(x, control, n, partition_rank=0):
     return results
 
 
-def flat_reassemble(inputs, control):
+def flat_reassemble(inputs, control, reassemble_rank=0):
     """Round-robin reassemble selected tokens per `control` row.
 
-    Output stream shape = control.stream + (n_active,) where n_active is a
-    new dynamic dim (mirrors IR ops.py:3120 — FlatReassemble inserts a
-    DynDim between control's stream and the reassemble tail).
+    Output stream shape =
+        control.stream + (n_active,) + inputs[0].stream[-reassemble_rank:]
+    where n_active is a new dynamic dim. Mirrors IR ops.py:3237 —
+    FlatReassemble inserts a DynDim between control's stream and the last
+    `reassemble_rank` stream dims inherited from the inputs. For the
+    common case (reassemble_rank=0, pairing with partition_rank=0
+    FlatPartition) the tail is empty and each input contributes one tile.
+    For reassemble_rank=k each input contributes one k-d sub-tensor per
+    selected control row (pairs with partition_rank=k FlatPartition).
     """
     n = len(inputs)
     assert n > 0, "flat_reassemble: must have at least one input"
-    sd0, _, _ = _step_meta(inputs[0], "flat_reassemble (inputs[0])")
+    assert isinstance(reassemble_rank, int) and reassemble_rank >= 0, (
+        f"flat_reassemble: reassemble_rank must be a non-negative int, "
+        f"got {reassemble_rank!r}"
+    )
+    sd0, mask0, orig0 = _step_meta(inputs[0], "flat_reassemble (inputs[0])")
     _assert_tile_kind(sd0, "flat_reassemble (inputs[0])")
     tile_shape = sd0.shape
+    # Last `reassemble_rank` stream dims of input 0 — these become the
+    # output's trailing static stream dims and must agree across all inputs
+    # (mirrors IR ops.py:3230).
+    t0 = inputs[0].underlying_tensor
+    assert len(t0.shape) >= 3 + reassemble_rank, (
+        f"flat_reassemble: input 0 has only {len(t0.shape)} dims but needs "
+        f"at least {3 + reassemble_rank} (>=1 outer DynDim + "
+        f"reassemble_rank={reassemble_rank} inner stream dim(s) + 2 tile "
+        f"dims). Got shape {tuple(t0.shape)}."
+    )
+    inner0 = tuple(t0.shape[len(t0.shape) - 2 - reassemble_rank:len(t0.shape) - 2])
     for i, p in enumerate(inputs):
         sd_i, _, _ = _step_meta(p, f"flat_reassemble (inputs[{i}])")
         _assert_tile_kind(sd_i, f"flat_reassemble (inputs[{i}])")
         assert sd_i.shape == tile_shape, (
             f"flat_reassemble: input {i} tile shape {sd_i.shape} != {tile_shape}"
+        )
+        assert len(p.underlying_tensor.shape) >= 3 + reassemble_rank, (
+            f"flat_reassemble: input {i} has only "
+            f"{len(p.underlying_tensor.shape)} dims but needs at least "
+            f"{3 + reassemble_rank}. Got shape "
+            f"{tuple(p.underlying_tensor.shape)}."
+        )
+        s_i = p.underlying_tensor.shape
+        inner_i = tuple(s_i[len(s_i) - 2 - reassemble_rank:len(s_i) - 2])
+        assert inner_i == inner0, (
+            f"flat_reassemble: input {i} inner stream dims {inner_i} != "
+            f"{inner0} (input 0). All inputs must agree on the last "
+            f"reassemble_rank={reassemble_rank} stream dims (mirrors IR "
+            f"ops.py:3230)."
         )
     sd_c, mask_c, orig_c = _step_meta(control, "flat_reassemble (control)")
     assert isinstance(sd_c, _SelectBase), (
@@ -966,17 +1001,24 @@ def flat_reassemble(inputs, control):
     flat_mh = ctrl_t.reshape(-1, n)
     total = flat_mh.shape[0]
 
+    # Flatten each input's outer stream dims to a single leading dim so
+    # `[ptrs[i]]` advances one sub-tensor (shape inner0 + tile) at a time.
+    # For the common case (single outer DynDim from FlatPartition) this
+    # reshape is a no-op.
+    unit_shape = inner0 + (tile_r, tile_c)
+    flat_inputs = [p.underlying_tensor.reshape(-1, *unit_shape) for p in inputs]
+
     ptrs = [0] * n
     token_groups = []
     for t in range(total):
         group = []
         for i in range(n):
             if flat_mh[t, i] > 0:
-                if ptrs[i] < inputs[i].underlying_tensor.shape[0]:
-                    group.append(inputs[i].underlying_tensor[ptrs[i]])
+                if ptrs[i] < flat_inputs[i].shape[0]:
+                    group.append(flat_inputs[i][ptrs[i]])
                     ptrs[i] += 1
         if len(group) == 0:
-            group.append(torch.zeros_like(inputs[0].underlying_tensor[0:1].squeeze(0)))
+            group.append(torch.zeros(*unit_shape, dtype=flat_inputs[0].dtype))
         token_groups.append(torch.stack(group, dim=0))
 
     output = torch.stack(token_groups, dim=0)
@@ -987,20 +1029,25 @@ def flat_reassemble(inputs, control):
         ctrl_stream_shape = (1,) + ctrl_stream_shape
         prepended_one = True
     n_active = output.shape[1]
-    result = output.reshape(*ctrl_stream_shape, n_active, tile_r, tile_c)
-    # Output dyn_mask: optionally-prepended-static + control's mask + new dyn.
-    # Note control.dyn_mask covers Select's full stream rank (= ndim-1), which
-    # equals len(ctrl_t.shape[:-1]) — so it lines up with the un-prepended
-    # ctrl_stream_shape. If we prepended a (1,) we add a leading False slot.
+    result = output.reshape(*ctrl_stream_shape, n_active, *inner0, tile_r, tile_c)
+    # Output dyn_mask: optionally-prepended-static + control's mask + new
+    # dyn + inputs[0]'s last reassemble_rank stream entries. The trailing
+    # entries mirror the IR shape control.shape + (DynDim,) +
+    # input.shape[-reassemble_rank:]. Use absolute-index slicing because
+    # mask[-0:] returns the whole tuple.
+    inner_mask = mask0[len(mask0) - reassemble_rank:]
+    inner_orig = orig0[len(orig0) - reassemble_rank:]
     out_mask = (
         ((False,) if prepended_one else ())
         + mask_c
         + (True,)
+        + inner_mask
     )
     out_orig = (
         ((None,) if prepended_one else ())
         + orig_c
         + ("flat_reassemble",)
+        + inner_orig
     )
     return StepTensor(result, stream_dtype=sd0,
                       dyn_mask=out_mask, dyn_origins=out_orig)

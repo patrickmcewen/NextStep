@@ -1148,13 +1148,15 @@ def _h_static_reassemble(state, target, call):
 def _h_flat_reassemble(state, target, call):
     inputs  = _src(_arg(call, 0, "inputs"))
     control = _src(_arg(call, 1, "control"))
+    reassemble_rank = _arg_or_default(call, 2, "reassemble_rank", "0")
     """assert control in state.select_gen_vars, (
         f"flat_reassemble: control argument {control!r} must be assigned "
         f"from select_gen(...) earlier in the function"
     )"""
     return _block(
         f"{target} = FlatReassemble(graph, inputs={inputs}, control={control}, "
-        f"reassemble_rank=0, switch_cycles=[1] * len({inputs}), "
+        f"reassemble_rank={reassemble_rank}, "
+        f"switch_cycles=[1] * len({inputs}), "
         f"write_back_mu=False)\n"
     )
 
