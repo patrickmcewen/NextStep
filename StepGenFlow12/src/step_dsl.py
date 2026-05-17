@@ -866,8 +866,8 @@ def eager_merge(inputs):
     ]
 
 
-def flat_partition(x, control, n):
-    sd_x, _, _ = _step_meta(x, "flat_partition")
+def flat_partition(x, control, n, partition_rank=0):
+    sd_x, mask_x, orig_x = _step_meta(x, "flat_partition")
     sd_c, _, _ = _step_meta(control, "flat_partition")
     _assert_tile_kind(sd_x, "flat_partition (input)")
     assert isinstance(sd_c, _SelectBase), (
@@ -876,6 +876,10 @@ def flat_partition(x, control, n):
     )
     assert sd_c.total_n == n, (
         f"flat_partition: control total_n={sd_c.total_n} != n={n}"
+    )
+    assert isinstance(partition_rank, int) and partition_rank >= 0, (
+        f"flat_partition: partition_rank must be a non-negative int, "
+        f"got {partition_rank!r}"
     )
 
     t = x.underlying_tensor
@@ -886,35 +890,47 @@ def flat_partition(x, control, n):
     )
     # The Rust simulator (step-perf/src/operator/partition.rs:243) computes
     # expected_stop_level = sel_level + partition_rank and panics at line 153
-    # when input emits a stop at a different level. The DSL convention is
-    # partition_rank=0, so input and control must have the SAME stream rank
-    # (= same number of dyn-mask entries / shape dims). The cardinality
-    # check below alone is not enough: it passes for (1,1,64,2) vs (1,64,2)
-    # because both flatten to 128, but the runtime would panic at 153.
-    assert len(t.shape) == len(c.shape) + 1, (
-        f"flat_partition: input stream rank ({len(t.shape) - 3}) must equal "
-        f"control stream rank ({len(c.shape) - 2}) for partition_rank=0. "
-        f"Input shape {tuple(t.shape)} (- 2 tile dims), control shape "
-        f"{tuple(c.shape)} (- 1 select-N dim). Without this alignment the "
-        f"simulator panics with stop-level mismatch at partition.rs:153."
+    # when input emits a stop at a different level. The required alignment
+    # is input_stream_rank == control_stream_rank + partition_rank. In
+    # underlying-shape terms (input strips 2 tile dims, control strips 1
+    # select-N dim) that becomes:
+    #     len(t.shape) - 2 == len(c.shape) - 1 + partition_rank
+    # The cardinality check below alone is not enough: it passes for
+    # (1,1,64,2) vs (1,64,2) because both flatten to 128, but the runtime
+    # would panic at partition.rs:153.
+    assert len(t.shape) == len(c.shape) + 1 + partition_rank, (
+        f"flat_partition: input stream rank ({len(t.shape) - 2}) must equal "
+        f"control stream rank ({len(c.shape) - 1}) + partition_rank "
+        f"({partition_rank}). Input shape {tuple(t.shape)} (- 2 tile dims), "
+        f"control shape {tuple(c.shape)} (- 1 select-N dim). Without this "
+        f"alignment the simulator panics with stop-level mismatch at "
+        f"partition.rs:153."
     )
-    tile_r, tile_c = t.shape[-2], t.shape[-1]
-    flat_inp = t.reshape(-1, tile_r, tile_c)
+    # Per-consumer output stream shape mirrors IR FlatPartition (ops.py:2902):
+    #   output.stream.shape = (DynDim,) + input.stream.shape[-partition_rank:]
+    # i.e. the outermost dim is sized by how many routed groups land in
+    # consumer i, and the inner `partition_rank` dims inherit the input's
+    # last `partition_rank` stream dims (plus the two tile dims at the end).
+    inner_shape = tuple(t.shape[-(2 + partition_rank):])
+    flat_inp = t.reshape(-1, *inner_shape)
     flat_mh = c.reshape(-1, n)
     assert flat_inp.shape[0] == flat_mh.shape[0], \
-        f"Tile count mismatch: input has {flat_inp.shape[0]} vs selector with {flat_mh.shape[0]}. The input stream and selector stream must have the same number of stream elements, meaning that x.reshape(-1, tile_r, tile_c) and control.reshape(-1, n) must resolve to the same number of elements in the upper (-1) dimensions."
+        f"Tile count mismatch: input has {flat_inp.shape[0]} vs selector with {flat_mh.shape[0]}. The input stream and selector stream must have the same number of stream elements, meaning that x.reshape(-1, *inner) and control.reshape(-1, n) must resolve to the same number of elements in the upper (-1) dimensions."
+
+    # Inner dyn_mask/origins entries come from the input's last
+    # `partition_rank` stream dims. Use absolute-index slicing so
+    # partition_rank=0 yields an empty tuple (mask[-0:] would be mask[:]).
+    inner_mask = mask_x[len(mask_x) - partition_rank:]
+    inner_origins = orig_x[len(orig_x) - partition_rank:]
 
     results = []
     for i in range(n):
         mask = flat_mh[:, i] > 0
-        # Each output is a rank-1 stream whose single stream dim is dynamic
-        # (its size depends on the runtime contents of the selector). Mirrors
-        # ops.py:2785 — FlatPartition adds an outermost DynDim per consumer.
         results.append(StepTensor(
             flat_inp[mask],
             stream_dtype=sd_x,
-            dyn_mask=(True,),
-            dyn_origins=("flat_partition",),
+            dyn_mask=(True,) + inner_mask,
+            dyn_origins=("flat_partition",) + inner_origins,
         ))
     return results
 

@@ -659,13 +659,17 @@ class _State:
             else:  # flat_partition
                 x = _src(_arg(call, 0, "x"))
                 ctrl = _src(_arg(call, 1, "control"))
+                partition_rank = _arg_or_default(
+                    call, 3, "partition_rank", "0"
+                )
                 """assert ctrl in self.select_gen_vars, (
                     f"flat_partition: control argument {ctrl!r} must be assigned "
                     f"from select_gen(...) earlier in the function"
                 )"""
                 ctor = (
                     f"{node_var} = FlatPartition(graph, {x}, control={ctrl}, "
-                    f"partition_rank=0, switch_cycles=[1] * {n_src}, "
+                    f"partition_rank={partition_rank}, "
+                    f"switch_cycles=[1] * {n_src}, "
                     f"write_back_mu=False, num_consumers={n_src})\n"
                 )
 
