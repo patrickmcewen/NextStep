@@ -29,4 +29,6 @@ The full DSL surface lives in ``step_dsl.py``:
 
 {memory_notes}
 
+{tile_shrink_fewshot}
+
 {output_protocol}

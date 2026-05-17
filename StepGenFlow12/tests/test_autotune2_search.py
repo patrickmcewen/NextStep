@@ -33,6 +33,7 @@ from src.autotune2.search import (
     build_synthetic_wrapper_for_node,
     build_variant_callables,
     cell_for_variant,
+    find_pass1_baseline_entry,
     gather_descendants_postorder,
     library_to_variant_registry,
     render_library_as_variant_summaries,
@@ -106,20 +107,120 @@ def _parent(name: str, children: tuple[PlanNode, ...]) -> PlanNode:
 
 def test_wrapper_raw_only_inputs():
     c = _raw_contract({"x": (64, 512)}, out_shapes=((4, 16, 512),))
-    src = build_synthetic_wrapper_for_node(node_name="my_leaf", parent_contract=c)
+    src = build_synthetic_wrapper_for_node(
+        node_name="my_leaf", parent_contract=c, input_contracts={},
+    )
     assert "def tiled_reference(dims, tensors):" in src
+    # RAW TensorArgs pass straight through; no offchip_load is synthesized for
+    # them — the leaf body is responsible for that.
     assert 'my_leaf(tensors["x"]' in src
+    assert "offchip_load(" not in src
     assert "out_shapes=((4, 16, 512),)" in src
     # Output flows through promote_outer to satisfy OffChipStore's stream
     # rank >= 1 startup constraint.
     assert "offchip_store(promote_outer(result))" in src
 
 
-def test_wrapper_rejects_on_chip_tensorarg():
+def test_wrapper_emits_offchip_load_for_on_chip_arg_identity_contract():
+    """Identity contract on an on-chip TensorArg lowers to a vanilla-strided
+    offchip_load followed by a leading-singleton flatten. The leaf consumes
+    the flattened on-chip stream as its positional arg."""
+    c = _raw_contract({"x": (64, 16, 32)}, out_shapes=((64, 16, 32),))
+    c = replace(c, arg_is_raw=(False,))
+    src = build_synthetic_wrapper_for_node(
+        node_name="leaf", parent_contract=c,
+        input_contracts={"x": vanilla_contract_for((64, 16, 32))},
+    )
+    # offchip_load strides + tile match the vanilla shape; leading-singleton
+    # absorbed via flatten(min_rank=0, max_rank=1) so the leaf sees a rank-1
+    # stream.
+    assert (
+        '_x_in = offchip_load(tensors["x"], stride=(1,), '
+        "out_shape_tiled=(64,), tile_row=16, tile_col=32)"
+    ) in src
+    assert "_x_in = flatten(_x_in, min_rank=0, max_rank=1)" in src
+    assert "leaf(_x_in" in src
+
+
+def test_wrapper_on_chip_arg_permuted_leading_axes():
+    """Permutations of the leading reshape axes are realizable as a strided
+    walk over physical tiles — the wrapper picks strides matching the
+    permuted batch order. The last two reshape axes must remain in place
+    (tile = vanilla[-2:])."""
+    c = _raw_contract({"x": (64, 16, 32)}, out_shapes=((64, 16, 32),))
+    c = replace(c, arg_is_raw=(False,))
+    # reshape = (8, 8, 16, 32), permutation = (1, 0, 2, 3) -> applied
+    # = (8, 8, 16, 32) with the leading batch axes swapped.
+    contract = TensorContract(
+        reshape=(8, 8, 16, 32), permutation=(1, 0, 2, 3),
+    )
+    src = build_synthetic_wrapper_for_node(
+        node_name="leaf", parent_contract=c, input_contracts={"x": contract},
+    )
+    # Stream axis 0 walks reshape axis 1 (stride 1); axis 1 walks reshape
+    # axis 0 (stride 8). out_shape_tiled mirrors the permuted leading dims.
+    assert (
+        '_x_in = offchip_load(tensors["x"], stride=(1, 8), '
+        "out_shape_tiled=(8, 8), tile_row=16, tile_col=32)"
+    ) in src
+    # Two stream dims so flatten absorbs index 0 (outermost = leading 1) and
+    # index 1 (first applied stream dim).
+    assert "_x_in = flatten(_x_in, min_rank=1, max_rank=2)" in src
+
+
+def test_wrapper_sub_tiled_within_vanilla_tail():
+    """Sub-tiling vanilla[-2:] (tile_row < vanilla[-2]) — splitting the row
+    dim into row_grid * tile_row produces a strided load that walks the
+    row-grid as an outer stream axis."""
+    c = _raw_contract({"x": (64, 16, 32)}, out_shapes=((64, 16, 32),))
+    c = replace(c, arg_is_raw=(False,))
+    # Splits the row dim into (4, 4) — the contract's tile shrinks to (4, 32).
+    contract = TensorContract(
+        reshape=(64, 4, 4, 32), permutation=(0, 1, 2, 3),
+    )
+    src = build_synthetic_wrapper_for_node(
+        node_name="leaf", parent_contract=c, input_contracts={"x": contract},
+    )
+    # Stride: outer reshape axis 0 (=64) walks one tile-row-block per step
+    # (4 row-tiles per "vanilla batch") and the second axis (=4) walks one
+    # row-tile per step.
+    assert (
+        '_x_in = offchip_load(tensors["x"], stride=(4, 1), '
+        "out_shape_tiled=(64, 4), tile_row=4, tile_col=32)"
+    ) in src
+
+
+def test_wrapper_fully_streamed_tile_one_by_one():
+    """Pass-1's "fully streamed" representation factors a (1, 1) tile onto
+    the end of the reshape so the leaf sees the full vanilla shape as a
+    stream. The wrapper computes per-axis strides that walk every vanilla
+    element as its own physical tile."""
+    c = _raw_contract({"x": (4, 4, 64, 32)}, out_shapes=((4, 4, 64, 32),))
+    c = replace(c, arg_is_raw=(False,))
+    contract = TensorContract(
+        reshape=(4, 4, 64, 32, 1, 1), permutation=(0, 1, 2, 3, 4, 5),
+    )
+    src = build_synthetic_wrapper_for_node(
+        node_name="leaf", parent_contract=c, input_contracts={"x": contract},
+    )
+    # Each tile = 1 element. Stride is just the row-major element-major
+    # stride of the reshape's leading axes: (4*64*32, 64*32, 32, 1).
+    assert (
+        '_x_in = offchip_load(tensors["x"], stride=(8192, 2048, 32, 1), '
+        "out_shape_tiled=(4, 4, 64, 32), tile_row=1, tile_col=1)"
+    ) in src
+    # m == 4 stream dims; flatten absorbs the outermost two (the leading 1
+    # from offchip_load and the first applied stream dim).
+    assert "_x_in = flatten(_x_in, min_rank=3, max_rank=4)" in src
+
+
+def test_wrapper_rejects_missing_input_contract():
     c = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
     c = replace(c, arg_is_raw=(False,))
-    with pytest.raises(AssertionError, match="on-chip TensorArg"):
-        build_synthetic_wrapper_for_node(node_name="bad", parent_contract=c)
+    with pytest.raises(AssertionError, match="missing entries"):
+        build_synthetic_wrapper_for_node(
+            node_name="bad", parent_contract=c, input_contracts={},
+        )
 
 
 def test_wrapper_multi_output_destructures_and_stores_each():
@@ -134,7 +235,7 @@ def test_wrapper_multi_output_destructures_and_stores_each():
         out_shapes=((64, 16, 32), (64, 4, 32), (64, 4, 32)),
     )
     src = build_synthetic_wrapper_for_node(
-        node_name="pre_attention", parent_contract=c,
+        node_name="pre_attention", parent_contract=c, input_contracts={},
     )
     # Destructured tuple assignment
     assert "_out_0, _out_1, _out_2 = pre_attention(" in src
@@ -161,7 +262,9 @@ def test_wrapper_list_args_pass_through():
         ),
         arg_is_raw=(True, True, True),
     )
-    src = build_synthetic_wrapper_for_node(node_name="ln", parent_contract=c)
+    src = build_synthetic_wrapper_for_node(
+        node_name="ln", parent_contract=c, input_contracts={},
+    )
     # List args are referenced exactly like tensor args; the DSL function
     # itself handles their list-ness internally.
     assert 'tensors["weights"]' in src
@@ -194,6 +297,55 @@ def test_node_tensors_dict_lists_pass_through():
     assert d["lens"] == [1, 2]
 
 
+def test_node_tensors_dict_preserves_real_values_for_dispatch_tensors():
+    """RAW dispatch tensors (e.g. expert_onehot) must keep their real
+    values, not be replaced with zeros — the functional executor in
+    timing reads them to compute per-expert active-token counts.
+    """
+    onehot = torch.zeros(8, 2, 4)
+    onehot[0, 0, 1] = 1
+    onehot[1, 0, 3] = 1
+    onehot[5, 1, 2] = 1
+    expected_sum = float(onehot.abs().sum())
+    c = Contract(
+        arg_names=("expert_onehot",),
+        vanilla_shapes=((8, 2, 4),),
+        tiled_shapes=((8, 2, 4),),
+        tiled_values=(onehot,),
+        out_shapes=((1, 8, 4),),
+        arg_specs=(TensorArg(shape=(8, 2, 4)),),
+        arg_is_raw=(True,),
+    )
+    d = build_node_tensors_dict(c)
+    assert tuple(d["expert_onehot"].shape) == (8, 2, 4)
+    assert float(d["expert_onehot"].abs().sum()) == expected_sum
+
+
+def test_node_tensors_dict_reshapes_tiled_value_to_vanilla():
+    """For on-chip TensorArgs the tile-stream shape factors differently
+    from vanilla; build_node_tensors_dict must lay the captured values
+    back out at vanilla shape so the wrapper's offchip_load (which
+    reads element-major from vanilla memory) sees the same bytes the
+    leaf was authored against.
+    """
+    vanilla = (64, 512)
+    tiled = (64, 1, 512)
+    val = torch.arange(64 * 512, dtype=torch.float32).reshape(tiled)
+    c = Contract(
+        arg_names=("normed_2",),
+        vanilla_shapes=(vanilla,),
+        tiled_shapes=(tiled,),
+        tiled_values=(val,),
+        out_shapes=((1, 64, 512),),
+        arg_specs=(TensorArg(shape=vanilla),),
+        arg_is_raw=(False,),
+    )
+    d = build_node_tensors_dict(c)
+    assert tuple(d["normed_2"].shape) == vanilla
+    # Element ordering must match: tiled[i, 0, j] -> vanilla[i, j].
+    assert torch.equal(d["normed_2"], val.reshape(vanilla))
+
+
 # --- gather_descendants_postorder --------------------------------------------
 
 
@@ -213,6 +365,68 @@ def test_gather_descendants_post_order_two_levels():
     out = gather_descendants_postorder(parent)
     # grandchild before childA; childA before childB; parent NOT included.
     assert out == ["# grandchild\n", "# childA\n", "# childB\n"]
+
+
+# --- find_pass1_baseline_entry -----------------------------------------------
+
+
+def test_find_pass1_baseline_entry_returns_the_pass1_entry_even_when_llm_is_faster():
+    """Even if an LLM variant lands in the identity-contract cell with
+    fewer cycles, the baseline picker must return the pass-1 entry."""
+    lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell = library_cell(lib, {"x": c_id}, {"out_0": c_id})
+    pass1 = DesignEntry(
+        dsl="# pass1\n", input_contracts={"x": c_id},
+        output_contracts={"out_0": c_id},
+        cycles=100, on_chip=200, provenance="pass1_baseline",
+    )
+    llm = DesignEntry(
+        dsl="# llm faster\n", input_contracts={"x": c_id},
+        output_contracts={"out_0": c_id},
+        cycles=50, on_chip=200, provenance="llm_attempt_0_turn_0",
+    )
+    cell.append(pass1)
+    cell.append(llm)
+    got = find_pass1_baseline_entry(lib)
+    assert got is pass1
+
+
+def test_find_pass1_baseline_entry_searches_across_cells():
+    """The pass-1 baseline may not always live in the first cell after
+    library mutation; the helper must scan every cell."""
+    lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    c_other = TensorContract(reshape=(4, 8), permutation=(1, 0))
+    other = library_cell(lib, {"x": c_other}, {"out_0": c_id})
+    other.append(DesignEntry(
+        dsl="# llm\n", provenance="llm_attempt_0_turn_0", cycles=10, on_chip=10,
+    ))
+    pass1_cell = library_cell(lib, {"x": c_id}, {"out_0": c_id})
+    pass1_entry = DesignEntry(
+        dsl="# pass1\n", provenance="pass1_baseline", cycles=100, on_chip=100,
+    )
+    pass1_cell.append(pass1_entry)
+    assert find_pass1_baseline_entry(lib) is pass1_entry
+
+
+def test_find_pass1_baseline_entry_asserts_missing():
+    lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell = library_cell(lib, {"x": c_id}, {"out_0": c_id})
+    cell.append(DesignEntry(dsl="# llm\n", provenance="llm_attempt_0_turn_0"))
+    with pytest.raises(AssertionError, match="expected exactly one"):
+        find_pass1_baseline_entry(lib)
+
+
+def test_find_pass1_baseline_entry_asserts_duplicate():
+    lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell = library_cell(lib, {"x": c_id}, {"out_0": c_id})
+    cell.append(DesignEntry(dsl="# a\n", provenance="pass1_baseline"))
+    cell.append(DesignEntry(dsl="# b\n", provenance="pass1_baseline"))
+    with pytest.raises(AssertionError, match="expected exactly one"):
+        find_pass1_baseline_entry(lib)
 
 
 # --- library_to_variant_registry / cell_for_variant --------------------------
@@ -349,7 +563,7 @@ def test_search_leaf_seeds_baseline_and_admits_llm_proposals(tmp_path):
         call_idx[0] += 1
         return r
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
     # Score: baseline=100, llm proposal=50 — Pareto-distinct cells, so both
@@ -380,6 +594,57 @@ def test_search_leaf_seeds_baseline_and_admits_llm_proposals(tmp_path):
     assert len(reg) >= 2
 
 
+def test_search_leaf_writes_pass1_baseline_and_per_turn_score_artifacts(tmp_path):
+    """The pass-1 baseline (cycles, on_chip) must land in the node-level
+    ckpt_dir as ``pass1_baseline_score.json`` and each ACCEPTED turn must
+    drop a ``score.json`` listing the admitted entries' scores. This lets
+    a reader inspect the attempt directory directly instead of having to
+    chase the numbers through the next attempt's user prompt."""
+    responses = [_make_leaf_response(reshape=(4, 4, 8), perm=(1, 0, 2))]
+    call_idx = [0]
+
+    async def agent(_conversation):
+        r = responses[call_idx[0]]
+        call_idx[0] += 1
+        return r
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    score_call = [0]
+    def score(_src):
+        score_call[0] += 1
+        # baseline = (111, 222); LLM proposal = (333, 444)
+        return (111, 222) if score_call[0] == 1 else (333, 444)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        score_fn=score,
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+    ))
+
+    baseline_path = tmp_path / "leaf" / "pass1_baseline_score.json"
+    assert baseline_path.exists(), "pass1 baseline score not persisted"
+    baseline = json.loads(baseline_path.read_text())
+    assert baseline == {"cycles": 111, "on_chip": 222, "provenance": "pass1_baseline"}
+
+    score_path = tmp_path / "leaf" / "attempt_0" / "turn_0" / "score.json"
+    assert score_path.exists(), "accepted-turn score not persisted"
+    payload = json.loads(score_path.read_text())
+    assert payload == {
+        "entries": [
+            {"cycles": 333, "on_chip": 444,
+             "provenance": "llm_attempt_0_turn_0"},
+        ],
+    }
+
+
 def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
     """Within a single attempt, a bad first turn should append feedback to
     the conversation and the next turn should see it. We verify by capturing
@@ -400,7 +665,7 @@ def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
         call_idx[0] += 1
         return r
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
     lib = run(search_leaf(
@@ -457,7 +722,7 @@ def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
         call_idx[0] += 1
         return r
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
     lib = run(search_leaf(
@@ -489,7 +754,7 @@ def test_search_leaf_skips_failed_verification(tmp_path):
     async def agent(_conversation):
         return _make_leaf_response(reshape=(1, 4, 8), perm=(0, 1, 2))
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=False, feedback="bad")
 
     lib = run(search_leaf(
@@ -505,6 +770,69 @@ def test_search_leaf_skips_failed_verification(tmp_path):
     ))
     # Only the baseline cell survives.
     assert len(library_to_variant_registry(lib)) == 1
+
+
+def test_search_leaf_score_fn_raise_becomes_user_feedback(tmp_path):
+    """If ``score_fn`` raises (e.g. analytical timing model crashes deep
+    inside ``execute_values``), the search loop must convert the
+    exception into LLM feedback and continue searching — not propagate
+    the exception out and tear down the whole autotune run."""
+    captured_convos: list[list[dict]] = []
+    responses = [
+        # First variant: score will raise.
+        _make_leaf_response(reshape=(1, 4, 8), perm=(0, 1, 2)),
+        # Second variant: score returns cleanly so the library gets a non-
+        # baseline cell.
+        _make_leaf_response(reshape=(4, 1, 8), perm=(1, 0, 2)),
+    ]
+    call_idx = [0]
+
+    async def agent(conversation: list[dict]):
+        captured_convos.append([dict(m) for m in conversation])
+        r = responses[call_idx[0]]
+        call_idx[0] += 1
+        return r
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    score_calls = [0]
+    def score(_src):
+        score_calls[0] += 1
+        if score_calls[0] <= 2:
+            # 1st = baseline seed, 2nd = first LLM variant. Raise on the
+            # variant only — letting the baseline through.
+            if score_calls[0] == 2:
+                raise RuntimeError(
+                    "stack expects each tensor to be equal size, but got "
+                    "[1, 23, 1, 512] at entry 0 and [1, 19, 1, 512] at entry 1"
+                )
+            return (10, 10)
+        return (50, 50)
+
+    lib = run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        score_fn=score,
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(max_turns_per_attempt=2, max_attempts=1),
+    ))
+    # Both LLM responses fired in the same attempt (max_turns_per_attempt=2).
+    assert call_idx[0] == 2
+    # The second agent call's conversation must include the score-fail
+    # feedback the search loop appended from the first turn's exception.
+    assert len(captured_convos[1]) >= 3
+    assert captured_convos[1][-1]["role"] == "user"
+    feedback = captured_convos[1][-1]["content"]
+    assert "Analytical scorer failed" in feedback
+    assert "stack expects each tensor to be equal size" in feedback
+    # Final library: baseline + second variant accepted (different cell).
+    reg = library_to_variant_registry(lib)
+    assert len(reg) >= 2
 
 
 # --- search_parent ------------------------------------------------------------
@@ -552,7 +880,7 @@ def test_search_parent_runs_cartesian_compose_and_admits(tmp_path):
     async def agent(_conversation):
         return _make_parent_response("child_under", variant_idx=1)
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
     score_calls = []
@@ -620,7 +948,7 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
         # Always return a malformed response so library only has baseline.
         return "garbage"
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
     def agent_factory(_system_prompt: str):
@@ -637,9 +965,10 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
         pass1_dsls=pass1_dsls,
         pass1_contracts=contracts,
         ckpt_dir=tmp_path / "tune",
-        score_fn=lambda _src: (10, 10),
+        make_score_fn=lambda _tensors: lambda _src: (10, 10),
+        root_tensors={},
         agent_factory=agent_factory,
-        verifier=verifier,
+        make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
         config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
@@ -717,7 +1046,7 @@ def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
         order.append(f"{nm}:end")
         return "garbage"
 
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
     def agent_factory(_system_prompt: str):
@@ -739,9 +1068,10 @@ def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
         pass1_dsls=pass1_dsls,
         pass1_contracts=contracts,
         ckpt_dir=tmp_path / "tune",
-        score_fn=lambda _src: (10, 10),
+        make_score_fn=lambda _tensors: lambda _src: (10, 10),
+        root_tensors={},
         agent_factory=agent_factory,
-        verifier=verifier,
+        make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
         config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
@@ -785,7 +1115,7 @@ def test_autotune_root_as_leaf_single_node_tree(tmp_path):
 
     async def agent(_conversation):
         return "garbage"  # baseline-only library
-    async def verifier(_src):
+    async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
     def agent_factory(_sys):
         return agent
@@ -798,9 +1128,10 @@ def test_autotune_root_as_leaf_single_node_tree(tmp_path):
         pass1_dsls=pass1_dsls,
         pass1_contracts=contracts,
         ckpt_dir=tmp_path / "tune",
-        score_fn=lambda _src: (10, 10),
+        make_score_fn=lambda _tensors: lambda _src: (10, 10),
+        root_tensors={},
         agent_factory=agent_factory,
-        verifier=verifier,
+        make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
         config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),

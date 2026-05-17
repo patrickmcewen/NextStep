@@ -124,15 +124,19 @@ def _strip_imports(code: str) -> str:
 
 
 def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
-                    timing_only: bool = False) -> EvalResult:
+                    timing_only: bool = False,
+                    step_impl_source: str | None = None) -> EvalResult:
     """Run the full evaluation pipeline for a single kernel pair + preset.
 
     Stages: exec -> simulate -> correctness -> success.
     When timing_only=True, skips correctness (stage 3) and disables functional sim.
+    When step_impl_source is provided, it replaces StepDB's on-disk step_impl
+    for this call (used by external autotuners that score generated kernels);
+    dims, the reference module, and precompute still come from StepDB.
     """
     dims = get_dims(kernel_name, preset)
     ref_mod = None if timing_only else load_problem(kernel_name)
-    step_code = load_step_impl(kernel_name)
+    step_code = step_impl_source if step_impl_source is not None else load_step_impl(kernel_name)
 
     if work_dir is None:
         work_dir = str(Path(__file__).resolve().parent / "kernels" / kernel_name / f"_work_{preset}")

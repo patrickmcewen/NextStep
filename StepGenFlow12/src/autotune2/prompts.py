@@ -60,6 +60,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROMPTS_DIR = _PROJECT_ROOT / "prompts"
 _SYSTEM_PROMPT_PATH = _PROMPTS_DIR / "autotune2_system.txt"
 _MEMORY_NOTES_PATH = _PROMPTS_DIR / "dsl_memory_notes.txt"
+_TILE_SHRINK_FEWSHOT_PATH = _PROMPTS_DIR / "autotune_tile_shrink_fewshot.txt"
 _STEP_DSL_MEMORY_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
 _OUTPUT_PROTOCOL_PATHS = {
     True: _PROMPTS_DIR / "autotune2_output_protocol_leaf.txt",
@@ -200,18 +201,22 @@ def render_variant_block(
 def build_autotune2_system_prompt(*, is_leaf: bool, dsl_code: str) -> str:
     """Self-contained autotune2 system prompt.
 
-    Template body lives in ``prompts/autotune2_system.txt`` with three
+    Template body lives in ``prompts/autotune2_system.txt`` with four
     placeholders: ``{step_dsl_code}`` (the DSL surface, passed in),
     ``{memory_notes}`` (loaded from ``prompts/dsl_memory_notes.txt`` and
-    shared with ``autotune_memory_system.txt``), and ``{output_protocol}``
-    (loaded from ``prompts/autotune2_output_protocol_{leaf,parent}.txt``
-    based on ``is_leaf``). ``str.replace`` is used instead of ``str.format``
-    because the protocol fragments contain literal YAML braces.
+    shared with ``autotune_memory_system.txt``), ``{tile_shrink_fewshot}``
+    (loaded from ``prompts/autotune_tile_shrink_fewshot.txt`` — worked
+    examples of the load/consumer/reduction-order rewrite recipe paired
+    with the memory observation above), and ``{output_protocol}`` (loaded
+    from ``prompts/autotune2_output_protocol_{leaf,parent}.txt`` based on
+    ``is_leaf``). ``str.replace`` is used instead of ``str.format`` because
+    the protocol fragments contain literal YAML braces.
     """
     assert dsl_code, "build_autotune2_system_prompt: dsl_code must be non-empty"
     protocol_path = _OUTPUT_PROTOCOL_PATHS[is_leaf]
     for path in (_SYSTEM_PROMPT_PATH, protocol_path,
-                 _MEMORY_NOTES_PATH, _STEP_DSL_MEMORY_PY):
+                 _MEMORY_NOTES_PATH, _TILE_SHRINK_FEWSHOT_PATH,
+                 _STEP_DSL_MEMORY_PY):
         assert path.exists(), (
             f"build_autotune2_system_prompt: required file not found at {path}"
         )
@@ -222,6 +227,9 @@ def build_autotune2_system_prompt(*, is_leaf: bool, dsl_code: str) -> str:
         _SYSTEM_PROMPT_PATH.read_text()
         .replace("{step_dsl_code}", dsl_code)
         .replace("{memory_notes}", memory_notes)
+        .replace(
+            "{tile_shrink_fewshot}", _TILE_SHRINK_FEWSHOT_PATH.read_text().rstrip()
+        )
         .replace("{output_protocol}", protocol_path.read_text().rstrip())
     )
 

@@ -45,20 +45,19 @@ the timing model).
               │
               ▼ (optional)
        ┌──────────────┐
-       │  autotune    │  LLM rewrites the verified DSL for cycles
-       │  (chain)     │  / memory; triple-gated DSL→translate→IR
-       └──────────────┘  every turn; chained agents per pass spec
+       │  autotune    │  Bottom-up tree-DP over the planner tree:
+       │  (tree DP)   │  per-node Pareto libraries on (cycles,
+       └──────────────┘  on_chip); top-K promoted through rust
 ```
 
 `max_outer` independent attempts at the implementer pipeline run in parallel
-per kernel; the first to succeed wins. The autotuner is opt-in via
-`run.py --autotune` and runs per-outer (immediately after each outer
-produces a verified DSL, in that outer's own coroutine);
-it can also be invoked standalone via `run_autotune.py` against a
-finished implementer checkpoint. A separate batch driver
-(`run_regression.py`) fans out across many `(kernel, preset)` jobs as
-subprocesses with a parallelism cap and forwards the autotune toggle
-unchanged.
+per kernel; the first to succeed wins. The autotuner is a **separate,
+standalone post-pipeline pass** invoked via `run_autotune2.py` against a
+finished implementer checkpoint; it walks the planner tree bottom-up,
+builds a Pareto-front library of variant DSL implementations at each node,
+and promotes the top-K root entries through the rust simulator. A
+separate batch driver (`run_regression.py`) fans out across many
+`(kernel, preset)` jobs as subprocesses with a parallelism cap.
 
 ## Two operating modes
 
@@ -94,9 +93,10 @@ unchanged.
   pipeline collapses.
 - [regression_runner.md](regression_runner.md) — multi-kernel batch
   driver: subset selection, subprocess model, parallelism cap, summary.
-- [autotuner.md](autotuner.md) — performance-tuning subsystem: DSL-form
-  rewrite loop with triple-gate correctness chain, chain-of-passes
-  schema, agent variants (`general` / `parallel` / `memory`),
-  feasibility halting.
+- [autotuner.md](autotuner.md) — performance-tuning subsystem: bottom-up
+  tree-DP over the planner tree, per-node Pareto-front libraries keyed
+  by `(input_contracts, output_contracts)`, synthetic isolation
+  wrapper for non-root scoring, top-K rust promotion, run-summary
+  schema.
 - [logging.md](logging.md) — the on-disk checkpoint tree, per-turn
   artifacts, `result.json`, regression summary.

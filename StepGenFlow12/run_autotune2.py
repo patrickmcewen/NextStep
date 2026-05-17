@@ -243,7 +243,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     from src.autotune2.compose import make_analytical_scorer
     from src.autotune2.runtime import (
         build_real_agent_fn,
-        build_real_verifier_fn,
+        build_real_verifier_factory_fn,
         build_rust_evaluate_fn,
         promote_top_k,
         write_autotune2_summary,
@@ -300,17 +300,27 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         llm_config=llm_config,
     )
 
-    score_fn = make_analytical_scorer(
-        dims=state["dims"], tensors=state["tensors"],
-        hw_config=state["hw_config"],
-        max_total_compute_bw=args.compute_bw,
-    )
+    # The scorer's closed-over ``tensors`` dict has to match the per-node
+    # arg names the synthetic wrapper references (e.g. ``tensors["Q"]``)
+    # — see ``build_synthetic_wrapper_for_node``. The driver rebuilds the
+    # scorer per node via this factory; the root falls back to the
+    # kernel-level dict passed in as ``root_tensors``.
+    def make_score_fn(node_tensors: dict):
+        return make_analytical_scorer(
+            dims=state["dims"], tensors=node_tensors,
+            hw_config=state["hw_config"],
+            max_total_compute_bw=args.compute_bw,
+        )
 
     agent_factory = build_real_agent_fn(llm_config=state["llm_config"])
-    verifier = build_real_verifier_fn(
-        kernel_name=args.kernel,
+    # Per-node verifier factory. For the root the closure uses
+    # ``compute_gold(args.kernel, dims, tensors)``; for non-root nodes
+    # the factory builds a verifier that injects ``parent_contract
+    # .tiled_outputs`` as gold and invokes the leaf directly. See
+    # build_real_verifier_factory_fn for the per-node behavior.
+    make_verifier = build_real_verifier_factory_fn(
+        root_kernel=args.kernel,
         dims=state["dims"],
-        tensors=state["tensors"],
         check_order=args.check_order,
     )
 
@@ -319,9 +329,10 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         pass1_dsls=state["pass1_dsls"],
         pass1_contracts=state["pass1_contracts"],
         ckpt_dir=ckpt_dir,
-        score_fn=score_fn,
+        make_score_fn=make_score_fn,
+        root_tensors=state["tensors"],
         agent_factory=agent_factory,
-        verifier=verifier,
+        make_verifier=make_verifier,
         prompt_inputs=state["prompt_inputs"],
         system_prompts=state["system_prompts"],
         config=SearchConfig(

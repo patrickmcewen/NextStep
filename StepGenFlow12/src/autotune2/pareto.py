@@ -21,19 +21,45 @@ def dominates(a: DesignEntry, b: DesignEntry) -> bool:
     )
 
 
+PROTECTED_PROVENANCES: frozenset[str] = frozenset({"pass1_baseline"})
+"""Provenance tags whose entries are never evicted from a Pareto front.
+
+The pass-1 baseline is a load-bearing reference: parents must compose against
+their children's pass-1 baseline (not whichever LLM variant happens to be
+Pareto-best) because that's the only chain pass-1 already proved composes
+end-to-end. Letting Pareto eviction drop it strands ``find_pass1_baseline_entry``
+later in the search.
+"""
+
+
 def insert_pareto(front: list[DesignEntry], entry: DesignEntry) -> bool:
     """Insert ``entry`` into the front if it's not dominated by any existing
-    member. Drop any members ``entry`` dominates. Returns True iff inserted.
+    member. Drop any members ``entry`` dominates, except those whose
+    ``provenance`` is in ``PROTECTED_PROVENANCES`` — those stay regardless.
+    Returns True iff inserted.
 
     Treats equal-on-both-axes entries as duplicates: the existing entry stays,
     the new one is rejected. This avoids unbounded front growth from
-    re-discovering identical Pareto points across LLM calls."""
+    re-discovering identical Pareto points across LLM calls.
+
+    Refuses to insert any new entry whose provenance is protected: the
+    seeding routines own the single insertion of those entries via raw
+    ``cell.append``, and a duplicate would silently break the
+    "exactly one baseline per library" invariant."""
+    assert entry.provenance not in PROTECTED_PROVENANCES, (
+        f"insert_pareto: refusing to insert entry with protected provenance "
+        f"{entry.provenance!r}; protected entries are seeded directly via "
+        f"cell.append, not through insert_pareto"
+    )
     for x in front:
         if dominates(x, entry):
             return False
         if x.cycles == entry.cycles and x.on_chip == entry.on_chip:
             return False
-    front[:] = [x for x in front if not dominates(entry, x)]
+    front[:] = [
+        x for x in front
+        if x.provenance in PROTECTED_PROVENANCES or not dominates(entry, x)
+    ]
     front.append(entry)
     return True
 

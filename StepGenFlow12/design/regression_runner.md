@@ -44,17 +44,17 @@ rather than in-process tasks?
 
 Pass-through arguments to each subprocess: the LLM profile (model /
 config), the per-job loop knobs (max-outer, max-turns, pipeline,
-translator, bundle-dir), the gate-ordering and decomposition-planner
+translator, bundle-dir), and the gate-ordering and decomposition-planner
 knobs (`--check-order`, `--no-plan`, `--max-replans`, `--node-attempts`,
-`--max-plan-depth`, `--non-root-sequential` / `--no-non-root-sequential`),
-and the autotune knobs (`--autotune`, `--autotune-config`,
-`--autotune-max-turns`, `--autotune-agent`). The runner does not
-mediate these; it just forwards them.
+`--max-plan-depth`, `--non-root-sequential` / `--no-non-root-sequential`).
+The runner does not mediate these; it just forwards them.
 
-Per-outer autotune integration and Phase-0 decomposition are therefore
-suite-level toggles: enabling `--autotune` (or disabling the planner)
-on `run_regression.py` flips it for every job's pipeline, with no
-regression-specific autotune or planner knobs of the runner's own.
+Phase-0 decomposition is therefore a suite-level toggle: disabling the
+planner on `run_regression.py` flips it for every job's pipeline, with
+no regression-specific planner knobs of the runner's own. Performance
+autotuning is **not invoked** by the regression runner — autotune2
+runs as a separate post-pipeline pass via `run_autotune2.py` against
+a chosen outer; see [autotuner.md](autotuner.md).
 
 The runner does **not** raise on a non-zero exit. A failing kernel is a
 real outcome the caller (the outer flow's scoring step, or a human)
@@ -96,10 +96,10 @@ path.
 
 `config.json` records: `argv`, `preset_mode`, `max_parallel`, `model` /
 `config`, every pass-through knob (`max_outer`, `max_turns`, `pipeline`,
-`translator`, `check_order`, the autotune flags, etc.), the resolved
-`bench_config` path, the `run_py` path, the `subset_file` (when
-relevant), and the full enumerated `jobs` list. The intent is that
-`config.json` alone is enough to reproduce the run.
+`translator`, `check_order`, etc.), the resolved `bench_config` path,
+the `run_py` path, the `subset_file` (when relevant), and the full
+enumerated `jobs` list. The intent is that `config.json` alone is
+enough to reproduce the run.
 
 ## Summary structure
 
@@ -120,11 +120,6 @@ SuiteSummary:
   outer_overall:
     passed:    int          # sum over jobs of per-outer passed counts
     total:     int          # sum over jobs of per-outer totals
-  autotune_overall:                # always present; fields null when no data
-    jobs_with_data:   int          # jobs whose headline autotune surfaced a speedup
-    min_speedup:      float | null
-    max_speedup:      float | null
-    geomean_speedup:  float | null # geomean across those jobs
   benchmarks:
     <kernel>:
       passed:    int
@@ -137,17 +132,6 @@ SuiteSummary:
           exit_code:     int
           outer_passed:  int
           outer_total:   int
-          autotune:                # null when no outer's autotune chain produced a usable best
-            best_outer:       int       # outer with the lowest overall.best_cycles
-            baseline_cycles:  int
-            best_cycles:      int
-            speedup:          float
-            per_outer:
-              - outer:            int
-                status:           "ok" | "halted" | "error" | "missing"
-                baseline_cycles:  int | null
-                best_cycles:      int | null
-                speedup:          float | null
   total_tokens:  int        # sum over jobs of LLM token usage
 ```
 
@@ -160,31 +144,11 @@ job's `result.json` (which records the pass/fail of each parallel outer
 attempt). When a job's result file is missing — typical on a hard crash
 — the runner falls back to `(0, 0)` rather than crashing the summary.
 
-Per-job `autotune` is the chain-aware headline: the runner reads each
-outer's `autotune.overall.best_cycles` from `result.json` (when the
-chain ran cleanly or was halted on infeasibility), picks the lowest,
-and surfaces that outer as `best_outer` along with its overall
-baseline / best / speedup. The per-outer breakdown distinguishes four
-states:
-
-- `ok` — the outer's autotune chain ran cleanly to completion;
-- `halted` — the chain stopped on a pass that ended `feasible=False`;
-- `error` — a pass crashed; partial best is recovered from the pass's
-  `progress.json` so the outer still contributes a `best_cycles` if
-  any work landed before the crash;
-- `missing` — the outer's functional pipeline never reached the
-  autotune hook (typically because the outer failed in Phase 1 or 2).
-
-When no outer produced a usable best, the headline `autotune` block is
-null and the job contributes nothing to `autotune_overall`. The "best
-across outers" framing is intentional: the chosen outer for the
-*functional* result is selected by correctness (first success), and
-the performance number you want is the best the run achieved, not
-necessarily the chosen one's.
-
-`autotune_overall` is always present in the summary, with all-null
-fields when no jobs produced any speedup data — this keeps consumers'
-schema parsing uniform across `--autotune` and non-`--autotune` runs.
+Performance metrics are intentionally absent from the suite summary:
+autotuning is a separate post-pipeline pass (`run_autotune2.py`) that
+operates on a chosen outer's snapshot and writes its own
+`autotune2_summary.json`. The regression runner only scores
+*functional* outcomes.
 
 ## Logging
 

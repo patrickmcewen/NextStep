@@ -13,6 +13,7 @@ from src.autotune2.contracts import (
     vanilla_contract_for,
 )
 from src.autotune2.pareto import (
+    PROTECTED_PROVENANCES,
     cull_top_T,
     dominates,
     dsl_dedup_hash,
@@ -182,6 +183,32 @@ def test_insert_pareto_rejects_duplicate_point():
     assert not insert_pareto(front, _e(100, 100, dsl="v2"))
     assert len(front) == 1
     assert front[0].dsl == "v1"
+
+
+def test_insert_pareto_does_not_evict_pass1_baseline():
+    # The pass-1 baseline must survive Pareto culling even when an LLM
+    # variant strictly dominates it on both axes: parent composition uses
+    # this entry as the canonical reference (see find_pass1_baseline_entry).
+    baseline = _e(200, 200, dsl="baseline", provenance="pass1_baseline")
+    front = [baseline]
+    assert insert_pareto(front, _e(100, 100, provenance="llm_0"))
+    assert len(front) == 2
+    # Baseline is still in the front by identity.
+    assert any(e is baseline for e in front)
+
+
+def test_insert_pareto_rejects_inserting_protected_provenance():
+    # Protected entries are seeded via direct cell.append; routing them
+    # through insert_pareto would silently violate "exactly one baseline".
+    front = [_e(100, 100, provenance="pass1_baseline")]
+    with pytest.raises(AssertionError, match="protected provenance"):
+        insert_pareto(front, _e(50, 50, provenance="pass1_baseline"))
+
+
+def test_protected_provenances_contains_pass1_baseline():
+    # The string is referenced by name elsewhere (find_pass1_baseline_entry,
+    # _seed_baseline). Catch accidental renames.
+    assert "pass1_baseline" in PROTECTED_PROVENANCES
 
 
 def test_cull_top_T_noop_when_under_T():

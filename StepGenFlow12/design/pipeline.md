@@ -33,10 +33,10 @@ arguments:
 | `--max-plan-depth` | maximum recursion depth of the planner tree |
 | `--non-root-sequential` / `--no-non-root-sequential` | with `--node-attempts > 1`, run non-root attempts sequentially with early-exit (default) or in parallel |
 | `--stateless-refactor` | discard refactor chat history; rebuild the prompt each turn from (orig + last failed code + last feedback) |
-| `--autotune` | run the autotuner on each outer's verified DSL (off by default) |
-| `--autotune-config` | path to `autotune_config.json` (loaded only when `--autotune` is set) |
-| `--autotune-max-turns` | override `max_turns` from the autotune config — only used when the config has no `passes` list |
-| `--autotune-agent` | autotune agent variant — only used when the config has no `passes` list |
+
+Performance autotuning runs as a **separate post-pipeline pass**
+(`run_autotune2.py`); the implementer pipeline does not invoke it
+inline. See [autotuner.md](autotuner.md).
 
 LLM configuration (provider URL, API key, model id, optional reasoning
 effort) is loaded from JSON profiles under a repo-root `configs/` directory
@@ -141,14 +141,11 @@ Outer attempts share precomputed gold tensors (memoized per `(kernel, dims)`
 to avoid re-allocating multi-GiB references) but otherwise have no shared
 state.
 
-Under `--autotune`, each outer that produces a verified `dsl_code.py`
-runs the autotuner inline before its coroutine returns. Because each
-outer is its own task, an outer's autotune runs concurrently with
-whatever the other outers are still doing on the functional pipeline.
-The autotuner writes under `outer_<i>/autotune/`, and an autotune
-crash is trapped at the boundary so the outer's functional success is
-preserved. The autotune step itself can be a chain of passes (see
-[autotuner.md](autotuner.md) for the chain schema and per-outer schema).
+Performance autotuning is **out of band**: the implementer pipeline is
+done as soon as some outer produces a verified `dsl_code.py`. The
+autotuner ([autotuner.md](autotuner.md)) is invoked separately via
+`run_autotune2.py` against a chosen `outer_<N>/` checkpoint and writes
+under its own snapshot of that outer.
 
 ## Resume
 

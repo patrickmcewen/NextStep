@@ -138,6 +138,33 @@ def test_system_prompt_requires_dsl_code():
         build_autotune2_system_prompt(is_leaf=True, dsl_code="")
 
 
+def test_system_prompt_embeds_tile_shrink_fewshot():
+    # Both leaf and parent prompts must carry the tile-shrink recipe and
+    # at least one of the worked examples, so the LLM can spot the
+    # canonical rewrite (matmul → map_accum, rowwise_sum → accum_add, …)
+    # without us having to spell it out in the user message.
+    for is_leaf in (True, False):
+        out = build_autotune2_system_prompt(is_leaf=is_leaf, dsl_code="X")
+        assert "Shrinking tile sizes" in out, (
+            f"is_leaf={is_leaf}: fewshot top header missing"
+        )
+        assert "binary_map_accum" in out, (
+            f"is_leaf={is_leaf}: fewshot rule table missing"
+        )
+        assert "rms_norm" in out, (
+            f"is_leaf={is_leaf}: Example 1 (rms_norm) missing"
+        )
+        # Ordering: fewshot must appear before the output protocol so the
+        # LLM reads the recipe in the system-prompt narrative order.
+        protocol_marker = (
+            "Output protocol (leaf node)" if is_leaf
+            else "Output protocol (parent node)"
+        )
+        assert out.index("Shrinking tile sizes") < out.index(protocol_marker), (
+            f"is_leaf={is_leaf}: fewshot must precede the output protocol"
+        )
+
+
 # --- build_autotune2_user_prompt ---------------------------------------------
 
 

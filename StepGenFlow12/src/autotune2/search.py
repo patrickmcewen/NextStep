@@ -26,15 +26,19 @@ Locked Phase-5 design decisions
    level cannot orphan a parent's reproducibility chain.
 
 2. **Synthetic ``tiled_reference`` wrapper** for non-root nodes is
-   constructed by ``build_synthetic_wrapper_for_node``. It expects
-   every TensorArg input to be **RAW** (Phase 5 v1 limitation: the
-   wrapper passes ``tensors[arg_name]`` directly into the node's
-   function; on-chip args would require synthesizing
-   ``offchip_load`` + contract-realizing DSL ops, which is the
-   parent-DSL writer's responsibility and not mechanically derivable.
-   Deferred to a future version). The wrapper terminates with
-   ``offchip_store`` so the translator's root-return-wrapping logic
-   has a stream to wrap.
+   constructed by ``build_synthetic_wrapper_for_node``. For each
+   non-RAW ``TensorArg``, it emits an ``offchip_load`` whose stream +
+   tile dims exactly match the variant's ``input_contracts[name]``
+   (computed by ``_offchip_load_args_for_contract``), then
+   ``flatten``-s away ``offchip_load``'s leading singleton so the
+   stream rank matches ``applied_shape[:-2]``. RAW ``TensorArg``s
+   pass through as ``tensors[name]`` — the leaf is responsible for
+   loading those itself. Because strides are contract-dependent the
+   wrapper is rebuilt per variant; the search loops pass identity
+   contracts for the baseline and ``parsed.input_contracts`` for
+   each LLM response. The wrapper terminates with ``offchip_store``
+   so the translator's root-return-wrapping logic has a stream to
+   wrap.
 
 3. **Per-node ``tensors`` dict** is built by
    ``build_node_tensors_dict``: ``torch.zeros(spec.shape)`` for each
@@ -131,8 +135,13 @@ class AgentResponse:
 # ``runtime.build_real_agent_fn`` return ``AgentResponse``; test stubs return
 # plain ``str``.
 AgentFn = Callable[[list[dict]], Awaitable["str | AgentResponse"]]
-# composed_source -> VerifyResult
-VerifierFn = Callable[[str], Awaitable[VerifyResult]]
+# (composed_source, output_contracts) -> VerifyResult.
+# ``output_contracts`` is the LLM-declared per-output TensorContract dict
+# for the variant under test (keyed ``out_0``, ``out_1``, ...). The
+# non-root verifier uses it for the contract-conformance check; test
+# stubs and the root verifier may ignore it (treat it as kw-only with
+# default ``None``).
+VerifierFn = Callable[..., Awaitable[VerifyResult]]
 
 
 def _coerce_agent_response(result) -> AgentResponse:
@@ -172,7 +181,7 @@ class SearchConfig:
     One of ``"correctness-first"``, ``"compliance-first"``, or
     ``"always-both"``. Wired through to the 4-gate cascade
     (correctness, compliance regex, LLM judge, post-validator) inside
-    ``build_real_verifier_fn``.
+    ``build_real_verifier_factory_fn``.
     """
 
 
@@ -204,36 +213,194 @@ class NodePromptInputs:
 # ---------------------------------------------------------------------------
 
 
+def _offchip_load_args_for_contract(
+    arg_name: str,
+    vanilla_shape: tuple[int, ...],
+    contract: TensorContract,
+) -> tuple[tuple[int, ...], int, int, tuple[int, ...]]:
+    """Compute ``(out_shape_tiled, tile_row, tile_col, stride)`` for an
+    ``offchip_load`` whose result — once its leading singleton stream dim
+    is flattened away — has stream + tile dims exactly equal to the
+    contract's ``applied_shape``.
+
+    The off-chip tensor lives row-major in ``vanilla_shape``.
+    ``applied_shape = vanilla.reshape(contract.reshape)
+    .permute(contract.permutation)`` is the layout the on-chip stream must
+    present to the leaf. ``offchip_load`` tiles the underlying tensor by
+    ``(tile_row, tile_col)`` (which must divide ``vanilla[-2:]``), walks
+    the resulting tile-grid in (batch, r_grid, c_grid) order, and indexes
+    that walk by ``stride`` against ``out_shape_tiled``.
+
+    For the on-chip layout to match ``applied_shape`` we require:
+
+      - ``permutation[-2:] == (n-2, n-1)`` — the contract's two innermost
+        axes are *its own* two innermost reshape axes, so the tile dims
+        come from the tail of ``reshape``. This is what fixes
+        ``tile_row = reshape[-2]`` and ``tile_col = reshape[-1]``.
+      - Each leading reshape axis's element-major stride decomposes
+        cleanly as ``batch_step * R*C + r_step * tile_row*C + c_step *
+        tile_col`` with zero remainder — i.e., one unit of that axis
+        lands the load on the top-left of a physical tile, never on a
+        sub-tile element offset.
+
+    Under those constraints we can compute the tile-flat stride per axis
+    in closed form, then permute / select to match the contract's
+    permutation. This supports both "tile equals vanilla[-2:]" and
+    sub-tiled contracts (e.g. ``reshape = vanilla + (1, 1)`` with a (1,1)
+    tile, which is how pass-1 represents fully-streamed leaves).
+    """
+    assert len(vanilla_shape) >= 2, (
+        f"_offchip_load_args_for_contract({arg_name!r}): vanilla_shape "
+        f"{vanilla_shape!r} must have rank >= 2"
+    )
+    R_tuple = contract.reshape
+    P = contract.permutation
+    n = len(R_tuple)
+    assert n >= 2, (
+        f"_offchip_load_args_for_contract({arg_name!r}): contract.reshape "
+        f"{R_tuple!r} must have rank >= 2 (the tile occupies the last two "
+        f"axes)"
+    )
+    assert tuple(P[-2:]) == (n - 2, n - 1), (
+        f"_offchip_load_args_for_contract({arg_name!r}): contract.permutation "
+        f"must leave the last two reshape axes in place; got permutation={P!r}. "
+        f"Permutations that move the contract's tile dims into the stream "
+        f"(or pull stream dims into the tile) aren't realizable as a single "
+        f"strided offchip_load — they'd need follow-up DSL ops "
+        f"(retile / streamify) to express, which isn't mechanically "
+        f"derivable from contract metadata alone."
+    )
+    R = int(vanilla_shape[-2])
+    C = int(vanilla_shape[-1])
+    tile_row = int(R_tuple[-2])
+    tile_col = int(R_tuple[-1])
+    assert R % tile_row == 0, (
+        f"_offchip_load_args_for_contract({arg_name!r}): vanilla R={R} not "
+        f"divisible by contract tile_row={tile_row}; reshape={R_tuple!r}, "
+        f"vanilla_shape={vanilla_shape!r}"
+    )
+    assert C % tile_col == 0, (
+        f"_offchip_load_args_for_contract({arg_name!r}): vanilla C={C} not "
+        f"divisible by contract tile_col={tile_col}; reshape={R_tuple!r}, "
+        f"vanilla_shape={vanilla_shape!r}"
+    )
+    Rg = R // tile_row
+    Cg = C // tile_col
+
+    m = n - 2
+    # offchip_load asserts ``len(out_shape_tiled) >= 1`` — rank-2 applied
+    # shapes (m == 0) would need a different load idiom. Surface this here
+    # so the failure mode is a parse-time assertion rather than a deep
+    # offchip_load shape mismatch later.
+    assert m >= 1, (
+        f"_offchip_load_args_for_contract({arg_name!r}): contract has no "
+        f"leading stream dims (rank-2 applied_shape="
+        f"{contract.applied_shape()!r}); the isolation wrapper currently "
+        f"requires at least one stream dim. Reshape the contract to factor "
+        f"a leading 1 (e.g. reshape=(1,)+...) if you want a single-tile load."
+    )
+
+    # For each leading reshape axis k (0..m-1), decompose its element-major
+    # stride E_k into (batch_step, r_step, c_step) over the offchip_load
+    # tile grid. The tile-flat stride contributed by axis k is then
+    # ``batch_step * Rg * Cg + r_step * Cg + c_step``.
+    leading_tile_flat_strides = [0] * m
+    for k in range(m):
+        E_k = 1
+        for j in range(k + 1, n):
+            E_k *= int(R_tuple[j])
+        batch_step, rem = divmod(E_k, R * C)
+        r_step, rem = divmod(rem, tile_row * C)
+        c_step, rem = divmod(rem, tile_col)
+        assert rem == 0, (
+            f"_offchip_load_args_for_contract({arg_name!r}): leading reshape "
+            f"axis {k} has element-major stride {E_k} that does not align to "
+            f"a tile boundary in vanilla layout (tile=({tile_row}, {tile_col}), "
+            f"vanilla[-2:]=({R}, {C})); reshape={R_tuple!r}, vanilla_shape="
+            f"{vanilla_shape!r}. The contract's stream axis would land mid-tile, "
+            f"which isn't realizable as a single strided offchip_load."
+        )
+        leading_tile_flat_strides[k] = batch_step * Rg * Cg + r_step * Cg + c_step
+
+    # Apply the permutation: applied stream axis j (0..m-1) corresponds to
+    # reshape leading axis P[j].
+    stride = tuple(leading_tile_flat_strides[P[j]] for j in range(m))
+    out_shape_tiled = tuple(int(R_tuple[P[j]]) for j in range(m))
+    return out_shape_tiled, tile_row, tile_col, stride
+
+
 def build_synthetic_wrapper_for_node(
     *,
     node_name: str,
     parent_contract: Contract,
+    input_contracts: dict[str, TensorContract],
 ) -> str:
     """Build a ``def tiled_reference(dims, tensors): ...`` wrapper that
     calls ``<node_name>`` with kernel-level tensor refs.
 
-    Phase 5 v1 requires that every ``TensorArg`` input is RAW (i.e. the
-    parent's call site forwarded it without on-chip loading). Asserts
-    loudly when this isn't met — supporting on-chip-arg-at-non-root
-    scoring requires generating ``offchip_load`` + contract-realizing
-    DSL ops, which is the parent-DSL writer's responsibility and can't
-    be mechanically derived from the contract alone.
+    For each non-RAW ``TensorArg``, the wrapper emits an ``offchip_load``
+    whose stream + tile dims exactly match ``input_contracts[name]``'s
+    ``applied_shape`` (then ``flatten``-s away ``offchip_load``'s leading
+    singleton). RAW ``TensorArg``s are passed through as ``tensors[name]``
+    — the leaf is responsible for ``offchip_load``-ing those itself
+    (``tensors`` arrives wrapped as ``StepRawTensor`` per
+    ``_wrap_input_tensors`` in tools.py, so the bare reference satisfies
+    every DSL source op's ``_assert_raw`` gate).
+
+    Because the load strides are contract-dependent, this wrapper is
+    rebuilt per variant — once with identity contracts to seed the
+    baseline, once per parsed LLM response. Pass ``input_contracts =
+    {name: vanilla_contract_for(spec.shape) for name, spec in ... if
+    on-chip}`` to reproduce the identity-contract baseline behavior.
     """
     arg_names = parent_contract.arg_names
     arg_specs = parent_contract.arg_specs
     arg_is_raw = parent_contract.arg_is_raw
     out_shapes = parent_contract.out_shapes
 
-    for name, spec, raw in zip(arg_names, arg_specs, arg_is_raw):
-        if isinstance(spec, TensorArg):
-            assert raw, (
-                f"build_synthetic_wrapper_for_node({node_name!r}): on-chip "
-                f"TensorArg {name!r} not supported in Phase 5 v1 — would "
-                f"require synthesizing offchip_load + contract-realizing "
-                f"DSL ops. Deferred."
-            )
+    on_chip_arg_names = {
+        name for name, spec, raw in zip(arg_names, arg_specs, arg_is_raw)
+        if isinstance(spec, TensorArg) and not raw
+    }
+    missing = on_chip_arg_names - set(input_contracts.keys())
+    assert not missing, (
+        f"build_synthetic_wrapper_for_node({node_name!r}): input_contracts "
+        f"is missing entries for on-chip TensorArg(s) {sorted(missing)!r}; "
+        f"got contracts for {sorted(input_contracts.keys())!r}"
+    )
+    extra = set(input_contracts.keys()) - on_chip_arg_names
+    assert not extra, (
+        f"build_synthetic_wrapper_for_node({node_name!r}): input_contracts "
+        f"has entries for non-on-chip args {sorted(extra)!r}; contracts "
+        f"only apply to on-chip TensorArg inputs"
+    )
 
-    lookups = ", ".join(f'tensors["{n}"]' for n in arg_names)
+    preamble_lines: list[str] = []
+    call_arg_exprs: list[str] = []
+    for name, spec, raw in zip(arg_names, arg_specs, arg_is_raw):
+        if isinstance(spec, TensorArg) and not raw:
+            ost, tr, tc, st = _offchip_load_args_for_contract(
+                name, tuple(spec.shape), input_contracts[name],
+            )
+            local = f"_{name}_in"
+            preamble_lines.append(
+                f'    {local} = offchip_load(tensors["{name}"], '
+                f"stride={st!r}, out_shape_tiled={ost!r}, "
+                f"tile_row={tr}, tile_col={tc})"
+            )
+            # offchip_load returns a stream of rank len(ost)+1 (it prepends
+            # a leading singleton); flatten the outermost two stream dims
+            # so the stream rank matches contract.applied_shape[:-2].
+            m = len(ost)
+            preamble_lines.append(
+                f"    {local} = flatten({local}, "
+                f"min_rank={m - 1}, max_rank={m})"
+            )
+            call_arg_exprs.append(local)
+        else:
+            call_arg_exprs.append(f'tensors["{name}"]')
+
+    lookups = ", ".join(call_arg_exprs)
     out_shapes_repr = repr(tuple(tuple(s) for s in out_shapes))
     n_outputs = len(out_shapes)
     # Multi-output nodes return a tuple; OffChipStore requires a single
@@ -248,32 +415,78 @@ def build_synthetic_wrapper_for_node(
     # come back from a fully-collapsing accum with stream rank 0; without
     # the promote the Rust simulator panics on startup.
     if n_outputs == 1:
-        body = (
-            f"    result = {node_name}({lookups}, out_shapes={out_shapes_repr})\n"
-            f"    return offchip_store(promote_outer(result))\n"
+        body_lines = list(preamble_lines)
+        body_lines.append(
+            f"    result = {node_name}({lookups}, out_shapes={out_shapes_repr})"
         )
+        body_lines.append("    return offchip_store(promote_outer(result))")
     else:
         out_names = [f"_out_{i}" for i in range(n_outputs)]
         destruct = ", ".join(out_names)
-        lines = [
-            f"    {destruct} = {node_name}({lookups}, out_shapes={out_shapes_repr})",
-        ]
+        body_lines = list(preamble_lines)
+        body_lines.append(
+            f"    {destruct} = {node_name}({lookups}, "
+            f"out_shapes={out_shapes_repr})"
+        )
         # Store every output but the last; return the final store so the
         # tiled_reference has a well-defined return value (mirrors single-
         # output case).
         for nm in out_names[:-1]:
-            lines.append(f"    offchip_store(promote_outer({nm}))")
-        lines.append(f"    return offchip_store(promote_outer({out_names[-1]}))")
-        body = "\n".join(lines) + "\n"
+            body_lines.append(f"    offchip_store(promote_outer({nm}))")
+        body_lines.append(
+            f"    return offchip_store(promote_outer({out_names[-1]}))"
+        )
+    body = "\n".join(body_lines) + "\n"
     return f"def tiled_reference(dims, tensors):\n{body}"
+
+
+def _identity_input_contracts(
+    parent_contract: Contract,
+) -> dict[str, TensorContract]:
+    """Pass-1-matching baseline contract per on-chip TensorArg.
+
+    The applied shape is ``parent_contract.tiled_shapes[i]`` — the actual
+    on-chip layout the leaf was authored against in pass-1, which may
+    differ from ``arg_specs[i].shape`` (the vanilla PyTorch input shape).
+    Specifically, pass-1 leaves that operate element-wise on a vanilla
+    tensor factor a trailing ``(1, 1)`` tile onto the reshape, producing
+    e.g. ``tiled_shape = (4, 4, 64, 32, 1, 1)`` for ``vanilla = (4, 4,
+    64, 32)`` so the leaf consumes a per-element stream. ``permutation``
+    is identity over the tiled rank, so the wrapper's ``offchip_load``
+    walks vanilla element-major into a stream whose layout exactly
+    matches what the leaf saw at pass-1 invocation time.
+    """
+    return {
+        name: vanilla_contract_for(tuple(tshape))
+        for name, spec, raw, tshape in zip(
+            parent_contract.arg_names,
+            parent_contract.arg_specs,
+            parent_contract.arg_is_raw,
+            parent_contract.tiled_shapes,
+        )
+        if isinstance(spec, TensorArg) and not raw
+    }
 
 
 def build_node_tensors_dict(parent_contract: Contract) -> dict:
     """Build a ``tensors`` dict for scoring this node in isolation.
 
-    For each TensorArg: ``torch.zeros(spec.shape)`` (timing model
-    inspects shape only). For each list arg: the recorded
-    ``tiled_values`` entry (already a list[Tensor] or list[int]).
+    For each TensorArg: the recorded ``tiled_values[i]`` reshaped to the
+    vanilla ``spec.shape``. Using the real pass-1 value (instead of
+    ``torch.zeros``) is required for leaves whose functional executor
+    inspects values, not just shapes — e.g. moe_dispatch reads
+    ``expert_onehot`` to compute per-expert active-token counts and
+    reshapes the resulting ragged buffer accordingly; an all-zero
+    one-hot collapses every expert's bucket to size 0 and
+    ``FlatReassemble`` panics on the invalid reshape. For RAW tensor
+    args ``tiled_value.shape == spec.shape`` (the parent passed through
+    the root's vanilla tensor unchanged); for on-chip TensorArgs the
+    tiled shape factors differently but numel matches, so the reshape
+    is a pure layout-recovery step (mirrors ``_vanillify`` in
+    blackbox_stub.py).
+
+    For each list arg: the recorded ``tiled_values`` entry (already a
+    ``list[Tensor]`` or ``list[int]``) passes through unchanged.
     """
     out: dict = {}
     for name, spec, val in zip(
@@ -282,7 +495,12 @@ def build_node_tensors_dict(parent_contract: Contract) -> dict:
         parent_contract.tiled_values,
     ):
         if isinstance(spec, TensorArg):
-            out[name] = torch.zeros(spec.shape)
+            assert isinstance(val, torch.Tensor), (
+                f"build_node_tensors_dict: arg {name!r} is a TensorArg but "
+                f"contract.tiled_values entry is "
+                f"{type(val).__name__}"
+            )
+            out[name] = val.reshape(spec.shape)
         else:
             assert isinstance(spec, (ListOfTensorArg, ListOfIntArg)), (
                 f"build_node_tensors_dict: arg {name!r} has unsupported spec "
@@ -408,6 +626,35 @@ def render_library_as_variant_summaries(
     return summaries
 
 
+def find_pass1_baseline_entry(lib: NodeLibrary) -> DesignEntry:
+    """Locate the unique pass-1 baseline entry in ``lib`` (provenance==
+    ``"pass1_baseline"``).
+
+    ``_seed_baseline`` / ``_seed_root_baseline`` insert exactly one such
+    entry per library, into the identity-contracts cell, before any LLM
+    variant is considered. The parent's baseline composition must use the
+    *pass-1* descendant DSLs — not whichever LLM variant happens to be
+    Pareto-best in the identity cell — because the pass-1 chain is the
+    only one already known to graph-build end-to-end as a tree (pass-1
+    proved it). LLM variants may legitimately reshape their stream/tile
+    decomposition; reusing one for the parent's baseline can break the
+    composition (see HANDOFF.md's contract-conformance section).
+    """
+    candidates = [
+        entry
+        for by_out in lib.values() for cell in by_out.values()
+        for entry in cell
+        if entry.provenance == "pass1_baseline"
+    ]
+    assert len(candidates) == 1, (
+        f"find_pass1_baseline_entry: expected exactly one entry with "
+        f"provenance='pass1_baseline' per library, got {len(candidates)}. "
+        f"_seed_baseline/_seed_root_baseline must insert the entry before "
+        f"any LLM-variant scoring runs."
+    )
+    return candidates[0]
+
+
 # ---------------------------------------------------------------------------
 # Search drivers
 # ---------------------------------------------------------------------------
@@ -420,25 +667,29 @@ def _seed_baseline(
     parent_contract: Contract,
     pass1_dsl: str,
     score_fn: ScoreFn,
-    wrapper_source: str,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
 ) -> DesignEntry:
-    """Insert the pass-1 baseline with identity contracts into the library."""
-    identity_in = {
-        name: vanilla_contract_for(spec.shape)
-        for name, spec, raw in zip(
-            parent_contract.arg_names, parent_contract.arg_specs,
-            parent_contract.arg_is_raw)
-        if isinstance(spec, TensorArg) and not raw
-    }
+    """Insert the pass-1 baseline with identity contracts into the library.
+
+    The synthetic wrapper is rebuilt here with the identity input contracts
+    so the per-arg ``offchip_load`` strides match the baseline's vanilla
+    layout; identical to what the search loop emits for any LLM variant
+    that picks identity contracts on its on-chip inputs.
+    """
+    identity_in = _identity_input_contracts(parent_contract)
     output_names = tuple(f"out_{i}" for i in range(len(parent_contract.out_shapes)))
     identity_out = {
         name: vanilla_contract_for(tuple(parent_contract.out_shapes[i]))
         for i, name in enumerate(output_names)
     }
+    wrapper = build_synthetic_wrapper_for_node(
+        node_name=node_name,
+        parent_contract=parent_contract,
+        input_contracts=identity_in,
+    )
     composed = compose_source(
-        parent_dsl=wrapper_source + "\n" + pass1_dsl,
+        parent_dsl=wrapper + "\n" + pass1_dsl,
         descendant_dsls_postorder=descendant_dsls,
     )
     cycles, on_chip = score_fn(composed)
@@ -484,6 +735,72 @@ def _append_turn_feedback(conversation: list[dict], feedback: str) -> None:
     conversation.append({"role": "user", "content": feedback})
 
 
+def _safe_score(
+    score_fn: ScoreFn, composed: str,
+) -> tuple[int | None, int | None, str | None]:
+    """Run ``score_fn(composed)`` and convert any exception to LLM feedback.
+
+    The analytical scorer goes ``translate → _exec_build_graph →
+    analyze_timing``; ``analyze_timing`` in turn invokes the timing
+    model's functional executor (``execute_values``), which can raise
+    on shape regimes the executor doesn't handle uniformly. The
+    non-root verifier's DSL-exec + graph-build smoke tests catch most
+    of these upstream (DSL eager-exec catches torch-level shape
+    mismatches that match the timing model's executor; graph-build
+    catches STeP frontend assertions). This helper is the last-resort
+    net for anything that still slips through — timing-model internals
+    or executor paths the DSL surface doesn't reach — so the search
+    loop converts them into LLM next-turn feedback instead of crashing
+    the autotune2 run.
+
+    Returns ``(cycles, on_chip, None)`` on success or ``(None, None,
+    feedback_str)`` on failure — call site picks one tuple shape and
+    branches.
+    """
+    import traceback as _tb
+    try:
+        cycles, on_chip = score_fn(composed)
+        return cycles, on_chip, None
+    except Exception:
+        err = _tb.format_exc()
+        feedback = (
+            "## Analytical scorer failed on this variant\n\n"
+            "The DSL translated and the STeP graph built, but the timing "
+            "model's analyzer raised while propagating concrete values "
+            "through the graph. This is usually a shape regime the "
+            "functional executor can't handle uniformly (e.g. an op like "
+            "`flat_reassemble` / `flat_partition` whose per-token or "
+            "per-expert buckets must be equal-sized for the executor's "
+            "internal stack-and-reshape path). Error follows:\n\n"
+            "```\n" + err + "```\n\n"
+            "Consider an alternative implementation that avoids the "
+            "failing op pattern, or adjust your contracts so the "
+            "downstream stream shapes are uniform across the dynamic "
+            "axes the failing op spans."
+        )
+        return None, None, feedback
+
+
+def _write_pass1_baseline_score(ckpt_dir: Path, baseline: DesignEntry) -> None:
+    """Persist the pass-1 baseline (cycles, on_chip) to the node's pass-2
+    ckpt_dir so the reference point is visible alongside the attempts
+    rather than only readable indirectly from the next attempt's prompt.
+
+    For parent nodes the recorded score reflects the composition of this
+    node's pass-1 DSL with each child's pass-1 baseline — matching what
+    ``_seed_baseline`` actually scored — so the number is directly
+    comparable to the cycles/on_chip recorded for each accepted variant
+    that uses different child picks.
+    """
+    import json
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "pass1_baseline_score.json").write_text(json.dumps({
+        "cycles": baseline.cycles,
+        "on_chip": baseline.on_chip,
+        "provenance": baseline.provenance,
+    }, indent=2))
+
+
 def _write_turn_artifacts(
     turn_dir: Path,
     *,
@@ -493,6 +810,7 @@ def _write_turn_artifacts(
     extracted_code: str | None = None,
     composed_source: str | None = None,
     verify_result: VerifyResult | None = None,
+    admitted_entries: list[DesignEntry] | None = None,
 ) -> None:
     """Per-turn checkpoint. Mirrors pass-1's turn_<N>/ layout so the same
     inspection tooling works across passes.
@@ -509,6 +827,10 @@ def _write_turn_artifacts(
         verified (full parent + descendant DSL the verifier saw).
       - ``verify_result.txt`` when the verifier was invoked
         (``"PASS"`` on success, the full gate feedback on failure).
+      - ``score.json`` when one or more entries were admitted on this
+        turn — records each admitted entry's (cycles, on_chip) so the
+        turn's performance is visible without inspecting the next
+        attempt's user prompt.
     """
     from src.token_accounting import write_turn_tokens
 
@@ -528,6 +850,18 @@ def _write_turn_artifacts(
         (turn_dir / "verify_result.txt").write_text(
             "PASS" if verify_result.passed else verify_result.feedback
         )
+    if admitted_entries:
+        import json
+        (turn_dir / "score.json").write_text(json.dumps({
+            "entries": [
+                {
+                    "cycles": e.cycles,
+                    "on_chip": e.on_chip,
+                    "provenance": e.provenance,
+                }
+                for e in admitted_entries
+            ],
+        }, indent=2))
 
 
 async def search_leaf(
@@ -560,9 +894,10 @@ async def search_leaf(
     assert node.is_leaf, f"search_leaf called on non-leaf node {node.path!r}"
     lib: NodeLibrary = {}
     is_root = parent_contract is None
-    wrapper = "" if is_root else build_synthetic_wrapper_for_node(
-        node_name=node.name, parent_contract=parent_contract,
-    )
+    # The synthetic wrapper's offchip_load strides depend on the variant's
+    # input_contracts, so we rebuild it per turn from ``parsed.input_contracts``
+    # below. The baseline path inside ``_seed_baseline`` builds its own wrapper
+    # with identity contracts.
 
     if system_prompt:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -577,9 +912,10 @@ async def search_leaf(
         baseline = _seed_baseline(
             lib=lib, node_name=node.name, parent_contract=parent_contract,
             pass1_dsl=pass1_dsl, score_fn=score_fn,
-            wrapper_source=wrapper, descendant_dsls=[],
+            descendant_dsls=[],
             children_picks={},
         )
+    _write_pass1_baseline_score(ckpt_dir, baseline)
 
     arg_vanilla_shapes = (
         {} if is_root else _on_chip_vanilla_shapes(parent_contract)
@@ -635,11 +971,34 @@ async def search_leaf(
                 ))
                 continue
 
+            try:
+                wrapper = "" if is_root else build_synthetic_wrapper_for_node(
+                    node_name=node.name,
+                    parent_contract=parent_contract,
+                    input_contracts=parsed.input_contracts,
+                )
+            except AssertionError as e:
+                _write_turn_artifacts(
+                    turn_dir,
+                    user_prompt=turn_user_prompt,
+                    agent_response=agent_response,
+                    status=f"WRAPPER_BUILD_FAIL: {e}",
+                    extracted_code=parsed.dsl,
+                )
+                _append_turn_feedback(conversation, (
+                    "Your declared input_contracts are not realizable as a "
+                    f"single strided offchip_load: {e}\n\n"
+                    "Pick contracts that keep the tile = vanilla[-2:] and "
+                    "leave the last two reshape axes in place; the leading "
+                    "stream axes may be factored/permuted freely."
+                ))
+                continue
+
             composed = compose_source(
                 parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
                 descendant_dsls_postorder=[],
             )
-            verify = await verifier(composed)
+            verify = await verifier(composed, parsed.output_contracts)
             if not verify.passed:
                 _write_turn_artifacts(
                     turn_dir,
@@ -658,7 +1017,20 @@ async def search_leaf(
                 ))
                 continue
 
-            cycles, on_chip = score_fn(composed)
+            cycles, on_chip, score_err = _safe_score(score_fn, composed)
+            if score_err is not None:
+                _write_turn_artifacts(
+                    turn_dir,
+                    user_prompt=turn_user_prompt,
+                    agent_response=agent_response,
+                    status="SCORE_FAIL",
+                    extracted_code=parsed.dsl,
+                    composed_source=composed,
+                    verify_result=VerifyResult(passed=False, feedback=score_err),
+                )
+                _append_turn_feedback(conversation, score_err)
+                continue
+
             entry = DesignEntry(
                 dsl=parsed.dsl,
                 input_contracts=parsed.input_contracts,
@@ -679,6 +1051,7 @@ async def search_leaf(
                 extracted_code=parsed.dsl,
                 composed_source=composed,
                 verify_result=verify,
+                admitted_entries=[entry],
             )
             break  # success → break inner loop, start a fresh attempt
 
@@ -724,11 +1097,10 @@ async def search_parent(
     """
     lib: NodeLibrary = {}
     is_root = parent_contract is None
-
-    # Build the synthetic wrapper (non-root) or use the parent DSL directly (root).
-    wrapper = "" if is_root else build_synthetic_wrapper_for_node(
-        node_name=node.name, parent_contract=parent_contract,
-    )
+    # The synthetic wrapper's offchip_load strides depend on the variant's
+    # input_contracts, so we rebuild it per turn from ``parsed.input_contracts``
+    # below. The baseline path inside ``_seed_baseline`` builds its own wrapper
+    # with identity contracts.
 
     if system_prompt:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -749,9 +1121,10 @@ async def search_parent(
         baseline = _seed_baseline(
             lib=lib, node_name=node.name, parent_contract=parent_contract,
             pass1_dsl=pass1_dsl, score_fn=score_fn,
-            wrapper_source=wrapper, descendant_dsls=baseline_descendants,
+            descendant_dsls=baseline_descendants,
             children_picks=children_picks_baseline,
         )
+    _write_pass1_baseline_score(ckpt_dir, baseline)
 
     # Build per-child variant tables for the prompt (stable across attempts —
     # children's libraries don't change while this parent is searching).
@@ -863,6 +1236,29 @@ async def search_parent(
                 continue
             children_order = [c.path for c in node.children]
 
+            try:
+                wrapper = "" if is_root else build_synthetic_wrapper_for_node(
+                    node_name=node.name,
+                    parent_contract=parent_contract,
+                    input_contracts=parsed.input_contracts,
+                )
+            except AssertionError as e:
+                _write_turn_artifacts(
+                    turn_dir,
+                    user_prompt=turn_user_prompt,
+                    agent_response=agent_response,
+                    status=f"WRAPPER_BUILD_FAIL: {e}",
+                    extracted_code=parsed.dsl,
+                )
+                _append_turn_feedback(conversation, (
+                    "Your declared parent_input_contracts are not realizable "
+                    f"as a single strided offchip_load: {e}\n\n"
+                    "Pick contracts that keep the tile = vanilla[-2:] and "
+                    "leave the last two reshape axes in place; the leading "
+                    "stream axes may be factored/permuted freely."
+                ))
+                continue
+
             # Score every Cartesian combination and admit non-dominated entries.
             cell = library_cell(
                 lib, parsed.input_contracts, parsed.output_contracts)
@@ -887,12 +1283,16 @@ async def search_parent(
                 )
                 if first_composed is None:
                     first_composed = composed
-                verify = await verifier(composed)
+                verify = await verifier(composed, parsed.output_contracts)
                 last_verify = verify
                 if not verify.passed:
                     last_failure = verify.feedback
                     continue
-                cycles, on_chip = score_fn(composed)
+                cycles, on_chip, score_err = _safe_score(score_fn, composed)
+                if score_err is not None:
+                    last_verify = VerifyResult(passed=False, feedback=score_err)
+                    last_failure = score_err
+                    continue
                 entry = DesignEntry(
                     dsl=parsed.dsl,
                     input_contracts=parsed.input_contracts,
@@ -915,22 +1315,24 @@ async def search_parent(
                     extracted_code=parsed.dsl,
                     composed_source=first_composed,
                     verify_result=last_verify,
+                    admitted_entries=list(admitted_this_turn),
                 )
                 break  # success → break inner loop, start a fresh attempt
             _write_turn_artifacts(
                 turn_dir,
                 user_prompt=turn_user_prompt,
                 agent_response=agent_response,
-                status="VERIFY_FAIL_ALL_COMPOSITIONS",
+                status="VERIFY_OR_SCORE_FAIL_ALL_COMPOSITIONS",
                 extracted_code=parsed.dsl,
                 composed_source=first_composed,
                 verify_result=last_verify,
             )
             _append_turn_feedback(conversation, (
-                "Your variant did not pass verification under any "
-                "Cartesian combination of the picked children's Pareto "
-                "front. Last gate feedback follows; please emit a "
-                "corrected DSL implementation:\n\n"
+                "Your variant did not produce an admissible entry under "
+                "any Cartesian combination of the picked children's Pareto "
+                "front — either a verification gate failed or the "
+                "analytical scorer raised. Last feedback follows; please "
+                "emit a corrected DSL implementation:\n\n"
                 f"{last_failure}"
             ))
 
@@ -1022,9 +1424,10 @@ async def autotune(
     pass1_dsls: dict[str, str],
     pass1_contracts: dict[str, Contract],
     ckpt_dir: Path,
-    score_fn: ScoreFn,
+    make_score_fn: Callable[[dict], ScoreFn],
+    root_tensors: dict,
     agent_factory: Callable[[str], AgentFn],
-    verifier: VerifierFn,
+    make_verifier: Callable[["PlanNode", "Contract | None", dict], VerifierFn],
     prompt_inputs: dict[str, NodePromptInputs],
     system_prompts: dict[str, str],
     config: SearchConfig = SearchConfig(),
@@ -1055,6 +1458,27 @@ async def autotune(
         driver calls it once per node, so each ``search_leaf`` /
         ``search_parent`` receives an agent whose system prompt and
         conversation history are local to that node.
+      - ``make_score_fn``: ``Callable[[tensors_dict], ScoreFn]``. The
+        driver invokes it once per node to construct a node-local
+        analytical scorer whose closed-over ``tensors`` dict matches
+        the per-node arg names referenced by that node's synthetic
+        wrapper (e.g. ``tensors["Q"]``). For non-root nodes the dict
+        is built via ``build_node_tensors_dict(parent_contract)``;
+        for the root it's ``root_tensors``.
+      - ``make_verifier``: ``Callable[[PlanNode, Contract | None,
+        tensors_dict], VerifierFn]``. Mirrors ``make_score_fn`` but
+        builds a per-node 4-gate verifier closed over the node's own
+        gold / call-args / tensors. Root nodes get a verifier whose
+        gold comes from the kernel's ``compute_gold`` (entry point
+        ``tiled_reference(dims, tensors)``). Non-root nodes get one
+        whose gold is the recorded ``parent_contract.tiled_outputs``
+        and whose entry point is ``<node_name>(*tiled_values, *,
+        out_shapes=...)`` — mirroring pass-1's non-root verification.
+      - ``root_tensors``: kernel-level tensors dict (same shape as
+        the dict passed to ``make_analytical_scorer`` in pass-1). Used
+        only at the root, whose DSL is the kernel's own
+        ``tiled_reference`` and resolves ``tensors[...]`` against the
+        kernel inputs directly.
 
     Returns the full ``{node_path: NodeLibrary}`` map plus the root path.
     """
@@ -1078,45 +1502,55 @@ async def autotune(
         node_ckpt = ckpt_dir / "autotune2" / node.path
         node_system_prompt = system_prompts[node.path]
         node_agent = agent_factory(node_system_prompt)
+        is_root_node = node.path == root_path
+        parent_contract = None if is_root_node else pass1_contracts[node.path]
+        # Build the per-node tensors dict the wrapper's offchip_load /
+        # ``tensors[arg_name]`` references resolve against. For the root the
+        # kernel-level tensors are correct (its DSL is the kernel's own
+        # ``tiled_reference``); for any other node we synthesize per-arg
+        # zero tensors at the contract's vanilla shapes — the analytical
+        # timing model only inspects shapes, not values.
+        node_tensors = (
+            root_tensors if is_root_node
+            else build_node_tensors_dict(parent_contract)
+        )
+        node_score_fn = make_score_fn(node_tensors)
+        node_verifier = make_verifier(node, parent_contract, node_tensors)
         if node.is_leaf:
             return await search_leaf(
                 node=node,
-                parent_contract=(
-                    None if node.path == root_path
-                    else pass1_contracts[node.path]
-                ),
+                parent_contract=parent_contract,
                 pass1_dsl=pass1_dsls[node.path],
                 ckpt_dir=node_ckpt,
-                score_fn=score_fn,
+                score_fn=node_score_fn,
                 agent=node_agent,
-                verifier=verifier,
+                verifier=node_verifier,
                 prompt_inputs=prompt_inputs[node.path],
                 config=config,
                 system_prompt=node_system_prompt,
             )
 
-        # Parent: gather each child's baseline entry (the Pareto-best of
-        # the baseline cell, i.e. the first cell by construction in
-        # ``_seed_baseline``).
-        baseline_picks: dict[str, DesignEntry] = {}
-        for child in node.children:
-            first_cell = next(iter(next(iter(child_libs[child.path].values())).values()))
-            baseline_picks[child.path] = min(
-                first_cell, key=lambda e: (e.cycles, e.on_chip)
-            )
+        # Parent: gather each child's pass-1 baseline entry. We must use
+        # the pass-1 DSL (not the child's Pareto-best LLM variant) because
+        # the parent's baseline is the canonical pass-1 reference — pass-1
+        # already proved that the parent's pass-1 DSL composes with each
+        # child's pass-1 DSL. An LLM child variant may declare the same
+        # output contract but a different stream/tile decomposition that
+        # the parent's pass-1 DSL wasn't authored against.
+        baseline_picks: dict[str, DesignEntry] = {
+            child.path: find_pass1_baseline_entry(child_libs[child.path])
+            for child in node.children
+        }
         return await search_parent(
             node=node,
-            parent_contract=(
-                None if node.path == root_path
-                else pass1_contracts[node.path]
-            ),
+            parent_contract=parent_contract,
             pass1_dsl=pass1_dsls[node.path],
             children_libraries=child_libs,
             children_picks_baseline=baseline_picks,
             ckpt_dir=node_ckpt,
-            score_fn=score_fn,
+            score_fn=node_score_fn,
             agent=node_agent,
-            verifier=verifier,
+            verifier=node_verifier,
             prompt_inputs=prompt_inputs[node.path],
             config=config,
             system_prompt=node_system_prompt,

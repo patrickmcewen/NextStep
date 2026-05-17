@@ -4,8 +4,9 @@ A StepGenFlow run produces a layered, on-disk record sufficient to
 reconstruct what every LLM saw and what every gate decided. There are
 three logical scopes: the per-kernel run (one invocation of the
 implementer pipeline), the regression suite (one invocation of the
-batch driver wrapping many per-kernel runs), and the autotune run.
-Each owns its own tree.
+batch driver wrapping many per-kernel runs), and the autotune run
+(`run_autotune2.py`, a separate post-pipeline pass). Each owns its
+own tree.
 
 ## Per-kernel checkpoint tree
 
@@ -32,17 +33,6 @@ directory is the durable record of the run.
         ├── pass2_composed.py       # Pass-2 output: the composed root DSL after name rebinding
         │                           # (only present when Pass 2 ran and succeeded)
         ├── dsl_code.py             # phase-1 verified DSL output (when refactor_final succeeded)
-        ├── autotune/               # only present when --autotune was set and this outer succeeded
-        │   └── pass_<idx>_<agent>/
-        │       └── <kernel>/       # the autotune subsystem's own checkpoint tree
-        │           ├── config.json
-        │           ├── baseline_dsl.py / baseline_translated.py
-        │           ├── baseline_timing.txt / baseline_verbose_timing.txt
-        │           ├── progress.json   # crash-safe best-so-far (see autotuner.md)
-        │           ├── turn_<n>/...
-        │           ├── best.py / best_translated.py
-        │           ├── best_timing.txt / best_verbose_timing.txt
-        │           └── result.json     # only present on a clean autotune completion
         └── <pass>/                 # one per LLM pass that ran (no-plan path; under Phase 0, see pass1/iteration_<k>/<node_path>/)
             ├── system_prompt.txt   # the rendered system prompt this pass actually used
             └── turn_<m>/
@@ -62,14 +52,10 @@ directory is the durable record of the run.
                     └── graph_correctness.txt      # gold comparison of the lowered graph
 ```
 
-The `autotune/pass_<idx>_<agent>/<kernel>/` nesting under each outer
-mirrors the autotune subsystem's chain-of-passes execution: each
-configured pass writes its own subdirectory, with the next pass
-resuming from the previous pass's `best.py`. See
-[autotuner.md](autotuner.md) for the chain schema. The whole
-`autotune/` block only appears when `--autotune` was set on the
-invocation *and* that particular outer's functional pipeline reached
-the verified-DSL step.
+Autotune2 runs as a separate, standalone post-pipeline pass against a
+finished `outer_<i>/` checkpoint (see [autotuner.md](autotuner.md));
+it does not write inside the implementer's checkpoint tree above. The
+autotune2 tree is described in its own section further down.
 
 The `plan/` and `pass1/` subtrees only appear when Phase 0 (the
 decomposition planner) ran for that outer. In the legacy single-shot
@@ -127,17 +113,16 @@ PerKernelResult:
   per_outer:
     - outer:    int
       success:  bool
-      autotune: dict | null                # per-outer autotune chain (see autotuner.md);
-                                           # absent when --autotune was off or the outer
-                                           # never reached the verified-DSL step
-  autotune:          dict | null           # the chosen outer's autotune block (when present)
   total_tokens:      int                   # summed across every outer attempt's LLM calls
   traces:            list                  # writer-style code/tool-output captures (legacy)
 ```
 
 `per_outer` is the field the regression runner reads to derive
-`outer_passed` / `outer_total` and per-job autotune for its summary.
-`total_tokens` is what the outer flow reads to score the bundle.
+`outer_passed` / `outer_total` for its summary. `total_tokens` is
+what the outer flow reads to score the bundle. Autotune outcomes
+are not embedded in this file — autotune2 runs as a separate
+post-pipeline pass against a chosen outer and writes its own
+`autotune2_summary.json` (see below).
 
 ## Run config
 
@@ -186,47 +171,72 @@ A regression-runner invocation owns its own timestamped directory (see
 `summary.json`'s structure is documented in
 [regression_runner.md](regression_runner.md).
 
-## Autotune checkpoint tree
+## Autotune2 checkpoint tree
 
-Standalone autotune (`run_autotune.py`) owns its own top-level tree.
-Per-outer autotune (`run.py --autotune`) writes one subdirectory per
-chained pass under each outer's `autotune/pass_<idx>_<agent>/<kernel>/`;
-the only structural difference is location and the chain wrapping.
+`run_autotune2.py` snapshots the source checkpoint into a fresh
+timestamped directory under `--checkpoint-dir` (default: parent of
+the source `<ts>/` directory). Sibling `outer_*` directories of the
+chosen outer are excluded from the copy so the snapshot stays
+small. All autotune2 artifacts live under the snapshot copy; the
+original outer is never modified.
 
 ```
-checkpoints_autotune/<YYYY-MM-DD-HHMMSS>/<kernel>/
-├── config.json                  # kernel, preset, dims, autotune config, resume path, agent
-├── baseline_dsl.py              # the verified DSL form the run started from
-├── baseline_translated.py       # the deterministic translator's output for the baseline
-├── baseline_timing.txt          # baseline timing report (compact)
-├── baseline_verbose_timing.txt  # baseline timing report (per-node + critical path)
-├── progress.json                # crash-safe best-so-far snapshot (see autotuner.md)
-├── best.py                      # the lowest-cycles verified DSL form found
-├── best_translated.py           # its translated build_graph
-├── best_timing.txt              # best's compact timing report
-├── best_verbose_timing.txt      # best's verbose timing report
-├── result.json                  # only present on a clean completion of the loop
-└── turn_<n>/
-    ├── user_prompt.txt
-    ├── response.txt
-    ├── reasoning.txt
-    ├── extracted_code.py                # the proposed DSL
-    ├── dsl_correctness_result.txt       # gate 1 output
-    ├── shape_trace.txt                  # captured DSL trace (when gate 1 raised)
-    ├── translated_code.py               # gate 2 output (when gate 2 succeeded)
-    ├── translate_error.txt              # gate 2 raised
-    ├── graph_correctness_result.txt     # gate 3 output (when gate 3 ran)
-    ├── timing.txt                       # only present when timing model succeeded
-    ├── timing_error.txt                 # timing model raised
-    ├── judge_response.txt               # judge ran
-    └── status.txt                       # see autotuner.md for the status vocabulary
+<checkpoint-dir>/<YYYY-MM-DD-HHMMSS>/                # snapshot root
+├── config.json                              # copied from the source <ts>/config.json
+└── <kernel>/
+    └── outer_<N>/                           # the chosen source outer, copied
+        ├── plan/  pass1/  pass2_composed.py  dsl_code.py   # carried forward from the source
+        ├── autotune2_summary.json           # final summary — root_pareto, rust_winners, best_rust_entry
+        └── autotune2/                       # everything autotune2 writes lives under here
+            ├── _rust_work/                  # composed sources passed to StepDB/evaluate.py
+            │   └── step_impl.py
+            └── <node_path>/                 # one subtree per plan-tree node
+                ├── system_prompt.txt        # the rendered autotune2 system prompt for this node
+                ├── pass1_baseline_score.json   # baseline (cycles, on_chip, provenance)
+                ├── variants.py              # declarative variant registry — overwritten on each admission
+                └── attempt_<i>/turn_<j>/
+                    ├── user_prompt.txt
+                    ├── response.txt
+                    ├── reasoning.txt        # when the agent returned reasoning summaries
+                    ├── tokens.json          # when the agent returned a usage object
+                    ├── extracted_code.py    # the parsed DSL block (when YAML/python parsed)
+                    ├── composed_source.py   # wrapper + leaf + descendants (when the verifier was reached)
+                    ├── verify_result.txt    # "PASS" or the full gate-feedback string
+                    ├── score.json           # admitted entries' (cycles, on_chip, provenance)
+                    └── status.txt           # see autotuner.md for the per-turn status vocabulary
 ```
 
-The autotuner's checkpoint tree carries more artifacts than the
-implementer's because the per-turn loop runs four sequential gates
-(DSL exec, translate, IR sim, timing) instead of two — each gets its
-own per-turn output file so the failure mode is recoverable from
-disk.
+The per-node `<node_path>` mirrors the planner-tree path (e.g.
+`attention_o_proj/attention/attention_compute`). Each node runs
+its own per-turn loop independently; sibling subtrees fan out in
+parallel under `asyncio.gather` with the only ordering constraint
+being "children before parent" (parents render each child's library
+as a variant table in the user prompt). For parent nodes the
+`composed_source.py` artifact is the *first* Cartesian combination's
+composed source — the parent DSL is identical across combinations;
+descendants differ.
+
+`autotune2_summary.json` is the canonical handoff artifact:
+
+```
+{
+  "root_path":          "<root node path>",
+  "library_sizes":      {"<node_path>": <num cells>, ...},
+  "root_pareto":        [{"cycles": ..., "on_chip": ..., "provenance": ...}, ...],
+  "rust_winners":       [
+    {"analytical_cycles": ..., "analytical_on_chip": ...,
+     "rust_cycles": ..., "rust_dur_ms": ..., "provenance": ...},
+    ...
+  ],
+  "best_rust_entry":    {<same shape>} | null,
+  "best_composed_source": "..."             // only when --include-sources was passed
+}
+```
+
+The summary is sorted by `rust_cycles` ascending — `rust_winners[0]`
+== `best_rust_entry` when any promotion ran. A rust evaluator
+failure on a promoted entry is a hard assertion (not silently
+skipped); the file is only written on clean completion of the run.
 
 ## Where to look when something breaks
 
@@ -244,6 +254,7 @@ disk.
 | Per-node refactor failure under planner | `outer_<i>/pass1/iteration_<k>/<node_path>/.../turn_*/status.txt` (the highest-numbered iteration is the one that ran last) |
 | Pass 2 composition failed | `outer_<i>/log.txt` (last lines) — Pass 2 writes no per-turn artifacts; failure escalates to replan |
 | Regression-suite kernel never started | `<results-root>/<stamp>/jobs/<kernel>__<preset>.log` |
-| Autotuner regressed correctness | `<...>/turn_<n>/dsl_correctness_result.txt` or `graph_correctness_result.txt` (the loop ignores it; baseline is preserved as `baseline_dsl.py`) |
-| Per-outer autotune crashed | `<checkpoint-dir>/<kernel>/outer_<i>/autotune/pass_<idx>_<agent>/<kernel>/progress.json` for last-known best; outer's `result.json` `autotune.passes[idx].status` will be `error` with the exception message |
-| Autotune chain halted early | `outer_<i>/.../autotune/...` — outer's `result.json` `autotune.halt_reason` and `halted_pass_index` identify which pass; `feasible=False` indicates infeasibility |
+| Autotune2 turn failed verification | `<snapshot>/<kernel>/outer_<N>/autotune2/<node_path>/attempt_<i>/turn_<j>/verify_result.txt` — carries the gate-feedback string the LLM saw next turn |
+| Autotune2 LLM kept emitting bad contracts | look for `WRAPPER_BUILD_FAIL` / `BAD_CHILD_PICK` in `<...>/turn_<j>/status.txt` |
+| Autotune2 timing model crashed | `<...>/turn_<j>/status.txt == SCORE_FAIL`; the traceback is embedded in `verify_result.txt` and was already routed back as next-turn feedback by `_safe_score` |
+| Where is the best variant? | `autotune2_summary.json` at the snapshot outer dir — `best_rust_entry` gives the rust-validated winner; pass `--include-sources` to embed its composed source |
