@@ -28,8 +28,6 @@ Python DSL block:
       attention_block: 3
     parent_input_contracts:       # empty when no input is on-chip
       Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
-    parent_output_contracts:
-      out_0: {reshape: [16, 4, 512], permutation: [1, 0, 2]}
     ```
 
     ```python
@@ -37,8 +35,13 @@ Python DSL block:
         ...
     ```
 
+Output contracts are NOT declared by the LLM — they are derived
+mechanically from the built graph (the wrapper's ``OffChipStore``
+nodes carry the actual produced stream+tile shapes). See
+``runtime._derive_output_contracts_from_graph``.
+
 ``parse_autotune2_response`` splits the response back into a structured
-``AutotuneResponse`` (child_picks dict, parent_*_contracts dicts of
+``AutotuneResponse`` (child_picks dict, parent_input_contracts dict of
 ``TensorContract``, and the raw DSL source string). All schema
 violations raise ``AssertionError`` with the offending fragment in the
 message; the search driver routes the assertion text back into the
@@ -267,7 +270,7 @@ correct against the PyTorch reference; your task is to propose a
 ```python
 {pass1_dsl}
 ```
-{variant_section}{accepted_section}
+{variant_section}{accepted_section}{budget_section}
 ### Your task
 
 Propose a DSL implementation that:
@@ -310,6 +313,7 @@ def build_autotune2_user_prompt(
     tensors_block: str,
     child_variant_blocks: dict[str, str] | None = None,
     accepted_summary: str = "",
+    budget_block: str = "",
 ) -> str:
     """Self-contained autotune2 user prompt for one (node, attempt) pair.
 
@@ -317,7 +321,10 @@ def build_autotune2_user_prompt(
     subsequent fresh attempts it is the rendered Pareto-front summary
     of already-accepted variants (see ``render_accepted_summary``) so
     the LLM can target gaps. ``child_variant_blocks`` is required for
-    parents and forbidden for leaves.
+    parents and forbidden for leaves. ``budget_block`` is the empty
+    string for an unlimited attempt or a pre-formatted markdown stanza
+    describing this attempt's on-chip memory budget (the per-attempt
+    parallel-fan-out signal in ``search_leaf`` / ``search_parent``).
     """
     if is_leaf:
         assert not child_variant_blocks, (
@@ -347,6 +354,7 @@ def build_autotune2_user_prompt(
         tensors_block=tensors_block,
         variant_section=variant_section,
         accepted_section=accepted_section,
+        budget_section=budget_block,
         accepted_hint=_ACCEPTED_HINT if accepted_summary else "",
         parent_hint="" if is_leaf else _PARENT_HINT_TEXT,
     )
@@ -415,16 +423,16 @@ def render_accepted_summary(
 class AutotuneResponse:
     """Parsed LLM response.
 
-    ``child_picks`` is empty for leaf prompts. ``input_contracts`` /
-    ``output_contracts`` use TensorContract values (already validated
-    against any provided vanilla shape — see ``parse_*``). ``dsl`` is
-    the raw DSL function source extracted from the response's python
-    code block.
+    ``child_picks`` is empty for leaf prompts. ``input_contracts`` uses
+    TensorContract values (validated against any provided vanilla shape
+    — see ``parse_*``). ``dsl`` is the raw DSL function source extracted
+    from the response's python code block. Output contracts are NOT
+    parsed from the LLM response — the verifier derives them from the
+    built graph; see ``VerifyResult.derived_output_contracts``.
     """
 
     child_picks: dict[str, int] = field(default_factory=dict)
     input_contracts: dict[str, TensorContract] = field(default_factory=dict)
-    output_contracts: dict[str, TensorContract] = field(default_factory=dict)
     dsl: str = ""
 
 
@@ -482,8 +490,8 @@ def parse_autotune2_response(
     yaml_body = _extract_fenced(response_text, "yaml")
     assert yaml_body is not None, (
         "parse_autotune2_response: response must contain a fenced ```yaml block "
-        "with the autotuner output spec (child_picks, parent_input_contracts, "
-        "parent_output_contracts); none found"
+        "with the autotuner output spec (child_picks, parent_input_contracts); "
+        "none found"
     )
     py_body = _extract_fenced(response_text, "python")
     assert py_body is not None, (
@@ -497,16 +505,16 @@ def parse_autotune2_response(
         f"got {type(parsed).__name__}"
     )
 
-    expected_keys_parent = {
-        "child_picks", "parent_input_contracts", "parent_output_contracts",
-    }
-    expected_keys_leaf = {"parent_input_contracts", "parent_output_contracts"}
+    expected_keys_parent = {"child_picks", "parent_input_contracts"}
+    expected_keys_leaf = {"parent_input_contracts"}
     expected = expected_keys_leaf if is_leaf else expected_keys_parent
     unexpected = set(parsed.keys()) - expected
     missing = expected - set(parsed.keys())
     assert not unexpected, (
         f"parse_autotune2_response: unexpected yaml keys "
-        f"{sorted(unexpected)!r}; allowed={sorted(expected)!r}"
+        f"{sorted(unexpected)!r}; allowed={sorted(expected)!r}. Note: "
+        f"`parent_output_contracts` is no longer accepted — output contracts "
+        f"are derived from the built graph."
     )
     assert not missing, (
         f"parse_autotune2_response: missing yaml keys {sorted(missing)!r}; "
@@ -535,24 +543,14 @@ def parse_autotune2_response(
         response.child_picks = dict(cp)
 
     in_c = parsed["parent_input_contracts"] or {}
-    out_c = parsed["parent_output_contracts"] or {}
     assert isinstance(in_c, dict), (
         f"parse_autotune2_response: parent_input_contracts must be a mapping "
         f"(or empty/None), got {type(in_c).__name__}"
-    )
-    assert isinstance(out_c, dict), (
-        f"parse_autotune2_response: parent_output_contracts must be a mapping "
-        f"(or empty/None), got {type(out_c).__name__}"
     )
     response.input_contracts = {
         name: _parse_contract_yaml(
             v, where=f"parent_input_contracts[{name!r}]")
         for name, v in in_c.items()
-    }
-    response.output_contracts = {
-        name: _parse_contract_yaml(
-            v, where=f"parent_output_contracts[{name!r}]")
-        for name, v in out_c.items()
     }
     return response
 

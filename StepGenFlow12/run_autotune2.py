@@ -168,10 +168,34 @@ def _load_pass1_state(
         f"--autotune-config not found: {autotune_config_path}"
     )
     autotune_config = json.loads(autotune_config_path.read_text())
-    assert "hw_config" in autotune_config, (
-        f"{autotune_config_path}: missing required 'hw_config' key"
-    )
+    for required in ("hw_config", "max_on_chip_memory", "attempt_budgets"):
+        assert required in autotune_config, (
+            f"{autotune_config_path}: missing required {required!r} key"
+        )
     hw_config = autotune_config["hw_config"]
+    max_on_chip_memory = autotune_config["max_on_chip_memory"]
+    attempt_budgets = autotune_config["attempt_budgets"]
+    assert (
+        isinstance(max_on_chip_memory, int) and max_on_chip_memory > 0
+    ), (
+        f"{autotune_config_path}: 'max_on_chip_memory' must be a positive int "
+        f"(bytes), got {max_on_chip_memory!r}"
+    )
+    assert isinstance(attempt_budgets, list) and attempt_budgets, (
+        f"{autotune_config_path}: 'attempt_budgets' must be a non-empty list "
+        f"of multipliers (null = unlimited), got {attempt_budgets!r}"
+    )
+    # Resolve multipliers -> absolute byte budgets (None passes through).
+    attempt_budgets_bytes: list[int | None] = []
+    for i, m in enumerate(attempt_budgets):
+        if m is None:
+            attempt_budgets_bytes.append(None)
+            continue
+        assert isinstance(m, (int, float)) and m > 0, (
+            f"{autotune_config_path}: attempt_budgets[{i}]={m!r} must be a "
+            f"positive number or null"
+        )
+        attempt_budgets_bytes.append(int(round(max_on_chip_memory * float(m))))
 
     # Tree + DSLs + tensors via shared loaders.
     from precompute import precompute_tensors  # StepDB
@@ -233,6 +257,8 @@ def _load_pass1_state(
         "dims": dims,
         "tensors": tensors,
         "hw_config": hw_config,
+        "max_on_chip_memory": max_on_chip_memory,
+        "attempt_budgets_bytes": attempt_budgets_bytes,
         "llm_config": llm_config,
         "prompt_inputs": prompt_inputs,
         "system_prompts": system_prompts,
@@ -325,10 +351,10 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     )
 
     # Per-node resume stamps — fold in hw_config + compute_bw + check_order
-    # so any change to scorer/verifier config invalidates every node's
-    # cached library at once (their cycle/on_chip numbers were measured
-    # against the old config). Pass-1 DSL and tree-shape changes ripple
-    # up transitively inside compute_plan_stamps.
+    # + budgets so any change to scorer/verifier config invalidates every
+    # node's cached library at once (their cycle/on_chip numbers were
+    # measured against the old config). Pass-1 DSL and tree-shape changes
+    # ripple up transitively inside compute_plan_stamps.
     from src.autotune2.persistence import compute_plan_stamps
     node_stamps = compute_plan_stamps(
         plan_tree=state["tree"],
@@ -338,6 +364,14 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             "hw_config": state["hw_config"],
             "compute_bw": args.compute_bw,
             "check_order": args.check_order,
+            "max_on_chip_memory": state["max_on_chip_memory"],
+            "attempt_budgets_bytes": state["attempt_budgets_bytes"],
+            # Bumped when output_contracts switched from LLM-declared to
+            # graph-derived. Old libraries were keyed by LLM-declared
+            # output contracts that may not match the derived (stream+tile,
+            # identity-permutation) form, so reuse would produce cell-key
+            # collisions. Increment this tag to invalidate again.
+            "output_contracts_source": "derived_v1",
         },
     )
 
@@ -354,7 +388,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         system_prompts=state["system_prompts"],
         config=SearchConfig(
             max_turns_per_attempt=args.max_turns_per_attempt,
-            max_attempts=args.max_attempts,
+            attempt_budgets_bytes=state["attempt_budgets_bytes"],
             check_order=args.check_order,
         ),
         node_stamps=node_stamps,
@@ -438,13 +472,9 @@ def main() -> int:
     parser.add_argument(
         "--max-turns-per-attempt", type=int, default=16,
         help="Max LLM turns within a single fresh-conversation attempt "
-             "(default: 3). Each turn within an attempt accumulates "
-             "gate-failure feedback.",
-    )
-    parser.add_argument(
-        "--max-attempts", type=int, default=5,
-        help="Max fresh-conversation attempts per node, after the pass-1 "
-             "baseline (default: 5). Use 0 to run only the pass-1 baseline.",
+             "(default: 16). Each turn within an attempt accumulates "
+             "gate-failure feedback. The number of attempts per node is "
+             "set by len(attempt_budgets) in the autotune-config JSON.",
     )
     parser.add_argument(
         "--check-order", default="correctness-first",

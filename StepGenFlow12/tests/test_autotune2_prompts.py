@@ -292,8 +292,6 @@ child_picks:
   moe_block: 1
 parent_input_contracts:
   Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
-parent_output_contracts:
-  out_0: {reshape: [16, 4, 512], permutation: [1, 0, 2]}
 ```
 
 ```python
@@ -309,7 +307,6 @@ def test_parse_parent_response_happy_path():
     assert r.child_picks == {"attention_block": 3, "moe_block": 1}
     assert r.input_contracts["Q"].reshape == (8, 8, 64)
     assert r.input_contracts["Q"].permutation == (1, 0, 2)
-    assert r.output_contracts["out_0"].reshape == (16, 4, 512)
     assert "def my_parent" in r.dsl
 
 
@@ -323,9 +320,8 @@ def test_parse_parent_response_validates_expected_children():
 
 _LEAF_RESPONSE_OK = """\
 ```yaml
-parent_input_contracts: {}
-parent_output_contracts:
-  out_0: {reshape: [64, 512], permutation: [0, 1]}
+parent_input_contracts:
+  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
 ```
 
 ```python
@@ -338,9 +334,8 @@ def gqa_attention(Q, K, V, *, out_shapes):
 def test_parse_leaf_response_happy_path():
     r = parse_autotune2_response(_LEAF_RESPONSE_OK, is_leaf=True)
     assert r.child_picks == {}
-    assert r.input_contracts == {}
-    assert r.output_contracts["out_0"] == TensorContract(
-        reshape=(64, 512), permutation=(0, 1))
+    assert r.input_contracts["Q"] == TensorContract(
+        reshape=(8, 8, 64), permutation=(1, 0, 2))
     assert "def gqa_attention" in r.dsl
 
 
@@ -350,7 +345,6 @@ def test_parse_leaf_response_rejects_child_picks_key():
 child_picks:
   whatever: 0
 parent_input_contracts: {}
-parent_output_contracts: {}
 ```
 ```python
 def x():
@@ -361,11 +355,30 @@ def x():
         parse_autotune2_response(bad, is_leaf=True)
 
 
+def test_parse_leaf_response_rejects_parent_output_contracts_key():
+    """Output contracts are derived, not declared — including
+    ``parent_output_contracts`` is now a hard parse error so the LLM
+    is forced to drop it (and the prompt's intent is enforced).
+    """
+    bad = """\
+```yaml
+parent_input_contracts: {}
+parent_output_contracts:
+  out_0: {reshape: [4, 4], permutation: [0, 1]}
+```
+```python
+def x():
+    pass
+```
+"""
+    with pytest.raises(AssertionError, match="parent_output_contracts"):
+        parse_autotune2_response(bad, is_leaf=True)
+
+
 def test_parse_response_rejects_missing_python_block():
     bad = """\
 ```yaml
 parent_input_contracts: {}
-parent_output_contracts: {}
 ```
 """
     with pytest.raises(AssertionError, match="```python"):
@@ -386,9 +399,8 @@ def x():
 def test_parse_response_rejects_unknown_contract_keys():
     bad = """\
 ```yaml
-parent_input_contracts: {}
-parent_output_contracts:
-  out_0: {reshape: [4, 4], permutation: [0, 1], extra: 99}
+parent_input_contracts:
+  Q: {reshape: [4, 4], permutation: [0, 1], extra: 99}
 ```
 ```python
 def x():
@@ -402,9 +414,8 @@ def x():
 def test_parse_response_rejects_non_int_reshape():
     bad = """\
 ```yaml
-parent_input_contracts: {}
-parent_output_contracts:
-  out_0: {reshape: [4, "x"], permutation: [0, 1]}
+parent_input_contracts:
+  Q: {reshape: [4, "x"], permutation: [0, 1]}
 ```
 ```python
 def x():
@@ -419,9 +430,8 @@ def test_parse_response_invalid_permutation_caught_by_tensor_contract():
     """TensorContract.__post_init__ validates permutation; surfaces upstream."""
     bad = """\
 ```yaml
-parent_input_contracts: {}
-parent_output_contracts:
-  out_0: {reshape: [4, 4], permutation: [0, 0]}
+parent_input_contracts:
+  Q: {reshape: [4, 4], permutation: [0, 0]}
 ```
 ```python
 def x():

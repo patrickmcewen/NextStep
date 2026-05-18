@@ -15,7 +15,7 @@ from src.autotune2.contracts import (
 )
 from src.autotune2.runtime import (
     RustPromotionResult,
-    _contract_conformance_smoke_test,
+    _derive_output_contracts_from_graph,
     _extract_node_def_block,
     build_real_verifier_factory_fn,
     pick_top_k_pareto_entries,
@@ -108,6 +108,45 @@ def test_promote_top_k_runs_rust_per_pick_and_sorts_by_rust_cycles():
     assert results[1].entry.provenance == "A"
     assert results[1].rust_cycles == 999
     assert rust_calls, "rust evaluator must be called per pick"
+
+
+def test_promote_top_k_runs_picks_concurrently():
+    """The rust evaluator should be invoked from multiple threads so wall-
+    clock cost scales with the slowest pick, not the sum. We lock all calls
+    inside the evaluator and observe that more than one thread is in-flight
+    simultaneously — proves promote_top_k isn't running them serially."""
+    import threading
+    import time
+
+    # All 4 are mutually non-dominated (each lower in one dim, higher in
+    # the other) so pick_top_k_pareto_entries returns all of them.
+    lib = _root_lib_with_entries([
+        (10, 400, "a"), (20, 300, "b"), (30, 200, "c"), (40, 100, "d"),
+    ])
+    in_flight = 0
+    max_in_flight = 0
+    lock = threading.Lock()
+    start_barrier = threading.Barrier(4)
+
+    def rust(src):
+        nonlocal in_flight, max_in_flight
+        # Wait for all 4 calls to have entered before any returns; if the
+        # implementation is serial, this will deadlock and the test fails
+        # with a Barrier timeout rather than a wrong value.
+        start_barrier.wait(timeout=2.0)
+        with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        time.sleep(0.01)
+        with lock:
+            in_flight -= 1
+        return (1, 1.0)
+
+    results = promote_top_k(root_library=lib, k=4, rust_evaluate_fn=rust)
+    assert len(results) == 4
+    assert max_in_flight == 4, (
+        f"expected 4 concurrent rust calls, observed peak {max_in_flight}"
+    )
 
 
 def test_promote_top_k_includes_descendants_in_composed_source():
@@ -299,13 +338,18 @@ def test_verifier_factory_non_root_passes_on_clean_translate_and_build(
     monkeypatch.setattr(rt_mod, "_build_non_root_verifier",
                         rt_mod._build_non_root_verifier)  # no-op; just guard against drift
 
+    # Derivation walks ``graph.nodes`` for OffChipStore nodes, so the
+    # fake build must return a graph that contains exactly one — matches
+    # the synthetic wrapper's one-store-per-output contract.
+    fake_graph = _build_fake_graph([((1, 4), (1, 4))])
+
     captured = {}
     def fake_translate(src):
         captured["translate_src"] = src
         return "# translated\n"
     def fake_build(translated, dims, tensors):
         captured["build_args"] = (translated, dims, tensors)
-        return (object(), object())
+        return (fake_graph, object())
     def fake_dsl_exec(code, dims, tensors, **kwargs):
         captured["dsl_exec_src"] = code
         return torch.zeros(1, 4, 4)
@@ -489,7 +533,7 @@ def test_verifier_factory_non_root_surfaces_dsl_exec_failure_as_feedback(
     )
 
 
-# --- _contract_conformance_smoke_test ----------------------------------------
+# --- _derive_output_contracts_from_graph -------------------------------------
 
 
 def _build_fake_graph(output_layouts):
@@ -545,120 +589,56 @@ def _build_fake_graph(output_layouts):
     return g
 
 
-def _conformance_call(output_layouts, output_contracts, tmp_path):
-    """Helper: build a fake graph + run the conformance smoke test."""
-    import traceback as tb
+def _derive_call(output_layouts):
+    """Helper: build a fake graph + run the derivation helper."""
     graph = _build_fake_graph(output_layouts)
     fake_translate = lambda src: "# translated\n"
     fake_build = lambda translated, dims, tensors: (graph, None)
-    return _contract_conformance_smoke_test(
+    return _derive_output_contracts_from_graph(
         "# composed\n", dims={}, tensors={},
-        output_contracts=output_contracts,
         translate_fn=fake_translate,
         exec_build_graph=fake_build,
-        traceback_mod=tb,
-        scratch=tmp_path,
         log=lambda _msg: None,
     )
 
 
-def test_conformance_passes_when_stream_plus_tile_matches_reshape(tmp_path):
-    # Output stream=(1, 64), tile=(16, 32) → combined=(1, 64, 16, 32);
-    # contract that truthfully declares that layout passes.
+def test_derive_returns_identity_contract_with_stream_plus_tile_reshape():
+    # Output stream=(1, 64), tile=(16, 32) → derived contract carries
+    # reshape=(1, 64, 16, 32) with identity permutation, exactly the
+    # concatenation of the produced stream + tile shapes.
     layouts = [((1, 64), (16, 32))]
-    contracts = {
+    derived = _derive_call(layouts)
+    assert derived == {
         "out_0": TensorContract(
             reshape=(1, 64, 16, 32), permutation=(0, 1, 2, 3),
         ),
     }
-    res = _conformance_call(layouts, contracts, tmp_path)
-    assert res.feedback is None, f"unexpected failure: {res.feedback!r}"
 
 
-def test_conformance_fails_when_total_rank_mismatch(tmp_path):
-    # This mirrors the bug from the checkpoint: actual layout has rank 4
-    # (`(1, 64, 16, 32)`), declared contract has rank 3 (`(64, 16, 32)`).
-    # The leading singleton in the produced layout is what eventually
-    # trips ``Parallelize`` downstream — catching it here rejects the
-    # variant before it can poison the parent composition.
-    layouts = [((1, 64), (16, 32))]
-    contracts = {
-        "out_0": TensorContract(
-            reshape=(64, 16, 32), permutation=(0, 1, 2),
-        ),
-    }
-    res = _conformance_call(layouts, contracts, tmp_path)
-    assert res.feedback is not None
-    assert "Contract conformance check failed" in res.feedback
-    assert "out_0" in res.feedback
-    assert "(64, 16, 32)" in res.feedback   # what the LLM declared
-    assert "(1, 64, 16, 32)" in res.feedback  # what it actually produced
-
-
-def test_conformance_fails_when_split_differs_at_same_rank(tmp_path):
-    # Both layouts have rank 3 but different stream-vs-tile splits:
-    # actual ``stream=(1, 64), tile=(16, 32)`` totals (1, 64, 16, 32);
-    # declared ``reshape=(1024, 1, 32)`` is the wrong rank-3 split.
-    layouts = [((1, 64), (16, 32))]
-    contracts = {
-        "out_0": TensorContract(
-            reshape=(1024, 1, 32), permutation=(0, 1, 2),
-        ),
-    }
-    res = _conformance_call(layouts, contracts, tmp_path)
-    assert res.feedback is not None
-    assert "Contract conformance check failed" in res.feedback
-
-
-def test_conformance_respects_permutation(tmp_path):
-    # Same underlying layout, but the contract claims a permutation that
-    # reorders the dims. The check must compare after applying it.
-    layouts = [((1, 64), (16, 32))]
-    # post_permute_shape of reshape=(1, 64, 16, 32) with permutation
-    # (1, 0, 2, 3) is (64, 1, 16, 32) — does NOT match actual (1, 64, 16, 32).
-    contracts_mismatch = {
-        "out_0": TensorContract(
-            reshape=(1, 64, 16, 32), permutation=(1, 0, 2, 3),
-        ),
-    }
-    res = _conformance_call(layouts, contracts_mismatch, tmp_path)
-    assert res.feedback is not None
-    # Identity permutation does match.
-    contracts_match = {
-        "out_0": TensorContract(
-            reshape=(1, 64, 16, 32), permutation=(0, 1, 2, 3),
-        ),
-    }
-    res2 = _conformance_call(layouts, contracts_match, tmp_path)
-    assert res2.feedback is None
-
-
-def test_conformance_multi_output_reports_only_mismatches(tmp_path):
-    # Three outputs: out_0 matches, out_1 mismatches, out_2 matches.
-    # Feedback must name out_1 only.
+def test_derive_keys_by_offchipstore_order():
+    # Multiple outputs are keyed ``out_0``, ``out_1``, ``out_2`` in
+    # OffChipStore declaration order (which matches the order the
+    # synthetic wrapper emits them in).
     layouts = [
         ((1, 64), (16, 32)),
-        ((1, 64), (4, 32)),
+        ((1, 8, 4), (1, 32)),
         ((1, 64), (4, 32)),
     ]
-    contracts = {
-        "out_0": TensorContract(reshape=(1, 64, 16, 32), permutation=(0, 1, 2, 3)),
-        "out_1": TensorContract(reshape=(64, 4, 32), permutation=(0, 1, 2)),  # rank mismatch
-        "out_2": TensorContract(reshape=(1, 64, 4, 32), permutation=(0, 1, 2, 3)),
-    }
-    res = _conformance_call(layouts, contracts, tmp_path)
-    assert res.feedback is not None
-    assert "out_1" in res.feedback
-    # out_0 / out_2 should NOT appear in the mismatch bullet list, even though
-    # their names appear in surrounding boilerplate. Use a specific marker.
-    assert "- `out_1`:" in res.feedback
-    assert "- `out_0`:" not in res.feedback
-    assert "- `out_2`:" not in res.feedback
+    derived = _derive_call(layouts)
+    assert set(derived.keys()) == {"out_0", "out_1", "out_2"}
+    assert derived["out_0"].reshape == (1, 64, 16, 32)
+    assert derived["out_1"].reshape == (1, 8, 4, 1, 32)
+    assert derived["out_2"].reshape == (1, 64, 4, 32)
+    for c in derived.values():
+        assert c.permutation == tuple(range(len(c.reshape)))
 
 
-def test_verifier_passes_conformance_when_layout_matches_contract(monkeypatch):
-    """End-to-end: verifier admits a variant whose declared output
-    contract correctly describes its produced stream+tile layout."""
+def test_verifier_surfaces_derived_output_contracts(monkeypatch):
+    """End-to-end: a passing non-root verifier exposes the derived output
+    contracts (reshape = produced stream + tile, identity permutation)
+    via ``VerifyResult.derived_output_contracts`` — they are no longer
+    declared by the LLM, so the search loop must read them off the
+    verifier's return."""
     import torch
     from src.contract import Contract
     from src.node_signature import TensorArg
@@ -690,7 +670,7 @@ def test_verifier_passes_conformance_when_layout_matches_contract(monkeypatch):
     )
 
     make_verifier = build_real_verifier_factory_fn(
-        root_kernel="__test_root_kernel_conformance_ok__",
+        root_kernel="__test_root_kernel_derive__",
         dims={"d": 1},
         check_order="correctness-first",
     )
@@ -708,76 +688,8 @@ def test_verifier_passes_conformance_when_layout_matches_contract(monkeypatch):
         "def my_leaf(x, *, out_shapes):\n"
         "    return unary_add_imm(x, 1.0)\n"
     )
-    output_contracts = {
+    result = asyncio.run(verifier(composed))
+    assert result.passed, f"variant must be admitted; feedback={result.feedback!r}"
+    assert result.derived_output_contracts == {
         "out_0": TensorContract(reshape=(1, 4, 1, 4), permutation=(0, 1, 2, 3)),
     }
-    result = asyncio.run(verifier(composed, output_contracts))
-    assert result.passed, (
-        f"variant whose declared contract matches actual layout must be "
-        f"admitted; got feedback={result.feedback!r}"
-    )
-
-
-def test_verifier_surfaces_conformance_failure_as_feedback(monkeypatch):
-    """End-to-end: verifier rejects a variant whose declared output
-    contract lies about the stream/tile split — the exact regime from
-    the pre_attn_norm_and_proj LLM-variant bug."""
-    import torch
-    from src.contract import Contract
-    from src.node_signature import TensorArg
-
-    c = Contract(
-        arg_names=("x",),
-        vanilla_shapes=((4, 4),),
-        tiled_shapes=((1, 4, 4),),
-        tiled_values=(torch.zeros(1, 4, 4),),
-        out_shapes=((1, 4, 4),),
-        tiled_outputs=(torch.zeros(1, 4, 4),),
-        out_is_tuple=False,
-        arg_specs=(TensorArg(shape=(4, 4)),),
-        arg_is_raw=(False,),
-    )
-
-    # Actual produced layout: stream=(1, 4), tile=(1, 4) → (1, 4, 1, 4).
-    # Declared (lying) contract: reshape=(4, 4) — rank 2, missing the
-    # leading singleton + extra tile-row dim.
-    graph_for_build = _build_fake_graph([((1, 4), (1, 4))])
-
-    import src.dsl_to_step as dsl_to_step_mod
-    import src.tools as tools_mod
-    monkeypatch.setattr(dsl_to_step_mod, "translate", lambda src: "# translated\n")
-    monkeypatch.setattr(
-        tools_mod, "_exec_build_graph",
-        lambda translated, dims, tensors: (graph_for_build, None),
-    )
-    monkeypatch.setattr(
-        tools_mod, "_exec_dsl_ref",
-        lambda code, dims, tensors, **kw: torch.zeros(1, 4, 4),
-    )
-
-    make_verifier = build_real_verifier_factory_fn(
-        root_kernel="__test_root_kernel_conformance_fail__",
-        dims={"d": 1},
-        check_order="correctness-first",
-    )
-
-    class _StubNode:
-        path = "root/my_leaf"
-        name = "my_leaf"
-
-    verifier = make_verifier(_StubNode(), c, {"x": torch.zeros(4, 4)})
-    composed = (
-        "def tiled_reference(dims, tensors):\n"
-        "    return offchip_store(promote_outer(\n"
-        "        my_leaf(tensors['x'], out_shapes=((1, 4, 4),))))\n"
-        "\n"
-        "def my_leaf(x, *, out_shapes):\n"
-        "    return unary_add_imm(x, 1.0)\n"
-    )
-    output_contracts = {
-        "out_0": TensorContract(reshape=(4, 4), permutation=(0, 1)),
-    }
-    result = asyncio.run(verifier(composed, output_contracts))
-    assert not result.passed
-    assert "Contract conformance check failed" in result.feedback
-    assert "out_0" in result.feedback

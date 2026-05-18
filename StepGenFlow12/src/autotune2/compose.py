@@ -1,41 +1,26 @@
-"""Library composition for autotune2.
+"""DSL source composition + analytical scorer factory for autotune2.
 
-Bottom-up DP step: after the parent LLM commits a parent DSL plus
-``child_picks``, this module enumerates the discrete Cartesian product
-of each picked child's Pareto front, scores each composition with the
-analytical timing model, and inserts non-dominated entries into the
-parent's library cell.
+Two pieces:
+  - ``compose_source`` — flat string-join of descendant DSLs followed by
+    the parent DSL. Lets ``exec`` resolve the parent's natural-name
+    child calls (e.g. ``attention_block(...)``) against the last-bound
+    descendant DSL of the same name. Caller is responsible for passing
+    exactly one descendant DSL per natural name in the parent's call
+    graph.
+  - ``make_analytical_scorer`` — closure over kernel-level ``dims`` /
+    ``tensors`` / ``hw_config`` returning ``score(composed_source) ->
+    (cycles, on_chip)``. Lazy-imports the STeP machinery so importing
+    this module from a light test environment is cheap.
 
-The scoring function is **dependency-injected** via ``score_fn`` so
-unit tests can swap in deterministic fake scorers (no STeP / sympy /
-torch graph build required). The default analytical scorer is built
-by ``make_analytical_scorer`` and pulls in ``translate`` +
-``_exec_build_graph`` + ``analyze_timing`` lazily, so importing this
-module from a light test environment is cheap.
-
-Scope boundary (deferred to Phase 5 — the search driver):
-  - Building a synthetic ``tiled_reference`` wrapper around a non-root
-    node so its graph can be analyzed in isolation. Phase 3 takes a
-    composed source as-is and scores it.
-  - Collecting transitive descendant DSLs from each child's chosen
-    library entry. ``compose_source`` here just concatenates whatever
-    list of pre-ordered DSL strings the caller hands in.
-  - Resolving the kernel-level ``tensors`` dict to per-arg keys
-    matching a node's signature.
+The Cartesian-product compose path that previously lived here is gone:
+``search_parent`` resolves each child pick to a single ``DesignEntry``
+(per-entry variant indices), so there's exactly one composed source per
+parent turn — no sweep.
 """
 
 from __future__ import annotations
 
-import itertools
-from typing import Callable, Iterator
-
-from src.autotune2.contracts import (
-    DesignEntry,
-    NodeLibrary,
-    TensorContract,
-    library_cell,
-)
-from src.autotune2.pareto import insert_pareto
+from typing import Callable
 
 
 # Global compute-BW budget. Per HANDOFF.md the regime is memory-bound at
@@ -71,93 +56,6 @@ def compose_source(
 
 
 # ---------------------------------------------------------------------------
-# Cartesian-product compose + Pareto admission
-# ---------------------------------------------------------------------------
-
-
-def cartesian_compose(
-    *,
-    parent_dsl: str,
-    children_fronts: dict[str, list[DesignEntry]],
-    children_order: list[str],
-    score_fn: ScoreFn,
-) -> Iterator[tuple[dict[str, DesignEntry], int, int]]:
-    """Yield ``(chosen_per_child, cycles, on_chip)`` for every combination.
-
-    ``children_order`` is a post-order child-path list; the yielded
-    ``chosen`` dict and the concatenation order are both driven by it.
-    """
-    assert set(children_fronts.keys()) == set(children_order), (
-        f"cartesian_compose: children_order keys {set(children_order)!r} "
-        f"must equal children_fronts keys {set(children_fronts.keys())!r}"
-    )
-    for path in children_order:
-        assert children_fronts[path], (
-            f"cartesian_compose: child {path!r} has an empty Pareto front; "
-            f"the autotuner must seed every node's library with at least "
-            f"the pass-1 baseline before composing parents"
-        )
-
-    fronts = [children_fronts[p] for p in children_order]
-    for combo in itertools.product(*fronts):
-        chosen = dict(zip(children_order, combo))
-        descendants_in_order = [chosen[p].dsl for p in children_order]
-        composed = compose_source(
-            parent_dsl=parent_dsl,
-            descendant_dsls_postorder=descendants_in_order,
-        )
-        cycles, on_chip = score_fn(composed)
-        yield chosen, cycles, on_chip
-
-
-def compose_into_library(
-    *,
-    parent_lib: NodeLibrary,
-    parent_input_contracts: dict[str, TensorContract],
-    parent_output_contracts: dict[str, TensorContract],
-    parent_dsl: str,
-    children_fronts: dict[str, list[DesignEntry]],
-    children_order: list[str],
-    score_fn: ScoreFn,
-    provenance: str,
-) -> int:
-    """Score every Cartesian combination; admit non-dominated into the cell.
-
-    Returns the count of admitted entries. Provenance per entry encodes
-    the child-by-index pick (``"<provenance>;<child_path>@<idx>,...">``)
-    so a library dump can be back-traced to the exact composition that
-    produced it within a single autotune2 session.
-    """
-    cell = library_cell(parent_lib, parent_input_contracts, parent_output_contracts)
-    admitted = 0
-    # Build child-entry -> index lookups once so provenance is O(1) per pick.
-    front_index: dict[str, dict[int, int]] = {
-        path: {id(entry): idx for idx, entry in enumerate(children_fronts[path])}
-        for path in children_order
-    }
-    for chosen, cycles, on_chip in cartesian_compose(
-        parent_dsl=parent_dsl,
-        children_fronts=children_fronts,
-        children_order=children_order,
-        score_fn=score_fn,
-    ):
-        picks_tag = ",".join(
-            f"{p}@{front_index[p][id(chosen[p])]}" for p in children_order
-        )
-        entry = DesignEntry(
-            dsl=parent_dsl,
-            input_contracts=dict(parent_input_contracts),
-            output_contracts=dict(parent_output_contracts),
-            cycles=cycles,
-            on_chip=on_chip,
-            provenance=f"{provenance};picks={picks_tag}",
-        )
-        if insert_pareto(cell, entry):
-            admitted += 1
-    return admitted
-
-
-# ---------------------------------------------------------------------------
 # Analytical scorer factory (production)
 # ---------------------------------------------------------------------------
 
@@ -173,7 +71,7 @@ def make_analytical_scorer(
 
     Closes over kernel-level ``dims`` / ``tensors`` / ``hw_config`` so
     the returned ``score(composed_source) -> (cycles, on_chip)`` is a
-    one-arg callable consumable by ``cartesian_compose``.
+    one-arg callable.
 
     Lazy-imports the STeP machinery (``translate``, ``analyze_timing``,
     ``_exec_build_graph``) so importing this module costs nothing in
@@ -188,9 +86,14 @@ def make_analytical_scorer(
         f"max_total_compute_bw must be >= 1, got {max_total_compute_bw}"
     )
 
-    def score(composed_source: str) -> tuple[int, int]:
-        import sympy
+    # Per-source memoization shared between ``score`` and ``breakdown`` so the
+    # OVER_BUDGET / baseline paths can fetch the per-node report without
+    # re-running ``analyze_timing`` on the same composed source.
+    cache: dict[str, tuple[int, int, str]] = {}
 
+    def _evaluate(composed_source: str) -> tuple[int, int, str]:
+        if composed_source in cache:
+            return cache[composed_source]
         from src.dsl_to_step import translate
         from src.tools import _exec_build_graph
         from timing_and_emulator.timing import analyze_timing
@@ -200,9 +103,25 @@ def make_analytical_scorer(
         _rescale_compute_bw(graph, max_total_compute_bw)
         result = analyze_timing(graph, hw_config=hw_config)
         total_cycles = _sym_to_int(result["total_cycles"])
-        on_chip_bytes = _sum_on_chip_bytes(result)
-        return total_cycles, on_chip_bytes
+        per_node = _per_node_on_chip_bytes(result)
+        on_chip_bytes = sum(b for _, _, b in per_node)
+        report = _format_per_node_memory_report(per_node, on_chip_bytes)
+        out = (total_cycles, on_chip_bytes, report)
+        cache[composed_source] = out
+        return out
 
+    def score(composed_source: str) -> tuple[int, int]:
+        cycles, on_chip, _ = _evaluate(composed_source)
+        return cycles, on_chip
+
+    def breakdown(composed_source: str) -> str:
+        _, _, report = _evaluate(composed_source)
+        return report
+
+    # Side-channel attribute: callers that want the per-node memory report
+    # opt in by reading ``score_fn.breakdown``. Keeping the ``ScoreFn`` return
+    # type as ``(cycles, on_chip)`` avoids touching every test scorer stub.
+    score.breakdown = breakdown
     return score
 
 
@@ -234,8 +153,13 @@ def _rescale_compute_bw(graph, max_total_compute_bw: int) -> None:
         n.compute_bw = max(1, int(round(n.compute_bw * scale)))
 
 
-def _sum_on_chip_bytes(result: dict) -> int:
-    """Sum ``on_chip_requirement(count_fifos=False)`` across all nodes."""
+def _per_node_on_chip_bytes(result: dict) -> list[tuple[int, str, int]]:
+    """``[(instance_id, op_label, on_chip_bytes), ...]`` for every node.
+
+    Computed once per ``analyze_timing`` run and shared between the
+    ``(cycles, on_chip)`` summary and the per-node memory report so we
+    never walk the per-node info twice for the same composed source.
+    """
     info = result["per_node"]
     sym_subs = result.get("sym_subs", {}) or {}
 
@@ -244,7 +168,51 @@ def _sum_on_chip_bytes(result: dict) -> int:
             return expr.xreplace(sym_subs)
         return expr
 
-    total = 0
+    out: list[tuple[int, str, int]] = []
     for nid, i in info.items():
-        total += _sym_to_int(_sub(i["node"].on_chip_requirement(count_fifos=False)))
-    return total
+        n = i["node"]
+        b = _sym_to_int(_sub(n.on_chip_requirement(count_fifos=False)))
+        out.append((nid, _node_label(n), b))
+    return out
+
+
+def _node_label(n) -> str:
+    """``"[id] OpType"`` or ``"[id] OpType<FnName>"`` for compute ops with ``fn``.
+
+    Mirrors ``src/autotune.py:_node_label`` so the per-node lines in the
+    prompt feedback match the labels in the verbose timing report a user
+    might inspect side-by-side.
+    """
+    label = f"[{n.instance_id}] {n.__class__.__name__}"
+    fn = getattr(n, "fn", None)
+    if fn is not None:
+        label += f"<{fn.__class__.__name__}>"
+    return label
+
+
+def _format_per_node_memory_report(
+    per_node: list[tuple[int, str, int]], total: int,
+) -> str:
+    """Render the per-node on-chip-memory contributors as a markdown stanza.
+
+    Sorted descending by bytes; every node with a non-zero footprint
+    appears on its own line. Earlier versions capped at top-K with a
+    ``... N more nodes`` rollup, which hid the long tail right when the
+    LLM most needs it (e.g. MoE graphs where the per-expert loads are
+    individually mid-sized but dominate the total in aggregate).
+    Returns the empty string when total is zero — no on-chip footprint
+    means nothing useful to surface.
+    """
+    if total <= 0:
+        return ""
+    nonzero = [t for t in per_node if t[2] > 0]
+    nonzero.sort(key=lambda t: t[2], reverse=True)
+
+    lines = [
+        f"Per-node on-chip memory breakdown (total {total} B across "
+        f"{len(nonzero)} contributing nodes):",
+    ]
+    for _nid, label, b in nonzero:
+        pct = 100.0 * b / total
+        lines.append(f"  {label:<44s} {b:>12d} B  ({pct:5.1f}%)")
+    return "\n".join(lines)

@@ -421,7 +421,7 @@ def test_autotune_skips_already_completed_nodes_on_resume(tmp_path: Path):
             make_verifier=lambda _node, _pc, _t: verifier,
             prompt_inputs=prompts,
             system_prompts=sys_prompts,
-            config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+            config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
             node_stamps=stamps,
         ))
 
@@ -502,7 +502,7 @@ def test_autotune_reruns_node_when_stamp_changes(tmp_path: Path):
             root_tensors={}, agent_factory=lambda _sp: agent,
             make_verifier=make_verifier,
             prompt_inputs=prompts, system_prompts=sys_prompts,
-            config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+            config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
             node_stamps=stamps,
         ))
 

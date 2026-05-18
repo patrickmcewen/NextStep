@@ -4,18 +4,8 @@
         "hbm_channel_latency": 2,
         "hbm_init_interval": 2,
         "hbm_addr_offset": 64,
-        "hbm_startup": 0,
-        "compute_bw": 64,
-        "pmu_buffer_bytes": 393216
+        "hbm_startup": 0
     },
-    "constraints": {
-        "max_total_compute_bw": 4096,
-        "max_par_dispatch": 16,
-        "pmu_bw_bytes_per_cycle": 64
-    },
-    "max_turns": 12,
-    "passes": [
-        {"agent": "memory", "max_turns": 12, "feasibility": {"on_chip_bytes": 1048576}},
-        {"agent": "general",  "max_turns": 12, "feasibility": {"on_chip_bytes": 1048576}}
-    ]
+    "max_on_chip_memory": 16777216,
+    "attempt_budgets": [null, 1.0, 0.5, 0.1]
 }

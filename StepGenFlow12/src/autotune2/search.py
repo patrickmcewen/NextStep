@@ -53,11 +53,11 @@ Locked Phase-5 design decisions
    alongside the existing blackbox stubs.
 
 5. **Variant indices** are assigned sequentially per node, one per
-   unique ``(input_contracts, output_contracts)`` cell, when the
-   library is serialized to ``variants.py``. Cells with multiple
-   Pareto-front entries share the variant index — the
-   ``cartesian_compose`` step inside ``search_parent`` enumerates
-   them.
+   ``DesignEntry``, when the library is serialized to ``variants.py``.
+   Each entry — even two entries that share a Pareto cell's boundary
+   contracts — gets its own index, so the parent LLM picks one concrete
+   child implementation per child. No Cartesian sweep; ``search_parent``
+   composes exactly one descendant chain per turn.
 """
 
 from __future__ import annotations
@@ -73,7 +73,6 @@ import torch
 
 from src.autotune2.compose import (
     ScoreFn,
-    cartesian_compose,
     compose_source,
 )
 from src.autotune2.contracts import (
@@ -116,6 +115,11 @@ from src.planner import PlanNode, Tree
 class VerifyResult:
     passed: bool
     feedback: str = ""
+    derived_output_contracts: dict[str, "TensorContract"] = field(default_factory=dict)
+    """Output contracts derived from the built graph (one per OffChipStore
+    node in declaration order, keyed ``out_0``, ``out_1``, ...). Populated
+    on ``passed=True`` for non-root nodes; empty for root (the root verifier
+    checks against ``compute_gold`` directly and has no contract to derive)."""
 
 
 @dataclass
@@ -141,13 +145,11 @@ class AgentResponse:
 # ``runtime.build_real_agent_fn`` return ``AgentResponse``; test stubs return
 # plain ``str``.
 AgentFn = Callable[[list[dict]], Awaitable["str | AgentResponse"]]
-# (composed_source, output_contracts) -> VerifyResult.
-# ``output_contracts`` is the LLM-declared per-output TensorContract dict
-# for the variant under test (keyed ``out_0``, ``out_1``, ...). The
-# non-root verifier uses it for the contract-conformance check; test
-# stubs and the root verifier may ignore it (treat it as kw-only with
-# default ``None``).
-VerifierFn = Callable[..., Awaitable[VerifyResult]]
+# composed_source -> VerifyResult. The non-root verifier derives
+# ``output_contracts`` from the built graph and surfaces them via
+# ``VerifyResult.derived_output_contracts``; the root verifier ignores
+# contracts (it checks against ``compute_gold``).
+VerifierFn = Callable[[str], Awaitable[VerifyResult]]
 
 
 def _coerce_agent_response(result) -> AgentResponse:
@@ -168,17 +170,21 @@ class SearchConfig:
 
     Each turn inside an attempt accumulates assistant responses + gate
     feedback in the same conversation, mirroring pass-1's refactor_final
-    loop. Exhausting this budget on an attempt aborts that attempt; the
-    outer loop then starts a fresh attempt (new conversation) up to
-    ``max_attempts`` times.
+    loop. Exhausting this budget on an attempt aborts that attempt.
     """
 
-    max_attempts: int = 5
-    """Max fresh-conversation attempts per node (after the pass-1 baseline).
+    attempt_budgets_bytes: list[int | None] = field(
+        default_factory=lambda: [None]
+    )
+    """Per-attempt on-chip-memory budgets (bytes). One attempt is fanned
+    out in parallel per list element. ``None`` ⇒ unlimited (no prompt
+    mention, no over-budget reject). A positive int ⇒ admit a variant
+    only if its scored ``on_chip <= budget``; over-budget hits become
+    ``OVER_BUDGET`` turn feedback so the LLM can revise.
 
-    Each attempt begins with a fresh user prompt that includes a summary
-    of already-accepted Pareto-front entries (rendered via
-    ``render_accepted_summary``) so the LLM targets gaps.
+    The length of this list replaces the legacy ``max_attempts`` knob —
+    each entry is one fresh-conversation attempt. Default ``[None]``
+    matches the prior single-unlimited-attempt behavior.
     """
 
     check_order: str = "correctness-first"
@@ -300,8 +306,8 @@ def _offchip_load_args_for_contract(
     # offchip_load shape mismatch later.
     assert m >= 1, (
         f"_offchip_load_args_for_contract({arg_name!r}): contract has no "
-        f"leading stream dims (rank-2 applied_shape="
-        f"{contract.applied_shape()!r}); the isolation wrapper currently "
+        f"leading stream dims (rank-2 post_permute_shape="
+        f"{contract.post_permute_shape()!r}); the isolation wrapper currently "
         f"requires at least one stream dim. Reshape the contract to factor "
         f"a leading 1 (e.g. reshape=(1,)+...) if you want a single-tile load."
     )
@@ -568,37 +574,42 @@ def build_variant_callables(
 
 
 def library_to_variant_registry(lib: NodeLibrary) -> dict[int, dict]:
-    """Assign sequential variant indices, one per unique (in,out) cell.
+    """Assign sequential variant indices, one per DesignEntry.
 
-    Multiple Pareto-front entries within a single cell share one index —
-    they all represent the same boundary contract, differing only in
-    internal DSL. Deterministic in lib iteration order.
+    Every Pareto-front entry across every cell gets its own index. Two
+    entries sharing boundary contracts (same cell) still get distinct
+    indices — the parent LLM picks one concrete child implementation,
+    not a cell, so the compose step has a single DSL per child.
+    Deterministic in lib iteration order.
     """
     reg: dict[int, dict] = {}
     idx = 0
     for in_key, by_out in lib.items():
         in_contracts = dict(in_key)
-        for out_key in by_out:
+        for out_key, cell in by_out.items():
             out_contracts = dict(out_key)
-            reg[idx] = {
-                "input_contracts": in_contracts,
-                "output_contracts": out_contracts,
-            }
-            idx += 1
+            for _ in cell:
+                reg[idx] = {
+                    "input_contracts": in_contracts,
+                    "output_contracts": out_contracts,
+                }
+                idx += 1
     return reg
 
 
-def cell_for_variant(lib: NodeLibrary, variant_index: int) -> list[DesignEntry]:
-    """Resolve a variant index back to its Pareto-front cell."""
+def entry_for_variant(lib: NodeLibrary, variant_index: int) -> DesignEntry:
+    """Resolve a variant index to its DesignEntry. Iteration order matches
+    ``library_to_variant_registry`` so a registry-derived index round-trips."""
     idx = 0
     for in_key, by_out in lib.items():
         for out_key, cell in by_out.items():
-            if idx == variant_index:
-                return cell
-            idx += 1
+            for entry in cell:
+                if idx == variant_index:
+                    return entry
+                idx += 1
     raise AssertionError(
-        f"cell_for_variant: variant_index {variant_index} out of range; "
-        f"library has {idx} cells"
+        f"entry_for_variant: variant_index {variant_index} out of range; "
+        f"library has {idx} entries"
     )
 
 
@@ -606,8 +617,9 @@ def render_library_as_variant_summaries(
     lib: NodeLibrary,
 ) -> list[VariantSummary]:
     """Build the summary list shown to the LLM. One ``VariantSummary``
-    per cell, with the cell's Pareto-best entry as the representative
-    (cycles, on_chip) coordinates.
+    per DesignEntry — every Pareto-front entry appears as its own row so
+    the parent agent can pick a specific child implementation rather
+    than a boundary-contract cell.
     """
     summaries: list[VariantSummary] = []
     idx = 0
@@ -615,20 +627,19 @@ def render_library_as_variant_summaries(
         in_contracts = dict(in_key)
         for out_key, cell in by_out.items():
             assert cell, (
-                f"render_library_as_variant_summaries: cell at index {idx} is "
-                "empty; library should never have empty cells"
+                "render_library_as_variant_summaries: empty cell at "
+                f"({sorted(in_key)!r}, {sorted(out_key)!r}); library "
+                "must not contain empty cells"
             )
-            # Show the cell's lowest-cycle entry as the representative; the
-            # full front is enumerated at composition time via cartesian_compose.
-            best = min(cell, key=lambda e: (e.cycles, e.on_chip))
-            summaries.append(VariantSummary(
-                variant_index=idx,
-                input_contracts=in_contracts,
-                output_contracts=dict(out_key),
-                cycles=best.cycles,
-                on_chip=best.on_chip,
-            ))
-            idx += 1
+            for entry in cell:
+                summaries.append(VariantSummary(
+                    variant_index=idx,
+                    input_contracts=in_contracts,
+                    output_contracts=dict(out_key),
+                    cycles=entry.cycles,
+                    on_chip=entry.on_chip,
+                ))
+                idx += 1
     return summaries
 
 
@@ -675,13 +686,19 @@ def _seed_baseline(
     score_fn: ScoreFn,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
-) -> DesignEntry:
+) -> tuple[DesignEntry, str]:
     """Insert the pass-1 baseline with identity contracts into the library.
 
     The synthetic wrapper is rebuilt here with the identity input contracts
     so the per-arg ``offchip_load`` strides match the baseline's vanilla
     layout; identical to what the search loop emits for any LLM variant
     that picks identity contracts on its on-chip inputs.
+
+    Returns ``(entry, baseline_breakdown)``; the breakdown is the
+    per-node on-chip memory report from the analytical scorer (or the
+    empty string when ``score_fn`` is a test stub without
+    ``.breakdown``). Callers thread the breakdown into the budgeted
+    user prompt via ``_budget_block``.
     """
     identity_in = _identity_input_contracts(parent_contract)
     output_names = tuple(f"out_{i}" for i in range(len(parent_contract.out_shapes)))
@@ -699,6 +716,7 @@ def _seed_baseline(
         descendant_dsls_postorder=descendant_dsls,
     )
     cycles, on_chip = score_fn(composed)
+    breakdown = _maybe_breakdown(score_fn, composed)
     entry = DesignEntry(
         dsl=pass1_dsl,
         input_contracts=identity_in,
@@ -710,7 +728,7 @@ def _seed_baseline(
     )
     cell = library_cell(lib, identity_in, identity_out)
     cell.append(entry)
-    return entry
+    return entry, breakdown
 
 
 def _on_chip_vanilla_shapes(parent_contract: Contract) -> dict[str, tuple[int, ...]]:
@@ -870,6 +888,292 @@ def _write_turn_artifacts(
         }, indent=2))
 
 
+def _budget_label(budget: int | None) -> str:
+    """Filesystem/provenance-safe label for a per-attempt budget.
+
+    ``None`` → ``"inf"``; positive ints → their decimal form. Used in
+    ``attempt_<i>_b<label>/`` dir names and entry provenance strings so
+    each parallel attempt's artifacts are unambiguous on disk.
+    """
+    return "inf" if budget is None else str(int(budget))
+
+
+def _budget_block(budget: int | None, baseline_breakdown: str = "") -> str:
+    """User-prompt block describing this attempt's on-chip budget.
+
+    Empty string for unlimited so the prompt looks identical to a
+    no-budget run; a budgeted attempt gets an explicit ``## On-chip
+    memory budget`` section the LLM is expected to honor. When
+    ``baseline_breakdown`` is non-empty (analytical scorer wired
+    through), append the pass-1 baseline's per-node on-chip memory
+    breakdown so the LLM can see where the biggest tiles live before
+    proposing a variant.
+    """
+    if budget is None:
+        return ""
+    block = (
+        "\n\n### On-chip memory budget\n\n"
+        f"This attempt enforces an on-chip memory budget of "
+        f"**{int(budget)} bytes**. Variants whose scored on_chip exceeds "
+        "this budget are rejected. Your goal should be to minimize the latency of the program"
+        "while staying within the memory budget. The equations used to calculate memory for each operation were given in the system prompt.\n"
+    )
+    if baseline_breakdown:
+        block += (
+            "\nPer-node on-chip memory of the pass-1 baseline (largest "
+            "contributors first) — use this to target the biggest tiles "
+            "when restructuring:\n\n"
+            f"```\n{baseline_breakdown}\n```\n"
+        )
+    return block
+
+
+def _maybe_breakdown(score_fn: ScoreFn, composed: str) -> str:
+    """Per-node memory report for ``composed`` if ``score_fn`` provides one.
+
+    ``make_analytical_scorer`` attaches ``score.breakdown``; test stubs
+    (``lambda _src: (10, 10)``) don't. Callers that want the report
+    funnel through here and degrade gracefully on stubs.
+    """
+    breakdown_fn = getattr(score_fn, "breakdown", None)
+    if breakdown_fn is None:
+        return ""
+    return breakdown_fn(composed)
+
+
+def _compliance_preflight_feedback(dsl: str, *, is_root: bool) -> str | None:
+    """Run pass-1's refactor_final regex compliance over ``dsl``; return
+    LLM-actionable feedback when violations are found, ``None`` otherwise.
+
+    Mirrors what the verifier's ``_gate_compliance`` does, but runs
+    before ``build_synthetic_wrapper_for_node`` / the smoke tests so the
+    banned-op patterns (``.underlying_tensor``, ``.unsqueeze(``, ...)
+    surface as concrete, named feedback even when a downstream check
+    (graph build, wrapper build) would otherwise fail first with a
+    cryptic error like ``'Flatten' object has no attribute
+    'underlying_tensor'``. Short-circuits the loop so the LLM iterates
+    on the actual cause rather than the symptom.
+    """
+    from src.orchestrator import _check_banned_ops
+
+    violations = _check_banned_ops(dsl, "refactor_final", is_root=is_root)
+    if not violations:
+        return None
+    return (
+        "## Compliance check FAILED\n\n"
+        "Your code uses disallowed operations:\n\n"
+        + "\n".join(violations)
+        + "\n\nReplace these with the corresponding DSL function calls "
+        "listed in the instructions."
+    )
+
+
+async def _run_leaf_attempt(
+    *,
+    node: PlanNode,
+    parent_contract: Contract | None,
+    pass1_dsl: str,
+    attempt_index: int,
+    budget: int | None,
+    attempt_dir: Path,
+    score_fn: ScoreFn,
+    agent: AgentFn,
+    verifier: VerifierFn,
+    prompt_inputs: NodePromptInputs,
+    config: SearchConfig,
+    baseline_accepted: list[DesignEntry],
+    baseline_breakdown: str = "",
+) -> list[DesignEntry]:
+    """Run one leaf attempt (one fresh conversation, up to
+    ``max_turns_per_attempt`` turns) under the given on-chip budget.
+
+    Returns the list of DesignEntries admitted on this attempt (may be
+    empty). The caller merges them into the shared per-node library via
+    ``insert_pareto`` so the cross-attempt Pareto admission is
+    consistent.
+
+    ``budget`` is in bytes; ``None`` disables both the prompt budget
+    block and the over-budget reject path (effectively the same control
+    flow as the prior single-attempt behavior).
+    """
+    is_root = parent_contract is None
+    arg_vanilla_shapes = (
+        {} if is_root else _on_chip_vanilla_shapes(parent_contract)
+    )
+    output_vanilla_shapes = (
+        {} if is_root else _output_vanilla_shapes(parent_contract)
+    )
+    accepted_summary = render_accepted_summary(
+        baseline_accepted,
+        arg_vanilla_shapes=arg_vanilla_shapes,
+        output_vanilla_shapes=output_vanilla_shapes,
+    )
+    user_prompt = build_autotune2_user_prompt(
+        is_leaf=True,
+        node_name=node.name,
+        function_signature=prompt_inputs.function_signature,
+        pytorch_reference=prompt_inputs.pytorch_reference,
+        pass1_dsl=pass1_dsl,
+        dims_block=prompt_inputs.dims_block,
+        tensors_block=prompt_inputs.tensors_block,
+        accepted_summary=accepted_summary,
+        budget_block=_budget_block(budget, baseline_breakdown),
+    )
+    conversation: list[dict] = [{"role": "user", "content": user_prompt}]
+    blabel = _budget_label(budget)
+    admitted: list[DesignEntry] = []
+
+    for turn in range(config.max_turns_per_attempt):
+        assert conversation[-1]["role"] == "user", (
+            "search_leaf: expected last conversation message to be a user "
+            "turn before invoking the agent"
+        )
+        turn_user_prompt = conversation[-1]["content"]
+        agent_response = _coerce_agent_response(await agent(conversation))
+        response = agent_response.text
+        conversation.append({"role": "assistant", "content": response})
+        turn_dir = attempt_dir / f"turn_{turn}"
+
+        try:
+            parsed = parse_autotune2_response(response, is_leaf=True)
+        except AssertionError as e:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"PARSE_FAIL: {e}",
+            )
+            _append_turn_feedback(conversation, (
+                f"Your response could not be parsed: {e}\n\n"
+                "Please re-emit the YAML and python blocks exactly per "
+                "the output protocol described in the system prompt."
+            ))
+            continue
+
+        compliance_feedback = _compliance_preflight_feedback(
+            parsed.dsl, is_root=is_root,
+        )
+        if compliance_feedback is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="COMPLIANCE_FAIL",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, compliance_feedback)
+            continue
+
+        try:
+            wrapper = "" if is_root else build_synthetic_wrapper_for_node(
+                node_name=node.name,
+                parent_contract=parent_contract,
+                input_contracts=parsed.input_contracts,
+            )
+        except AssertionError as e:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"WRAPPER_BUILD_FAIL: {e}",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, (
+                "Your declared input_contracts are not realizable as a "
+                f"single strided offchip_load: {e}\n\n"
+                "Pick contracts that keep the tile = vanilla[-2:] and "
+                "leave the last two reshape axes in place; the leading "
+                "stream axes may be factored/permuted freely."
+            ))
+            continue
+
+        composed = compose_source(
+            parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
+            descendant_dsls_postorder=[],
+        )
+        verify = await verifier(composed)
+        if not verify.passed:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="VERIFY_FAIL",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=verify,
+            )
+            _append_turn_feedback(conversation, (
+                "Your variant did not pass verification. Gate feedback "
+                "follows; please emit a corrected DSL implementation "
+                "that addresses the issues:\n\n"
+                f"{verify.feedback}"
+            ))
+            continue
+
+        cycles, on_chip, score_err = _safe_score(score_fn, composed)
+        if score_err is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="SCORE_FAIL",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=VerifyResult(passed=False, feedback=score_err),
+            )
+            _append_turn_feedback(conversation, score_err)
+            continue
+
+        if budget is not None and on_chip > budget:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"OVER_BUDGET (on_chip={on_chip} > {budget})",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=verify,
+            )
+            over_budget_breakdown = _maybe_breakdown(score_fn, composed)
+            feedback = (
+                f"Your variant verified and scored at on_chip={on_chip} "
+                f"bytes, which exceeds this attempt's on-chip budget of "
+                f"{budget} bytes. Emit a corrected DSL implementation "
+                "that reduces on-chip memory below the budget."
+            )
+            if over_budget_breakdown:
+                feedback += (
+                    "\n\nPer-node on-chip memory of the rejected variant "
+                    "(largest contributors first):\n\n"
+                    f"```\n{over_budget_breakdown}\n```"
+                )
+            _append_turn_feedback(conversation, feedback)
+            continue
+
+        entry = DesignEntry(
+            dsl=parsed.dsl,
+            input_contracts=parsed.input_contracts,
+            output_contracts=verify.derived_output_contracts,
+            cycles=cycles,
+            on_chip=on_chip,
+            provenance=f"llm_attempt_{attempt_index}_b{blabel}_turn_{turn}",
+        )
+        admitted.append(entry)
+        _write_turn_artifacts(
+            turn_dir,
+            user_prompt=turn_user_prompt,
+            agent_response=agent_response,
+            status="ACCEPTED",
+            extracted_code=parsed.dsl,
+            composed_source=composed,
+            verify_result=verify,
+            admitted_entries=[entry],
+        )
+        break  # one admission per attempt — mirrors the legacy semantics
+
+    return admitted
+
+
 async def search_leaf(
     *,
     node: PlanNode,
@@ -885,12 +1189,17 @@ async def search_leaf(
 ) -> NodeLibrary:
     """Populate one leaf node's library.
 
-    Seeds with the pass-1 baseline (identity contracts), then runs up to
-    ``config.max_attempts`` fresh-conversation attempts. Each attempt
-    accumulates up to ``config.max_turns_per_attempt`` LLM turns of
-    parse/verify feedback before giving up and starting fresh. Fresh
-    attempts render a Pareto-front summary of already-accepted entries
-    into the user prompt so the LLM targets gaps.
+    Seeds with the pass-1 baseline (identity contracts), then fans out
+    one fresh-conversation attempt per entry in
+    ``config.attempt_budgets_bytes`` — all attempts run in parallel via
+    ``asyncio.gather``. Each attempt budget is rendered into its own
+    user prompt; variants whose scored ``on_chip`` exceeds the budget
+    are rejected with ``OVER_BUDGET`` turn feedback. ``budget == None``
+    skips both the prompt mention and the reject filter.
+
+    After all attempts complete, every admitted DesignEntry is merged
+    into the shared library via ``insert_pareto`` so the per-attempt
+    Pareto admissions remain consistent across the fan-out.
 
     ``parent_contract`` is ``None`` only for the root-as-leaf case
     (single-node plan tree): the pass-1 DSL is already
@@ -898,24 +1207,24 @@ async def search_leaf(
     needed and the library uses empty identity contracts.
     """
     assert node.is_leaf, f"search_leaf called on non-leaf node {node.path!r}"
+    assert config.attempt_budgets_bytes, (
+        "search_leaf: SearchConfig.attempt_budgets_bytes must contain at "
+        "least one entry (use [None] for a single unlimited attempt)"
+    )
     lib: NodeLibrary = {}
     is_root = parent_contract is None
-    # The synthetic wrapper's offchip_load strides depend on the variant's
-    # input_contracts, so we rebuild it per turn from ``parsed.input_contracts``
-    # below. The baseline path inside ``_seed_baseline`` builds its own wrapper
-    # with identity contracts.
 
     if system_prompt:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         (ckpt_dir / "system_prompt.txt").write_text(system_prompt)
 
     if is_root:
-        baseline = _seed_root_baseline(
+        baseline, baseline_breakdown = _seed_root_baseline(
             lib=lib, node_name=node.name, pass1_dsl=pass1_dsl,
             score_fn=score_fn, descendant_dsls=[], children_picks={},
         )
     else:
-        baseline = _seed_baseline(
+        baseline, baseline_breakdown = _seed_baseline(
             lib=lib, node_name=node.name, parent_contract=parent_contract,
             pass1_dsl=pass1_dsl, score_fn=score_fn,
             descendant_dsls=[],
@@ -923,143 +1232,31 @@ async def search_leaf(
         )
     _write_pass1_baseline_score(ckpt_dir, baseline)
 
-    arg_vanilla_shapes = (
-        {} if is_root else _on_chip_vanilla_shapes(parent_contract)
-    )
-    output_vanilla_shapes = (
-        {} if is_root else _output_vanilla_shapes(parent_contract)
-    )
-    accepted: list[DesignEntry] = [baseline]
-
-    for attempt in range(config.max_attempts):
-        attempt_dir = ckpt_dir / f"attempt_{attempt}"
-        accepted_summary = render_accepted_summary(
-            accepted,
-            arg_vanilla_shapes=arg_vanilla_shapes,
-            output_vanilla_shapes=output_vanilla_shapes,
-        )
-        user_prompt = build_autotune2_user_prompt(
-            is_leaf=True,
-            node_name=node.name,
-            function_signature=prompt_inputs.function_signature,
-            pytorch_reference=prompt_inputs.pytorch_reference,
+    baseline_accepted: list[DesignEntry] = [baseline]
+    attempt_coros = [
+        _run_leaf_attempt(
+            node=node,
+            parent_contract=parent_contract,
             pass1_dsl=pass1_dsl,
-            dims_block=prompt_inputs.dims_block,
-            tensors_block=prompt_inputs.tensors_block,
-            accepted_summary=accepted_summary,
+            attempt_index=i,
+            budget=budget,
+            attempt_dir=ckpt_dir / f"attempt_{i}_b{_budget_label(budget)}",
+            score_fn=score_fn,
+            agent=agent,
+            verifier=verifier,
+            prompt_inputs=prompt_inputs,
+            config=config,
+            baseline_accepted=baseline_accepted,
+            baseline_breakdown=baseline_breakdown,
         )
-        conversation: list[dict] = [{"role": "user", "content": user_prompt}]
-
-        for turn in range(config.max_turns_per_attempt):
-            assert conversation[-1]["role"] == "user", (
-                "search_leaf: expected last conversation message to be a user "
-                "turn before invoking the agent"
-            )
-            turn_user_prompt = conversation[-1]["content"]
-            agent_response = _coerce_agent_response(await agent(conversation))
-            response = agent_response.text
-            conversation.append({"role": "assistant", "content": response})
-            turn_dir = attempt_dir / f"turn_{turn}"
-
-            try:
-                parsed = parse_autotune2_response(response, is_leaf=True)
-            except AssertionError as e:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status=f"PARSE_FAIL: {e}",
-                )
-                _append_turn_feedback(conversation, (
-                    f"Your response could not be parsed: {e}\n\n"
-                    "Please re-emit the YAML and python blocks exactly per "
-                    "the output protocol described in the system prompt."
-                ))
-                continue
-
-            try:
-                wrapper = "" if is_root else build_synthetic_wrapper_for_node(
-                    node_name=node.name,
-                    parent_contract=parent_contract,
-                    input_contracts=parsed.input_contracts,
-                )
-            except AssertionError as e:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status=f"WRAPPER_BUILD_FAIL: {e}",
-                    extracted_code=parsed.dsl,
-                )
-                _append_turn_feedback(conversation, (
-                    "Your declared input_contracts are not realizable as a "
-                    f"single strided offchip_load: {e}\n\n"
-                    "Pick contracts that keep the tile = vanilla[-2:] and "
-                    "leave the last two reshape axes in place; the leading "
-                    "stream axes may be factored/permuted freely."
-                ))
-                continue
-
-            composed = compose_source(
-                parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
-                descendant_dsls_postorder=[],
-            )
-            verify = await verifier(composed, parsed.output_contracts)
-            if not verify.passed:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status="VERIFY_FAIL",
-                    extracted_code=parsed.dsl,
-                    composed_source=composed,
-                    verify_result=verify,
-                )
-                _append_turn_feedback(conversation, (
-                    "Your variant did not pass verification. Gate feedback "
-                    "follows; please emit a corrected DSL implementation "
-                    "that addresses the issues:\n\n"
-                    f"{verify.feedback}"
-                ))
-                continue
-
-            cycles, on_chip, score_err = _safe_score(score_fn, composed)
-            if score_err is not None:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status="SCORE_FAIL",
-                    extracted_code=parsed.dsl,
-                    composed_source=composed,
-                    verify_result=VerifyResult(passed=False, feedback=score_err),
-                )
-                _append_turn_feedback(conversation, score_err)
-                continue
-
-            entry = DesignEntry(
-                dsl=parsed.dsl,
-                input_contracts=parsed.input_contracts,
-                output_contracts=parsed.output_contracts,
-                cycles=cycles,
-                on_chip=on_chip,
-                provenance=f"llm_attempt_{attempt}_turn_{turn}",
-            )
+        for i, budget in enumerate(config.attempt_budgets_bytes)
+    ]
+    per_attempt = await asyncio.gather(*attempt_coros)
+    for admitted in per_attempt:
+        for entry in admitted:
             cell = library_cell(
-                lib, parsed.input_contracts, parsed.output_contracts)
-            if insert_pareto(cell, entry):
-                accepted.append(entry)
-            _write_turn_artifacts(
-                turn_dir,
-                user_prompt=turn_user_prompt,
-                agent_response=agent_response,
-                status="ACCEPTED",
-                extracted_code=parsed.dsl,
-                composed_source=composed,
-                verify_result=verify,
-                admitted_entries=[entry],
-            )
-            break  # success → break inner loop, start a fresh attempt
+                lib, entry.input_contracts, entry.output_contracts)
+            insert_pareto(cell, entry)
 
     # Persist registry artifact for downstream variant binding.
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1069,6 +1266,247 @@ async def search_leaf(
         variants=library_to_variant_registry(lib),
     )
     return lib
+
+
+async def _run_parent_attempt(
+    *,
+    node: PlanNode,
+    parent_contract: Contract | None,
+    pass1_dsl: str,
+    children_libraries: dict[str, NodeLibrary],
+    child_blocks: dict[str, str],
+    expected_child_names: tuple[str, ...],
+    attempt_index: int,
+    budget: int | None,
+    attempt_dir: Path,
+    score_fn: ScoreFn,
+    agent: AgentFn,
+    verifier: VerifierFn,
+    prompt_inputs: NodePromptInputs,
+    config: SearchConfig,
+    baseline_accepted: list[DesignEntry],
+    baseline_breakdown: str = "",
+) -> list[DesignEntry]:
+    """One parent attempt — fresh conversation, up to
+    ``max_turns_per_attempt`` turns, scoped to a single on-chip-memory
+    budget. Returns admitted DesignEntries (merged into the shared lib
+    by the caller).
+
+    Children's full Pareto fronts are exposed to the LLM via
+    ``child_blocks``; the agent autonomously picks one variant_index
+    per child (a single ``DesignEntry``), and the parent DSL is
+    expected to add intermediate STeP ops if the picked children's
+    contracts don't compose cleanly. No Cartesian sweep.
+    """
+    is_root = parent_contract is None
+    arg_vanilla_shapes = (
+        {} if is_root else _on_chip_vanilla_shapes(parent_contract)
+    )
+    output_vanilla_shapes = (
+        {} if is_root else _output_vanilla_shapes(parent_contract)
+    )
+    accepted_summary = render_accepted_summary(
+        baseline_accepted,
+        arg_vanilla_shapes=arg_vanilla_shapes,
+        output_vanilla_shapes=output_vanilla_shapes,
+    )
+    user_prompt = build_autotune2_user_prompt(
+        is_leaf=False,
+        node_name=node.name,
+        function_signature=prompt_inputs.function_signature,
+        pytorch_reference=prompt_inputs.pytorch_reference,
+        pass1_dsl=pass1_dsl,
+        dims_block=prompt_inputs.dims_block,
+        tensors_block=prompt_inputs.tensors_block,
+        child_variant_blocks=child_blocks,
+        accepted_summary=accepted_summary,
+        budget_block=_budget_block(budget, baseline_breakdown),
+    )
+    conversation: list[dict] = [{"role": "user", "content": user_prompt}]
+    blabel = _budget_label(budget)
+    admitted: list[DesignEntry] = []
+
+    for turn in range(config.max_turns_per_attempt):
+        assert conversation[-1]["role"] == "user", (
+            "search_parent: expected last conversation message to be a "
+            "user turn before invoking the agent"
+        )
+        turn_user_prompt = conversation[-1]["content"]
+        agent_response = _coerce_agent_response(await agent(conversation))
+        response = agent_response.text
+        conversation.append({"role": "assistant", "content": response})
+        turn_dir = attempt_dir / f"turn_{turn}"
+
+        try:
+            parsed = parse_autotune2_response(
+                response, is_leaf=False,
+                expected_child_names=expected_child_names,
+            )
+        except AssertionError as e:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"PARSE_FAIL: {e}",
+            )
+            _append_turn_feedback(conversation, (
+                f"Your response could not be parsed: {e}\n\n"
+                "Please re-emit the YAML and python blocks exactly per "
+                "the output protocol described in the system prompt."
+            ))
+            continue
+
+        try:
+            children_picks: dict[str, DesignEntry] = {
+                child.path: entry_for_variant(
+                    children_libraries[child.path],
+                    parsed.child_picks[child.name],
+                )
+                for child in node.children
+            }
+        except AssertionError as e:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"BAD_CHILD_PICK: {e}",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, (
+                f"One of your child_picks indices is invalid: {e}\n\n"
+                "Refer to the child variant tables in the user prompt "
+                "and pick a valid variant_index per child."
+            ))
+            continue
+
+        compliance_feedback = _compliance_preflight_feedback(
+            parsed.dsl, is_root=is_root,
+        )
+        if compliance_feedback is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="COMPLIANCE_FAIL",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, compliance_feedback)
+            continue
+
+        try:
+            wrapper = "" if is_root else build_synthetic_wrapper_for_node(
+                node_name=node.name,
+                parent_contract=parent_contract,
+                input_contracts=parsed.input_contracts,
+            )
+        except AssertionError as e:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"WRAPPER_BUILD_FAIL: {e}",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, (
+                "Your declared parent_input_contracts are not realizable "
+                f"as a single strided offchip_load: {e}\n\n"
+                "Pick contracts that keep the tile = vanilla[-2:] and "
+                "leave the last two reshape axes in place; the leading "
+                "stream axes may be factored/permuted freely."
+            ))
+            continue
+
+        descendants: list[str] = []
+        for child in node.children:
+            child_entry = children_picks[child.path]
+            descendants.extend(gather_descendants_postorder(child_entry))
+            descendants.append(child_entry.dsl)
+        composed = compose_source(
+            parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
+            descendant_dsls_postorder=descendants,
+        )
+        verify = await verifier(composed)
+        if not verify.passed:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="VERIFY_FAIL",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=verify,
+            )
+            _append_turn_feedback(conversation, (
+                "Your variant did not pass verification. Gate feedback "
+                "follows; please emit a corrected DSL implementation "
+                "that addresses the issues:\n\n"
+                f"{verify.feedback}"
+            ))
+            continue
+        cycles, on_chip, score_err = _safe_score(score_fn, composed)
+        if score_err is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="SCORE_FAIL",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=VerifyResult(passed=False, feedback=score_err),
+            )
+            _append_turn_feedback(conversation, score_err)
+            continue
+
+        if budget is not None and on_chip > budget:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status=f"OVER_BUDGET (on_chip={on_chip} > {budget})",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=verify,
+            )
+            over_budget_breakdown = _maybe_breakdown(score_fn, composed)
+            feedback = (
+                f"Your composed variant scored at on_chip={on_chip} "
+                f"bytes, which exceeds this attempt's on-chip budget of "
+                f"{budget} bytes. Pick different child variants and/or "
+                "restructure the parent DSL to reduce on-chip memory "
+                "below the budget."
+            )
+            if over_budget_breakdown:
+                feedback += (
+                    "\n\nPer-node on-chip memory of the rejected "
+                    "composition (largest contributors first):\n\n"
+                    f"```\n{over_budget_breakdown}\n```"
+                )
+            _append_turn_feedback(conversation, feedback)
+            continue
+
+        entry = DesignEntry(
+            dsl=parsed.dsl,
+            input_contracts=parsed.input_contracts,
+            output_contracts=verify.derived_output_contracts,
+            cycles=cycles,
+            on_chip=on_chip,
+            provenance=f"llm_attempt_{attempt_index}_b{blabel}_turn_{turn}",
+            children_picks=children_picks,
+        )
+        admitted.append(entry)
+        _write_turn_artifacts(
+            turn_dir,
+            user_prompt=turn_user_prompt,
+            agent_response=agent_response,
+            status="ACCEPTED",
+            extracted_code=parsed.dsl,
+            composed_source=composed,
+            verify_result=verify,
+            admitted_entries=[entry],
+        )
+        break  # one admission per attempt — mirrors the legacy semantics
+
+    return admitted
 
 
 async def search_parent(
@@ -1093,20 +1531,20 @@ async def search_parent(
     provides the pass-1-baseline pick per child (used to score the
     parent's pass-1 baseline against the children's pass-1 baselines).
 
-    Outer loop: ``config.max_attempts`` fresh-conversation attempts.
-    Inner loop: ``config.max_turns_per_attempt`` parse/verify-feedback
-    turns within one attempt. Each attempt's user prompt renders the
-    current Pareto front so the LLM targets gaps. On a successful turn
-    the parent's DSL is composed with the Cartesian product of the
-    picked children's Pareto fronts; every non-dominated composition is
-    admitted to the library.
+    Fans out one fresh-conversation attempt per entry in
+    ``config.attempt_budgets_bytes`` (all in parallel via
+    ``asyncio.gather``). Each attempt picks one specific child variant
+    per child and composes a single descendant chain — no Cartesian
+    sweep. Variants whose scored composition exceeds the attempt's
+    budget are rejected with ``OVER_BUDGET`` turn feedback; ``None``
+    skips both the prompt mention and the reject filter.
     """
+    assert config.attempt_budgets_bytes, (
+        "search_parent: SearchConfig.attempt_budgets_bytes must contain at "
+        "least one entry (use [None] for a single unlimited attempt)"
+    )
     lib: NodeLibrary = {}
     is_root = parent_contract is None
-    # The synthetic wrapper's offchip_load strides depend on the variant's
-    # input_contracts, so we rebuild it per turn from ``parsed.input_contracts``
-    # below. The baseline path inside ``_seed_baseline`` builds its own wrapper
-    # with identity contracts.
 
     if system_prompt:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1118,13 +1556,13 @@ async def search_parent(
         baseline_descendants.extend(gather_descendants_postorder(child_entry))
         baseline_descendants.append(child_entry.dsl)
     if is_root:
-        baseline = _seed_root_baseline(
+        baseline, baseline_breakdown = _seed_root_baseline(
             lib=lib, node_name=node.name, pass1_dsl=pass1_dsl,
             score_fn=score_fn, descendant_dsls=baseline_descendants,
             children_picks=children_picks_baseline,
         )
     else:
-        baseline = _seed_baseline(
+        baseline, baseline_breakdown = _seed_baseline(
             lib=lib, node_name=node.name, parent_contract=parent_contract,
             pass1_dsl=pass1_dsl, score_fn=score_fn,
             descendant_dsls=baseline_descendants,
@@ -1160,192 +1598,35 @@ async def search_parent(
         )
 
     expected_child_names = tuple(c.name for c in node.children)
-    arg_vanilla_shapes = (
-        {} if is_root else _on_chip_vanilla_shapes(parent_contract)
-    )
-    output_vanilla_shapes = (
-        {} if is_root else _output_vanilla_shapes(parent_contract)
-    )
-    accepted: list[DesignEntry] = [baseline]
+    baseline_accepted: list[DesignEntry] = [baseline]
 
-    for attempt in range(config.max_attempts):
-        attempt_dir = ckpt_dir / f"attempt_{attempt}"
-        accepted_summary = render_accepted_summary(
-            accepted,
-            arg_vanilla_shapes=arg_vanilla_shapes,
-            output_vanilla_shapes=output_vanilla_shapes,
-        )
-        user_prompt = build_autotune2_user_prompt(
-            is_leaf=False,
-            node_name=node.name,
-            function_signature=prompt_inputs.function_signature,
-            pytorch_reference=prompt_inputs.pytorch_reference,
+    attempt_coros = [
+        _run_parent_attempt(
+            node=node,
+            parent_contract=parent_contract,
             pass1_dsl=pass1_dsl,
-            dims_block=prompt_inputs.dims_block,
-            tensors_block=prompt_inputs.tensors_block,
-            child_variant_blocks=child_blocks,
-            accepted_summary=accepted_summary,
+            children_libraries=children_libraries,
+            child_blocks=child_blocks,
+            expected_child_names=expected_child_names,
+            attempt_index=i,
+            budget=budget,
+            attempt_dir=ckpt_dir / f"attempt_{i}_b{_budget_label(budget)}",
+            score_fn=score_fn,
+            agent=agent,
+            verifier=verifier,
+            prompt_inputs=prompt_inputs,
+            config=config,
+            baseline_accepted=baseline_accepted,
+            baseline_breakdown=baseline_breakdown,
         )
-        conversation: list[dict] = [{"role": "user", "content": user_prompt}]
-
-        for turn in range(config.max_turns_per_attempt):
-            assert conversation[-1]["role"] == "user", (
-                "search_parent: expected last conversation message to be a "
-                "user turn before invoking the agent"
-            )
-            turn_user_prompt = conversation[-1]["content"]
-            agent_response = _coerce_agent_response(await agent(conversation))
-            response = agent_response.text
-            conversation.append({"role": "assistant", "content": response})
-            turn_dir = attempt_dir / f"turn_{turn}"
-
-            try:
-                parsed = parse_autotune2_response(
-                    response, is_leaf=False,
-                    expected_child_names=expected_child_names,
-                )
-            except AssertionError as e:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status=f"PARSE_FAIL: {e}",
-                )
-                _append_turn_feedback(conversation, (
-                    f"Your response could not be parsed: {e}\n\n"
-                    "Please re-emit the YAML and python blocks exactly per "
-                    "the output protocol described in the system prompt."
-                ))
-                continue
-
-            try:
-                children_fronts: dict[str, list[DesignEntry]] = {
-                    child.path: cell_for_variant(
-                        children_libraries[child.path],
-                        parsed.child_picks[child.name],
-                    )
-                    for child in node.children
-                }
-            except AssertionError as e:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status=f"BAD_CHILD_PICK: {e}",
-                    extracted_code=parsed.dsl,
-                )
-                _append_turn_feedback(conversation, (
-                    f"One of your child_picks indices is invalid: {e}\n\n"
-                    "Refer to the child variant tables in the user prompt "
-                    "and pick a valid variant_index per child."
-                ))
-                continue
-            children_order = [c.path for c in node.children]
-
-            try:
-                wrapper = "" if is_root else build_synthetic_wrapper_for_node(
-                    node_name=node.name,
-                    parent_contract=parent_contract,
-                    input_contracts=parsed.input_contracts,
-                )
-            except AssertionError as e:
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status=f"WRAPPER_BUILD_FAIL: {e}",
-                    extracted_code=parsed.dsl,
-                )
-                _append_turn_feedback(conversation, (
-                    "Your declared parent_input_contracts are not realizable "
-                    f"as a single strided offchip_load: {e}\n\n"
-                    "Pick contracts that keep the tile = vanilla[-2:] and "
-                    "leave the last two reshape axes in place; the leading "
-                    "stream axes may be factored/permuted freely."
-                ))
-                continue
-
-            # Score every Cartesian combination and admit non-dominated entries.
-            # The cell is created lazily on first admission: if every combination
-            # fails verify/score, the library must not retain an empty cell —
-            # render_library_as_variant_summaries treats empty cells as a bug.
-            cell: list[DesignEntry] | None = None
-            admitted_this_turn: list[DesignEntry] = []
-            last_failure: str = ""
-            # Track the first composed source + last verify result for the
-            # per-turn checkpoint. Cartesian compositions can fan out widely;
-            # logging every one would explode the turn_dir. The first combo
-            # is representative for the entry's DSL content (descendants
-            # differ but the parent DSL is identical), and the last verify
-            # result is what's surfaced in the user-feedback message.
-            first_composed: str | None = None
-            last_verify: VerifyResult | None = None
-            for chosen, descendants in _iter_parent_compositions(
-                parent_dsl=parsed.dsl,
-                children_fronts=children_fronts,
-                children_order=children_order,
-            ):
-                composed = compose_source(
-                    parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
-                    descendant_dsls_postorder=descendants,
-                )
-                if first_composed is None:
-                    first_composed = composed
-                verify = await verifier(composed, parsed.output_contracts)
-                last_verify = verify
-                if not verify.passed:
-                    last_failure = verify.feedback
-                    continue
-                cycles, on_chip, score_err = _safe_score(score_fn, composed)
-                if score_err is not None:
-                    last_verify = VerifyResult(passed=False, feedback=score_err)
-                    last_failure = score_err
-                    continue
-                entry = DesignEntry(
-                    dsl=parsed.dsl,
-                    input_contracts=parsed.input_contracts,
-                    output_contracts=parsed.output_contracts,
-                    cycles=cycles,
-                    on_chip=on_chip,
-                    provenance=f"llm_attempt_{attempt}_turn_{turn}",
-                    children_picks=chosen,
-                )
-                if cell is None:
-                    cell = library_cell(
-                        lib, parsed.input_contracts, parsed.output_contracts)
-                if insert_pareto(cell, entry):
-                    admitted_this_turn.append(entry)
-
-            if admitted_this_turn:
-                accepted.extend(admitted_this_turn)
-                _write_turn_artifacts(
-                    turn_dir,
-                    user_prompt=turn_user_prompt,
-                    agent_response=agent_response,
-                    status=f"ACCEPTED ({len(admitted_this_turn)} entries)",
-                    extracted_code=parsed.dsl,
-                    composed_source=first_composed,
-                    verify_result=last_verify,
-                    admitted_entries=list(admitted_this_turn),
-                )
-                break  # success → break inner loop, start a fresh attempt
-            _write_turn_artifacts(
-                turn_dir,
-                user_prompt=turn_user_prompt,
-                agent_response=agent_response,
-                status="VERIFY_OR_SCORE_FAIL_ALL_COMPOSITIONS",
-                extracted_code=parsed.dsl,
-                composed_source=first_composed,
-                verify_result=last_verify,
-            )
-            _append_turn_feedback(conversation, (
-                "Your variant did not produce an admissible entry under "
-                "any Cartesian combination of the picked children's Pareto "
-                "front — either a verification gate failed or the "
-                "analytical scorer raised. Last feedback follows; please "
-                "emit a corrected DSL implementation:\n\n"
-                f"{last_failure}"
-            ))
+        for i, budget in enumerate(config.attempt_budgets_bytes)
+    ]
+    per_attempt = await asyncio.gather(*attempt_coros)
+    for admitted in per_attempt:
+        for entry in admitted:
+            cell = library_cell(
+                lib, entry.input_contracts, entry.output_contracts)
+            insert_pareto(cell, entry)
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     emit_variants_module(
@@ -1356,32 +1637,6 @@ async def search_parent(
     return lib
 
 
-def _iter_parent_compositions(
-    *,
-    parent_dsl: str,
-    children_fronts: dict[str, list[DesignEntry]],
-    children_order: list[str],
-):
-    """Yield (chosen_dict, descendant_dsls_postorder) per Cartesian combo.
-
-    Mirrors ``cartesian_compose`` from compose.py but exposes the chosen
-    per-child entry plus the full transitive descendant DSL list (so
-    grandchildren etc. are included). Doesn't call any scorer — used
-    inside ``search_parent``'s per-turn loop where verification + scoring
-    happen on the composed source.
-    """
-    import itertools
-    fronts = [children_fronts[p] for p in children_order]
-    for combo in itertools.product(*fronts):
-        chosen = {p: e for p, e in zip(children_order, combo)}
-        descendants: list[str] = []
-        for path in children_order:
-            entry = chosen[path]
-            descendants.extend(gather_descendants_postorder(entry))
-            descendants.append(entry.dsl)
-        yield chosen, descendants
-
-
 def _seed_root_baseline(
     *,
     lib: NodeLibrary,
@@ -1390,15 +1645,19 @@ def _seed_root_baseline(
     score_fn: ScoreFn,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
-) -> DesignEntry:
+) -> tuple[DesignEntry, str]:
     """Like ``_seed_baseline`` but for the root (no synthetic wrapper, no
     parent_contract). The root's library has a single cell keyed by
-    empty input/output contracts."""
+    empty input/output contracts.
+
+    Returns ``(entry, baseline_breakdown)`` — see ``_seed_baseline``.
+    """
     composed = compose_source(
         parent_dsl=pass1_dsl,
         descendant_dsls_postorder=descendant_dsls,
     )
     cycles, on_chip = score_fn(composed)
+    breakdown = _maybe_breakdown(score_fn, composed)
     entry = DesignEntry(
         dsl=pass1_dsl,
         input_contracts={},
@@ -1410,7 +1669,7 @@ def _seed_root_baseline(
     )
     cell = library_cell(lib, {}, {})
     cell.append(entry)
-    return entry
+    return entry, breakdown
 
 
 # ---------------------------------------------------------------------------

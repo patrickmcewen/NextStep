@@ -169,7 +169,10 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     assert build_graph is not None, "step_impl.py does not define build_graph"
 
     # --- Stage 2: simulate ---
-    orig_dir = os.getcwd()
+    # No os.chdir here: the parent process's cwd is shared global state, so
+    # mutating it would race when multiple evaluate_kernel calls run
+    # concurrently (e.g. autotune2's top-K rust promotion). The simulator
+    # subprocess does its own chdir into work_dir; the parent stays put.
 
     from sim import serialize, SimConfig, HBMConfig
     from utils.gold_checking import reconstruct_numpy
@@ -184,8 +187,7 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
         from validate_timing import normalize_compute_bw
         normalize_compute_bw(graph, max_total_compute_bw)
 
-    os.chdir(work_dir)
-    pb_path = os.path.join(os.getcwd(), "graph.pb")
+    pb_path = os.path.join(work_dir, "graph.pb")
 
     sim_config = SimConfig(channel_depth=2, functional_sim=not timing_only, mock_bf16=False)
     hbm_config = HBMConfig(
@@ -223,7 +225,7 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
 
     proc = subprocess.run(
         [sys.executable, "-c", sim_runner_script,
-         os.getcwd(), pb_path,
+         work_dir, pb_path,
          json.dumps(asdict(hbm_config)),
          json.dumps({"channel_depth": sim_config.channel_depth,
                       "functional_sim": sim_config.functional_sim,
@@ -231,8 +233,6 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
         capture_output=True, text=True, timeout=SIM_TIMEOUT_SECONDS,
         env=env,
     )
-
-    os.chdir(orig_dir)
 
     if proc.returncode != 0:
         return EvalResult(

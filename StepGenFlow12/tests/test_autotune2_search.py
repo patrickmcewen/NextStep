@@ -32,7 +32,7 @@ from src.autotune2.search import (
     build_node_tensors_dict,
     build_synthetic_wrapper_for_node,
     build_variant_callables,
-    cell_for_variant,
+    entry_for_variant,
     find_pass1_baseline_entry,
     gather_descendants_postorder,
     library_to_variant_registry,
@@ -40,7 +40,6 @@ from src.autotune2.search import (
     search_leaf,
     search_parent,
     write_library_snapshot,
-    _iter_parent_compositions,
 )
 
 
@@ -429,10 +428,12 @@ def test_find_pass1_baseline_entry_asserts_duplicate():
         find_pass1_baseline_entry(lib)
 
 
-# --- library_to_variant_registry / cell_for_variant --------------------------
+# --- library_to_variant_registry / entry_for_variant -------------------------
 
 
 def _sample_lib() -> NodeLibrary:
+    """Two cells, three entries total — the second cell has two Pareto
+    entries so the per-entry flatten exposes three variant indices."""
     lib: NodeLibrary = {}
     c_id = vanilla_contract_for((4, 8))
     c_perm = TensorContract(reshape=(4, 8), permutation=(1, 0))
@@ -444,62 +445,44 @@ def _sample_lib() -> NodeLibrary:
     return lib
 
 
-def test_library_to_variant_registry_sequential():
+def test_library_to_variant_registry_per_entry():
     lib = _sample_lib()
     reg = library_to_variant_registry(lib)
-    assert set(reg.keys()) == {0, 1}
+    # 1 entry in cell0 + 2 entries in cell1 = 3 indices total
+    assert set(reg.keys()) == {0, 1, 2}
     assert reg[0]["input_contracts"]["x"] == vanilla_contract_for((4, 8))
-    assert reg[1]["input_contracts"]["x"] == TensorContract(
-        reshape=(4, 8), permutation=(1, 0))
+    # idx 1 and 2 share boundary contracts (cell1) but are distinct entries
+    perm = TensorContract(reshape=(4, 8), permutation=(1, 0))
+    assert reg[1]["input_contracts"]["x"] == perm
+    assert reg[2]["input_contracts"]["x"] == perm
 
 
-def test_cell_for_variant_resolves_back():
+def test_entry_for_variant_resolves_back():
     lib = _sample_lib()
-    cell0 = cell_for_variant(lib, 0)
-    cell1 = cell_for_variant(lib, 1)
-    assert len(cell0) == 1 and len(cell1) == 2
+    e0 = entry_for_variant(lib, 0)
+    e1 = entry_for_variant(lib, 1)
+    e2 = entry_for_variant(lib, 2)
+    assert e0.dsl == "# v0\n"
+    assert e1.dsl == "# v1a\n"
+    assert e2.dsl == "# v1b\n"
 
 
-def test_cell_for_variant_out_of_range():
+def test_entry_for_variant_out_of_range():
     with pytest.raises(AssertionError, match="out of range"):
-        cell_for_variant(_sample_lib(), 99)
+        entry_for_variant(_sample_lib(), 99)
 
 
 # --- render_library_as_variant_summaries -------------------------------------
 
 
-def test_render_summaries_uses_best_pareto_entry():
+def test_render_summaries_one_row_per_entry():
     lib = _sample_lib()
     summaries = render_library_as_variant_summaries(lib)
-    assert [s.variant_index for s in summaries] == [0, 1]
-    # cell 1 has entries (80,300) and (120,150) — neither dominates the other;
-    # min by (cycles, on_chip) is (80, 300).
-    assert summaries[1].cycles == 80 and summaries[1].on_chip == 300
-
-
-# --- _iter_parent_compositions -----------------------------------------------
-
-
-def test_iter_parent_compositions_full_product_with_descendants():
-    grandchild_a = DesignEntry(dsl="# gc_a\n")
-    grandchild_b = DesignEntry(dsl="# gc_b\n")
-    child_x = DesignEntry(dsl="# x\n", children_picks={"root/a/gc": grandchild_a})
-    child_y = DesignEntry(dsl="# y\n", children_picks={"root/a/gc": grandchild_b})
-    fronts = {"root/x": [child_x, child_y], "root/z": [DesignEntry(dsl="# z\n")]}
-    out = list(_iter_parent_compositions(
-        parent_dsl="# parent\n",
-        children_fronts=fronts,
-        children_order=["root/x", "root/z"],
-    ))
-    assert len(out) == 2
-    chosen0, descendants0 = out[0]
-    assert "# parent\n" not in descendants0  # parent is excluded
-    # First combo: child_x (with grandchild_a) + z
-    assert "# gc_a\n" in descendants0
-    assert "# x\n" in descendants0
-    assert "# z\n" in descendants0
-    # x's grandchild appears BEFORE x (post-order)
-    assert descendants0.index("# gc_a\n") < descendants0.index("# x\n")
+    # three entries → three summaries, indices match registry order
+    assert [s.variant_index for s in summaries] == [0, 1, 2]
+    assert (summaries[0].cycles, summaries[0].on_chip) == (100, 200)
+    assert (summaries[1].cycles, summaries[1].on_chip) == (80, 300)
+    assert (summaries[2].cycles, summaries[2].on_chip) == (120, 150)
 
 
 # --- build_variant_callables -------------------------------------------------
@@ -537,11 +520,14 @@ def test_build_variant_callables_creates_named_stubs():
 
 
 def _make_leaf_response(reshape, perm, body: str = "    return None"):
+    # ``reshape``/``perm`` are honored for the *input* contract (the only
+    # boundary the LLM still declares). Output contracts are derived from
+    # the built graph by the verifier; the test fakes a verifier so the
+    # specific reshape/perm here doesn't drive Pareto cell keying.
     return (
         "```yaml\n"
-        "parent_input_contracts: {}\n"
-        "parent_output_contracts:\n"
-        f"  out_0: {{reshape: {list(reshape)}, permutation: {list(perm)}}}\n"
+        "parent_input_contracts:\n"
+        f"  x: {{reshape: {list(reshape)}, permutation: {list(perm)}}}\n"
         "```\n\n"
         "```python\n"
         f"def my_leaf(x, *, out_shapes):\n{body}\n"
@@ -585,7 +571,7 @@ def test_search_leaf_seeds_baseline_and_admits_llm_proposals(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=2),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*2),
     ))
     # variants.py was emitted
     assert (tmp_path / "leaf" / "variants.py").exists()
@@ -626,7 +612,7 @@ def test_search_leaf_writes_pass1_baseline_and_per_turn_score_artifacts(tmp_path
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
     ))
 
     baseline_path = tmp_path / "leaf" / "pass1_baseline_score.json"
@@ -634,13 +620,13 @@ def test_search_leaf_writes_pass1_baseline_and_per_turn_score_artifacts(tmp_path
     baseline = json.loads(baseline_path.read_text())
     assert baseline == {"cycles": 111, "on_chip": 222, "provenance": "pass1_baseline"}
 
-    score_path = tmp_path / "leaf" / "attempt_0" / "turn_0" / "score.json"
+    score_path = tmp_path / "leaf" / "attempt_0_binf" / "turn_0" / "score.json"
     assert score_path.exists(), "accepted-turn score not persisted"
     payload = json.loads(score_path.read_text())
     assert payload == {
         "entries": [
             {"cycles": 333, "on_chip": 444,
-             "provenance": "llm_attempt_0_turn_0"},
+             "provenance": "llm_attempt_0_binf_turn_0"},
         ],
     }
 
@@ -677,7 +663,7 @@ def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=2, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=2, attempt_budgets_bytes=[None]*1),
     ))
     # Two agent calls within one attempt
     assert call_idx[0] == 2
@@ -698,34 +684,35 @@ def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
 def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
     """After a successful first attempt, the second attempt's opening user
     prompt should include the rendered Pareto-front summary so the LLM can
-    avoid duplicating already-accepted variants."""
+    avoid duplicating already-accepted variants.
+
+    Parallel attempts share the same baseline-only accepted_summary at
+    start time (they can't see each other's admissions), so the relevant
+    invariant is that *budgeted* attempts get distinct prompts via the
+    budget block. We verify two attempts with different budgets produce
+    two distinct opening prompts, both of which include the baseline in
+    the accepted-summary section."""
     captured_first_user_per_attempt: list[str] = []
-    # Two structurally distinct responses → land in distinct Pareto cells
-    # so both get added to ``accepted`` (not Pareto-dominated by baseline).
     responses = [
         _make_leaf_response(reshape=(4, 1, 8), perm=(1, 0, 2)),
         _make_leaf_response(reshape=(2, 2, 8), perm=(0, 1, 2)),
     ]
     call_idx = [0]
-    seen_attempts: set[str] = set()
 
     async def agent(conversation: list[dict]):
         # Each attempt opens with a 1-message conversation (just the user
-        # prompt); on subsequent turns within an attempt the conversation
-        # is >1. We snapshot the opener.
+        # prompt). With parallel attempts the prompt is captured per
+        # coroutine — record one entry per "opener" call.
         if len(conversation) == 1:
-            first_user = conversation[0]["content"]
-            if first_user not in seen_attempts:
-                seen_attempts.add(first_user)
-                captured_first_user_per_attempt.append(first_user)
-        r = responses[call_idx[0]]
+            captured_first_user_per_attempt.append(conversation[0]["content"])
+        r = responses[call_idx[0] % len(responses)]
         call_idx[0] += 1
         return r
 
     async def verifier(_src, *_a, **_kw):
         return VerifyResult(passed=True)
 
-    lib = run(search_leaf(
+    run(search_leaf(
         node=_leaf("my_leaf"),
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
@@ -734,20 +721,24 @@ def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=2, max_attempts=2),
+        config=SearchConfig(
+            max_turns_per_attempt=2,
+            # Two attempts at distinct budgets — unlimited and 1024 bytes.
+            attempt_budgets_bytes=[None, 1024],
+        ),
     ))
-    # Two attempts → two distinct opening user prompts
     assert len(captured_first_user_per_attempt) == 2
-    # Second attempt's prompt mentions the accepted block
-    assert "Already-accepted variants" in captured_first_user_per_attempt[1]
-    # First attempt's prompt does not (only baseline is accepted at attempt 0
-    # — and the baseline IS rendered in attempt 0 too, since the seeded
-    # baseline goes into ``accepted`` before the first attempt opens).
-    # Therefore both attempts should include the section. Assert second has
-    # at least one more entry mentioned than the first.
-    first_count = captured_first_user_per_attempt[0].count("cycles=")
-    second_count = captured_first_user_per_attempt[1].count("cycles=")
-    assert second_count > first_count
+    # Both attempts render the baseline in the accepted-summary section.
+    for prompt in captured_first_user_per_attempt:
+        assert "Already-accepted variants" in prompt
+    # Exactly one of the two attempts is budgeted → exactly one prompt
+    # carries the on-chip budget block.
+    budget_mentions = sum(
+        "On-chip memory budget" in p for p in captured_first_user_per_attempt
+    )
+    assert budget_mentions == 1
+    # The two prompts must differ (budget block presence / wording).
+    assert captured_first_user_per_attempt[0] != captured_first_user_per_attempt[1]
 
 
 def test_search_leaf_skips_failed_verification(tmp_path):
@@ -766,7 +757,7 @@ def test_search_leaf_skips_failed_verification(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=3),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*3),
     ))
     # Only the baseline cell survives.
     assert len(library_to_variant_registry(lib)) == 1
@@ -819,7 +810,7 @@ def test_search_leaf_score_fn_raise_becomes_user_feedback(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=2, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=2, attempt_budgets_bytes=[None]*1),
     ))
     # Both LLM responses fired in the same attempt (max_turns_per_attempt=2).
     assert call_idx[0] == 2
@@ -844,8 +835,6 @@ def _make_parent_response(child_name: str, variant_idx: int):
         "child_picks:\n"
         f"  {child_name}: {variant_idx}\n"
         "parent_input_contracts: {}\n"
-        "parent_output_contracts:\n"
-        "  out_0: {reshape: [1, 4, 8], permutation: [0, 1, 2]}\n"
         "```\n\n"
         "```python\n"
         "def my_parent(x, *, out_shapes):\n"
@@ -854,9 +843,9 @@ def _make_parent_response(child_name: str, variant_idx: int):
     )
 
 
-def test_search_parent_runs_cartesian_compose_and_admits(tmp_path):
-    # Seed a child library with two cells (variant 0 and variant 1, each
-    # with one entry).
+def test_search_parent_picks_one_child_entry_and_admits(tmp_path):
+    """search_parent resolves child_picks to one concrete DesignEntry per
+    child (no Cartesian sweep) and admits the resulting composition."""
     child_node = _leaf("child_under")
     child_lib: NodeLibrary = {}
     c_id = vanilla_contract_for((4, 8))
@@ -878,6 +867,7 @@ def test_search_parent_runs_cartesian_compose_and_admits(tmp_path):
     parent_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
 
     async def agent(_conversation):
+        # variant_idx=1 → cell1's single entry (the second per-entry index).
         return _make_parent_response("child_under", variant_idx=1)
 
     async def verifier(_src, *_a, **_kw):
@@ -899,25 +889,20 @@ def test_search_parent_runs_cartesian_compose_and_admits(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_parent"),
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
     ))
 
-    # Two scoring calls expected: baseline + one Cartesian-compose entry
-    # (cell1 has only one entry, so only one combo).
+    # Two scoring calls expected: baseline + exactly one LLM composition
+    # (no Cartesian sweep — one DesignEntry per child).
     assert len(score_calls) == 2
     reg = library_to_variant_registry(lib)
-    # Baseline cell + llm cell, but they share the same output_contract;
-    # since parent's child_picks output here is identity, and baseline output
-    # is also identity, both may share a cell or not depending on input
-    # contract. Just check the registry is non-empty.
     assert len(reg) >= 1
 
 
-def test_search_parent_leaves_no_empty_cell_when_all_compositions_fail(tmp_path):
-    """If every Cartesian combination fails verify or score for an LLM-proposed
-    variant, ``search_parent`` must not leave an empty cell in the library.
-    An empty cell trips ``render_library_as_variant_summaries``'s "no empty
-    cells" assertion when this node's parent later renders this library."""
+def test_search_parent_admits_only_baseline_when_llm_verify_fails(tmp_path):
+    """When every LLM-proposed turn fails verification, the library should
+    contain only the pass-1 baseline. ``render_library_as_variant_summaries``
+    must not see an empty cell."""
     child_node = _leaf("child_under")
     child_lib: NodeLibrary = {}
     c_id = vanilla_contract_for((4, 8))
@@ -956,12 +941,9 @@ def test_search_parent_leaves_no_empty_cell_when_all_compositions_fail(tmp_path)
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_parent"),
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
     ))
 
-    # No empty cells: every cell in the library must hold at least one entry.
-    # render_library_as_variant_summaries asserts this invariant; running it
-    # here serves as the regression check.
     for by_out in lib.values():
         for cell in by_out.values():
             assert cell, "search_parent left an empty cell after failed turn"
@@ -1026,7 +1008,7 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
         make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
     ))
     assert set(result.libraries.keys()) == {leaf.path, root.path}
     assert result.root_path == root.path
@@ -1129,7 +1111,7 @@ def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
         make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
     ))
 
     # All three libraries populated
@@ -1189,7 +1171,7 @@ def test_autotune_root_as_leaf_single_node_tree(tmp_path):
         make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
-        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
     ))
     assert set(result.libraries.keys()) == {only.path}
     assert result.root_path == only.path

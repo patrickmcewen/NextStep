@@ -1,7 +1,7 @@
 ## Output protocol (parent node)
 
 Your response MUST contain two fenced blocks in order: a ``yaml`` block
-with the three required keys, followed by a ``python`` block with the
+with the two required keys, followed by a ``python`` block with the
 DSL function. Surrounding prose is ignored.
 
 ```yaml
@@ -9,8 +9,6 @@ child_picks:                   # exactly one variant index per child
   attention_block: 3
 parent_input_contracts:        # on-chip inputs only; empty mapping if none
   Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
-parent_output_contracts:       # every output requires a contract
-  out_0: {reshape: [<vanilla_dim_0>, ...], permutation: [0, 1, ...]}
 ```
 
 ```python
@@ -25,3 +23,8 @@ contracts (``reshape == vanilla_shape`` with identity permutation) mean
 name (e.g. ``attention_block(...)``); the autotuner binds the call to
 the picked variant at exec time. The child variant tables show
 declarative contract metadata only — the variant DSL bodies are hidden.
+
+Note: output contracts are NOT declared. The autotuner derives them
+mechanically from the built graph after your DSL passes the graph-build
+smoke test — the actual stream + tile shape of each output is read off
+the live IR and recorded automatically.

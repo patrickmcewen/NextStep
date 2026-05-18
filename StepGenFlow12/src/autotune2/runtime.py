@@ -139,7 +139,13 @@ def promote_top_k(
     k: int,
     rust_evaluate_fn: RustEvaluateFn,
 ) -> list[RustPromotionResult]:
-    """Pick top-K and rust-evaluate each.
+    """Pick top-K and rust-evaluate each in parallel.
+
+    All picks are dispatched concurrently via a thread pool — each rust
+    evaluator call is dominated by a blocking ``subprocess.run`` on the
+    rust sim, so threads parallelize the wall-clock cost cleanly. The
+    closure built by ``build_rust_evaluate_fn`` writes per-call
+    artifacts to a unique subdir so concurrent calls don't collide.
 
     Results are returned sorted by rust_cycles (best first). The list
     length equals ``len(pick_top_k_pareto_entries(root_library, k))``;
@@ -147,11 +153,19 @@ def promote_top_k(
     must succeed for every promoted entry (otherwise the calling
     pipeline has a bug worth surfacing).
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     picks = pick_top_k_pareto_entries(root_library, k)
+    composed_sources = [_build_composed_source_for_entry(e) for e in picks]
+
+    # max_workers caps parallelism so a large top_k doesn't fork an
+    # arbitrarily large number of rust subprocesses. K is typically <=8
+    # in practice; cap at len(picks) so we never spin idle threads.
+    with ThreadPoolExecutor(max_workers=max(1, len(picks))) as ex:
+        rust_results = list(ex.map(rust_evaluate_fn, composed_sources))
+
     out: list[RustPromotionResult] = []
-    for entry in picks:
-        composed = _build_composed_source_for_entry(entry)
-        cycles, dur_ms = rust_evaluate_fn(composed)
+    for entry, composed, (cycles, dur_ms) in zip(picks, composed_sources, rust_results):
         out.append(RustPromotionResult(
             entry=entry,
             rust_cycles=cycles,
@@ -259,7 +273,15 @@ def build_rust_evaluate_fn(
     does via ``compose._rescale_compute_bw``. Pass the same value here
     that ``make_analytical_scorer`` got, or the analytical-vs-rust
     cycle comparison in the summary uses two different cost models.
+
+    Each call writes its artifacts under a unique ``work_dir/top_<i>/``
+    subdirectory so concurrent evaluations (``promote_top_k`` runs them
+    in parallel) don't overwrite each other's ``step_impl.py`` /
+    ``graph.pb`` / sim outputs.
     """
+    import threading
+    _counter = {"i": 0}
+    _counter_lock = threading.Lock()
 
     def evaluate(composed_source: str) -> tuple[int, float]:
         import sys
@@ -290,13 +312,17 @@ def build_rust_evaluate_fn(
         from src.dsl_to_step import translate as _dsl_to_step_translate
         step_source = _dsl_to_step_translate(composed_source)
 
-        work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "step_impl.py").write_text(step_source)
+        with _counter_lock:
+            idx = _counter["i"]
+            _counter["i"] += 1
+        sub_work_dir = work_dir / f"top_{idx}"
+        sub_work_dir.mkdir(parents=True, exist_ok=True)
+        (sub_work_dir / "step_impl.py").write_text(step_source)
         t0 = time.perf_counter()
         result = evaluate_kernel(
             kernel_name=kernel_name,
             preset=preset,
-            work_dir=str(work_dir),
+            work_dir=str(sub_work_dir),
             timing_only=timing_only,
             step_impl_source=step_source,
             max_total_compute_bw=max_total_compute_bw,
@@ -409,12 +435,17 @@ def build_real_verifier_factory_fn(
         via ``node_tensors``. Numerical correctness is checked end-to-
         end exactly once at the root.
 
-      * **Non-root node**: cycles + on-chip-memory evaluation only.
-        The LLM is allowed to propose new ``parent_input_contracts`` /
-        ``parent_output_contracts`` per node, which decouples the
-        node-local notion of a "correct" output from pass-1's recorded
-        ``tiled_outputs`` — so we *don't* compare against those.
-        Instead the verifier:
+      * **Non-root node**: smoke + value check + cycles/on-chip
+        evaluation. The LLM proposes ``parent_input_contracts`` per node
+        (boundary contracts the autotuner-generated wrapper consumes
+        when emitting offchip_loads), but the leaf body must still
+        reproduce ``parent_contract.tiled_outputs`` for
+        ``parent_contract.tiled_values`` — that's the gold the parent's
+        pass-1 stub captured at exactly this call site, so it's the
+        layout-independent ground truth for the leaf's math. Output
+        contracts are NOT declared by the LLM — they're a function of
+        what the DSL produces and so are derived from the built graph
+        on success. The verifier:
           1. extracts the LLM-emitted ``def <node_name>(...)`` block
              from the composed source and runs compliance / judge on
              it with ``is_root=False``;
@@ -423,12 +454,21 @@ def build_real_verifier_factory_fn(
              that contract/leaf shape clashes (e.g. STeP frontend
              ``stride x out_shape_tiled exceeds buffer grid``
              assertions) become LLM feedback instead of crashing
-             ``score_fn``.
-        Variants that pass the smoke test are admitted to the
-        Pareto library on ``(cycles, on_chip)`` alone; functional
-        correctness is recovered at composition time (the parent's /
-        root's verifier, which sees the full chain, catches
-        mismatches).
+             ``score_fn``;
+          3. on smoke-test pass, runs a value check
+             (``_value_check_nonroot``) that calls the leaf with
+             ``parent_contract.tiled_values`` as positional args and
+             compares the result element-wise to
+             ``parent_contract.tiled_outputs``. This catches body math
+             bugs (e.g. a chunked ``offchip_load_ref`` whose stride
+             indexes the wrong row of a weight matrix) that the smoke
+             tests pass over because they only check that the ops run,
+             not what they compute;
+          4. on full success, derives per-output TensorContracts from
+             the built graph's OffChipStore nodes and surfaces them via
+             ``VerifyResult.derived_output_contracts``.
+        Variants that pass all three gates are admitted to the Pareto
+        library on ``(cycles, on_chip)``.
 
     ``check_order`` matches the existing 3 modes. For non-root nodes
     the "correctness" slot in ``gate_order`` is filled by the graph-
@@ -503,11 +543,7 @@ def _build_root_verifier(
     )
     gate_order, break_on_fail = _gate_order_for(check_order)
 
-    async def verify(
-        composed_source: str,
-        output_contracts: dict | None = None,
-    ) -> VerifyResult:
-        del output_contracts  # root verifies against compute_gold directly
+    async def verify(composed_source: str) -> VerifyResult:
         scratch = _Path(tempfile.mkdtemp(prefix="autotune2_verify_root_"))
         feedbacks: list[str] = []
         correctness_verified = check_order != "compliance-first"
@@ -574,15 +610,19 @@ def _build_non_root_verifier(
     extra_required_ops: tuple,
     log: Callable[[str], None],
 ):
-    """Non-root verifier — graph-build smoke + compliance, no gold compare.
+    """Non-root verifier — smoke + value-check + compliance + output-
+    contract derivation.
 
     Autotune2's bottom-up tree DP evaluates non-root nodes for
-    ``(cycles, on_chip)`` only — the LLM is free to propose new
-    ``parent_input_contracts`` / ``parent_output_contracts`` so the
-    notion of a "correct" sub-output is decoupled from pass-1's
-    recorded ``tiled_outputs``. Numerical correctness is recovered at
-    the parent / root composition step, where ``compute_gold`` checks
-    the full kernel against the LLM-picked leaf variants.
+    ``(cycles, on_chip)`` and for value correctness against the parent's
+    recorded ``tiled_outputs``. The LLM is free to propose new
+    ``parent_input_contracts`` (boundary contracts the wrapper consumes
+    when emitting offchip_loads), but the leaf body must reproduce the
+    pass-1 reference output for the pass-1 input values. Output
+    contracts are derived from the built graph after the smoke tests
+    pass (the wrapper's OffChipStore nodes carry the actual produced
+    stream+tile shapes) and surfaced via
+    ``VerifyResult.derived_output_contracts``.
 
     Concretely, the verifier:
 
@@ -606,11 +646,20 @@ def _build_non_root_verifier(
         (stride mismatches, buffer-grid overflows, etc.) as actionable
         LLM feedback rather than letting it crash the score path. A
         clean build means ``score_fn`` can run ``analyze_timing``;
-        the value-correctness of the result is *not* checked here.
-
-    No gold injection. No call_args / call_kwargs entry-point
-    invocation. ``parent_contract`` is retained on the signature for
-    API symmetry with future extensions but is otherwise unused.
+      * runs a *value check* against ``parent_contract.tiled_outputs``
+        via ``_value_check_nonroot`` — invokes ``<node_name>(
+        *tiled_values, out_shapes=...)`` directly and compares element-
+        wise to the parent's recorded gold via the existing tuple-aware
+        ``_gate_correctness`` / ``_compare_against_gold`` machinery.
+        This catches math bugs in the body whose ops all run cleanly
+        but produce wrong values (e.g. a chunked ``offchip_load_ref``
+        whose ``stride`` / ``out_shape_tiled`` indexes the wrong tile
+        per stream position — see the moe_dispatch leaf in
+        checkpoints/2026-05-18-033705/.../moe_dispatch__root_moe_moe_dispatch).
+        Without this gate such bugs only surface at the root composition,
+        by which point the autotuner has already committed the variant
+        to the Pareto library — leaving the root LLM no recovery path
+        when budget rules out the non-buggy alternatives.
     """
     import tempfile
     import traceback as _tb
@@ -625,17 +674,13 @@ def _build_non_root_verifier(
     )
     from src.tools import _exec_build_graph, _exec_dsl_ref
 
-    del root_kernel, node_path, parent_contract  # unused; see docstring
-
     gate_order, break_on_fail = _gate_order_for(check_order)
 
-    async def verify(
-        composed_source: str,
-        output_contracts: dict | None = None,
-    ) -> VerifyResult:
+    async def verify(composed_source: str) -> VerifyResult:
         scratch = _Path(tempfile.mkdtemp(prefix="autotune2_verify_nonroot_"))
         feedbacks: list[str] = []
         compliance_invoked_judge = False
+        graph_build_passed = False
         # Only the LLM-emitted leaf def is subject to compliance / judge —
         # the autotuner-generated wrapper has its own offchip_load /
         # offchip_store calls that would trip ``is_root=False``.
@@ -643,17 +688,21 @@ def _build_non_root_verifier(
 
         for gate_name in gate_order:
             if gate_name == "correctness":
-                # Three-step correctness: DSL eager exec, IR graph build,
-                # contract conformance. They catch disjoint failure
-                # modes — torch-level runtime errors, STeP frontend
-                # assertions, and stream/tile-vs-declared-contract
-                # mismatches respectively — so subsequent checks still
-                # run after each earlier one passes. The conformance
-                # check is what catches the variant whose declared
-                # ``reshape`` claims one layout while the DSL actually
-                # produces another (e.g. a leading-singleton stream that
-                # later trips ``Parallelize``'s ``shape[0] % n_consumers``
-                # assertion in the parent composition).
+                # Three-step correctness: DSL eager exec, then IR graph
+                # build, then value compare against the parent's recorded
+                # ``tiled_outputs``. They catch disjoint failure modes:
+                # eager-exec catches torch-level runtime errors inside DSL
+                # ops; graph-build catches STeP frontend assertions; value-
+                # check catches math bugs in the LLM-emitted body whose
+                # ops all run cleanly but produce wrong values (e.g. a
+                # chunked ``offchip_load_ref`` whose ``stride`` /
+                # ``out_shape_tiled`` doesn't index the right tile per
+                # stream position). The value check mirrors pass1's
+                # non-root correctness gate — see ``_value_check_nonroot``
+                # — and admits the variant to the Pareto library only if
+                # all three pass. Output contracts are derived from the
+                # built graph (see ``_derive_output_contracts_from_graph``)
+                # after this gate passes.
                 res = _dsl_exec_smoke_test(
                     composed_source, dims, tensors,
                     exec_dsl_ref=_exec_dsl_ref,
@@ -670,12 +719,16 @@ def _build_non_root_verifier(
                         scratch=scratch,
                         log=log,
                     )
-                if res.feedback is None and output_contracts:
-                    res = _contract_conformance_smoke_test(
-                        composed_source, dims, tensors, output_contracts,
-                        translate_fn=_dsl_to_step_translate,
-                        exec_build_graph=_exec_build_graph,
-                        traceback_mod=_tb,
+                graph_build_passed = (res.feedback is None)
+                if graph_build_passed:
+                    res = await _value_check_nonroot(
+                        composed_source,
+                        root_kernel=root_kernel,
+                        node_path=node_path,
+                        node_name=node_name,
+                        parent_contract=parent_contract,
+                        dims=dims,
+                        tensors=tensors,
                         scratch=scratch,
                         log=log,
                     )
@@ -712,7 +765,22 @@ def _build_non_root_verifier(
                     break
 
         if not feedbacks:
-            return VerifyResult(passed=True, feedback="")
+            assert graph_build_passed, (
+                "_build_non_root_verifier: feedbacks is empty but the graph "
+                "build gate never ran or never reported success — the "
+                "non-root verifier requires a built graph to derive output "
+                "contracts. Check ``gate_order`` includes 'correctness'."
+            )
+            derived = _derive_output_contracts_from_graph(
+                composed_source, dims, tensors,
+                translate_fn=_dsl_to_step_translate,
+                exec_build_graph=_exec_build_graph,
+                log=log,
+            )
+            return VerifyResult(
+                passed=True, feedback="",
+                derived_output_contracts=derived,
+            )
         return VerifyResult(
             passed=False, feedback="\n\n---\n\n".join(feedbacks),
         )
@@ -784,6 +852,90 @@ def _dsl_exec_smoke_test(
     return _GateResult(None, "PASS", 0)
 
 
+async def _value_check_nonroot(
+    composed_source: str,
+    root_kernel: str,
+    node_path: str,
+    node_name: str,
+    parent_contract,
+    dims: dict,
+    tensors: dict,
+    *,
+    scratch,
+    log: Callable[[str], None],
+):
+    """Element-wise compare the LLM's leaf def output against the parent's
+    recorded ``tiled_outputs``.
+
+    Mirrors pass1's non-root correctness gate (see
+    ``_synthesize_child_pass_node_async`` at orchestrator.py:2297-2316 and
+    the ``call_args`` setup at orchestrator.py:2504-2512): inject
+    ``parent_contract.tiled_outputs`` as the gold for this node's
+    ``synth_name``, then invoke ``<node_name>(*tiled_values,
+    out_shapes=...)`` via ``_gate_correctness`` so the existing tuple-
+    aware ``_compare_against_gold`` machinery does the comparison.
+
+    Calling the leaf with positional ``tiled_values`` deliberately
+    bypasses the autotuner's wrapper — the wrapper's job is to materialize
+    on-chip inputs from off-chip tensors at the contract layout, which the
+    smoke tests already exercise. This check is purely "does the LLM-
+    emitted def compute the right values for the inputs the parent's
+    pass-1 actually fed it?" Layout / wrapper-vs-body mismatches surface
+    in the smoke tests; math bugs (like the moe_dispatch leaf whose
+    ``offchip_load_ref`` indexed the wrong rows of ``w_gate``) only
+    surface here.
+
+    Returns a ``_GateResult`` (``feedback=None`` on PASS).
+    """
+    from src.gold_cache import _inject_gold
+    from src.orchestrator import (
+        _GateResult, _gate_correctness, _synth_kernel_name,
+    )
+    from src.tools import _wrap_on_chip_call_args
+
+    if not parent_contract.tiled_outputs:
+        # Un-stamped legacy contract — no gold to compare against. Treat
+        # as PASS so older flows that build contracts without populating
+        # tiled_outputs (e.g. test fixtures) keep working.
+        log("      [value-check] skipped (parent_contract.tiled_outputs empty)")
+        return _GateResult(None, "PASS", 0)
+    if not parent_contract.arg_is_raw:
+        # ``_wrap_on_chip_call_args`` requires arg_is_raw to be populated;
+        # without it we can't safely construct the call. Pass-1 always
+        # stamps it before recursing (see orchestrator.py:2499), but be
+        # defensive in case autotune2 is invoked on a fixture that didn't.
+        log("      [value-check] skipped (parent_contract.arg_is_raw empty)")
+        return _GateResult(None, "PASS", 0)
+
+    synth_name = _synth_kernel_name(root_kernel, node_path)
+    if parent_contract.out_is_tuple:
+        gold = parent_contract.tiled_outputs
+    else:
+        assert len(parent_contract.tiled_outputs) == 1, (
+            f"_value_check_nonroot: parent_contract.out_is_tuple=False but "
+            f"tiled_outputs has {len(parent_contract.tiled_outputs)} entries"
+        )
+        gold = parent_contract.tiled_outputs[0]
+    _inject_gold(synth_name, dims, gold)
+
+    call_args = _wrap_on_chip_call_args(
+        tuple(parent_contract.tiled_values),
+        parent_contract.arg_specs,
+        parent_contract.arg_is_raw,
+        parent_contract.tiled_shapes,
+    )
+    call_kwargs = {"out_shapes": parent_contract.out_shapes}
+
+    res, _trace = await _gate_correctness(
+        composed_source, synth_name, dims, tensors, "dsl",
+        scratch, log,
+        entry_point=node_name,
+        call_args=call_args,
+        call_kwargs=call_kwargs,
+    )
+    return res
+
+
 def _graph_build_smoke_test(
     composed_source: str,
     dims: dict,
@@ -838,17 +990,16 @@ def _graph_build_smoke_test(
             feedback=(
                 "## Graph-build smoke test: STeP graph build failed\n\n"
                 "Your DSL translated but the resulting STeP graph could not "
-                "be constructed — usually this means the input or output "
-                "stream shapes implied by your declared "
-                "`parent_input_contracts` / `parent_output_contracts` are "
-                "incompatible with the leaf body's internal bufferize / "
-                "streamify operations (the leaf body's stride math no "
+                "be constructed — usually this means the input stream "
+                "shapes implied by your declared `parent_input_contracts` "
+                "are incompatible with the leaf body's internal bufferize "
+                "/ streamify operations (the leaf body's stride math no "
                 "longer fits the wrapper-supplied stream shape). Error "
                 "follows:\n\n"
                 "```\n" + err + "```\n\n"
-                "Either change the contracts so they match the leaf's "
-                "internal shape assumptions, or rewrite the leaf body's "
-                "internal ops to consume the new contract layout."
+                "Either change `parent_input_contracts` so they match the "
+                "leaf's internal shape assumptions, or rewrite the leaf "
+                "body's internal ops to consume the new contract layout."
             ),
             status="GRAPH_BUILD_FAIL_EXEC",
             tokens=0,
@@ -858,148 +1009,64 @@ def _graph_build_smoke_test(
     return _GateResult(None, "PASS", 0)
 
 
-def _contract_conformance_smoke_test(
+def _derive_output_contracts_from_graph(
     composed_source: str,
     dims: dict,
     tensors: dict,
-    output_contracts: dict,
     *,
     translate_fn,
     exec_build_graph,
-    traceback_mod,
-    scratch,
     log: Callable[[str], None],
 ):
-    """Verify each declared output contract matches the built graph's
-    actual stream+tile decomposition; return a ``_GateResult``.
+    """Walk the built graph's ``OffChipStore`` nodes and return one
+    identity-permutation ``TensorContract`` per output, keyed
+    ``out_0``, ``out_1``, ....
 
-    Background: ``TensorContract`` is just (reshape, permutation) over
-    the vanilla shape and does not encode the STeP IR stream/tile split.
-    Two leaves can both declare ``reshape=(64, 16, 32)`` while producing
-    incompatible underlying layouts — e.g. ``stream=(64,) tile=(16,32)``
-    vs ``stream=(1, 1024) tile=(1, 32)``. A downstream consumer that's
-    authored against one layout will fail when fed the other (the most
-    common failure is ``Parallelize``'s ``shape[0] % num_consumers``
-    check tripping on a leading singleton; the variant is "honest" by
-    vanilla shape but lies about the actual layout).
+    The synthetic wrapper emits ``offchip_store(promote_outer(out_i))``
+    for every output, in declared order. Each store's predecessor
+    ``PromoteOuter`` wraps the leaf's actual produced stream; we read
+    ``(stream.shape, stream.stream_dtype.shape)`` and concatenate them
+    (stream dims followed by the 2D tile) to obtain the contract's
+    ``reshape``. ``permutation`` is identity — there is nothing to
+    permute since the dims come straight off the live graph.
 
-    This check enforces the convention that *the concatenation of the
-    output stream shape and the output tile shape, after permutation,
-    must equal* ``output_contracts[out_i].post_permute_shape()``.
-    STeP tiles are always 2D, so the contract's last two reshape dims
-    are interpreted as the tile shape and the prefix as the stream
-    shape. Variants that violate this fail the gate with feedback
-    telling the LLM the actual produced layout vs what it declared.
-
-    Only outputs are checked — wrapper-constructed inputs come from
-    ``offchip_load`` with shapes derived directly from the declared
-    input_contracts, so they are constrained by construction.
+    The caller has already passed ``_graph_build_smoke_test``, so the
+    rebuild here can only fail if something non-deterministic snuck in;
+    we assert and let the failure surface as a hard crash if so.
     """
-    from src.orchestrator import _GateResult, _error_summary, _write
+    from src.autotune2.contracts import TensorContract
     from step_py.ops import OffChipStore, PromoteOuter, get_stream
 
-    log("      Running contract conformance smoke test...")
-    try:
-        translated = translate_fn(composed_source)
-        graph, _ = exec_build_graph(translated, dims, tensors)
-    except Exception:
-        # The graph-build smoke test should have caught this; if we hit
-        # it again here, surface as conformance failure with the trace.
-        err = traceback_mod.format_exc()
-        _write(scratch / "conformance_build_error.txt", err)
-        log(f"      [conformance] re-build FAILED: {_error_summary(err)}")
-        return _GateResult(
-            feedback=(
-                "## Contract conformance: graph re-build failed\n\n"
-                "Unexpected — the graph-build smoke test passed but "
-                "rebuilding for conformance inspection raised. Error:\n\n"
-                "```\n" + err + "```"
-            ),
-            status="CONTRACT_CONFORMANCE_BUILD_FAIL",
-            tokens=0,
-        )
+    log("      Deriving output contracts from built graph...")
+    translated = translate_fn(composed_source)
+    graph, _ = exec_build_graph(translated, dims, tensors)
 
     stores = sorted(
         (n for n in graph.nodes if isinstance(n, OffChipStore)),
         key=lambda n: n.instance_id,
     )
-    assert len(stores) == len(output_contracts), (
-        f"_contract_conformance_smoke_test: expected {len(output_contracts)} "
-        f"OffChipStore nodes (one per declared output), found {len(stores)}. "
-        f"The synthetic wrapper should emit exactly one store per output."
-    )
-
-    mismatches: list[tuple[str, tuple, tuple, tuple, tuple]] = []
+    contracts: dict[str, "TensorContract"] = {}
     for i, store in enumerate(stores):
         promote = store.input
         if isinstance(promote, tuple):
             promote = promote[0]
         assert isinstance(promote, PromoteOuter), (
-            f"_contract_conformance_smoke_test: OffChipStore {i}'s predecessor "
-            f"is {type(promote).__name__}, expected PromoteOuter (the wrapper "
-            f"emits 'offchip_store(promote_outer(out_i))' for every output)."
+            f"_derive_output_contracts_from_graph: OffChipStore {i}'s "
+            f"predecessor is {type(promote).__name__}, expected PromoteOuter "
+            f"(the wrapper emits 'offchip_store(promote_outer(out_i))' for "
+            f"every output)."
         )
         leaf_stream = get_stream(promote.input)
-        actual_stream = tuple(leaf_stream.shape)
-        actual_tile = tuple(leaf_stream.stream_dtype.shape)
-        actual_combined = actual_stream + actual_tile
-
-        out_name = f"out_{i}"
-        contract = output_contracts[out_name]
-        expected_combined = contract.post_permute_shape()
-
-        if actual_combined != expected_combined:
-            mismatches.append((
-                out_name, expected_combined, actual_combined,
-                actual_stream, actual_tile,
-            ))
-
-    if mismatches:
-        lines = [
-            "## Contract conformance check failed",
-            "",
-            "Your declared `parent_output_contracts` do not match the actual "
-            "stream + tile shape your DSL produces for one or more outputs. "
-            "A `TensorContract`'s `reshape` (after applying `permutation`) "
-            "must equal the concatenation of the output's stream shape and "
-            "its tile shape — in that order. STeP tiles are 2D, so the "
-            "last two dims of `reshape` are interpreted as the tile and the "
-            "prefix as the stream.",
-            "",
-            "Why this matters: a downstream consumer that's authored against "
-            "the layout you advertised will rely on `shape[0]`-style checks "
-            "(e.g. `Parallelize`'s divisibility assertion) that silently "
-            "fail when the upstream produces a different stream-vs-tile "
-            "split — even if total element count matches.",
-            "",
-            "Mismatches:",
-        ]
-        for name, expected, actual, stream, tile in mismatches:
-            lines.append(
-                f"- `{name}`: declared `reshape={expected!r}` (post-permutation), "
-                f"actual stream+tile = `{actual!r}` "
-                f"(stream={stream!r}, tile={tile!r})"
-            )
-        lines.extend([
-            "",
-            "Fix by either (a) changing your DSL so the produced stream and "
-            "tile decomposition matches the declared contract, or (b) "
-            "changing the declared `reshape` to truthfully describe what your "
-            "DSL emits. Note: downstream nodes will see your declared layout "
-            "and break if it lies.",
-        ])
-        feedback = "\n".join(lines) + "\n"
-        _write(scratch / "conformance_mismatch.txt", feedback)
-        names = ",".join(m[0] for m in mismatches)
-        log(f"      [conformance] FAILED for outputs: {names}")
-        return _GateResult(
-            feedback=feedback,
-            status="CONTRACT_NONCONFORMANCE",
-            tokens=0,
+        stream_shape = tuple(leaf_stream.shape)
+        tile_shape = tuple(leaf_stream.stream_dtype.shape)
+        combined = stream_shape + tile_shape
+        contracts[f"out_{i}"] = TensorContract(
+            reshape=combined,
+            permutation=tuple(range(len(combined))),
         )
 
-    log("      [conformance] OK")
-    return _GateResult(None, "PASS", 0)
+    log(f"      [derive] {len(contracts)} output contract(s) derived")
+    return contracts
 
 
 def _gate_order_for(check_order: str):
