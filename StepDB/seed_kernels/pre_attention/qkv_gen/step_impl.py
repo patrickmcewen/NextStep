@@ -100,7 +100,7 @@ def build_graph(dims):
     # ---------- Input + projection ----------
     # x: one tile of [B, D], repeated N_HEAD times
     x_load = LinearOffChipLoad(
-        underlying=x, stride=(1,),
+        underlying=x, stride=(1, 1),
         out_shape_tiled=(B, 1),
         tile_row=1, tile_col=D, par_dispatch=PAR_DISPATCH,
     )
@@ -123,8 +123,8 @@ def build_graph(dims):
             graph=step_graph, input=proj_reshaped,
             output_stream_dtype=Tile(tile_dtype=Float32(), shape=(N_HEAD, HEAD_DIM)),
             fn=RetileRow(),
-            init_fn=Empty(shape=(N_HEAD, 0), dtype=Float32()),
-            accum_rank=1, compute_bw=1024, write_back_mu=False,
+            init_fn=Empty(shape=(0, HEAD_DIM), dtype=Float32()),
+            accum_rank=1, compute_bw=1024, write_back_mu=True,
         )
         proj_reshaped_3 = Promote(
             graph=step_graph, input=proj_reshaped_2,
@@ -172,26 +172,24 @@ def build_graph(dims):
 
     print(Q_norm._stream.shape, Q_norm._stream.stream_dtype, K_norm._stream.shape, K_norm._stream.stream_dtype)
 
-    # ---------- RoPE: cos/sin broadcast across heads ----------
-    cos_load = LinearOffChipLoad(
-        underlying=cos, stride=(1, 1), out_shape_tiled=(B, 1),
-        tile_row=1, tile_col=HEAD_DIM, par_dispatch=4,
-    )
-    sin_load = LinearOffChipLoad(
-        underlying=sin, stride=(1, 1), out_shape_tiled=(B, 1),
-        tile_row=1, tile_col=HEAD_DIM, par_dispatch=4,
-    )
-
-    def rope(weight, cos, sin, num_heads, head_dim):
+    # ---------- RoPE: cos/sin per head to avoid simulator deadlock on shared loads ----------
+    def rope(weight, num_heads, head_dim):
+        cos_load = LinearOffChipLoad(
+            underlying=cos, stride=(1, 1), out_shape_tiled=(B, 1),
+            tile_row=1, tile_col=HEAD_DIM, par_dispatch=4,
+        )
+        sin_load = LinearOffChipLoad(
+            underlying=sin, stride=(1, 1), out_shape_tiled=(B, 1),
+            tile_row=1, tile_col=HEAD_DIM, par_dispatch=4,
+        )
         weight_rot = _rotate_half(step_graph, weight, B, num_heads, head_dim)
-        print("finished rotate_half")
 
         weight_cos = BinaryMap(
-            graph=step_graph, in1=weight, in2=cos,
+            graph=step_graph, in1=weight, in2=cos_load,
             fn=Mul(), write_back_mu=False, compute_bw=1024,
         )
         weight_sin = BinaryMap(
-            graph=step_graph, in1=weight_rot, in2=sin,
+            graph=step_graph, in1=weight_rot, in2=sin_load,
             fn=Mul(), write_back_mu=False, compute_bw=1024,
         )
         weight_out = BinaryMap(
@@ -200,8 +198,8 @@ def build_graph(dims):
         )
         return weight_out
 
-    Q_out = rope(Q_norm, cos_load, sin_load, N_HEAD, HEAD_DIM)
-    K_out = rope(K_norm, cos_load, sin_load, N_HEAD, HEAD_DIM)
+    Q_out = rope(Q_norm, N_HEAD, HEAD_DIM)
+    K_out = rope(K_norm, N_HEAD, HEAD_DIM)
 
     print(Q_out._stream.shape, Q_out._stream.stream_dtype, K_out._stream.shape, K_out._stream.stream_dtype, V._stream.shape, V._stream.stream_dtype)
 

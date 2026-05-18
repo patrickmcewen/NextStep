@@ -1840,6 +1840,23 @@ generated_prefill_transformer:
       seq_len: 64
       is_small: true
   origin: seed
+generated_prefill_transformer_working:
+  problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
+  step_impl: seed_kernels/transformer_layer/generated_prefill_transformer_working/step_impl.py
+  params:
+  - model_name
+  - seq_len
+  - is_small
+  presets:
+    tiny:
+      model_name: mixtral
+      seq_len: 8
+      is_small: true
+    small:
+      model_name: mixtral
+      seq_len: 64
+      is_small: true
+  origin: seed
 prefill_transformer_simple:
   problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
   step_impl: seed_kernels/transformer_layer/prefill_transformer_simple/step_impl.py

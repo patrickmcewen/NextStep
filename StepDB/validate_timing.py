@@ -263,13 +263,13 @@ def run_simulator(graph, output_op, work_dir):
         "sim = SimConfig(**sim_cfg)\n"
         "ret = step_perf.run_graph(pb_path, False, hbm, sim, None)\n"
         "if len(ret) == 4:\n"
-        "    _, cycles, dur_ms, dur_s = ret\n"
+        "    passed, cycles, dur_ms, dur_s = ret\n"
         "elif len(ret) == 2:\n"
-        "    _, cycles = ret\n"
+        "    passed, cycles = ret\n"
         "    dur_ms, dur_s = 0.0, 0.0\n"
         "else:\n"
         "    raise RuntimeError(f'Unexpected return: {ret}')\n"
-        "print(json.dumps({'cycles': cycles, 'dur_ms': dur_ms, 'dur_s': dur_s}))\n"
+        "print(json.dumps({'passed': bool(passed), 'cycles': cycles, 'dur_ms': dur_ms, 'dur_s': dur_s}))\n"
     )
 
     pythonpath = STEP_TL_SRC + ":" + STEP_TL_PROTO + ":" + os.environ.get("PYTHONPATH", "")
@@ -292,6 +292,18 @@ def run_simulator(graph, output_op, work_dir):
     )
 
     sim_result = json.loads(proc.stdout.strip().split("\n")[-1])
+
+    # The Rust simulator catches panics inside worker threads and still returns
+    # (passed=False, cycles=<elapsed-at-time-of-panic>). If we ignore `passed`,
+    # we end up comparing the analytical prediction against a crashed sim and
+    # report a nonsense error. Surface the panic lines so the root cause is
+    # visible instead of buried in megabytes of stderr.
+    assert sim_result["passed"], (
+        f"Simulator did not pass (cycles before crash: {sim_result['cycles']}).\n"
+        f"Panic excerpts:\n"
+        + "\n".join(l for l in proc.stderr.split("\n") if "panicked" in l or "assertion" in l)[-2000:]
+    )
+
     cycles = int(sim_result["cycles"])
 
     # Parse TRACE_EVENT lines from stderr if STEP_TRACE is set

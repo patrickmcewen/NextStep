@@ -703,6 +703,7 @@ def _precompute_kv_cache_tile_append(dims):
 
 @register("prefill_transformer_simple")
 @register("generated_prefill_transformer")
+@register("generated_prefill_transformer_working")
 def _precompute_prefill_transformer_simple(dims):
     """Precompute tensors for the simple prefill transformer kernel.
 
