@@ -28,9 +28,14 @@ The injected ``rust_evaluate_fn`` has signature
 
     rust_evaluate_fn(composed_source: str) -> tuple[int, float]
 
-returning ``(cycles, dur_ms)``. Production callers build it as a
-closure over the per-kernel ``work_dir`` and ``hbm_config`` / ``sim_config``
-used by ``StepDB/evaluate.py``; unit tests inject deterministic fakes.
+returning ``(cycles, dur_ms)``. The argument is the autotuner's composed
+*DSL* source (``def tiled_reference(...)`` plus descendant defs).
+``build_rust_evaluate_fn`` runs ``src.dsl_to_step.translate`` on it before
+handing the resulting ``def build_graph(...)`` STeP source to
+``StepDB/evaluate.py::evaluate_kernel``, which requires ``build_graph``.
+Production callers build the closure over the per-kernel ``work_dir`` and
+the rust simulator's ``hbm_config`` / ``sim_config``; unit tests inject
+deterministic fakes that ignore the translation step.
 """
 
 from __future__ import annotations
@@ -236,6 +241,7 @@ def build_rust_evaluate_fn(
     kernel_name: str,
     preset: str,
     timing_only: bool = True,
+    max_total_compute_bw: int | None = None,
 ) -> RustEvaluateFn:
     """Build a rust evaluator that writes a temp DSL file and invokes
     ``StepDB/evaluate.py``'s rust simulator subprocess.
@@ -246,6 +252,13 @@ def build_rust_evaluate_fn(
     each call (overwrites prior contents). ``timing_only=True`` skips
     correctness comparison (faster; matches the autotuner's analytical
     role).
+
+    ``max_total_compute_bw`` is forwarded to ``evaluate_kernel`` so each
+    compute op's ``compute_bw`` is rescaled (in place) to sum to that
+    budget before serialization — mirrors what the analytical scorer
+    does via ``compose._rescale_compute_bw``. Pass the same value here
+    that ``make_analytical_scorer`` got, or the analytical-vs-rust
+    cycle comparison in the summary uses two different cost models.
     """
 
     def evaluate(composed_source: str) -> tuple[int, float]:
@@ -269,15 +282,24 @@ def build_rust_evaluate_fn(
 
         from evaluate import evaluate_kernel  # type: ignore  # StepDB/evaluate.py
 
+        # The composed source is a DSL `tiled_reference` body; StepDB's
+        # evaluate_kernel exec's the source as-is and requires it to define
+        # `build_graph`. Run the deterministic DSL → STeP IR translator so
+        # the file written into work_dir mirrors what evaluate_kernel exec's
+        # and the same string is fed via `step_impl_source`.
+        from src.dsl_to_step import translate as _dsl_to_step_translate
+        step_source = _dsl_to_step_translate(composed_source)
+
         work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "step_impl.py").write_text(composed_source)
+        (work_dir / "step_impl.py").write_text(step_source)
         t0 = time.perf_counter()
         result = evaluate_kernel(
             kernel_name=kernel_name,
             preset=preset,
             work_dir=str(work_dir),
             timing_only=timing_only,
-            step_impl_source=composed_source,
+            step_impl_source=step_source,
+            max_total_compute_bw=max_total_compute_bw,
         )
         dur_ms = (time.perf_counter() - t0) * 1000.0
 

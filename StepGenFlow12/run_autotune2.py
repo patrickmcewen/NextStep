@@ -324,6 +324,23 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         check_order=args.check_order,
     )
 
+    # Per-node resume stamps — fold in hw_config + compute_bw + check_order
+    # so any change to scorer/verifier config invalidates every node's
+    # cached library at once (their cycle/on_chip numbers were measured
+    # against the old config). Pass-1 DSL and tree-shape changes ripple
+    # up transitively inside compute_plan_stamps.
+    from src.autotune2.persistence import compute_plan_stamps
+    node_stamps = compute_plan_stamps(
+        plan_tree=state["tree"],
+        pass1_dsls=state["pass1_dsls"],
+        pass1_contracts=state["pass1_contracts"],
+        extra={
+            "hw_config": state["hw_config"],
+            "compute_bw": args.compute_bw,
+            "check_order": args.check_order,
+        },
+    )
+
     result = await autotune(
         plan_tree=state["tree"],
         pass1_dsls=state["pass1_dsls"],
@@ -340,6 +357,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             max_attempts=args.max_attempts,
             check_order=args.check_order,
         ),
+        node_stamps=node_stamps,
     )
 
     rust_evaluate = build_rust_evaluate_fn(
@@ -347,6 +365,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         kernel_name=args.kernel,
         preset=args.preset,
         timing_only=True,
+        max_total_compute_bw=args.compute_bw,
     )
     promotions = promote_top_k(
         root_library=result.root_library(),

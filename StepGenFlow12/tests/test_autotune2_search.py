@@ -913,6 +913,61 @@ def test_search_parent_runs_cartesian_compose_and_admits(tmp_path):
     assert len(reg) >= 1
 
 
+def test_search_parent_leaves_no_empty_cell_when_all_compositions_fail(tmp_path):
+    """If every Cartesian combination fails verify or score for an LLM-proposed
+    variant, ``search_parent`` must not leave an empty cell in the library.
+    An empty cell trips ``render_library_as_variant_summaries``'s "no empty
+    cells" assertion when this node's parent later renders this library."""
+    child_node = _leaf("child_under")
+    child_lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell0 = library_cell(child_lib, {"x": c_id}, {"out_0": c_id})
+    cell0.append(DesignEntry(
+        dsl="def child_under(x, *, out_shapes):\n    return None\n",
+        input_contracts={"x": c_id}, output_contracts={"out_0": c_id},
+        cycles=100, on_chip=200, provenance="pass1_baseline",
+    ))
+
+    parent_node = _parent("my_parent", children=(child_node,))
+    parent_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
+
+    async def agent(_conversation):
+        return _make_parent_response("child_under", variant_idx=0)
+
+    verify_calls = [0]
+    async def verifier(_src, *_a, **_kw):
+        verify_calls[0] += 1
+        # Pass for the baseline (first call), fail for every LLM composition.
+        if verify_calls[0] == 1:
+            return VerifyResult(passed=True)
+        return VerifyResult(passed=False, feedback="synthetic fail")
+
+    def score(_src):
+        return (50, 100)
+
+    lib = run(search_parent(
+        node=parent_node,
+        parent_contract=parent_contract,
+        pass1_dsl="def my_parent(x, *, out_shapes):\n    return None\n",
+        children_libraries={child_node.path: child_lib},
+        children_picks_baseline={child_node.path: cell0[0]},
+        ckpt_dir=tmp_path / "parent",
+        score_fn=score,
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_parent"),
+        config=SearchConfig(max_turns_per_attempt=1, max_attempts=1),
+    ))
+
+    # No empty cells: every cell in the library must hold at least one entry.
+    # render_library_as_variant_summaries asserts this invariant; running it
+    # here serves as the regression check.
+    for by_out in lib.values():
+        for cell in by_out.values():
+            assert cell, "search_parent left an empty cell after failed turn"
+    render_library_as_variant_summaries(lib)
+
+
 # --- autotune driver ---------------------------------------------------------
 
 

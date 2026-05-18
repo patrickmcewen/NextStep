@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable
@@ -85,6 +86,11 @@ from src.autotune2.contracts import (
     vanilla_contract_for,
 )
 from src.autotune2.pareto import insert_pareto
+from src.autotune2.persistence import (
+    SNAPSHOT_FILENAME,
+    save_library_snapshot,
+    try_load_library_snapshot,
+)
 from src.autotune2.prompts import (
     VariantSummary,
     build_autotune2_user_prompt,
@@ -1260,8 +1266,10 @@ async def search_parent(
                 continue
 
             # Score every Cartesian combination and admit non-dominated entries.
-            cell = library_cell(
-                lib, parsed.input_contracts, parsed.output_contracts)
+            # The cell is created lazily on first admission: if every combination
+            # fails verify/score, the library must not retain an empty cell —
+            # render_library_as_variant_summaries treats empty cells as a bug.
+            cell: list[DesignEntry] | None = None
             admitted_this_turn: list[DesignEntry] = []
             last_failure: str = ""
             # Track the first composed source + last verify result for the
@@ -1302,6 +1310,9 @@ async def search_parent(
                     provenance=f"llm_attempt_{attempt}_turn_{turn}",
                     children_picks=chosen,
                 )
+                if cell is None:
+                    cell = library_cell(
+                        lib, parsed.input_contracts, parsed.output_contracts)
                 if insert_pareto(cell, entry):
                     admitted_this_turn.append(entry)
 
@@ -1418,6 +1429,32 @@ class AutotuneResult:
         return self.libraries[self.root_path]
 
 
+# Files + dir-prefixes that ``search_leaf`` / ``search_parent`` own and that
+# need wiping when a node's snapshot stamp doesn't match — leaving any of
+# these around would make a fresh run either collide with prior turn dirs
+# or read stale ``variants.py`` from the previous attempt.
+_NODE_OWNED_FILES = frozenset({
+    SNAPSHOT_FILENAME, "variants.py", "system_prompt.txt",
+    "pass1_baseline_score.json",
+})
+_NODE_OWNED_DIR_PREFIXES = ("attempt_",)
+
+
+def _wipe_node_run_artifacts(node_ckpt: Path) -> None:
+    """Delete the node's own run artifacts in-place, preserving child
+    subdirectories (children live at ``node_ckpt / <child_name>/`` and may
+    hold valid snapshots from already-completed search tasks)."""
+    if not node_ckpt.exists():
+        return
+    for item in node_ckpt.iterdir():
+        if item.name in _NODE_OWNED_FILES and item.is_file():
+            item.unlink()
+        elif item.is_dir() and any(
+            item.name.startswith(p) for p in _NODE_OWNED_DIR_PREFIXES
+        ):
+            shutil.rmtree(item)
+
+
 async def autotune(
     *,
     plan_tree: Tree,
@@ -1431,6 +1468,7 @@ async def autotune(
     prompt_inputs: dict[str, NodePromptInputs],
     system_prompts: dict[str, str],
     config: SearchConfig = SearchConfig(),
+    node_stamps: dict[str, str] | None = None,
 ) -> AutotuneResult:
     """Walk plan_tree bottom-up and search each node — in parallel where
     the tree shape allows.
@@ -1479,6 +1517,14 @@ async def autotune(
         only at the root, whose DSL is the kernel's own
         ``tiled_reference`` and resolves ``tensors[...]`` against the
         kernel inputs directly.
+      - ``node_stamps``: optional ``{node_path: stamp}`` for per-node
+        snapshot resume. When provided, each node checks for an existing
+        ``library.json`` under its ckpt dir and reuses it if its stored
+        stamp matches; otherwise the node's ckpt subtree is wiped and the
+        search re-runs, saving a fresh snapshot at the end. ``None``
+        disables persistence — no load, no save, no cleanup. Stamps must
+        be transitive (a descendant DSL change must invalidate every
+        ancestor's stamp); see ``persistence.compute_plan_stamps``.
 
     Returns the full ``{node_path: NodeLibrary}`` map plus the root path.
     """
@@ -1500,6 +1546,25 @@ async def autotune(
             child_libs = {}
 
         node_ckpt = ckpt_dir / "autotune2" / node.path
+
+        # Resume path: if a snapshot exists with a matching stamp, reuse
+        # it and skip the search entirely. Mismatched / missing → wipe the
+        # node's own run artifacts (attempt_*, variants.py, etc.) so the
+        # upcoming search's writes don't collide with stale files. Children
+        # live under ``node_ckpt`` (paths are hierarchical: ``root/`` contains
+        # ``root/leaf_a/``), so a blanket rmtree would clobber an already-
+        # completed child's snapshot — wipe selectively.
+        node_stamp = node_stamps.get(node.path) if node_stamps else None
+        if node_stamp is not None:
+            loaded = try_load_library_snapshot(
+                node_ckpt / SNAPSHOT_FILENAME,
+                expected_stamp=node_stamp,
+                children_libraries=child_libs,
+            )
+            if loaded is not None:
+                return loaded
+            _wipe_node_run_artifacts(node_ckpt)
+
         node_system_prompt = system_prompts[node.path]
         node_agent = agent_factory(node_system_prompt)
         is_root_node = node.path == root_path
@@ -1517,7 +1582,7 @@ async def autotune(
         node_score_fn = make_score_fn(node_tensors)
         node_verifier = make_verifier(node, parent_contract, node_tensors)
         if node.is_leaf:
-            return await search_leaf(
+            lib = await search_leaf(
                 node=node,
                 parent_contract=parent_contract,
                 pass1_dsl=pass1_dsls[node.path],
@@ -1529,32 +1594,41 @@ async def autotune(
                 config=config,
                 system_prompt=node_system_prompt,
             )
+        else:
+            # Parent: gather each child's pass-1 baseline entry. We must use
+            # the pass-1 DSL (not the child's Pareto-best LLM variant) because
+            # the parent's baseline is the canonical pass-1 reference — pass-1
+            # already proved that the parent's pass-1 DSL composes with each
+            # child's pass-1 DSL. An LLM child variant may declare the same
+            # output contract but a different stream/tile decomposition that
+            # the parent's pass-1 DSL wasn't authored against.
+            baseline_picks: dict[str, DesignEntry] = {
+                child.path: find_pass1_baseline_entry(child_libs[child.path])
+                for child in node.children
+            }
+            lib = await search_parent(
+                node=node,
+                parent_contract=parent_contract,
+                pass1_dsl=pass1_dsls[node.path],
+                children_libraries=child_libs,
+                children_picks_baseline=baseline_picks,
+                ckpt_dir=node_ckpt,
+                score_fn=node_score_fn,
+                agent=node_agent,
+                verifier=node_verifier,
+                prompt_inputs=prompt_inputs[node.path],
+                config=config,
+                system_prompt=node_system_prompt,
+            )
 
-        # Parent: gather each child's pass-1 baseline entry. We must use
-        # the pass-1 DSL (not the child's Pareto-best LLM variant) because
-        # the parent's baseline is the canonical pass-1 reference — pass-1
-        # already proved that the parent's pass-1 DSL composes with each
-        # child's pass-1 DSL. An LLM child variant may declare the same
-        # output contract but a different stream/tile decomposition that
-        # the parent's pass-1 DSL wasn't authored against.
-        baseline_picks: dict[str, DesignEntry] = {
-            child.path: find_pass1_baseline_entry(child_libs[child.path])
-            for child in node.children
-        }
-        return await search_parent(
-            node=node,
-            parent_contract=parent_contract,
-            pass1_dsl=pass1_dsls[node.path],
-            children_libraries=child_libs,
-            children_picks_baseline=baseline_picks,
-            ckpt_dir=node_ckpt,
-            score_fn=node_score_fn,
-            agent=node_agent,
-            verifier=node_verifier,
-            prompt_inputs=prompt_inputs[node.path],
-            config=config,
-            system_prompt=node_system_prompt,
-        )
+        if node_stamp is not None:
+            save_library_snapshot(
+                lib,
+                path=node_ckpt / SNAPSHOT_FILENAME,
+                stamp=node_stamp,
+                children_libraries=child_libs,
+            )
+        return lib
 
     # Schedule every node's task. ``iter_topological`` is post-order, so
     # child tasks are created before any parent task that references them.

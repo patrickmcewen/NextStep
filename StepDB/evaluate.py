@@ -125,7 +125,8 @@ def _strip_imports(code: str) -> str:
 
 def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
                     timing_only: bool = False,
-                    step_impl_source: str | None = None) -> EvalResult:
+                    step_impl_source: str | None = None,
+                    max_total_compute_bw: int | None = None) -> EvalResult:
     """Run the full evaluation pipeline for a single kernel pair + preset.
 
     Stages: exec -> simulate -> correctness -> success.
@@ -133,6 +134,11 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     When step_impl_source is provided, it replaces StepDB's on-disk step_impl
     for this call (used by external autotuners that score generated kernels);
     dims, the reference module, and precompute still come from StepDB.
+    When max_total_compute_bw is set, every compute op's ``compute_bw`` is
+    rescaled (in place) so the sum equals the budget before serialization —
+    same routine as ``validate_timing.normalize_compute_bw``. Autotuners pass
+    this so the rust sim runs against the same compute budget the analytical
+    scorer used to rank candidates.
     """
     dims = get_dims(kernel_name, preset)
     ref_mod = None if timing_only else load_problem(kernel_name)
@@ -173,6 +179,10 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
         graph, output_op = build_graph(dims, tensors)
     else:
         graph, output_op = build_graph(dims)
+
+    if max_total_compute_bw is not None:
+        from validate_timing import normalize_compute_bw
+        normalize_compute_bw(graph, max_total_compute_bw)
 
     os.chdir(work_dir)
     pb_path = os.path.join(os.getcwd(), "graph.pb")
