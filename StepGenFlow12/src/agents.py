@@ -16,7 +16,10 @@ contaminating the response content.
 """
 
 from agents import Agent, AsyncOpenAI, ModelSettings, OpenAIChatCompletionsModel
-from openai.types.chat import ChatCompletion
+from agents.retry import ModelRetrySettings, RetryPolicyContext, retry_policies
+from openai import APIError, APIStatusError
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice as _ChatCompletionChoice
 from openai.types.shared import Reasoning
 
 from src.prompts import (build_pass_system_prompt, build_judge_system_prompt,
@@ -348,6 +351,36 @@ def _load_pass1_judge_prompt(
 _VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 
+def _retry_on_mid_stream_api_error(context: RetryPolicyContext) -> bool:
+    """Retry policy predicate for SSE-injected provider errors.
+
+    OpenRouter (and Anthropic's OpenAI-compat endpoint) returns an HTTP 200
+    and starts streaming, then injects a ``data: {"error": ...}`` SSE chunk
+    when their upstream translation fails — e.g. the literal message
+    ``"JSON error injected into SSE stream"`` we've seen from OpenRouter.
+    The OpenAI SDK surfaces that as ``openai.APIError`` with no status code
+    (the original HTTP response was already 200). Built-in policies key off
+    HTTP status (``http_status``) or transport state (``network_error``), so
+    neither catches this case. We retry it explicitly.
+
+    We intentionally exclude ``APIStatusError`` (HTTP 4xx/5xx) — those are
+    handled by ``provider_suggested`` / ``http_status`` policies that respect
+    retry-after headers. Letting both run via ``retry_policies.any(...)``
+    would double-retry on rate limits.
+    """
+    err = context.error
+    return isinstance(err, APIError) and not isinstance(err, APIStatusError)
+
+
+_RETRY_SETTINGS = ModelRetrySettings(
+    max_retries=3,
+    policy=retry_policies.any(
+        retry_policies.network_error(),
+        _retry_on_mid_stream_api_error,
+    ),
+)
+
+
 def _build_model_settings(llm_config: dict) -> ModelSettings:
     """Construct per-call ModelSettings from llm_config.
 
@@ -355,47 +388,158 @@ def _build_model_settings(llm_config: dict) -> ModelSettings:
     cap when the caller omits it, which truncates reasoning-model turns
     mid-thought.
 
+    `include_usage=True` is required for non-OpenAI providers: ReasoningAwareModel
+    upgrades non-streaming calls to streaming under the hood (see its docstring),
+    and the SDK only auto-sets stream_options.include_usage for openai.com hosts.
+    Without this, usage info is dropped for Anthropic / OpenRouter.
+
+    `retry` covers two transient failure modes the SDK's default does not:
+    network errors during streaming, and SSE-injected provider errors that
+    surface as APIError post-200 (see _retry_on_mid_stream_api_error).
+
     `reasoning_effort` is optional. If present in llm_config, it's passed
     to the provider as `reasoning_effort` (supported by OpenAI o-series,
     kimi-k2.*, deepseek-r1, etc.). Non-reasoning models ignore it.
     """
     effort = llm_config.get("reasoning_effort")
     if effort is None:
-        return ModelSettings(max_tokens=100000)
+        return ModelSettings(
+            max_tokens=100000,
+            include_usage=True,
+            retry=_RETRY_SETTINGS,
+        )
     assert effort in _VALID_REASONING_EFFORTS, (
         f"reasoning_effort must be one of {sorted(_VALID_REASONING_EFFORTS)}, "
         f"got {effort!r}"
     )
-    return ModelSettings(max_tokens=100000, reasoning=Reasoning(effort=effort))
+    return ModelSettings(
+        max_tokens=100000,
+        include_usage=True,
+        retry=_RETRY_SETTINGS,
+        reasoning=Reasoning(effort=effort),
+    )
 
 
 class ReasoningAwareModel(OpenAIChatCompletionsModel):
-    """Surfaces provider reasoning traces as first-class reasoning items.
+    """Surfaces provider reasoning + forces streaming under the hood.
 
-    OpenRouter reasoning models (e.g. moonshotai/kimi-k2.6, deepseek/deepseek-r1)
-    return the chain-of-thought in a top-level `reasoning` field on the message.
-    The stock agents-SDK converter at chatcmpl_converter.py:135 only looks for
-    `reasoning_content`, so we copy it over. That causes the SDK to emit a
-    ResponseReasoningItem which the orchestrator can log separately.
+    Two jobs:
 
-    We deliberately do NOT merge reasoning into `content`: if the model was
-    truncated mid-reasoning, leaving `content` empty lets the orchestrator's
-    existing "no code block" branch catch the failure instead of treating
-    the raw chain-of-thought as the final answer.
+    1. Streaming upgrade. Callers (Runner.run -> get_response) request
+       non-streaming responses, but for long generations Anthropic stalls
+       and OpenRouter injects ``: OPENROUTER PROCESSING`` SSE keepalives
+       that crash json.loads. We upgrade every non-streaming call to a
+       streaming one and reassemble the chunks into a ChatCompletion of
+       the same shape the SDK would otherwise produce. The native
+       streaming path (Runner.run_streamed -> stream_response) is left
+       untouched.
+
+    2. Reasoning passthrough. OpenRouter reasoning models (kimi-k2.6,
+       deepseek-r1, ...) return chain-of-thought in a top-level
+       ``reasoning`` field; the stock SDK converter only looks at
+       ``reasoning_content``, so we mirror it. We deliberately do NOT
+       merge reasoning into ``content``: if a turn truncates mid-reasoning,
+       leaving ``content`` empty lets the orchestrator's existing "no code
+       block" branch catch it instead of treating raw CoT as the answer.
     """
 
     async def _fetch_response(self, *args, **kwargs):
-        result = await super()._fetch_response(*args, **kwargs)
-        completion = result[0] if isinstance(result, tuple) else result
-        if isinstance(completion, ChatCompletion):
-            for choice in completion.choices:
-                msg = choice.message
-                reasoning = getattr(msg, "reasoning", None)
-                if reasoning and not getattr(msg, "reasoning_content", None):
-                    setattr(msg, "reasoning_content", reasoning)
-            usage = completion.usage.model_dump() if completion.usage else None
-            print(f"[llm] finish={completion.choices[0].finish_reason} usage={usage}")
-        return result
+        # Streaming path (Runner.run_streamed): pass through unchanged.
+        if kwargs.get("stream"):
+            return await super()._fetch_response(*args, **kwargs)
+
+        # Non-streaming path: upgrade to streaming internally and reassemble.
+        kwargs["stream"] = True
+        _resp, stream = await super()._fetch_response(*args, **kwargs)
+        completion = await _collect_stream_into_completion(stream)
+
+        for choice in completion.choices:
+            msg = choice.message
+            reasoning = getattr(msg, "reasoning", None)
+            if reasoning and not getattr(msg, "reasoning_content", None):
+                setattr(msg, "reasoning_content", reasoning)
+        usage = completion.usage.model_dump() if completion.usage else None
+        print(f"[llm] finish={completion.choices[0].finish_reason} usage={usage}")
+        return completion
+
+
+async def _collect_stream_into_completion(stream) -> ChatCompletion:
+    """Accumulate a chat-completions stream into a ChatCompletion.
+
+    Assumes a single choice and no tool calls (no agent in this codebase
+    declares ``tools=...``). Captures content, reasoning, finish_reason,
+    and usage (which requires ``stream_options.include_usage`` — set via
+    ``include_usage=True`` in _build_model_settings).
+    """
+    completion_id: str | None = None
+    model: str = ""
+    created: int = 0
+    role: str = "assistant"
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    finish_reason: str | None = None
+    usage = None
+    n_chunks = 0
+
+    async for chunk in stream:
+        n_chunks += 1
+        if completion_id is None:
+            completion_id = chunk.id
+            model = chunk.model
+            created = chunk.created
+        if chunk.usage is not None:
+            usage = chunk.usage
+        assert len(chunk.choices) <= 1, "multi-choice streaming is not supported"
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        delta = choice.delta
+        assert not delta.tool_calls, "tool_calls in streamed response are not supported"
+        if delta.role:
+            role = delta.role
+        if delta.content:
+            content_parts.append(delta.content)
+        r = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+        if r:
+            reasoning_parts.append(r)
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    assert completion_id is not None, "stream produced no chunks"
+
+    # OpenRouter / Anthropic compat occasionally close a stream cleanly without
+    # setting finish_reason on any chunk (no final "stop" chunk, just [DONE]).
+    # Default to "stop" so the SDK's ChatCompletion validates. If we got zero
+    # content + zero reasoning, log loudly — downstream's "no code block" branch
+    # will treat the turn as a failure and trigger a retry/abandon as usual.
+    content_len = sum(len(p) for p in content_parts)
+    reasoning_len = sum(len(p) for p in reasoning_parts)
+    if finish_reason is None:
+        finish_reason = "stop"
+        print(
+            f"[llm] WARNING: stream had no finish_reason "
+            f"(chunks={n_chunks}, content_chars={content_len}, "
+            f"reasoning_chars={reasoning_len}, usage={'yes' if usage else 'no'}); "
+            f"defaulting to 'stop'"
+        )
+
+    message = ChatCompletionMessage(
+        role=role,
+        content="".join(content_parts) or None,
+    )
+    if reasoning_parts:
+        setattr(message, "reasoning", "".join(reasoning_parts))
+
+    return ChatCompletion(
+        id=completion_id,
+        object="chat.completion",
+        created=created,
+        model=model,
+        choices=[_ChatCompletionChoice(
+            index=0, message=message, finish_reason=finish_reason, logprobs=None,
+        )],
+        usage=usage,
+    )
 
 
 def make_client(llm_config: dict) -> AsyncOpenAI:

@@ -62,8 +62,10 @@ from src.autotune2.contracts import TensorContract, vanilla_contract_for
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROMPTS_DIR = _PROJECT_ROOT / "prompts"
 _SYSTEM_PROMPT_PATH = _PROMPTS_DIR / "autotune2_system.txt"
+_SYSTEM_PROMPT_PATH_PARALLEL = _PROMPTS_DIR / "autotune2_system_parallel.txt"
 _MEMORY_NOTES_PATH = _PROMPTS_DIR / "dsl_memory_notes.txt"
 _TILE_SHRINK_FEWSHOT_PATH = _PROMPTS_DIR / "autotune_tile_shrink_fewshot.txt"
+_PARALLEL_FEWSHOT_PATH = _PROMPTS_DIR / "autotune_parallel_fewshot.txt"
 _STEP_DSL_MEMORY_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
 _OUTPUT_PROTOCOL_PATHS = {
     True: _PROMPTS_DIR / "autotune2_output_protocol_leaf.txt",
@@ -201,24 +203,47 @@ def render_variant_block(
 # ---------------------------------------------------------------------------
 
 
-def build_autotune2_system_prompt(*, is_leaf: bool, dsl_code: str) -> str:
+def build_autotune2_system_prompt(
+    *, is_leaf: bool, dsl_code: str, fewshot: str = "tile_shrink"
+) -> str:
     """Self-contained autotune2 system prompt.
 
-    Template body lives in ``prompts/autotune2_system.txt`` with four
-    placeholders: ``{step_dsl_code}`` (the DSL surface, passed in),
-    ``{memory_notes}`` (loaded from ``prompts/dsl_memory_notes.txt`` and
-    shared with ``autotune_memory_system.txt``), ``{tile_shrink_fewshot}``
-    (loaded from ``prompts/autotune_tile_shrink_fewshot.txt`` — worked
-    examples of the load/consumer/reduction-order rewrite recipe paired
-    with the memory observation above), and ``{output_protocol}`` (loaded
+    ``fewshot`` selects which worked-example pack to inject and which
+    system-prompt template to load:
+
+      - ``"tile_shrink"`` (default): ``autotune2_system.txt`` +
+        ``autotune_tile_shrink_fewshot.txt`` (placeholder
+        ``{tile_shrink_fewshot}``). The load/consumer/reduction-order
+        rewrite recipe.
+      - ``"parallel"``: ``autotune2_system_parallel.txt`` +
+        ``autotune_parallel_fewshot.txt`` (placeholder
+        ``{parallel_fewshot}``). Shared vs. independent parallelism
+        worked examples.
+
+    Other placeholders are identical across variants: ``{step_dsl_code}``
+    (the DSL surface, passed in), ``{memory_notes}`` (loaded from
+    ``prompts/dsl_memory_notes.txt`` and shared with
+    ``autotune_memory_system.txt``), and ``{output_protocol}`` (loaded
     from ``prompts/autotune2_output_protocol_{leaf,parent}.txt`` based on
-    ``is_leaf``). ``str.replace`` is used instead of ``str.format`` because
-    the protocol fragments contain literal YAML braces.
+    ``is_leaf``). ``str.replace`` is used instead of ``str.format``
+    because the protocol fragments contain literal YAML braces.
     """
     assert dsl_code, "build_autotune2_system_prompt: dsl_code must be non-empty"
+    assert fewshot in ("tile_shrink", "parallel"), (
+        f"build_autotune2_system_prompt: fewshot must be 'tile_shrink' or "
+        f"'parallel', got {fewshot!r}"
+    )
+    if fewshot == "tile_shrink":
+        system_path = _SYSTEM_PROMPT_PATH
+        fewshot_path = _TILE_SHRINK_FEWSHOT_PATH
+        fewshot_placeholder = "{tile_shrink_fewshot}"
+    else:
+        system_path = _SYSTEM_PROMPT_PATH_PARALLEL
+        fewshot_path = _PARALLEL_FEWSHOT_PATH
+        fewshot_placeholder = "{parallel_fewshot}"
     protocol_path = _OUTPUT_PROTOCOL_PATHS[is_leaf]
-    for path in (_SYSTEM_PROMPT_PATH, protocol_path,
-                 _MEMORY_NOTES_PATH, _TILE_SHRINK_FEWSHOT_PATH,
+    for path in (system_path, protocol_path,
+                 _MEMORY_NOTES_PATH, fewshot_path,
                  _STEP_DSL_MEMORY_PY):
         assert path.exists(), (
             f"build_autotune2_system_prompt: required file not found at {path}"
@@ -227,12 +252,10 @@ def build_autotune2_system_prompt(*, is_leaf: bool, dsl_code: str) -> str:
         "{step_dsl_memory_code}", _STEP_DSL_MEMORY_PY.read_text()
     ).rstrip()
     return (
-        _SYSTEM_PROMPT_PATH.read_text()
+        system_path.read_text()
         .replace("{step_dsl_code}", dsl_code)
         .replace("{memory_notes}", memory_notes)
-        .replace(
-            "{tile_shrink_fewshot}", _TILE_SHRINK_FEWSHOT_PATH.read_text().rstrip()
-        )
+        .replace(fewshot_placeholder, fewshot_path.read_text().rstrip())
         .replace("{output_protocol}", protocol_path.read_text().rstrip())
     )
 
@@ -268,7 +291,7 @@ correct against the PyTorch reference; your task is to propose a
 ### Pass-1 verified design
 
 ```python
-{pass1_dsl}
+{baseline_dsl}
 ```
 {variant_section}{accepted_section}{budget_section}
 ### Your task
@@ -308,7 +331,7 @@ def build_autotune2_user_prompt(
     node_name: str,
     function_signature: str,
     pytorch_reference: str,
-    pass1_dsl: str,
+    baseline_dsl: str,
     dims_block: str,
     tensors_block: str,
     child_variant_blocks: dict[str, str] | None = None,
@@ -316,6 +339,13 @@ def build_autotune2_user_prompt(
     budget_block: str = "",
 ) -> str:
     """Self-contained autotune2 user prompt for one (node, attempt) pair.
+
+    ``baseline_dsl`` is the DSL the LLM is asked to vary. For single-pass
+    autotune2 this is always the pass-1 baseline; multi-pass / branching
+    expansion supplies any prior library entry's DSL. The prompt's
+    "Pass-1 verified design" heading is preserved for now (it's accurate
+    in single-pass mode); chunk 3 may rename it once non-pass-1 baselines
+    are actually fed in.
 
     ``accepted_summary`` is the empty string on the first attempt; on
     subsequent fresh attempts it is the rendered Pareto-front summary
@@ -349,7 +379,7 @@ def build_autotune2_user_prompt(
         node_name=node_name,
         function_signature=function_signature,
         pytorch_reference=pytorch_reference,
-        pass1_dsl=pass1_dsl,
+        baseline_dsl=baseline_dsl,
         dims_block=dims_block,
         tensors_block=tensors_block,
         variant_section=variant_section,

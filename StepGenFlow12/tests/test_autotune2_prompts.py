@@ -172,7 +172,7 @@ _PROMPT_KWARGS = dict(
     node_name="attention_softmax",
     function_signature="def attention_softmax(x, *, out_shapes):",
     pytorch_reference="class Model(nn.Module):\n    pass",
-    pass1_dsl="def attention_softmax(x, *, out_shapes):\n    return x",
+    baseline_dsl="def attention_softmax(x, *, out_shapes):\n    return x",
     dims_block="```json\n{\"B\": 2}\n```",
     tensors_block="x: (64, 512)",
 )

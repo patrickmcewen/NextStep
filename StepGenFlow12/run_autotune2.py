@@ -118,18 +118,144 @@ def _format_dims_block(dims: dict) -> str:
     return "```json\n" + json.dumps(dims, indent=2) + "\n```"
 
 
+def _resolve_attempt_budgets(
+    attempt_budgets: list, max_on_chip_memory: int, *, source: str,
+) -> list[int | None]:
+    """Validate + scale a list of attempt-budget multipliers to absolute
+    byte budgets. ``None`` passes through unchanged (unlimited)."""
+    assert isinstance(attempt_budgets, list) and attempt_budgets, (
+        f"{source}: 'attempt_budgets' must be a non-empty list "
+        f"of multipliers (null = unlimited), got {attempt_budgets!r}"
+    )
+    bytes_out: list[int | None] = []
+    for i, m in enumerate(attempt_budgets):
+        if m is None:
+            bytes_out.append(None)
+            continue
+        assert isinstance(m, (int, float)) and m > 0, (
+            f"{source}: attempt_budgets[{i}]={m!r} must be a "
+            f"positive number or null"
+        )
+        bytes_out.append(int(round(max_on_chip_memory * float(m))))
+    return bytes_out
+
+
+_PASS_KNOBS = (
+    "fewshot", "max_baselines_per_node", "baseline_selection",
+    "attempt_budgets", "max_turns_per_attempt",
+)
+_PASS_SPEC_DEFAULTS = {
+    "fewshot": "tile_shrink",
+    "max_baselines_per_node": 4,
+    "baseline_selection": "pareto_diverse",
+    "max_turns_per_attempt": 16,
+}
+
+
+def _resolve_pass_specs(
+    autotune_config: dict, *, cli_args: argparse.Namespace, source: str,
+) -> tuple[list[dict], bool]:
+    """Normalize the optional ``passes:[...]`` block into a list of
+    fully-resolved pass specs.
+
+    Resolution order per knob: per-pass key > top-level config key >
+    CLI arg (where applicable) > library default. Returns
+    ``(specs, is_multi_pass)`` where ``is_multi_pass`` reflects whether
+    a ``passes`` key was present in the JSON — used to decide whether
+    to lay artifacts out under per-pass subdirs.
+    """
+    max_on_chip_memory = autotune_config["max_on_chip_memory"]
+    top_level_budgets = autotune_config["attempt_budgets"]
+
+    # Per-knob fallback chain. CLI args win over library defaults but
+    # lose to top-level config (top-level is a config-file decision).
+    cli_overrides = {
+        "fewshot": cli_args.fewshot,
+        "max_turns_per_attempt": cli_args.max_turns_per_attempt,
+    }
+    config_defaults: dict = {}
+    for knob in _PASS_KNOBS:
+        if knob == "attempt_budgets":
+            continue  # handled separately so byte resolution is per-pass
+        if knob in autotune_config:
+            config_defaults[knob] = autotune_config[knob]
+        elif knob in cli_overrides:
+            config_defaults[knob] = cli_overrides[knob]
+        else:
+            config_defaults[knob] = _PASS_SPEC_DEFAULTS[knob]
+
+    raw_passes = autotune_config.get("passes")
+    is_multi_pass = raw_passes is not None
+    if not is_multi_pass:
+        raw_passes = [{"name": "pass0"}]
+    assert isinstance(raw_passes, list) and raw_passes, (
+        f"{source}: 'passes' must be a non-empty list when present, "
+        f"got {raw_passes!r}"
+    )
+
+    specs: list[dict] = []
+    for i, p in enumerate(raw_passes):
+        assert isinstance(p, dict), (
+            f"{source}: passes[{i}] must be a dict, got {type(p).__name__}"
+        )
+        assert "name" in p and isinstance(p["name"], str) and p["name"], (
+            f"{source}: passes[{i}] missing required 'name' string"
+        )
+        # Validate each per-pass key is a recognized knob.
+        for k in p:
+            assert k == "name" or k in _PASS_KNOBS, (
+                f"{source}: passes[{i}] has unknown key {k!r}; "
+                f"recognized: {('name',) + _PASS_KNOBS}"
+            )
+        spec = {"name": p["name"], **config_defaults}
+        for knob in _PASS_KNOBS:
+            if knob == "attempt_budgets":
+                continue
+            if knob in p:
+                spec[knob] = p[knob]
+        budgets = p.get("attempt_budgets", top_level_budgets)
+        spec["attempt_budgets_bytes"] = _resolve_attempt_budgets(
+            budgets, max_on_chip_memory,
+            source=f"{source} passes[{i}].attempt_budgets",
+        )
+        specs.append(spec)
+    return specs, is_multi_pass
+
+
+def _build_system_prompts(
+    tree, *, dsl_code: str, fewshot: str,
+) -> dict[str, str]:
+    """Build ``{node_path: system_prompt}`` for one fewshot variant.
+
+    Rebuilt per pass when multi-pass fewshots differ, so each pass's
+    LLM agent sees the worked-example pack matching its goal.
+    """
+    from src.autotune2.prompts import build_autotune2_system_prompt
+    return {
+        node.path: build_autotune2_system_prompt(
+            is_leaf=node.is_leaf, dsl_code=dsl_code, fewshot=fewshot,
+        )
+        for node in tree.iter_topological()
+    }
+
+
 def _load_pass1_state(
     outer_dir: Path,
     *,
     kernel: str,
     autotune_config_path: Path,
     llm_config: dict,
+    cli_args: argparse.Namespace,
 ) -> dict:
     """Read the plan tree + per-node DSLs + per-node contracts from a
-    saved outer_dir.
+    saved outer_dir, and resolve the multi-pass spec from the autotune
+    config.
 
     Returns ``{tree, pass1_dsls, pass1_contracts, dims, tensors,
-    hw_config, llm_config, prompt_inputs, system_prompts}``.
+    hw_config, max_on_chip_memory, dsl_code, llm_config, prompt_inputs,
+    pass_specs, is_multi_pass}``. ``pass_specs`` is a list of one (legacy
+    single-pass) or N (multi-pass) fully-resolved specs; the runner
+    iterates over them.
 
     ``llm_config`` is passed in already-resolved (via
     ``src.config_loader.load_llm_config``) so that ``api_key`` and any
@@ -144,7 +270,6 @@ def _load_pass1_state(
     was added will fail loudly here; re-running Pass-1 populates the
     pickles.
     """
-    from src.autotune2.prompts import build_autotune2_system_prompt
     from src.autotune2.search import NodePromptInputs
     from src.orchestrator import _load_tree_from_dir, _load_verified_dsls
     from src.prompts import _STEP_DSL_PY, _format_tensors_description
@@ -174,28 +299,15 @@ def _load_pass1_state(
         )
     hw_config = autotune_config["hw_config"]
     max_on_chip_memory = autotune_config["max_on_chip_memory"]
-    attempt_budgets = autotune_config["attempt_budgets"]
     assert (
         isinstance(max_on_chip_memory, int) and max_on_chip_memory > 0
     ), (
         f"{autotune_config_path}: 'max_on_chip_memory' must be a positive int "
         f"(bytes), got {max_on_chip_memory!r}"
     )
-    assert isinstance(attempt_budgets, list) and attempt_budgets, (
-        f"{autotune_config_path}: 'attempt_budgets' must be a non-empty list "
-        f"of multipliers (null = unlimited), got {attempt_budgets!r}"
+    pass_specs, is_multi_pass = _resolve_pass_specs(
+        autotune_config, cli_args=cli_args, source=str(autotune_config_path),
     )
-    # Resolve multipliers -> absolute byte budgets (None passes through).
-    attempt_budgets_bytes: list[int | None] = []
-    for i, m in enumerate(attempt_budgets):
-        if m is None:
-            attempt_budgets_bytes.append(None)
-            continue
-        assert isinstance(m, (int, float)) and m > 0, (
-            f"{autotune_config_path}: attempt_budgets[{i}]={m!r} must be a "
-            f"positive number or null"
-        )
-        attempt_budgets_bytes.append(int(round(max_on_chip_memory * float(m))))
 
     # Tree + DSLs + tensors via shared loaders.
     from precompute import precompute_tensors  # StepDB
@@ -226,12 +338,12 @@ def _load_pass1_state(
         with open(pkl, "rb") as f:
             pass1_contracts[node.path] = pickle.load(f)
 
-    # Per-node prompt inputs (user-prompt building blocks) and
-    # per-node autotune2 system prompts (system prompts are
-    # ``is_leaf``-dependent only; we still index by path for symmetry).
+    # Per-node prompt inputs (user-prompt building blocks). System
+    # prompts are built per pass by the runner since fewshot may differ
+    # across passes; only the inputs that don't depend on fewshot live
+    # here.
     dsl_code = _STEP_DSL_PY.read_text()
     prompt_inputs: dict = {}
-    system_prompts: dict = {}
     dims_block = _format_dims_block(dims)
     for node in tree.iter_topological():
         parent_contract = (
@@ -246,9 +358,6 @@ def _load_pass1_state(
                 _format_tensors_description(tensors) if tensors else ""
             ),
         )
-        system_prompts[node.path] = build_autotune2_system_prompt(
-            is_leaf=node.is_leaf, dsl_code=dsl_code,
-        )
 
     return {
         "tree": tree,
@@ -258,10 +367,11 @@ def _load_pass1_state(
         "tensors": tensors,
         "hw_config": hw_config,
         "max_on_chip_memory": max_on_chip_memory,
-        "attempt_budgets_bytes": attempt_budgets_bytes,
+        "dsl_code": dsl_code,
+        "pass_specs": pass_specs,
+        "is_multi_pass": is_multi_pass,
         "llm_config": llm_config,
         "prompt_inputs": prompt_inputs,
-        "system_prompts": system_prompts,
     }
 
 
@@ -324,6 +434,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         kernel=args.kernel,
         autotune_config_path=Path(args.autotune_config).resolve(),
         llm_config=llm_config,
+        cli_args=args,
     )
 
     # The scorer's closed-over ``tensors`` dict has to match the per-node
@@ -351,48 +462,91 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     )
 
     # Per-node resume stamps — fold in hw_config + compute_bw + check_order
-    # + budgets so any change to scorer/verifier config invalidates every
-    # node's cached library at once (their cycle/on_chip numbers were
-    # measured against the old config). Pass-1 DSL and tree-shape changes
-    # ripple up transitively inside compute_plan_stamps.
+    # so any change to scorer/verifier config invalidates every node's
+    # cached library at once (their cycle/on_chip numbers were measured
+    # against the old config). Pass-1 DSL and tree-shape changes ripple
+    # up transitively inside compute_plan_stamps. Multi-pass uses a
+    # cascading ``pass_specs[0..i]`` slice in ``extra`` so editing pass j
+    # invalidates pass j and every later pass but leaves earlier passes
+    # alone.
     from src.autotune2.persistence import compute_plan_stamps
-    node_stamps = compute_plan_stamps(
-        plan_tree=state["tree"],
-        pass1_dsls=state["pass1_dsls"],
-        pass1_contracts=state["pass1_contracts"],
-        extra={
-            "hw_config": state["hw_config"],
-            "compute_bw": args.compute_bw,
-            "check_order": args.check_order,
-            "max_on_chip_memory": state["max_on_chip_memory"],
-            "attempt_budgets_bytes": state["attempt_budgets_bytes"],
-            # Bumped when output_contracts switched from LLM-declared to
-            # graph-derived. Old libraries were keyed by LLM-declared
-            # output contracts that may not match the derived (stream+tile,
-            # identity-permutation) form, so reuse would produce cell-key
-            # collisions. Increment this tag to invalidate again.
-            "output_contracts_source": "derived_v1",
-        },
+    base_stamp_extra = {
+        "hw_config": state["hw_config"],
+        "compute_bw": args.compute_bw,
+        "check_order": args.check_order,
+        "max_on_chip_memory": state["max_on_chip_memory"],
+        # Bumped when output_contracts switched from LLM-declared to
+        # graph-derived. Old libraries were keyed by LLM-declared
+        # output contracts that may not match the derived (stream+tile,
+        # identity-permutation) form, so reuse would produce cell-key
+        # collisions. Increment this tag to invalidate again.
+        "output_contracts_source": "derived_v1",
+    }
+
+    pass_specs = state["pass_specs"]
+    is_multi_pass = state["is_multi_pass"]
+    print(
+        f"autotune2: running {len(pass_specs)} pass(es): "
+        + ", ".join(f"{i}={s['name']}({s['fewshot']})"
+                    for i, s in enumerate(pass_specs))
     )
 
-    result = await autotune(
-        plan_tree=state["tree"],
-        pass1_dsls=state["pass1_dsls"],
-        pass1_contracts=state["pass1_contracts"],
-        ckpt_dir=ckpt_dir,
-        make_score_fn=make_score_fn,
-        root_tensors=state["tensors"],
-        agent_factory=agent_factory,
-        make_verifier=make_verifier,
-        prompt_inputs=state["prompt_inputs"],
-        system_prompts=state["system_prompts"],
-        config=SearchConfig(
-            max_turns_per_attempt=args.max_turns_per_attempt,
-            attempt_budgets_bytes=state["attempt_budgets_bytes"],
-            check_order=args.check_order,
-        ),
-        node_stamps=node_stamps,
-    )
+    prior_libraries: dict | None = None
+    result = None  # type: ignore[assignment]
+    for pass_idx, spec in enumerate(pass_specs):
+        pass_subdir = (
+            f"pass_{pass_idx}_{spec['name']}" if is_multi_pass else None
+        )
+        # Per-pass stamps cascade: hash of pass_specs[0..pass_idx+1] +
+        # base extra. Editing spec j changes the cascade for pass j+,
+        # invalidating their snapshots; earlier passes stay valid.
+        pass_extra = {
+            **base_stamp_extra,
+            "attempt_budgets_bytes": spec["attempt_budgets_bytes"],
+            "pass_specs": [
+                {k: v for k, v in s.items() if k != "attempt_budgets_bytes"}
+                for s in pass_specs[: pass_idx + 1]
+            ],
+        }
+        node_stamps = compute_plan_stamps(
+            plan_tree=state["tree"],
+            pass1_dsls=state["pass1_dsls"],
+            pass1_contracts=state["pass1_contracts"],
+            extra=pass_extra,
+        )
+        system_prompts = _build_system_prompts(
+            state["tree"], dsl_code=state["dsl_code"], fewshot=spec["fewshot"],
+        )
+        print(
+            f"autotune2: pass {pass_idx} '{spec['name']}' — "
+            f"fewshot={spec['fewshot']}, "
+            f"max_baselines_per_node={spec['max_baselines_per_node']}, "
+            f"baseline_selection={spec['baseline_selection']}"
+        )
+        result = await autotune(
+            plan_tree=state["tree"],
+            pass1_dsls=state["pass1_dsls"],
+            pass1_contracts=state["pass1_contracts"],
+            ckpt_dir=ckpt_dir,
+            make_score_fn=make_score_fn,
+            root_tensors=state["tensors"],
+            agent_factory=agent_factory,
+            make_verifier=make_verifier,
+            prompt_inputs=state["prompt_inputs"],
+            system_prompts=system_prompts,
+            config=SearchConfig(
+                max_turns_per_attempt=spec["max_turns_per_attempt"],
+                attempt_budgets_bytes=spec["attempt_budgets_bytes"],
+                check_order=args.check_order,
+            ),
+            node_stamps=node_stamps,
+            initial_libraries=prior_libraries,
+            max_baselines_per_node=spec["max_baselines_per_node"],
+            baseline_selection=spec["baseline_selection"],
+            pass_subdir=pass_subdir,
+        )
+        prior_libraries = result.libraries
+    assert result is not None, "pass loop produced no result"
 
     rust_evaluate = build_rust_evaluate_fn(
         work_dir=ckpt_dir / "autotune2" / "_rust_work",
@@ -496,6 +650,14 @@ def main() -> int:
         "--include-sources", action="store_true",
         help="Embed the rust-best composed source string in the summary JSON "
              "(can be megabytes for large kernels).",
+    )
+    parser.add_argument(
+        "--fewshot", default="tile_shrink",
+        choices=("tile_shrink", "parallel"),
+        help="Worked-example pack to inject into the autotune2 system "
+             "prompt (default: tile_shrink). 'parallel' swaps in the "
+             "shared-vs-independent parallelism examples and uses "
+             "autotune2_system_parallel.txt as the template.",
     )
     args = parser.parse_args()
 

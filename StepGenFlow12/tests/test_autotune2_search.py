@@ -620,13 +620,15 @@ def test_search_leaf_writes_pass1_baseline_and_per_turn_score_artifacts(tmp_path
     baseline = json.loads(baseline_path.read_text())
     assert baseline == {"cycles": 111, "on_chip": 222, "provenance": "pass1_baseline"}
 
-    score_path = tmp_path / "leaf" / "attempt_0_binf" / "turn_0" / "score.json"
+    score_path = (
+        tmp_path / "leaf" / "baseline_0_attempt_0_binf" / "turn_0" / "score.json"
+    )
     assert score_path.exists(), "accepted-turn score not persisted"
     payload = json.loads(score_path.read_text())
     assert payload == {
         "entries": [
             {"cycles": 333, "on_chip": 444,
-             "provenance": "llm_attempt_0_binf_turn_0"},
+             "provenance": "llm_baseline_0_attempt_0_binf_turn_0"},
         ],
     }
 
@@ -739,6 +741,134 @@ def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
     assert budget_mentions == 1
     # The two prompts must differ (budget block presence / wording).
     assert captured_first_user_per_attempt[0] != captured_first_user_per_attempt[1]
+
+
+def test_search_leaf_default_initial_baselines_matches_current_behavior(tmp_path):
+    """``initial_baselines=None`` (default) ⇒ exactly N attempt coros for
+    N budgets — one branch (the always-seeded pass-1 baseline). Verifies
+    that the multi-pass plumbing didn't accidentally fan out in the
+    single-pass call path."""
+    agent_calls = [0]
+
+    async def agent(_conversation):
+        agent_calls[0] += 1
+        # Garbage response — drops on parse; the count is what matters.
+        return "no fenced blocks"
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        score_fn=lambda _src: (10, 20),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None, 1024]),
+    ))
+    # 2 budgets × 1 baseline (pass-1 only) = 2 agent calls.
+    assert agent_calls[0] == 2
+    # Attempt dirs use the baseline_0_ prefix even in single-pass mode.
+    assert (tmp_path / "leaf" / "baseline_0_attempt_0_binf").exists()
+    assert (tmp_path / "leaf" / "baseline_0_attempt_1_b1024").exists()
+
+
+def test_search_leaf_extra_baselines_spawn_additional_attempts(tmp_path):
+    """``initial_baselines=[A, B]`` + 1 budget ⇒ 3 attempt coros
+    (pass-1 + A + B). Each conversation opens with its branch's
+    ``baseline_dsl`` rendered into the user prompt — verified by
+    capturing the opening user prompts and checking the DSL text
+    appears in the right one."""
+    pass1_dsl = "def my_leaf(x, *, out_shapes):\n    return None\n# pass1\n"
+    extra_a = DesignEntry(
+        dsl=(
+            "def my_leaf(x, *, out_shapes):\n    return None\n# branch_A\n"
+        ),
+        input_contracts={"x": vanilla_contract_for((4, 8))},
+        output_contracts={"out_0": vanilla_contract_for((1, 4, 8))},
+        cycles=42, on_chip=84, provenance="prior_pass_A", breakdown="",
+    )
+    extra_b = DesignEntry(
+        dsl=(
+            "def my_leaf(x, *, out_shapes):\n    return None\n# branch_B\n"
+        ),
+        input_contracts={"x": vanilla_contract_for((4, 8))},
+        output_contracts={"out_0": vanilla_contract_for((1, 4, 8))},
+        cycles=21, on_chip=168, provenance="prior_pass_B", breakdown="",
+    )
+
+    opener_prompts: list[str] = []
+
+    async def agent(conversation: list[dict]):
+        if len(conversation) == 1:
+            opener_prompts.append(conversation[0]["content"])
+        return "no fenced blocks"
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl=pass1_dsl,
+        ckpt_dir=tmp_path / "leaf",
+        score_fn=lambda _src: (10, 20),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]),
+        initial_baselines=[extra_a, extra_b],
+    ))
+
+    # 3 branches × 1 budget = 3 attempt openers.
+    assert len(opener_prompts) == 3
+    # Each opener carries its branch's DSL.
+    pass1_hit = sum("# pass1" in p for p in opener_prompts)
+    a_hit = sum("# branch_A" in p for p in opener_prompts)
+    b_hit = sum("# branch_B" in p for p in opener_prompts)
+    assert pass1_hit == 1, f"pass1 baseline DSL appears in {pass1_hit} prompts, expected 1"
+    assert a_hit == 1, f"branch_A DSL appears in {a_hit} prompts, expected 1"
+    assert b_hit == 1, f"branch_B DSL appears in {b_hit} prompts, expected 1"
+
+
+def test_search_leaf_per_branch_attempt_dir_naming(tmp_path):
+    """Multi-baseline + multi-budget fan-out produces attempt dirs named
+    ``baseline_{b_idx}_attempt_{a_idx}_b{label}``. Verifies the naming
+    convention end-to-end so artifacts are discoverable per branch."""
+    extra = DesignEntry(
+        dsl="def my_leaf(x, *, out_shapes):\n    return None\n# branch_X\n",
+        input_contracts={"x": vanilla_contract_for((4, 8))},
+        output_contracts={"out_0": vanilla_contract_for((1, 4, 8))},
+        cycles=1, on_chip=1, provenance="prior_pass", breakdown="",
+    )
+
+    async def agent(_conversation):
+        return "no fenced blocks"
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        score_fn=lambda _src: (10, 20),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None, 2048]),
+        initial_baselines=[extra],
+    ))
+
+    # 2 baselines × 2 budgets = 4 distinct attempt dirs.
+    for b_idx in (0, 1):
+        for a_idx, blabel in enumerate(("binf", "b2048")):
+            d = tmp_path / "leaf" / f"baseline_{b_idx}_attempt_{a_idx}_{blabel}"
+            assert d.exists(), f"missing attempt dir {d}"
 
 
 def test_search_leaf_skips_failed_verification(tmp_path):

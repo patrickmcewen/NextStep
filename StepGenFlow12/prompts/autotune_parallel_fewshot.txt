@@ -1,0 +1,183 @@
+# Applying parallelism to relieve a compute or load bottleneck
+
+The DSL exposes two parallelism patterns. Pick by what's actually bottlenecking
+the lowered graph — they have different cost models.
+
+  - **Shared parallelism** (DSL `parallelize` + `static_reassemble`):
+    one upstream stream is round-robin routed to N consumers by the IR's
+    `Parallelize` op. Consumers replicate compute (and any downstream ops)
+    but share a single upstream — so the source's token rate is still a
+    ceiling on aggregate throughput. Cheap in HBM bandwidth, useful when
+    the bottleneck is purely compute and the source has slack.
+
+  - **Independent parallelism** (per-consumer `offchip_load` with
+    `start_tile_idx`): each consumer owns its own `LinearOffChipLoad`,
+    differing only by `start_tile_idx` (and by stride along the
+    parallelized axis). No upstream `Parallelize` op is emitted; each
+    consumer reads its own tile range from HBM in parallel. This breaks
+    the shared-source ceiling at the cost of replicated reads — operands
+    that are *broadcast* across the parallelized axis (the B matrix when
+    parallelizing GEMM along M) are pulled in full by every consumer.
+
+The two patterns produce the same numerical output when `static_reassemble`
+merges at the outermost stream dim — they only differ in their lowered IR
+graph and, therefore, in their cycle count.
+
+## The recipe
+
+1. **Identify the parallelized axis.** It must be an *outer* stream dim
+   (smallest-rank-index in DSL terms is innermost, so "outer" = largest
+   stream-shape index). The axis must be divisible by `par_factor`.
+
+2. **Decide shared vs. independent.** If the timing report shows the
+   consumer-side op as the bottleneck and the source has slack, use
+   shared (`parallelize`). If the source itself is the bottleneck, or
+   you've already saturated `Parallelize`'s back-pressure ceiling, use
+   independent.
+
+3. **Rewrite the load(s) along the parallelized axis.** For shared, leave
+   the load unchanged and add a single `parallelize(x, par_factor)`
+   downstream. For independent, fan the load out in a Python `for`-loop:
+   each iteration calls `offchip_load(...)` with `start_tile_idx` shifted
+   and stride scaled along the parallelized axis. There is no DSL call
+   for the IR `Parallelize` op in this branch — the `for`-loop *is* the
+   parallelism.
+
+4. **Replicate consumers and rejoin.** Each consumer's body is identical
+   except for its operand(s). After the per-consumer compute, collect the
+   outputs into a Python list and pass it to
+   `static_reassemble(partials)`. With the default
+   `merge_rank = outermost stream rank`, the interleaving exactly inverts
+   the round-robin slice — the post-merge tile order matches the
+   unparallelized graph.
+
+5. **Operands that broadcast across the parallelized axis.** In
+   independent mode, every consumer's load of such an operand reads the
+   full off-chip tensor (stride 0 along the parallelized axis is already
+   how the unparallelized graph reads it; nothing changes). Be aware of
+   the HBM cost — `par_factor`× the B-side traffic for GEMM-along-M.
+
+---
+
+## Example 1 — GEMM with M-axis parallelism (independent mode)
+
+Reference: `out = A @ B`, `A ∈ (M, K)`, `B ∈ (K, N)`, `tile_m × tile_k`
+tiles of A and `tile_k × tile_n` tiles of B.
+
+### Before (sequential, no parallelism)
+```python
+def tiled_reference(dims, tensors):
+    M, K, N = dims["M"], dims["K"], dims["N"]
+    tile_m, tile_k, tile_n = dims["tile_m"], dims["tile_k"], dims["tile_n"]
+    m_tiles, n_tiles, k_tiles = M // tile_m, N // tile_n, K // tile_k
+
+    A = offchip_load(
+        tensors["A"],
+        stride=(k_tiles, 0, 1),
+        out_shape_tiled=(m_tiles, n_tiles, k_tiles),
+        tile_row=tile_m, tile_col=tile_k,
+    )
+    B = offchip_load(
+        tensors["B"],
+        stride=(0, 1, n_tiles),
+        out_shape_tiled=(m_tiles, n_tiles, k_tiles),
+        tile_row=tile_k, tile_col=tile_n,
+    )
+    A_flat = flatten(A, min_rank=2, max_rank=3)
+    B_flat = flatten(B, min_rank=2, max_rank=3)
+    out = binary_map_accum(A_flat, B_flat, rank=1)
+    return offchip_store(out)
+```
+
+### After (independent M-axis parallelism, par_factor consumers)
+```python
+def tiled_reference(dims, tensors):
+    M, K, N = dims["M"], dims["K"], dims["N"]
+    tile_m, tile_k, tile_n = dims["tile_m"], dims["tile_k"], dims["tile_n"]
+    par_factor = dims["par_factor"]
+    m_tiles, n_tiles, k_tiles = M // tile_m, N // tile_n, K // tile_k
+    m_tiles_per = m_tiles // par_factor
+
+    partials = []
+    for i in range(par_factor):
+        # Consumer i sees M-tile rows {i, par_factor+i, 2*par_factor+i, ...}.
+        # start_tile_idx=i*k_tiles shifts A's base by i M-tile rows; the
+        # par_factor*k_tiles stride along the M axis then steps by P
+        # M-rows between tiles. B is loaded in full per consumer.
+        A_i = offchip_load(
+            tensors["A"],
+            stride=(par_factor * k_tiles, 0, 1),
+            out_shape_tiled=(m_tiles_per, n_tiles, k_tiles),
+            tile_row=tile_m, tile_col=tile_k,
+            start_tile_idx=i * k_tiles,
+        )
+        B_i = offchip_load(
+            tensors["B"],
+            stride=(0, 1, n_tiles),
+            out_shape_tiled=(m_tiles_per, n_tiles, k_tiles),
+            tile_row=tile_k, tile_col=tile_n,
+        )
+        A_flat = flatten(A_i, min_rank=2, max_rank=3)
+        B_flat = flatten(B_i, min_rank=2, max_rank=3)
+        partials.append(binary_map_accum(A_flat, B_flat, rank=1))
+
+    # Default merge_rank = outermost stream rank, which interleaves at the
+    # M axis and restores the unparallelized tile order.
+    return offchip_store(static_reassemble(partials))
+```
+
+Transforms applied:
+1. `m_tiles_per = m_tiles // par_factor` — partitions the outer stream
+   dim. `par_factor` must divide `m_tiles`.
+2. Single `offchip_load` for A becomes a Python `for`-loop emitting
+   `par_factor` separate loads. The stride along the parallelized axis
+   grows by `par_factor` (`k_tiles` → `par_factor * k_tiles`), and each
+   load's `start_tile_idx` is shifted by `i * k_tiles` (one M-tile row
+   in the original A's tile grid). All consumers share the *same*
+   underlying tensor object (`tensors["A"]`); only the address gen
+   differs.
+3. B is broadcast across the M axis (stride 0 at rank-2 already), so
+   every consumer's `offchip_load` for B is identical. Each is a
+   *separate* IR `LinearOffChipLoad`, so HBM B-traffic is replicated by
+   `par_factor`. If B is large and HBM-bound, prefer shared mode instead.
+4. The consumer body (`flatten` + `binary_map_accum`) is identical to the
+   sequential version — it just runs `par_factor` times in the lowered
+   graph.
+5. `static_reassemble(partials)` with default `merge_rank` interleaves at
+   the outermost (M) stream dim, exactly inverting the round-robin slice
+   embedded in the `start_tile_idx`/stride pattern. The post-merge stream
+   shape is `(m_tiles, n_tiles)` — equal to the sequential graph's.
+
+---
+
+## Pitfalls
+
+- **`parallelize` is not independent mode.** DSL `parallelize(x, n)`
+  lowers to a single IR `Parallelize` op fed by one upstream — that's
+  shared mode. For independent mode you write a Python `for`-loop of
+  `offchip_load` calls; there is no single DSL call that emits per-load
+  fan-out.
+- **`start_tile_idx` is in tile-grid units, not elements.** It indexes
+  the linearized tile grid of the underlying tensor (row-major over
+  `out_shape_tiled` of the underlying, *not* of this load). Shifting by
+  one M-tile row in a `(m_tiles, k_tiles)` underlying means
+  `start_tile_idx += k_tiles`, not `+= tile_m * K`.
+- **Stride along the parallelized axis must scale by `par_factor`.**
+  Forgetting this makes every consumer read overlapping ranges — the
+  graph still types-checks, but the output is wrong by a factor of
+  `par_factor` (each tile contributes `par_factor` times to its slot).
+- **`static_reassemble` requires matching stream dtypes and `dyn_mask`.**
+  If consumers diverge (e.g. one consumer feeds an extra op the others
+  skip), the merge will reject them.
+- **Static divisibility.** `par_factor` must divide the partitioned
+  axis's tile count exactly — the DSL doesn't currently emit padding for
+  parallel loads. Pick `par_factor` to be a clean factor of the outer
+  tile dim.
+- **HBM duplication.** A `par_factor=8` independent split of an op whose
+  broadcast operand is the dominant traffic source multiplies that
+  traffic by 8. Watch the timing report's HBM utilization, not just the
+  consumer-op end times.
+- **More examples to add here:** elementwise/reduction kernels, mixed
+  shared+independent layouts, parallelism over N or K axes instead of M.
+  (Skeleton — extend with these once more reference kernels are
+  validated end-to-end.)

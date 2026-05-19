@@ -84,6 +84,7 @@ from src.autotune2.contracts import (
     library_cell,
     vanilla_contract_for,
 )
+from src.autotune2.baseline_selection import select_baselines
 from src.autotune2.pareto import insert_pareto
 from src.autotune2.persistence import (
     SNAPSHOT_FILENAME,
@@ -724,6 +725,7 @@ def _seed_baseline(
         cycles=cycles,
         on_chip=on_chip,
         provenance="pass1_baseline",
+        breakdown=breakdown,
         children_picks=dict(children_picks),
     )
     cell = library_cell(lib, identity_in, identity_out)
@@ -972,7 +974,8 @@ async def _run_leaf_attempt(
     *,
     node: PlanNode,
     parent_contract: Contract | None,
-    pass1_dsl: str,
+    baseline_dsl: str,
+    baseline_index: int,
     attempt_index: int,
     budget: int | None,
     attempt_dir: Path,
@@ -991,6 +994,14 @@ async def _run_leaf_attempt(
     empty). The caller merges them into the shared per-node library via
     ``insert_pareto`` so the cross-attempt Pareto admission is
     consistent.
+
+    ``baseline_dsl`` is the DSL shown to the LLM as its starting design.
+    Single-pass autotune2 always passes the pass-1 baseline; multi-pass
+    branching may supply any prior library entry's DSL.
+    ``baseline_index`` identifies which branch this attempt belongs to —
+    0 is the always-seeded pass-1 baseline; 1+ are caller-supplied
+    branches. It is embedded in the admitted entries' ``provenance``
+    string so the originating branch is recoverable from the library.
 
     ``budget`` is in bytes; ``None`` disables both the prompt budget
     block and the over-budget reject path (effectively the same control
@@ -1013,7 +1024,7 @@ async def _run_leaf_attempt(
         node_name=node.name,
         function_signature=prompt_inputs.function_signature,
         pytorch_reference=prompt_inputs.pytorch_reference,
-        pass1_dsl=pass1_dsl,
+        baseline_dsl=baseline_dsl,
         dims_block=prompt_inputs.dims_block,
         tensors_block=prompt_inputs.tensors_block,
         accepted_summary=accepted_summary,
@@ -1156,7 +1167,11 @@ async def _run_leaf_attempt(
             output_contracts=verify.derived_output_contracts,
             cycles=cycles,
             on_chip=on_chip,
-            provenance=f"llm_attempt_{attempt_index}_b{blabel}_turn_{turn}",
+            provenance=(
+                f"llm_baseline_{baseline_index}_attempt_{attempt_index}"
+                f"_b{blabel}_turn_{turn}"
+            ),
+            breakdown=_maybe_breakdown(score_fn, composed),
         )
         admitted.append(entry)
         _write_turn_artifacts(
@@ -1186,19 +1201,27 @@ async def search_leaf(
     prompt_inputs: NodePromptInputs,
     config: SearchConfig = SearchConfig(),
     system_prompt: str = "",
+    initial_baselines: list[DesignEntry] | None = None,
 ) -> NodeLibrary:
     """Populate one leaf node's library.
 
-    Seeds with the pass-1 baseline (identity contracts), then fans out
-    one fresh-conversation attempt per entry in
-    ``config.attempt_budgets_bytes`` — all attempts run in parallel via
-    ``asyncio.gather``. Each attempt budget is rendered into its own
-    user prompt; variants whose scored ``on_chip`` exceeds the budget
-    are rejected with ``OVER_BUDGET`` turn feedback. ``budget == None``
-    skips both the prompt mention and the reject filter.
+    Seeds with the pass-1 baseline (identity contracts) — always
+    baseline index 0 — and then runs one fresh-conversation attempt per
+    ``(baseline, budget)`` pair via ``asyncio.gather``. The default
+    ``initial_baselines=None`` matches single-pass autotune2: a single
+    branch of attempts off the pass-1 baseline. Supplying additional
+    branches (e.g. tiling variants from a prior pass) spawns one
+    attempt-fanout per branch, each conversation seeded with the
+    branch's own DSL and breakdown. Branches are isolated — each
+    conversation only sees its own starting design.
+
+    Each attempt budget is rendered into its own user prompt; variants
+    whose scored ``on_chip`` exceeds the budget are rejected with
+    ``OVER_BUDGET`` turn feedback. ``budget == None`` skips both the
+    prompt mention and the reject filter.
 
     After all attempts complete, every admitted DesignEntry is merged
-    into the shared library via ``insert_pareto`` so the per-attempt
+    into the shared library via ``insert_pareto`` so the cross-branch
     Pareto admissions remain consistent across the fan-out.
 
     ``parent_contract`` is ``None`` only for the root-as-leaf case
@@ -1232,24 +1255,29 @@ async def search_leaf(
         )
     _write_pass1_baseline_score(ckpt_dir, baseline)
 
-    baseline_accepted: list[DesignEntry] = [baseline]
+    baselines: list[DesignEntry] = [baseline, *(initial_baselines or [])]
     attempt_coros = [
         _run_leaf_attempt(
             node=node,
             parent_contract=parent_contract,
-            pass1_dsl=pass1_dsl,
-            attempt_index=i,
+            baseline_dsl=b.dsl,
+            baseline_index=b_idx,
+            attempt_index=a_idx,
             budget=budget,
-            attempt_dir=ckpt_dir / f"attempt_{i}_b{_budget_label(budget)}",
+            attempt_dir=(
+                ckpt_dir
+                / f"baseline_{b_idx}_attempt_{a_idx}_b{_budget_label(budget)}"
+            ),
             score_fn=score_fn,
             agent=agent,
             verifier=verifier,
             prompt_inputs=prompt_inputs,
             config=config,
-            baseline_accepted=baseline_accepted,
-            baseline_breakdown=baseline_breakdown,
+            baseline_accepted=[b],
+            baseline_breakdown=b.breakdown,
         )
-        for i, budget in enumerate(config.attempt_budgets_bytes)
+        for b_idx, b in enumerate(baselines)
+        for a_idx, budget in enumerate(config.attempt_budgets_bytes)
     ]
     per_attempt = await asyncio.gather(*attempt_coros)
     for admitted in per_attempt:
@@ -1272,7 +1300,8 @@ async def _run_parent_attempt(
     *,
     node: PlanNode,
     parent_contract: Contract | None,
-    pass1_dsl: str,
+    baseline_dsl: str,
+    baseline_index: int,
     children_libraries: dict[str, NodeLibrary],
     child_blocks: dict[str, str],
     expected_child_names: tuple[str, ...],
@@ -1297,6 +1326,13 @@ async def _run_parent_attempt(
     per child (a single ``DesignEntry``), and the parent DSL is
     expected to add intermediate STeP ops if the picked children's
     contracts don't compose cleanly. No Cartesian sweep.
+
+    ``baseline_dsl`` is the parent DSL shown to the LLM as its starting
+    design. Single-pass autotune2 always passes the pass-1 baseline;
+    multi-pass branching may supply any prior library entry's DSL.
+    ``baseline_index`` identifies which branch this attempt belongs to —
+    0 is the pass-1 baseline; 1+ are caller-supplied branches. Embedded
+    in admitted entries' ``provenance`` for branch traceability.
     """
     is_root = parent_contract is None
     arg_vanilla_shapes = (
@@ -1315,7 +1351,7 @@ async def _run_parent_attempt(
         node_name=node.name,
         function_signature=prompt_inputs.function_signature,
         pytorch_reference=prompt_inputs.pytorch_reference,
-        pass1_dsl=pass1_dsl,
+        baseline_dsl=baseline_dsl,
         dims_block=prompt_inputs.dims_block,
         tensors_block=prompt_inputs.tensors_block,
         child_variant_blocks=child_blocks,
@@ -1490,7 +1526,11 @@ async def _run_parent_attempt(
             output_contracts=verify.derived_output_contracts,
             cycles=cycles,
             on_chip=on_chip,
-            provenance=f"llm_attempt_{attempt_index}_b{blabel}_turn_{turn}",
+            provenance=(
+                f"llm_baseline_{baseline_index}_attempt_{attempt_index}"
+                f"_b{blabel}_turn_{turn}"
+            ),
+            breakdown=_maybe_breakdown(score_fn, composed),
             children_picks=children_picks,
         )
         admitted.append(entry)
@@ -1523,6 +1563,7 @@ async def search_parent(
     prompt_inputs: NodePromptInputs,
     config: SearchConfig = SearchConfig(),
     system_prompt: str = "",
+    initial_baselines: list[DesignEntry] | None = None,
 ) -> NodeLibrary:
     """Populate one parent node's library.
 
@@ -1531,13 +1572,22 @@ async def search_parent(
     provides the pass-1-baseline pick per child (used to score the
     parent's pass-1 baseline against the children's pass-1 baselines).
 
-    Fans out one fresh-conversation attempt per entry in
-    ``config.attempt_budgets_bytes`` (all in parallel via
-    ``asyncio.gather``). Each attempt picks one specific child variant
-    per child and composes a single descendant chain — no Cartesian
-    sweep. Variants whose scored composition exceeds the attempt's
-    budget are rejected with ``OVER_BUDGET`` turn feedback; ``None``
-    skips both the prompt mention and the reject filter.
+    Fans out one fresh-conversation attempt per ``(baseline, budget)``
+    pair (all in parallel via ``asyncio.gather``). The default
+    ``initial_baselines=None`` matches single-pass autotune2: attempts
+    branch only off the pass-1 baseline. Supplying additional branches
+    (e.g. tiling variants from a prior pass) spawns one attempt-fanout
+    per branch; each branch's conversation only sees its own starting
+    design. The branch's existing ``children_picks`` are reused as the
+    composition for the prompt; ``children_picks_baseline`` is still
+    used for the pass-1 (index-0) seed and for the parent's vanilla-
+    shape variant tables, which are stable across branches.
+
+    Each attempt picks one specific child variant per child and composes
+    a single descendant chain — no Cartesian sweep. Variants whose
+    scored composition exceeds the attempt's budget are rejected with
+    ``OVER_BUDGET`` turn feedback; ``None`` skips both the prompt
+    mention and the reject filter.
     """
     assert config.attempt_budgets_bytes, (
         "search_parent: SearchConfig.attempt_budgets_bytes must contain at "
@@ -1598,28 +1648,33 @@ async def search_parent(
         )
 
     expected_child_names = tuple(c.name for c in node.children)
-    baseline_accepted: list[DesignEntry] = [baseline]
+    baselines: list[DesignEntry] = [baseline, *(initial_baselines or [])]
 
     attempt_coros = [
         _run_parent_attempt(
             node=node,
             parent_contract=parent_contract,
-            pass1_dsl=pass1_dsl,
+            baseline_dsl=b.dsl,
+            baseline_index=b_idx,
             children_libraries=children_libraries,
             child_blocks=child_blocks,
             expected_child_names=expected_child_names,
-            attempt_index=i,
+            attempt_index=a_idx,
             budget=budget,
-            attempt_dir=ckpt_dir / f"attempt_{i}_b{_budget_label(budget)}",
+            attempt_dir=(
+                ckpt_dir
+                / f"baseline_{b_idx}_attempt_{a_idx}_b{_budget_label(budget)}"
+            ),
             score_fn=score_fn,
             agent=agent,
             verifier=verifier,
             prompt_inputs=prompt_inputs,
             config=config,
-            baseline_accepted=baseline_accepted,
-            baseline_breakdown=baseline_breakdown,
+            baseline_accepted=[b],
+            baseline_breakdown=b.breakdown,
         )
-        for i, budget in enumerate(config.attempt_budgets_bytes)
+        for b_idx, b in enumerate(baselines)
+        for a_idx, budget in enumerate(config.attempt_budgets_bytes)
     ]
     per_attempt = await asyncio.gather(*attempt_coros)
     for admitted in per_attempt:
@@ -1665,6 +1720,7 @@ def _seed_root_baseline(
         cycles=cycles,
         on_chip=on_chip,
         provenance="pass1_baseline",
+        breakdown=breakdown,
         children_picks=dict(children_picks),
     )
     cell = library_cell(lib, {}, {})
@@ -1696,7 +1752,7 @@ _NODE_OWNED_FILES = frozenset({
     SNAPSHOT_FILENAME, "variants.py", "system_prompt.txt",
     "pass1_baseline_score.json",
 })
-_NODE_OWNED_DIR_PREFIXES = ("attempt_",)
+_NODE_OWNED_DIR_PREFIXES = ("baseline_",)
 
 
 def _wipe_node_run_artifacts(node_ckpt: Path) -> None:
@@ -1728,6 +1784,10 @@ async def autotune(
     system_prompts: dict[str, str],
     config: SearchConfig = SearchConfig(),
     node_stamps: dict[str, str] | None = None,
+    initial_libraries: dict[str, NodeLibrary] | None = None,
+    max_baselines_per_node: int = 4,
+    baseline_selection: str = "pareto_diverse",
+    pass_subdir: str | None = None,
 ) -> AutotuneResult:
     """Walk plan_tree bottom-up and search each node — in parallel where
     the tree shape allows.
@@ -1784,6 +1844,23 @@ async def autotune(
         disables persistence — no load, no save, no cleanup. Stamps must
         be transitive (a descendant DSL change must invalidate every
         ancestor's stamp); see ``persistence.compute_plan_stamps``.
+      - ``initial_libraries``: optional ``{node_path: NodeLibrary}`` from
+        a prior pass. When present, each node calls ``select_baselines``
+        to pick ``max_baselines_per_node`` extra branches from the prior
+        pass's library (excluding the prior library's own pass-1
+        baseline by identity, since this pass re-seeds its own pass-1
+        baseline at index 0). Branches are threaded into
+        ``search_leaf``/``search_parent`` as ``initial_baselines``. Pass-0
+        (single-pass mode) leaves this ``None``, preserving existing
+        semantics.
+      - ``max_baselines_per_node`` / ``baseline_selection``: knobs for
+        ``select_baselines``. Only consulted when ``initial_libraries``
+        is non-None.
+      - ``pass_subdir``: optional dir-name suffix appended to each
+        node's ckpt path so multi-pass artifacts land in
+        ``<ckpt>/autotune2/<node>/<pass_subdir>/`` (node-major layout).
+        ``None`` (default) keeps the single-pass layout
+        ``<ckpt>/autotune2/<node>/``.
 
     Returns the full ``{node_path: NodeLibrary}`` map plus the root path.
     """
@@ -1805,6 +1882,8 @@ async def autotune(
             child_libs = {}
 
         node_ckpt = ckpt_dir / "autotune2" / node.path
+        if pass_subdir is not None:
+            node_ckpt = node_ckpt / pass_subdir
 
         # Resume path: if a snapshot exists with a matching stamp, reuse
         # it and skip the search entirely. Mismatched / missing → wipe the
@@ -1840,6 +1919,23 @@ async def autotune(
         )
         node_score_fn = make_score_fn(node_tensors)
         node_verifier = make_verifier(node, parent_contract, node_tensors)
+
+        # Multi-pass branching: pull additional starting designs from the
+        # prior pass's library for this node. Exclude the prior library's
+        # own pass-1 baseline by object identity — this pass re-seeds its
+        # own pass-1 baseline at index 0 via ``_seed_baseline``, and
+        # double-seeding wastes one branch slot on a duplicate.
+        node_initial_baselines: list[DesignEntry] | None = None
+        if initial_libraries is not None and node.path in initial_libraries:
+            prior_lib = initial_libraries[node.path]
+            prior_pass1 = find_pass1_baseline_entry(prior_lib)
+            node_initial_baselines = select_baselines(
+                prior_lib,
+                k=max_baselines_per_node,
+                strategy=baseline_selection,
+                exclude=[prior_pass1],
+            )
+
         if node.is_leaf:
             lib = await search_leaf(
                 node=node,
@@ -1852,6 +1948,7 @@ async def autotune(
                 prompt_inputs=prompt_inputs[node.path],
                 config=config,
                 system_prompt=node_system_prompt,
+                initial_baselines=node_initial_baselines,
             )
         else:
             # Parent: gather each child's pass-1 baseline entry. We must use
@@ -1878,6 +1975,7 @@ async def autotune(
                 prompt_inputs=prompt_inputs[node.path],
                 config=config,
                 system_prompt=node_system_prompt,
+                initial_baselines=node_initial_baselines,
             )
 
         if node_stamp is not None:

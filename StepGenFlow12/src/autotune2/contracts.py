@@ -131,6 +131,14 @@ class DesignEntry:
     ``"pass1_baseline"``, ``"llm_call_3"``). Useful for debugging library
     growth; not consumed by any logic."""
 
+    breakdown: str = ""
+    """Per-node on-chip memory report from the analytical scorer for this
+    entry's composed source. Populated when the entry is created against a
+    scorer that exposes ``.breakdown`` (production); empty string when the
+    scorer is a test stub without it. Cached here so multi-pass branches
+    can render a starting-design memory breakdown into the LLM prompt
+    without re-running ``compose_source`` + ``score_fn.breakdown``."""
+
     children_picks: dict[str, "DesignEntry"] = field(default_factory=dict)
     """For parent entries: child_path -> the DesignEntry chosen from that
     child's library at the time this entry was scored. Used by the search
