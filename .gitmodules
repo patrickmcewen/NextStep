@@ -10,3 +10,6 @@
 [submodule "openevolve"]
 	path = openevolve
 	url = https://github.com/algorithmicsuperintelligence/openevolve.git
+[submodule "hwsim"]
+	path = hwsim
+	url = https://github.com/stanford-ppl/hwsim.git
