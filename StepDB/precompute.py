@@ -121,6 +121,7 @@ def _precompute_multi_load_compute(dims):
 # ---------------------------------------------------------------------------
 
 @register("gemm")
+@register("gemm_parallel")
 def _precompute_gemm(dims):
     torch.manual_seed(SEED)
     M, K, N = dims["M"], dims["K"], dims["N"]
