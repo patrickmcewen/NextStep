@@ -107,14 +107,16 @@ def build_graph(dims, tensors):
         m_tiles_per = m_tiles // par_factor
         for i in range(par_factor):
             # Consumer i starts at M-tile i and steps by par_factor along M.
-            # A[i*tile_m:] is a contiguous view (row-major slice from offset).
-            a_view = A[i * tile_m :].contiguous() if i > 0 else A
+            # `start_tile_idx=i*k_tiles` shifts the load's base address by i
+            # M-tile-rows into the original A — no Python-side slicing needed,
+            # all consumers share the same underlying tensor object.
             a_load_i = LinearOffChipLoad(
-                underlying=a_view,
+                underlying=A,
                 stride=(par_factor * k_tiles, 0, 1),
                 out_shape_tiled=(m_tiles_per, n_tiles, k_tiles),
                 tile_row=tile_m, tile_col=tile_k,
                 par_dispatch=par_dispatch,
+                start_tile_idx=i * k_tiles,
             )
             # Each consumer reads the full B independently.
             b_load_i = LinearOffChipLoad(
