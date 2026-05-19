@@ -208,9 +208,10 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
     )
 
 
-def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
+def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1, start_tile_idx=0):
     underlying = _assert_raw(underlying, "offchip_load_ref", "underlying")
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
+    assert start_tile_idx >= 0, f"offchip_load_ref: start_tile_idx must be >= 0, got {start_tile_idx}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
     _assert_tile_kind(sd_ref, "offchip_load_ref (ref)")
@@ -218,7 +219,7 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     # _assert_raw insists on the wrapper type even when invoked from inside
     # the DSL implementation. The wrap is a no-op semantically (same
     # underlying tensor) — it just satisfies the source-op type gate.
-    loaded = offchip_load(StepRawTensor(underlying), stride, out_shape_tiled, tile_row, tile_col, transposed).underlying_tensor
+    loaded = offchip_load(StepRawTensor(underlying), stride, out_shape_tiled, tile_row, tile_col, transposed, start_tile_idx=start_tile_idx).underlying_tensor
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
     ref_stream = list(ref.underlying_tensor.shape[:-2])

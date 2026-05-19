@@ -767,12 +767,14 @@ def _h_offchip_load_ref(state, target, call):
     tile_col   = _src(_arg(call, 5, "tile_col"))
     transposed = _arg(call, 6, "transposed")
     par_dispatch = _arg_or_default(call, 7, "par_dispatch", "1")
+    start_tile_idx = _arg_or_default(call, 8, "start_tile_idx", "0")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     return _block(
         f"{target} = LinearOffChipLoadRef(graph, ref={ref}, "
         f"underlying={underlying}, stride=tuple({stride}), "
         f"out_shape_tiled=tuple({out_shape}), "
-        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch={par_dispatch}{extra})\n"
+        f"tile_row={tile_row}, tile_col={tile_col}, par_dispatch={par_dispatch}, "
+        f"start_tile_idx={start_tile_idx}{extra})\n"
     )
 
 
