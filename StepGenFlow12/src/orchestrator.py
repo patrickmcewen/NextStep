@@ -2541,6 +2541,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
                 arg_names=child_sig.arg_names,
                 arg_specs=child_sig.arg_specs,
                 recorder=child_recorders[child_path],
+                max_tile=max_tile,
             )
 
         def _reset_recorders():

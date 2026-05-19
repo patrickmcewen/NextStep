@@ -68,6 +68,26 @@ alone.
 **``retile_streamify`` — unconstrained.** It can only shrink a tile dim, so
 the output stays within bounds whenever the input does.
 
+**Child stub calls — every ``out_shapes`` entry's tile must be within
+``({max_tile}, {max_tile})``:** when you invoke a child blackbox as
+``child(..., out_shapes=((..., S, T_R, T_C), ...))``, each declared
+``out_shape``'s last two dims (the child's tile dims) must satisfy
+``T_R <= {max_tile}`` and ``T_C <= {max_tile}``. The contract recorded at the
+call site asserts this in the same shot as the load/store/reshape ops above
+— picking an oversize tile for a child fails loud at the first stub call,
+not later when the child runs. The same bound applies to every on-chip
+tensor you hand a stub: its tile must be within the cap by the time it
+reaches the call site (your upstream DSL ops are what guarantee that).
+
+**Contract block (non-root nodes) already respects the cap.** Any
+``tiled shape declared by parent`` shown in the contract for an **on-chip**
+input has tile dims within ``({max_tile}, {max_tile})``; the parent's DSL
+already enforced it. **RAW** inputs in the contract are shown at *vanilla*
+shape and are not bounded — you load them with ``offchip_load`` and pick
+``tile_row, tile_col <= {max_tile}`` yourself. The ``Required output shapes``
+line is likewise bounded — the parent could not have requested a shape
+outside the cap.
+
 **Matmul at small tiles.** ``binary_matmul`` on small tiles gives a small
 output tile (output tile = ``(a_tile_r, b_tile_c)``); the cross-tile
 reduction over the K dimension must come from a stream dim reduced with

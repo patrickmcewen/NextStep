@@ -75,6 +75,21 @@ class Contract:
     # construction); the orchestrator stamps this after the parent's pass-1
     # code is verified, by static AST inspection of the call site.
     arg_is_raw: tuple[bool, ...] = ()
+    # Live ``--max-tile N`` bound, mirroring step_dsl_max_tile.MAX_TILE_ROW /
+    # MAX_TILE_COL at the moment the parent's pass-1 captured this contract.
+    # ``None`` = max-tile mode is off (stock step_dsl). When set, the last two
+    # dims of every tile-stream shape recorded here must satisfy
+    # ``<= max_tile``:
+    #   - ``out_shapes[i]``: always a tile-stream shape (Contract enforces
+    #     rank >= 3), so always checked.
+    #   - ``tiled_shapes[i]``: only checked for on-chip tensor args. Raw
+    #     forwards (``arg_is_raw[i] = True``) store the *vanilla* shape there
+    #     — the child's ``offchip_load`` is what later picks a tile within
+    #     bounds, so the parent's call-site shape legitimately exceeds the
+    #     cap. When ``arg_is_raw`` is un-stamped (``()``), the tiled_shapes
+    #     check is deferred — the orchestrator re-validates by re-running
+    #     ``__post_init__`` via ``dataclasses.replace(c, arg_is_raw=...)``.
+    max_tile: int | None = None
 
     def __post_init__(self):
         for i, shape in enumerate(self.out_shapes):
@@ -114,3 +129,35 @@ class Contract:
                 f"`()` (read arg_specs for shape info). Got "
                 f"vanilla={self.vanilla_shapes[i]!r}, "
                 f"tiled={self.tiled_shapes[i]!r}")
+        if self.max_tile is not None:
+            assert isinstance(self.max_tile, int) and self.max_tile >= 1, (
+                f"Contract.max_tile must be a positive int or None, got "
+                f"{self.max_tile!r}"
+            )
+            for i, shape in enumerate(self.out_shapes):
+                # out_shapes is asserted rank >= _MIN_STREAM_RANK (= 3) above,
+                # so shape[-2:] is always the tile (tile_row, tile_col).
+                assert shape[-2] <= self.max_tile and shape[-1] <= self.max_tile, (
+                    f"Contract.out_shapes[{i}]={shape}: tile dims "
+                    f"{shape[-2:]} exceed max_tile={self.max_tile}. Under "
+                    f"--max-tile mode the parent's stub call site must "
+                    f"request an output whose last two dims are within bounds."
+                )
+            # On-chip tiled_shapes entries — only checked when arg_is_raw is
+            # stamped (so we can tell apart on-chip tile streams from raw
+            # vanilla forwards). Un-stamped contracts skip this check; the
+            # orchestrator re-runs __post_init__ after stamping rawness.
+            for i, raw in enumerate(self.arg_is_raw):
+                if raw:
+                    continue
+                shape = self.tiled_shapes[i]
+                if shape == () or len(shape) < 2:
+                    continue
+                assert shape[-2] <= self.max_tile and shape[-1] <= self.max_tile, (
+                    f"Contract.tiled_shapes[{i}]={shape} (on-chip arg "
+                    f"{self.arg_names[i]!r}): tile dims {shape[-2:]} exceed "
+                    f"max_tile={self.max_tile}. Under --max-tile mode every "
+                    f"on-chip value handed to a stub must have its last two "
+                    f"dims within bounds; the parent's DSL ops should have "
+                    f"produced a tile-stream that respects the cap."
+                )

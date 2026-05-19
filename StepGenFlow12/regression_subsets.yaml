@@ -41,3 +41,10 @@ moe_routed_mlp:
 toughies:
   basic_prefill_attention: small
   prefill_transformer_simple: small
+
+end_to_end_subparts:
+  gqa_decode_e2e: mixtral_b32_ctx512
+  qkv_gen: mixtral_b64
+  kv_cache_tile_append: mixtral_b64
+  #moe_routed: large_d1k
+

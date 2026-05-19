@@ -117,10 +117,13 @@ def _clone_value(value, spec: ArgSpec):
 def make_stub(*, ref_module: nn.Module,
               arg_names: tuple[str, ...],
               arg_specs: tuple[ArgSpec, ...],
-              recorder: ContractRecorder):
+              recorder: ContractRecorder,
+              max_tile: int | None = None):
     assert len(arg_names) == len(arg_specs), (
         f"arg_names ({len(arg_names)}) and arg_specs "
         f"({len(arg_specs)}) length mismatch")
+    assert max_tile is None or (isinstance(max_tile, int) and max_tile >= 1), (
+        f"make_stub max_tile must be a positive int or None, got {max_tile!r}")
 
     def stub(*tiled_args, out_shapes):
         assert len(tiled_args) == len(arg_names), (
@@ -171,6 +174,7 @@ def make_stub(*, ref_module: nn.Module,
                 tiled_outputs=tuple(r.detach().clone() for r in results),
                 out_is_tuple=isinstance(raw, tuple),
                 arg_specs=arg_specs,
+                max_tile=max_tile,
             )
 
         # Wrap each output as a StepTensor so the parent's DSL ops can

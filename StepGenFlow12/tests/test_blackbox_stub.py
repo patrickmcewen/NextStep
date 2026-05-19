@@ -301,3 +301,37 @@ def test_stub_rejects_wrong_length_list():
     except AssertionError:
         raised = True
     assert raised
+
+
+def test_make_stub_propagates_max_tile_to_contract():
+    """The contract recorded by the stub carries the ``max_tile`` bound from
+    ``make_stub``, and oversize out_shapes are rejected at record time."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+        max_tile=4,
+    )
+    a = torch.randn(2, 2, 4, 2)   # tile (4, 2) — within max_tile=4
+    b = torch.randn(2, 2, 4, 2)
+    stub(a, b, out_shapes=((2, 2, 4, 2),))
+    assert rec.contract is not None
+    assert rec.contract.max_tile == 4
+    # Re-running stub with an oversize out_shape requested would fail at
+    # Contract construction; bypass the recorder-first-call cache by using
+    # a fresh recorder.
+    rec2 = ContractRecorder()
+    stub2 = make_stub(
+        ref_module=_Add(), arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec2, max_tile=2,
+    )
+    raised = False
+    try:
+        stub2(a, b, out_shapes=((2, 2, 4, 2),))   # tile (4, 2) > max_tile=2
+    except AssertionError as e:
+        raised = True
+        assert "max_tile=2" in str(e), str(e)
+    assert raised
