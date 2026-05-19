@@ -141,9 +141,10 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
     )
 
 
-def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
+def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1, start_tile_idx=0):
     underlying = _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
+    assert start_tile_idx >= 0, f"offchip_load: start_tile_idx must be >= 0, got {start_tile_idx}"
     assert tile_row <= MAX_TILE_ROW and tile_col <= MAX_TILE_COL, (
         f"offchip_load: max-tile mode requires tile_row <= {MAX_TILE_ROW} and "
         f"tile_col <= {MAX_TILE_COL}, got tile_row={tile_row}, tile_col={tile_col}. "
@@ -195,10 +196,13 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
     # Flatten batch + grid into single tile index
     flat = tiled.reshape(-1, tile_row, tile_col)
 
-    # Compute linear tile index for every position in out_shape_tiled
+    # Compute linear tile index for every position in out_shape_tiled.
+    # start_tile_idx shifts the base by a constant — mirrors the Rust sim's
+    # base_addr_byte (= start_tile_idx * tile_row * tile_col * n_byte) so
+    # the DSL and timing-sim views of which tiles get read stay in lockstep.
     ranges = [torch.arange(s) for s in out_shape_tiled]
     grids = torch.meshgrid(*ranges, indexing="ij")
-    linear_idx = sum(g.long() * int(s) for g, s in zip(grids, stride))
+    linear_idx = sum(g.long() * int(s) for g, s in zip(grids, stride)) + int(start_tile_idx)
 
     result = flat[linear_idx.long()]  # (*out_shape_tiled, tile_row, tile_col)
     if transposed:
