@@ -33,6 +33,7 @@ from src.autotune2.search import (
     VerifyResult,
     autotune,
 )
+from src.autotune2.sim_manager import AnalyticalOnly
 from src.contract import Contract
 from src.node_signature import TensorArg
 from src.planner import PlanNode, Tree
@@ -109,7 +110,7 @@ def _baseline_invariant_inputs(node, tree):
         pass1_dsls=pass1_dsls,
         pass1_contracts={},  # root-as-leaf has no parent_contract
         root_tensors={},
-        make_score_fn=lambda _tensors: lambda _src: (10, 20),
+        make_sim_manager=lambda _tensors: AnalyticalOnly(lambda _src: (10, 20)),
         agent_factory=lambda _sys: _async_agent_returning("garbage"),
         make_verifier=lambda _node, _pc, _t: _async_pass_verifier(),
         prompt_inputs={node.path: _stub_prompt_inputs("solo")},
@@ -204,6 +205,73 @@ def test_autotune_threads_initial_baselines_into_search_leaf(tmp_path, monkeypat
     # Prior pass-1 must NOT be in the threaded list — that would double-seed.
     for b in initial_baselines:
         assert b.provenance != "pass1_baseline"
+
+
+def test_autotune_accumulates_prior_pass_library_into_snapshot(tmp_path):
+    """The autotune2 library is meant to grow monotonically across passes:
+    each pass's snapshot for a node carries forward every variant ever
+    admitted, with the prior pass's pass-1 baseline excluded (the current
+    pass re-seeds its own) and byte-identical DSL deduped.
+
+    Here we drive autotune with a synthetic prior library holding one
+    pass-1 entry and two LLM variants, run a single pass whose agent
+    returns garbage (no new admissions), and verify the returned library
+    contains the two prior LLM variants — i.e. the merge brought them
+    forward even though this pass admitted nothing new.
+    """
+    tree, node = _single_leaf_tree()
+
+    pass1_entry = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n# prior_pass1\n",
+        input_contracts={}, output_contracts={},
+        cycles=100, on_chip=100, provenance="pass1_baseline",
+    )
+    llm_a = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n# A\n",
+        input_contracts={}, output_contracts={},
+        cycles=80, on_chip=120, provenance="llm_baseline_0_attempt_0_binf_turn_0",
+    )
+    llm_b = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n# B\n",
+        input_contracts={}, output_contracts={},
+        cycles=120, on_chip=60, provenance="llm_baseline_0_attempt_0_binf_turn_1",
+    )
+    prior_lib: NodeLibrary = {}
+    cell = library_cell(prior_lib, {}, {})
+    cell.extend([pass1_entry, llm_a, llm_b])
+
+    kwargs = _baseline_invariant_inputs(node, tree)
+    result = asyncio.run(autotune(
+        ckpt_dir=tmp_path / "tune",
+        initial_libraries={node.path: prior_lib},
+        max_baselines_per_node=2,
+        baseline_selection="pareto_diverse",
+        pass_subdir="pass_1_test",
+        **kwargs,
+    ))
+
+    merged = result.libraries[node.path]
+    all_provenances = {
+        e.provenance
+        for by_out in merged.values()
+        for cell in by_out.values() for e in cell
+    }
+    # Current pass re-seeds its own pass-1 baseline.
+    assert "pass1_baseline" in all_provenances
+    # Prior LLM variants are brought forward by the merge.
+    assert llm_a.provenance in all_provenances
+    assert llm_b.provenance in all_provenances
+    # And only one pass-1 baseline survives the merge (the current pass's).
+    pass1_entries = [
+        e
+        for by_out in merged.values()
+        for cell in by_out.values() for e in cell
+        if e.provenance == "pass1_baseline"
+    ]
+    assert len(pass1_entries) == 1, (
+        f"expected exactly one pass1_baseline post-merge, got "
+        f"{len(pass1_entries)}: {pass1_entries!r}"
+    )
 
 
 def test_autotune_no_initial_libraries_threads_none(tmp_path, monkeypatch):

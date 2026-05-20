@@ -41,6 +41,7 @@ from src.autotune2.search import (
     search_parent,
     write_library_snapshot,
 )
+from src.autotune2.sim_manager import AnalyticalOnly
 
 
 def _stub_prompt_inputs(node_name: str = "node") -> NodePromptInputs:
@@ -485,6 +486,31 @@ def test_render_summaries_one_row_per_entry():
     assert (summaries[2].cycles, summaries[2].on_chip) == (120, 150)
 
 
+def test_render_summaries_filters_dominated_entries():
+    """The library accumulates every admitted variant (admit_to_cell
+    doesn't evict), but the parent LLM should only see Pareto-non-
+    dominated entries. Indices are preserved from the full iteration
+    so they still round-trip through library_to_variant_registry /
+    entry_for_variant."""
+    lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell = library_cell(lib, {"x": c_id}, {"out_0": c_id})
+    cell.append(DesignEntry(dsl="# pareto_best\n", cycles=80, on_chip=200))
+    cell.append(DesignEntry(dsl="# dominated\n", cycles=120, on_chip=300))
+    cell.append(DesignEntry(dsl="# other_pareto\n", cycles=200, on_chip=100))
+
+    summaries = render_library_as_variant_summaries(lib)
+    # Only the two non-dominated entries surface to the parent agent.
+    rendered = [(s.variant_index, s.cycles, s.on_chip) for s in summaries]
+    assert (0, 80, 200) in rendered
+    assert (2, 200, 100) in rendered
+    assert all(s.cycles != 120 for s in summaries)
+    # Indices still round-trip into the full library (dominated entry at
+    # idx 1 remains addressable for variant binding).
+    assert entry_for_variant(lib, 1).dsl == "# dominated\n"
+    assert len(library_to_variant_registry(lib)) == 3
+
+
 # --- build_variant_callables -------------------------------------------------
 
 
@@ -567,7 +593,7 @@ def test_search_leaf_seeds_baseline_and_admits_llm_proposals(tmp_path):
         parent_contract=contract,
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=score,
+        sim_manager=AnalyticalOnly(score),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -608,7 +634,7 @@ def test_search_leaf_writes_pass1_baseline_and_per_turn_score_artifacts(tmp_path
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=score,
+        sim_manager=AnalyticalOnly(score),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -661,7 +687,7 @@ def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=lambda _src: (50, 100),
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -719,7 +745,7 @@ def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=lambda _src: (50, 100),
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -763,7 +789,7 @@ def test_search_leaf_default_initial_baselines_matches_current_behavior(tmp_path
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=lambda _src: (10, 20),
+        sim_manager=AnalyticalOnly(lambda _src: (10, 20)),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -815,7 +841,7 @@ def test_search_leaf_extra_baselines_spawn_additional_attempts(tmp_path):
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl=pass1_dsl,
         ckpt_dir=tmp_path / "leaf",
-        score_fn=lambda _src: (10, 20),
+        sim_manager=AnalyticalOnly(lambda _src: (10, 20)),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -856,7 +882,7 @@ def test_search_leaf_per_branch_attempt_dir_naming(tmp_path):
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=lambda _src: (10, 20),
+        sim_manager=AnalyticalOnly(lambda _src: (10, 20)),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -883,7 +909,7 @@ def test_search_leaf_skips_failed_verification(tmp_path):
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=lambda _src: (1, 1),
+        sim_manager=AnalyticalOnly(lambda _src: (1, 1)),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -936,7 +962,7 @@ def test_search_leaf_score_fn_raise_becomes_user_feedback(tmp_path):
         parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
         pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
         ckpt_dir=tmp_path / "leaf",
-        score_fn=score,
+        sim_manager=AnalyticalOnly(score),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
@@ -1015,7 +1041,7 @@ def test_search_parent_picks_one_child_entry_and_admits(tmp_path):
         children_libraries={child_node.path: child_lib},
         children_picks_baseline={child_node.path: cell0[0]},
         ckpt_dir=tmp_path / "parent",
-        score_fn=score,
+        sim_manager=AnalyticalOnly(score),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_parent"),
@@ -1067,7 +1093,7 @@ def test_search_parent_admits_only_baseline_when_llm_verify_fails(tmp_path):
         children_libraries={child_node.path: child_lib},
         children_picks_baseline={child_node.path: cell0[0]},
         ckpt_dir=tmp_path / "parent",
-        score_fn=score,
+        sim_manager=AnalyticalOnly(score),
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_parent"),
@@ -1132,7 +1158,7 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
         pass1_dsls=pass1_dsls,
         pass1_contracts=contracts,
         ckpt_dir=tmp_path / "tune",
-        make_score_fn=lambda _tensors: lambda _src: (10, 10),
+        make_sim_manager=lambda _tensors: AnalyticalOnly(lambda _src: (10, 10)),
         root_tensors={},
         agent_factory=agent_factory,
         make_verifier=lambda _node, _pc, _t: verifier,
@@ -1235,7 +1261,7 @@ def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
         pass1_dsls=pass1_dsls,
         pass1_contracts=contracts,
         ckpt_dir=tmp_path / "tune",
-        make_score_fn=lambda _tensors: lambda _src: (10, 10),
+        make_sim_manager=lambda _tensors: AnalyticalOnly(lambda _src: (10, 10)),
         root_tensors={},
         agent_factory=agent_factory,
         make_verifier=lambda _node, _pc, _t: verifier,
@@ -1295,7 +1321,7 @@ def test_autotune_root_as_leaf_single_node_tree(tmp_path):
         pass1_dsls=pass1_dsls,
         pass1_contracts=contracts,
         ckpt_dir=tmp_path / "tune",
-        make_score_fn=lambda _tensors: lambda _src: (10, 10),
+        make_sim_manager=lambda _tensors: AnalyticalOnly(lambda _src: (10, 10)),
         root_tensors={},
         agent_factory=agent_factory,
         make_verifier=lambda _node, _pc, _t: verifier,

@@ -25,6 +25,7 @@ from src.autotune2.persistence import (
     serialize_library,
     try_load_library_snapshot,
 )
+from src.autotune2.sim_manager import AnalyticalOnly
 from src.contract import Contract
 from src.node_signature import TensorArg
 from src.planner import PlanNode, Tree
@@ -415,7 +416,7 @@ def test_autotune_skips_already_completed_nodes_on_resume(tmp_path: Path):
             pass1_dsls=pass1_dsls,
             pass1_contracts=contracts,
             ckpt_dir=tmp_path / "tune",
-            make_score_fn=lambda _tensors: lambda _src: (10, 10),
+            make_sim_manager=lambda _tensors: AnalyticalOnly(lambda _src: (10, 10)),
             root_tensors={},
             agent_factory=lambda _sp: agent,
             make_verifier=lambda _node, _pc, _t: verifier,
@@ -498,7 +499,7 @@ def test_autotune_reruns_node_when_stamp_changes(tmp_path: Path):
         return asyncio.run(autotune(
             plan_tree=tree, pass1_dsls=pass1, pass1_contracts=contracts,
             ckpt_dir=tmp_path / "tune",
-            make_score_fn=lambda _t: lambda _s: (10, 10),
+            make_sim_manager=lambda _t: AnalyticalOnly(lambda _s: (10, 10)),
             root_tensors={}, agent_factory=lambda _sp: agent,
             make_verifier=make_verifier,
             prompt_inputs=prompts, system_prompts=sys_prompts,

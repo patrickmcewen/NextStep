@@ -125,6 +125,7 @@ def _entry_to_json(
         "output_contracts": _contracts_dict_to_json(entry.output_contracts),
         "cycles": entry.cycles,
         "on_chip": entry.on_chip,
+        "cycle_source": entry.cycle_source,
         "provenance": entry.provenance,
         "children_picks": child_picks_json,
     }
@@ -153,6 +154,7 @@ def _entry_from_json(
         output_contracts=_contracts_dict_from_json(data["output_contracts"]),
         cycles=data["cycles"],
         on_chip=data["on_chip"],
+        cycle_source=data.get("cycle_source", "analytical"),
         provenance=data["provenance"],
         children_picks=children_picks,
     )

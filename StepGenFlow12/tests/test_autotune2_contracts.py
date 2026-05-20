@@ -14,10 +14,12 @@ from src.autotune2.contracts import (
 )
 from src.autotune2.pareto import (
     PROTECTED_PROVENANCES,
+    admit_to_cell,
     cull_top_T,
     dominates,
     dsl_dedup_hash,
     insert_pareto,
+    pareto_front_of,
 )
 
 
@@ -242,3 +244,65 @@ def test_dsl_dedup_hash_distinguishes_content():
     a = "tile_row=16"
     b = "tile_row=32"
     assert dsl_dedup_hash(a) != dsl_dedup_hash(b)
+
+
+# --- admit_to_cell (no-eviction accumulator) ----------------------------------
+
+
+def test_admit_to_cell_appends_all_including_dominated():
+    """``admit_to_cell`` accumulates every variant the search admits — no
+    Pareto eviction. A dominated entry must still land in the cell so the
+    library snapshot keeps it."""
+    cell = []
+    assert admit_to_cell(cell, _e(100, 100, dsl="a"))
+    # Strictly worse on both axes — would be rejected by insert_pareto but
+    # admit_to_cell keeps it.
+    assert admit_to_cell(cell, _e(200, 200, dsl="b"))
+    # Strictly better — would evict the worse two under insert_pareto; here
+    # all three stay.
+    assert admit_to_cell(cell, _e(50, 50, dsl="c"))
+    assert len(cell) == 3
+
+
+def test_admit_to_cell_skips_byte_identical_dsl():
+    """Byte-equivalent DSL resubmissions are pure noise from a confused
+    LLM — they get dropped to keep the accumulator from blowing up over
+    many turns."""
+    cell = []
+    assert admit_to_cell(cell, _e(100, 100, dsl="def f():\n  return 1\n"))
+    # Same logical DSL, different whitespace — same hash.
+    assert not admit_to_cell(
+        cell, _e(200, 999, dsl="def f():\n\treturn 1"),
+    )
+    assert len(cell) == 1
+
+
+def test_admit_to_cell_rejects_protected_provenance():
+    """Pass-1 baselines must be seeded via raw ``cell.append``; routing
+    them through admit_to_cell would silently break the "exactly one
+    pass-1 baseline" invariant."""
+    cell = []
+    with pytest.raises(AssertionError, match="protected provenance"):
+        admit_to_cell(cell, _e(50, 50, provenance="pass1_baseline"))
+
+
+# --- pareto_front_of (consumer-side filter) -----------------------------------
+
+
+def test_pareto_front_of_drops_dominated():
+    a = _e(100, 100)
+    b = _e(150, 150)  # dominated by a
+    c = _e(200, 50)
+    front = pareto_front_of([a, b, c])
+    assert a in front and c in front
+    assert b not in front
+
+
+def test_pareto_front_of_keeps_equal_score_duplicates():
+    """Two entries with identical (cycles, on_chip) don't strictly
+    dominate each other — both stay so callers can distinguish them by
+    identity (e.g. for variant-index resolution)."""
+    a = _e(100, 100, dsl="v1")
+    b = _e(100, 100, dsl="v2")
+    front = pareto_front_of([a, b])
+    assert len(front) == 2

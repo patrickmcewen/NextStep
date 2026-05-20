@@ -7,7 +7,7 @@
         "hbm_startup": 0
     },
     "max_on_chip_memory": 16777216,
-    "attempt_budgets": [null, 1.0, 0.5, 0.1],
+    "attempt_budgets": [1.0, 0.5, 0.25, 0.1],
     "max_baselines_per_node": 4,
     "baseline_selection": "pareto_diverse",
     "passes": [

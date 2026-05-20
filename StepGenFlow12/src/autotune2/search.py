@@ -72,7 +72,6 @@ from typing import Awaitable, Callable, Iterable
 import torch
 
 from src.autotune2.compose import (
-    ScoreFn,
     compose_source,
 )
 from src.autotune2.contracts import (
@@ -85,7 +84,7 @@ from src.autotune2.contracts import (
     vanilla_contract_for,
 )
 from src.autotune2.baseline_selection import select_baselines
-from src.autotune2.pareto import insert_pareto
+from src.autotune2.pareto import admit_to_cell, pareto_front_of
 from src.autotune2.persistence import (
     SNAPSHOT_FILENAME,
     save_library_snapshot,
@@ -97,6 +96,11 @@ from src.autotune2.prompts import (
     parse_autotune2_response,
     render_accepted_summary,
     render_variant_block,
+)
+from src.autotune2.sim_manager import (
+    SimContext,
+    SimulationManager,
+    SimulationResult,
 )
 from src.autotune2.stubs import (
     emit_variants_module,
@@ -624,10 +628,21 @@ def entry_for_variant(lib: NodeLibrary, variant_index: int) -> DesignEntry:
 def render_library_as_variant_summaries(
     lib: NodeLibrary,
 ) -> list[VariantSummary]:
-    """Build the summary list shown to the LLM. One ``VariantSummary``
-    per DesignEntry — every Pareto-front entry appears as its own row so
-    the parent agent can pick a specific child implementation rather
-    than a boundary-contract cell.
+    """Build the summary list shown to the parent LLM.
+
+    Only Pareto-non-dominated entries are surfaced — the autotune2
+    library now accumulates every variant the search admits
+    (``admit_to_cell`` no longer evicts), so a child's library can
+    contain dominated entries that would only distract the parent
+    agent. Pareto filtering happens here at the prompt boundary; the
+    underlying library still holds the full accumulator.
+
+    Indices are assigned over the full library iteration order so they
+    round-trip through ``library_to_variant_registry`` and
+    ``entry_for_variant`` (both of which iterate every entry, including
+    dominated ones). The LLM only ever sees the Pareto subset's
+    indices, but if it ever picked a "hidden" index the resolver would
+    still find the right entry.
     """
     summaries: list[VariantSummary] = []
     idx = 0
@@ -639,14 +654,16 @@ def render_library_as_variant_summaries(
                 f"({sorted(in_key)!r}, {sorted(out_key)!r}); library "
                 "must not contain empty cells"
             )
+            front_ids = {id(e) for e in pareto_front_of(list(cell))}
             for entry in cell:
-                summaries.append(VariantSummary(
-                    variant_index=idx,
-                    input_contracts=in_contracts,
-                    output_contracts=dict(out_key),
-                    cycles=entry.cycles,
-                    on_chip=entry.on_chip,
-                ))
+                if id(entry) in front_ids:
+                    summaries.append(VariantSummary(
+                        variant_index=idx,
+                        input_contracts=in_contracts,
+                        output_contracts=dict(out_key),
+                        cycles=entry.cycles,
+                        on_chip=entry.on_chip,
+                    ))
                 idx += 1
     return summaries
 
@@ -685,13 +702,14 @@ def find_pass1_baseline_entry(lib: NodeLibrary) -> DesignEntry:
 # ---------------------------------------------------------------------------
 
 
-def _seed_baseline(
+async def _seed_baseline(
     *,
     lib: NodeLibrary,
+    node_path: str,
     node_name: str,
     parent_contract: Contract,
     pass1_dsl: str,
-    score_fn: ScoreFn,
+    sim_manager: SimulationManager,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
 ) -> tuple[DesignEntry, str]:
@@ -703,10 +721,10 @@ def _seed_baseline(
     that picks identity contracts on its on-chip inputs.
 
     Returns ``(entry, baseline_breakdown)``; the breakdown is the
-    per-node on-chip memory report from the analytical scorer (or the
-    empty string when ``score_fn`` is a test stub without
-    ``.breakdown``). Callers thread the breakdown into the budgeted
-    user prompt via ``_budget_block``.
+    per-node on-chip memory report sourced from
+    ``SimulationResult.breakdown`` (empty when the manager wraps a test
+    stub without ``.breakdown``). Callers thread the breakdown into the
+    budgeted user prompt via ``_budget_block``.
     """
     identity_in = _identity_input_contracts(parent_contract)
     output_names = tuple(f"out_{i}" for i in range(len(parent_contract.out_shapes)))
@@ -723,21 +741,30 @@ def _seed_baseline(
         parent_dsl=wrapper + "\n" + pass1_dsl,
         descendant_dsls_postorder=descendant_dsls,
     )
-    cycles, on_chip = score_fn(composed)
-    breakdown = _maybe_breakdown(score_fn, composed)
+    ctx = SimContext(
+        node_path=node_path, variant_kind="baseline", is_root=False,
+    )
+    result = await sim_manager.score(ctx, composed)
+    assert result.error_feedback is None, (
+        f"_seed_baseline: simulation manager returned error_feedback "
+        f"for the pass-1 baseline at node {node_path!r}. Baseline "
+        f"scoring must succeed — the baseline is the rollback anchor for "
+        f"this node. Feedback was:\n{result.error_feedback}"
+    )
     entry = DesignEntry(
         dsl=pass1_dsl,
         input_contracts=identity_in,
         output_contracts=identity_out,
-        cycles=cycles,
-        on_chip=on_chip,
+        cycles=result.cycles,
+        on_chip=result.on_chip,
+        cycle_source=result.cycle_source,
         provenance="pass1_baseline",
-        breakdown=breakdown,
+        breakdown=result.breakdown,
         children_picks=dict(children_picks),
     )
     cell = library_cell(lib, identity_in, identity_out)
     cell.append(entry)
-    return entry, breakdown
+    return entry, result.breakdown
 
 
 def _on_chip_vanilla_shapes(parent_contract: Contract) -> dict[str, tuple[int, ...]]:
@@ -777,7 +804,7 @@ def _admission_continuation_feedback(
     The conversation stays open after each admission so the model can
     build on what it just produced and iterate toward lower cycles
     without burning a fresh attempt. Successive admissions all land in
-    the same per-node library via ``insert_pareto``.
+    the same per-node library via ``admit_to_cell``.
     """
     msg = (
         f"Variant ACCEPTED at cycles={entry.cycles}, on_chip={entry.on_chip} "
@@ -802,52 +829,6 @@ def _admission_continuation_feedback(
             f"```\n{entry.breakdown}\n```"
         )
     return msg
-
-
-def _safe_score(
-    score_fn: ScoreFn, composed: str,
-) -> tuple[int | None, int | None, str | None]:
-    """Run ``score_fn(composed)`` and convert any exception to LLM feedback.
-
-    The analytical scorer goes ``translate → _exec_build_graph →
-    analyze_timing``; ``analyze_timing`` in turn invokes the timing
-    model's functional executor (``execute_values``), which can raise
-    on shape regimes the executor doesn't handle uniformly. The
-    non-root verifier's DSL-exec + graph-build smoke tests catch most
-    of these upstream (DSL eager-exec catches torch-level shape
-    mismatches that match the timing model's executor; graph-build
-    catches STeP frontend assertions). This helper is the last-resort
-    net for anything that still slips through — timing-model internals
-    or executor paths the DSL surface doesn't reach — so the search
-    loop converts them into LLM next-turn feedback instead of crashing
-    the autotune2 run.
-
-    Returns ``(cycles, on_chip, None)`` on success or ``(None, None,
-    feedback_str)`` on failure — call site picks one tuple shape and
-    branches.
-    """
-    import traceback as _tb
-    try:
-        cycles, on_chip = score_fn(composed)
-        return cycles, on_chip, None
-    except Exception:
-        err = _tb.format_exc()
-        feedback = (
-            "## Analytical scorer failed on this variant\n\n"
-            "The DSL translated and the STeP graph built, but the timing "
-            "model's analyzer raised while propagating concrete values "
-            "through the graph. This is usually a shape regime the "
-            "functional executor can't handle uniformly (e.g. an op like "
-            "`flat_reassemble` / `flat_partition` whose per-token or "
-            "per-expert buckets must be equal-sized for the executor's "
-            "internal stack-and-reshape path). Error follows:\n\n"
-            "```\n" + err + "```\n\n"
-            "Consider an alternative implementation that avoids the "
-            "failing op pattern, or adjust your contracts so the "
-            "downstream stream shapes are uniform across the dynamic "
-            "axes the failing op spans."
-        )
-        return None, None, feedback
 
 
 def _write_pass1_baseline_score(ckpt_dir: Path, baseline: DesignEntry) -> None:
@@ -973,19 +954,6 @@ def _budget_block(budget: int | None, baseline_breakdown: str = "") -> str:
     return block
 
 
-def _maybe_breakdown(score_fn: ScoreFn, composed: str) -> str:
-    """Per-node memory report for ``composed`` if ``score_fn`` provides one.
-
-    ``make_analytical_scorer`` attaches ``score.breakdown``; test stubs
-    (``lambda _src: (10, 10)``) don't. Callers that want the report
-    funnel through here and degrade gracefully on stubs.
-    """
-    breakdown_fn = getattr(score_fn, "breakdown", None)
-    if breakdown_fn is None:
-        return ""
-    return breakdown_fn(composed)
-
-
 def _compliance_preflight_feedback(dsl: str, *, is_root: bool) -> str | None:
     """Run pass-1's refactor_final regex compliance over ``dsl``; return
     LLM-actionable feedback when violations are found, ``None`` otherwise.
@@ -1022,7 +990,7 @@ async def _run_leaf_attempt(
     attempt_index: int,
     budget: int | None,
     attempt_dir: Path,
-    score_fn: ScoreFn,
+    sim_manager: SimulationManager,
     agent: AgentFn,
     verifier: VerifierFn,
     prompt_inputs: NodePromptInputs,
@@ -1035,8 +1003,7 @@ async def _run_leaf_attempt(
 
     Returns the list of DesignEntries admitted on this attempt (may be
     empty). The caller merges them into the shared per-node library via
-    ``insert_pareto`` so the cross-attempt Pareto admission is
-    consistent.
+    ``admit_to_cell`` (no Pareto eviction — every variant accumulates).
 
     ``baseline_dsl`` is the DSL shown to the LLM as its starting design.
     Single-pass autotune2 always passes the pass-1 baseline; multi-pass
@@ -1165,8 +1132,12 @@ async def _run_leaf_attempt(
             ))
             continue
 
-        cycles, on_chip, score_err = _safe_score(score_fn, composed)
-        if score_err is not None:
+        sim_ctx = SimContext(
+            node_path=node.path, variant_kind="variant", is_root=is_root,
+            attempt_index=attempt_index, turn_index=turn,
+        )
+        result = await sim_manager.score(sim_ctx, composed)
+        if result.error_feedback is not None:
             _write_turn_artifacts(
                 turn_dir,
                 user_prompt=turn_user_prompt,
@@ -1174,33 +1145,35 @@ async def _run_leaf_attempt(
                 status="SCORE_FAIL",
                 extracted_code=parsed.dsl,
                 composed_source=composed,
-                verify_result=VerifyResult(passed=False, feedback=score_err),
+                verify_result=VerifyResult(
+                    passed=False, feedback=result.error_feedback,
+                ),
             )
-            _append_turn_feedback(conversation, score_err)
+            _append_turn_feedback(conversation, result.error_feedback)
             continue
 
-        if budget is not None and on_chip > budget:
+        if budget is not None and result.on_chip > budget:
             _write_turn_artifacts(
                 turn_dir,
                 user_prompt=turn_user_prompt,
                 agent_response=agent_response,
-                status=f"OVER_BUDGET (on_chip={on_chip} > {budget})",
+                status=f"OVER_BUDGET (on_chip={result.on_chip} > {budget})",
                 extracted_code=parsed.dsl,
                 composed_source=composed,
                 verify_result=verify,
             )
-            over_budget_breakdown = _maybe_breakdown(score_fn, composed)
             feedback = (
-                f"Your variant verified and scored at on_chip={on_chip} "
-                f"bytes, which exceeds this attempt's on-chip budget of "
-                f"{budget} bytes. Emit a corrected DSL implementation "
-                "that reduces on-chip memory below the budget."
+                f"Your variant verified and scored at on_chip="
+                f"{result.on_chip} bytes, which exceeds this attempt's "
+                f"on-chip budget of {budget} bytes. Emit a corrected DSL "
+                "implementation that reduces on-chip memory below the "
+                "budget."
             )
-            if over_budget_breakdown:
+            if result.breakdown:
                 feedback += (
                     "\n\nPer-node on-chip memory of the rejected variant "
                     "(largest contributors first):\n\n"
-                    f"```\n{over_budget_breakdown}\n```"
+                    f"```\n{result.breakdown}\n```"
                 )
             _append_turn_feedback(conversation, feedback)
             continue
@@ -1209,13 +1182,14 @@ async def _run_leaf_attempt(
             dsl=parsed.dsl,
             input_contracts=parsed.input_contracts,
             output_contracts=verify.derived_output_contracts,
-            cycles=cycles,
-            on_chip=on_chip,
+            cycles=result.cycles,
+            on_chip=result.on_chip,
+            cycle_source=result.cycle_source,
             provenance=(
                 f"llm_baseline_{baseline_index}_attempt_{attempt_index}"
                 f"_b{blabel}_turn_{turn}"
             ),
-            breakdown=_maybe_breakdown(score_fn, composed),
+            breakdown=result.breakdown,
         )
         admitted.append(entry)
         _write_turn_artifacts(
@@ -1230,7 +1204,7 @@ async def _run_leaf_attempt(
         )
         # Don't break — keep the conversation open so the agent can chase
         # further improvements within the same attempt. Every admitted
-        # entry is later merged into the shared library via ``insert_pareto``.
+        # entry is later merged into the shared library via ``admit_to_cell``.
         _append_turn_feedback(
             conversation,
             _admission_continuation_feedback(entry, budget),
@@ -1245,7 +1219,7 @@ async def search_leaf(
     parent_contract: Contract | None,
     pass1_dsl: str,
     ckpt_dir: Path,
-    score_fn: ScoreFn,
+    sim_manager: SimulationManager,
     agent: AgentFn,
     verifier: VerifierFn,
     prompt_inputs: NodePromptInputs,
@@ -1271,8 +1245,8 @@ async def search_leaf(
     prompt mention and the reject filter.
 
     After all attempts complete, every admitted DesignEntry is merged
-    into the shared library via ``insert_pareto`` so the cross-branch
-    Pareto admissions remain consistent across the fan-out.
+    into the shared library via ``admit_to_cell`` — no Pareto eviction,
+    so dominated variants from different branches all accumulate.
 
     ``parent_contract`` is ``None`` only for the root-as-leaf case
     (single-node plan tree): the pass-1 DSL is already
@@ -1292,14 +1266,16 @@ async def search_leaf(
         (ckpt_dir / "system_prompt.txt").write_text(system_prompt)
 
     if is_root:
-        baseline, baseline_breakdown = _seed_root_baseline(
-            lib=lib, node_name=node.name, pass1_dsl=pass1_dsl,
-            score_fn=score_fn, descendant_dsls=[], children_picks={},
+        baseline, baseline_breakdown = await _seed_root_baseline(
+            lib=lib, node_path=node.path, node_name=node.name,
+            pass1_dsl=pass1_dsl, sim_manager=sim_manager,
+            descendant_dsls=[], children_picks={},
         )
     else:
-        baseline, baseline_breakdown = _seed_baseline(
-            lib=lib, node_name=node.name, parent_contract=parent_contract,
-            pass1_dsl=pass1_dsl, score_fn=score_fn,
+        baseline, baseline_breakdown = await _seed_baseline(
+            lib=lib, node_path=node.path, node_name=node.name,
+            parent_contract=parent_contract,
+            pass1_dsl=pass1_dsl, sim_manager=sim_manager,
             descendant_dsls=[],
             children_picks={},
         )
@@ -1318,7 +1294,7 @@ async def search_leaf(
                 ckpt_dir
                 / f"baseline_{b_idx}_attempt_{a_idx}_b{_budget_label(budget)}"
             ),
-            score_fn=score_fn,
+            sim_manager=sim_manager,
             agent=agent,
             verifier=verifier,
             prompt_inputs=prompt_inputs,
@@ -1334,7 +1310,7 @@ async def search_leaf(
         for entry in admitted:
             cell = library_cell(
                 lib, entry.input_contracts, entry.output_contracts)
-            insert_pareto(cell, entry)
+            admit_to_cell(cell, entry)
 
     # Persist registry artifact for downstream variant binding.
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1358,7 +1334,7 @@ async def _run_parent_attempt(
     attempt_index: int,
     budget: int | None,
     attempt_dir: Path,
-    score_fn: ScoreFn,
+    sim_manager: SimulationManager,
     agent: AgentFn,
     verifier: VerifierFn,
     prompt_inputs: NodePromptInputs,
@@ -1530,8 +1506,12 @@ async def _run_parent_attempt(
                 f"{verify.feedback}"
             ))
             continue
-        cycles, on_chip, score_err = _safe_score(score_fn, composed)
-        if score_err is not None:
+        sim_ctx = SimContext(
+            node_path=node.path, variant_kind="variant", is_root=is_root,
+            attempt_index=attempt_index, turn_index=turn,
+        )
+        result = await sim_manager.score(sim_ctx, composed)
+        if result.error_feedback is not None:
             _write_turn_artifacts(
                 turn_dir,
                 user_prompt=turn_user_prompt,
@@ -1539,34 +1519,35 @@ async def _run_parent_attempt(
                 status="SCORE_FAIL",
                 extracted_code=parsed.dsl,
                 composed_source=composed,
-                verify_result=VerifyResult(passed=False, feedback=score_err),
+                verify_result=VerifyResult(
+                    passed=False, feedback=result.error_feedback,
+                ),
             )
-            _append_turn_feedback(conversation, score_err)
+            _append_turn_feedback(conversation, result.error_feedback)
             continue
 
-        if budget is not None and on_chip > budget:
+        if budget is not None and result.on_chip > budget:
             _write_turn_artifacts(
                 turn_dir,
                 user_prompt=turn_user_prompt,
                 agent_response=agent_response,
-                status=f"OVER_BUDGET (on_chip={on_chip} > {budget})",
+                status=f"OVER_BUDGET (on_chip={result.on_chip} > {budget})",
                 extracted_code=parsed.dsl,
                 composed_source=composed,
                 verify_result=verify,
             )
-            over_budget_breakdown = _maybe_breakdown(score_fn, composed)
             feedback = (
-                f"Your composed variant scored at on_chip={on_chip} "
+                f"Your composed variant scored at on_chip={result.on_chip} "
                 f"bytes, which exceeds this attempt's on-chip budget of "
                 f"{budget} bytes. Pick different child variants and/or "
                 "restructure the parent DSL to reduce on-chip memory "
                 "below the budget."
             )
-            if over_budget_breakdown:
+            if result.breakdown:
                 feedback += (
                     "\n\nPer-node on-chip memory of the rejected "
                     "composition (largest contributors first):\n\n"
-                    f"```\n{over_budget_breakdown}\n```"
+                    f"```\n{result.breakdown}\n```"
                 )
             _append_turn_feedback(conversation, feedback)
             continue
@@ -1575,13 +1556,14 @@ async def _run_parent_attempt(
             dsl=parsed.dsl,
             input_contracts=parsed.input_contracts,
             output_contracts=verify.derived_output_contracts,
-            cycles=cycles,
-            on_chip=on_chip,
+            cycles=result.cycles,
+            on_chip=result.on_chip,
+            cycle_source=result.cycle_source,
             provenance=(
                 f"llm_baseline_{baseline_index}_attempt_{attempt_index}"
                 f"_b{blabel}_turn_{turn}"
             ),
-            breakdown=_maybe_breakdown(score_fn, composed),
+            breakdown=result.breakdown,
             children_picks=children_picks,
         )
         admitted.append(entry)
@@ -1597,7 +1579,7 @@ async def _run_parent_attempt(
         )
         # Don't break — keep the conversation open so the agent can chase
         # further improvements within the same attempt. Every admitted
-        # entry is later merged into the shared library via ``insert_pareto``.
+        # entry is later merged into the shared library via ``admit_to_cell``.
         _append_turn_feedback(
             conversation,
             _admission_continuation_feedback(entry, budget),
@@ -1614,7 +1596,7 @@ async def search_parent(
     children_libraries: dict[str, NodeLibrary],
     children_picks_baseline: dict[str, DesignEntry],
     ckpt_dir: Path,
-    score_fn: ScoreFn,
+    sim_manager: SimulationManager,
     agent: AgentFn,
     verifier: VerifierFn,
     prompt_inputs: NodePromptInputs,
@@ -1663,15 +1645,17 @@ async def search_parent(
         baseline_descendants.extend(gather_descendants_postorder(child_entry))
         baseline_descendants.append(child_entry.dsl)
     if is_root:
-        baseline, baseline_breakdown = _seed_root_baseline(
-            lib=lib, node_name=node.name, pass1_dsl=pass1_dsl,
-            score_fn=score_fn, descendant_dsls=baseline_descendants,
+        baseline, baseline_breakdown = await _seed_root_baseline(
+            lib=lib, node_path=node.path, node_name=node.name,
+            pass1_dsl=pass1_dsl,
+            sim_manager=sim_manager, descendant_dsls=baseline_descendants,
             children_picks=children_picks_baseline,
         )
     else:
-        baseline, baseline_breakdown = _seed_baseline(
-            lib=lib, node_name=node.name, parent_contract=parent_contract,
-            pass1_dsl=pass1_dsl, score_fn=score_fn,
+        baseline, baseline_breakdown = await _seed_baseline(
+            lib=lib, node_path=node.path, node_name=node.name,
+            parent_contract=parent_contract,
+            pass1_dsl=pass1_dsl, sim_manager=sim_manager,
             descendant_dsls=baseline_descendants,
             children_picks=children_picks_baseline,
         )
@@ -1722,7 +1706,7 @@ async def search_parent(
                 ckpt_dir
                 / f"baseline_{b_idx}_attempt_{a_idx}_b{_budget_label(budget)}"
             ),
-            score_fn=score_fn,
+            sim_manager=sim_manager,
             agent=agent,
             verifier=verifier,
             prompt_inputs=prompt_inputs,
@@ -1738,7 +1722,7 @@ async def search_parent(
         for entry in admitted:
             cell = library_cell(
                 lib, entry.input_contracts, entry.output_contracts)
-            insert_pareto(cell, entry)
+            admit_to_cell(cell, entry)
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     emit_variants_module(
@@ -1749,12 +1733,13 @@ async def search_parent(
     return lib
 
 
-def _seed_root_baseline(
+async def _seed_root_baseline(
     *,
     lib: NodeLibrary,
+    node_path: str,
     node_name: str,
     pass1_dsl: str,
-    score_fn: ScoreFn,
+    sim_manager: SimulationManager,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
 ) -> tuple[DesignEntry, str]:
@@ -1768,21 +1753,29 @@ def _seed_root_baseline(
         parent_dsl=pass1_dsl,
         descendant_dsls_postorder=descendant_dsls,
     )
-    cycles, on_chip = score_fn(composed)
-    breakdown = _maybe_breakdown(score_fn, composed)
+    ctx = SimContext(
+        node_path=node_path, variant_kind="baseline", is_root=True,
+    )
+    result = await sim_manager.score(ctx, composed)
+    assert result.error_feedback is None, (
+        f"_seed_root_baseline: simulation manager returned error_feedback "
+        f"for the root pass-1 baseline at {node_path!r}. Baseline scoring "
+        f"must succeed. Feedback was:\n{result.error_feedback}"
+    )
     entry = DesignEntry(
         dsl=pass1_dsl,
         input_contracts={},
         output_contracts={},
-        cycles=cycles,
-        on_chip=on_chip,
+        cycles=result.cycles,
+        on_chip=result.on_chip,
+        cycle_source=result.cycle_source,
         provenance="pass1_baseline",
-        breakdown=breakdown,
+        breakdown=result.breakdown,
         children_picks=dict(children_picks),
     )
     cell = library_cell(lib, {}, {})
     cell.append(entry)
-    return entry, breakdown
+    return entry, result.breakdown
 
 
 # ---------------------------------------------------------------------------
@@ -1812,6 +1805,58 @@ _NODE_OWNED_FILES = frozenset({
 _NODE_OWNED_DIR_PREFIXES = ("baseline_",)
 
 
+def _merge_prior_pass_library(
+    lib: NodeLibrary,
+    prior_lib: NodeLibrary,
+) -> int:
+    """Append entries from ``prior_lib`` into ``lib`` in place — multi-pass
+    accumulator.
+
+    The autotune2 library is meant to grow monotonically across passes:
+    pass N's snapshot for a node contains every variant ever admitted
+    for that node, not just the ones from pass N. This helper performs
+    that merge after a fresh pass completes and before the snapshot is
+    written.
+
+    Skip rules:
+      - ``provenance == "pass1_baseline"`` — the current pass re-seeded
+        its own pass-1 baseline via ``_seed_baseline``; merging the
+        prior pass's pass-1 baseline would create two pass-1 baselines
+        and trip ``find_pass1_baseline_entry``'s "exactly one" check.
+      - DSL-hash duplicates of entries already in ``lib`` — keeps the
+        accumulator from re-storing byte-identical variants the current
+        pass happened to re-discover.
+
+    Otherwise the prior ``DesignEntry`` is appended *by identity* into
+    the matching ``(in_key, out_key)`` cell of ``lib`` — same object,
+    so any parent entry that references it via ``children_picks`` can
+    still resolve. No Pareto eviction. Returns the number of entries
+    appended (for logging / debug).
+    """
+    from src.autotune2.pareto import dsl_dedup_hash as _dsl_hash
+
+    existing_hashes: set[str] = {
+        _dsl_hash(e.dsl)
+        for by_out in lib.values()
+        for cell in by_out.values()
+        for e in cell
+    }
+    appended = 0
+    for in_key, by_out in prior_lib.items():
+        for out_key, cell in by_out.items():
+            for entry in cell:
+                if entry.provenance == "pass1_baseline":
+                    continue
+                h = _dsl_hash(entry.dsl)
+                if h in existing_hashes:
+                    continue
+                existing_hashes.add(h)
+                target = library_cell(lib, dict(in_key), dict(out_key))
+                target.append(entry)
+                appended += 1
+    return appended
+
+
 def _wipe_node_run_artifacts(node_ckpt: Path) -> None:
     """Delete the node's own run artifacts in-place, preserving child
     subdirectories (children live at ``node_ckpt / <child_name>/`` and may
@@ -1833,7 +1878,7 @@ async def autotune(
     pass1_dsls: dict[str, str],
     pass1_contracts: dict[str, Contract],
     ckpt_dir: Path,
-    make_score_fn: Callable[[dict], ScoreFn],
+    make_sim_manager: Callable[[dict], SimulationManager],
     root_tensors: dict,
     agent_factory: Callable[[str], AgentFn],
     make_verifier: Callable[["PlanNode", "Contract | None", dict], VerifierFn],
@@ -1872,15 +1917,18 @@ async def autotune(
         driver calls it once per node, so each ``search_leaf`` /
         ``search_parent`` receives an agent whose system prompt and
         conversation history are local to that node.
-      - ``make_score_fn``: ``Callable[[tensors_dict], ScoreFn]``. The
-        driver invokes it once per node to construct a node-local
-        analytical scorer whose closed-over ``tensors`` dict matches
-        the per-node arg names referenced by that node's synthetic
-        wrapper (e.g. ``tensors["Q"]``). For non-root nodes the dict
-        is built via ``build_node_tensors_dict(parent_contract)``;
-        for the root it's ``root_tensors``.
+      - ``make_sim_manager``: ``Callable[[tensors_dict],
+        SimulationManager]``. The driver invokes it once per node to
+        construct a node-local simulation manager whose closed-over
+        scorer ``tensors`` dict matches the per-node arg names
+        referenced by that node's synthetic wrapper (e.g.
+        ``tensors["Q"]``). For non-root nodes the dict is built via
+        ``build_node_tensors_dict(parent_contract)``; for the root
+        it's ``root_tensors``. The manager decides per variant whether
+        to record the analytical cycle estimate or the rust simulator's
+        — see ``src.autotune2.sim_manager``.
       - ``make_verifier``: ``Callable[[PlanNode, Contract | None,
-        tensors_dict], VerifierFn]``. Mirrors ``make_score_fn`` but
+        tensors_dict], VerifierFn]``. Mirrors ``make_sim_manager`` but
         builds a per-node 4-gate verifier closed over the node's own
         gold / call-args / tensors. Root nodes get a verifier whose
         gold comes from the kernel's ``compute_gold`` (entry point
@@ -1974,7 +2022,7 @@ async def autotune(
             root_tensors if is_root_node
             else build_node_tensors_dict(parent_contract)
         )
-        node_score_fn = make_score_fn(node_tensors)
+        node_sim_manager = make_sim_manager(node_tensors)
         node_verifier = make_verifier(node, parent_contract, node_tensors)
 
         # Multi-pass branching: pull additional starting designs from the
@@ -1999,7 +2047,7 @@ async def autotune(
                 parent_contract=parent_contract,
                 pass1_dsl=pass1_dsls[node.path],
                 ckpt_dir=node_ckpt,
-                score_fn=node_score_fn,
+                sim_manager=node_sim_manager,
                 agent=node_agent,
                 verifier=node_verifier,
                 prompt_inputs=prompt_inputs[node.path],
@@ -2026,7 +2074,7 @@ async def autotune(
                 children_libraries=child_libs,
                 children_picks_baseline=baseline_picks,
                 ckpt_dir=node_ckpt,
-                score_fn=node_score_fn,
+                sim_manager=node_sim_manager,
                 agent=node_agent,
                 verifier=node_verifier,
                 prompt_inputs=prompt_inputs[node.path],
@@ -2034,6 +2082,24 @@ async def autotune(
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
             )
+
+        # Multi-pass accumulator: merge the prior pass's entries for this
+        # node into ``lib`` so the snapshot under this pass's subdir holds
+        # every variant ever admitted (not just the ones this pass added).
+        # Children also accumulate via this same path (post-order walk), so
+        # any prior parent entry's ``children_picks`` references resolve in
+        # the current child_libs. Re-emit variants.py so the on-disk stub
+        # registry reflects the merged library.
+        if initial_libraries is not None and node.path in initial_libraries:
+            appended = _merge_prior_pass_library(
+                lib, initial_libraries[node.path],
+            )
+            if appended:
+                emit_variants_module(
+                    out_path=node_ckpt / "variants.py",
+                    child_name=node.name,
+                    variants=library_to_variant_registry(lib),
+                )
 
         if node_stamp is not None:
             save_library_snapshot(

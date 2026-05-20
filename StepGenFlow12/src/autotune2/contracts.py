@@ -121,10 +121,20 @@ class DesignEntry:
     outputs in pass-1's model), so every output has a contract."""
 
     cycles: int = 0
-    """Analytical cycle estimate. Set by the autotuner after scoring."""
+    """Recorded cycle estimate. Set by the autotuner after scoring. The
+    estimator that produced this number is tagged in ``cycle_source``."""
 
     on_chip: int = 0
-    """Analytical on-chip bytes estimate."""
+    """Analytical on-chip bytes estimate. Always from the analytical model
+    — the rust simulator does not surface on-chip bytes today."""
+
+    cycle_source: str = "analytical"
+    """Which simulator produced ``cycles``: ``"analytical"`` (STeP timing
+    model) or ``"rust"`` (cycle-approximate rust sim). When the simulation
+    manager invokes both for one variant, only one value is recorded —
+    callers reading ``cycles`` MUST consult this tag before comparing
+    across entries, since mixed-source numbers are not directly
+    comparable."""
 
     provenance: str = ""
     """Free-form tag indicating where the entry came from (e.g.,

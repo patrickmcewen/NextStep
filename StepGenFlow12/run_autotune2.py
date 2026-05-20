@@ -531,14 +531,21 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     # The scorer's closed-over ``tensors`` dict has to match the per-node
     # arg names the synthetic wrapper references (e.g. ``tensors["Q"]``)
     # — see ``build_synthetic_wrapper_for_node``. The driver rebuilds the
-    # scorer per node via this factory; the root falls back to the
-    # kernel-level dict passed in as ``root_tensors``.
-    def make_score_fn(node_tensors: dict):
-        return make_analytical_scorer(
+    # scorer (wrapped in an ``AnalyticalOnly`` simulation manager) per
+    # node via this factory; the root falls back to the kernel-level
+    # dict passed in as ``root_tensors``. PR1 of the simulation-manager
+    # work locks the in-loop policy to ``AnalyticalOnly`` (behavior-
+    # equivalent to the legacy score_fn path) so the seam is in place
+    # without changing what the autotuner does today.
+    from src.autotune2.sim_manager import AnalyticalOnly
+
+    def make_sim_manager(node_tensors: dict):
+        score_fn = make_analytical_scorer(
             dims=state["dims"], tensors=node_tensors,
             hw_config=state["hw_config"],
             max_total_compute_bw=args.compute_bw,
         )
+        return AnalyticalOnly(score_fn=score_fn)
 
     agent_factory = build_real_agent_fn(llm_config=state["llm_config"])
     # Per-node verifier factory. For the root the closure uses
@@ -620,7 +627,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             pass1_dsls=state["pass1_dsls"],
             pass1_contracts=state["pass1_contracts"],
             ckpt_dir=ckpt_dir,
-            make_score_fn=make_score_fn,
+            make_sim_manager=make_sim_manager,
             root_tensors=state["tensors"],
             agent_factory=agent_factory,
             make_verifier=make_verifier,
