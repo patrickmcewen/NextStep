@@ -610,7 +610,15 @@ class _State:
         gen = comp.generators[0]
         if gen.ifs or gen.is_async:
             return None
-        if not isinstance(gen.target, ast.Name):
+        # Accept either a single Name target (`for x in xs:`) or a tuple/list
+        # of Names (`for a, b in zip(A, B):`). The latter is what naturally
+        # arises when iterating over `zip(...)` of parallelized branches.
+        if isinstance(gen.target, ast.Name):
+            pass
+        elif (isinstance(gen.target, (ast.Tuple, ast.List))
+              and all(isinstance(e, ast.Name) for e in gen.target.elts)):
+            pass
+        else:
             return None
         if not (isinstance(comp.elt, ast.Call)
                 and isinstance(comp.elt.func, ast.Name)
@@ -625,7 +633,7 @@ class _State:
         elt_target = self.fresh(fname)
         src = (
             f"{target.id} = []\n"
-            f"for {gen.target.id} in {ast.unparse(gen.iter)}:\n"
+            f"for {ast.unparse(gen.target)} in {ast.unparse(gen.iter)}:\n"
             f"    {elt_target} = {ast.unparse(comp.elt)}\n"
             f"    {target.id}.append({elt_target})\n"
         )

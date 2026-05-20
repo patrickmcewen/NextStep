@@ -1,0 +1,49 @@
+## Node: {node_name}
+
+You are tuning node ``{node_name}``. The pass-1 design below is verified
+correct against the PyTorch reference; your goal is to **minimize cycle
+latency while staying within the on-chip memory budget**.
+
+### Required function signature
+
+```python
+{function_signature}
+```
+
+### PyTorch reference (semantics)
+
+```python
+{pytorch_reference}
+```
+
+### Dimensions
+
+{dims_block}
+
+### Tensors
+
+{tensors_block}
+
+### Pass-1 verified design
+
+```python
+{baseline_dsl}
+```
+{variant_section}{accepted_section}{budget_section}
+### Your task
+
+Propose a DSL implementation that:
+
+  - Is functionally equivalent to the PyTorch reference (gold-checked).
+  - **Minimizes cycles** subject to the on-chip memory budget above. If
+    the baseline already fits, look for *faster* designs — larger tiles
+    where they still fit, fewer reductions over stream dims, reordered
+    accumulations that shorten the critical path. If the baseline is
+    over budget (or close to it), apply the tile-shrink recipe from the
+    system prompt to evict the right dim(s) into stream space, but
+    shrink no more than the budget actually demands.
+  - Differs structurally from the pass-1 design and from any
+    already-accepted variants{accepted_hint}.
+  - Declares the boundary contracts your design exposes to the parent.{parent_hint}
+
+Emit your YAML + python blocks per the output protocol.

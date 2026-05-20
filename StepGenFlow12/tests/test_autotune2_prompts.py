@@ -190,6 +190,32 @@ def test_user_prompt_leaf_first_attempt_no_accepted_section():
     # Per-node building blocks present
     assert "def attention_softmax(x, *, out_shapes):" in out
     assert "x: (64, 512)" in out
+    # Direction is to minimize cycles while staying within budget.
+    flat = " ".join(out.lower().split())
+    assert "minimize cycle latency" in flat
+    assert "on-chip memory budget" in flat
+
+
+def test_user_prompt_specializes_per_fewshot():
+    """tile_shrink and parallel templates should mention their own
+    recipe by name so the user-prompt framing matches the system-prompt
+    agent baked into the conversation."""
+    shrink = build_autotune2_user_prompt(
+        is_leaf=True, fewshot="tile_shrink", **_PROMPT_KWARGS,
+    )
+    parallel = build_autotune2_user_prompt(
+        is_leaf=True, fewshot="parallel", **_PROMPT_KWARGS,
+    )
+    assert "tile-shrink" in shrink.lower()
+    assert "tile-shrink" not in parallel.lower()
+    assert "parallel" in parallel.lower()
+
+
+def test_user_prompt_rejects_unknown_fewshot():
+    with pytest.raises(AssertionError, match="fewshot must be one of"):
+        build_autotune2_user_prompt(
+            is_leaf=True, fewshot="not_a_real_agent", **_PROMPT_KWARGS,
+        )
 
 
 def test_user_prompt_leaf_with_accepted_summary_renders_block():

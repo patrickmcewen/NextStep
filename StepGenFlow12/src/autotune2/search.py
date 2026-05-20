@@ -197,6 +197,13 @@ class SearchConfig:
     ``build_real_verifier_factory_fn``.
     """
 
+    fewshot: str = "tile_shrink"
+    """Which per-agent user-prompt template to use — matches the
+    fewshot agent baked into the system prompt by
+    ``build_autotune2_system_prompt``. One of ``"tile_shrink"`` or
+    ``"parallel"``.
+    """
+
 
 @dataclass(frozen=True)
 class NodePromptInputs:
@@ -761,6 +768,42 @@ def _append_turn_feedback(conversation: list[dict], feedback: str) -> None:
     conversation.append({"role": "user", "content": feedback})
 
 
+def _admission_continuation_feedback(
+    entry: DesignEntry, budget: int | None,
+) -> str:
+    """Feedback appended after a variant is admitted, asking the agent to
+    keep proposing better designs within the same attempt.
+
+    The conversation stays open after each admission so the model can
+    build on what it just produced and iterate toward lower cycles
+    without burning a fresh attempt. Successive admissions all land in
+    the same per-node library via ``insert_pareto``.
+    """
+    msg = (
+        f"Variant ACCEPTED at cycles={entry.cycles}, on_chip={entry.on_chip} "
+        f"bytes. It has been admitted to this node's library.\n\n"
+        "Now propose another DSL implementation that achieves **lower "
+        "cycles** than the variant above"
+    )
+    if budget is not None:
+        msg += f" while still keeping on_chip <= {int(budget)} bytes"
+    msg += (
+        ". The new variant must remain functionally equivalent to the "
+        "PyTorch reference and must differ structurally from every "
+        "variant already accepted in this conversation (and from the "
+        "pass-1 baseline). Emit your YAML + python blocks per the "
+        "output protocol."
+    )
+    if entry.breakdown:
+        msg += (
+            "\n\nPer-node on-chip memory of the just-accepted variant "
+            "(largest contributors first) — use this to find where "
+            "cycles might still be improved without busting the budget:\n\n"
+            f"```\n{entry.breakdown}\n```"
+        )
+    return msg
+
+
 def _safe_score(
     score_fn: ScoreFn, composed: str,
 ) -> tuple[int | None, int | None, str | None]:
@@ -1027,6 +1070,7 @@ async def _run_leaf_attempt(
         baseline_dsl=baseline_dsl,
         dims_block=prompt_inputs.dims_block,
         tensors_block=prompt_inputs.tensors_block,
+        fewshot=config.fewshot,
         accepted_summary=accepted_summary,
         budget_block=_budget_block(budget, baseline_breakdown),
     )
@@ -1184,7 +1228,13 @@ async def _run_leaf_attempt(
             verify_result=verify,
             admitted_entries=[entry],
         )
-        break  # one admission per attempt — mirrors the legacy semantics
+        # Don't break — keep the conversation open so the agent can chase
+        # further improvements within the same attempt. Every admitted
+        # entry is later merged into the shared library via ``insert_pareto``.
+        _append_turn_feedback(
+            conversation,
+            _admission_continuation_feedback(entry, budget),
+        )
 
     return admitted
 
@@ -1354,6 +1404,7 @@ async def _run_parent_attempt(
         baseline_dsl=baseline_dsl,
         dims_block=prompt_inputs.dims_block,
         tensors_block=prompt_inputs.tensors_block,
+        fewshot=config.fewshot,
         child_variant_blocks=child_blocks,
         accepted_summary=accepted_summary,
         budget_block=_budget_block(budget, baseline_breakdown),
@@ -1544,7 +1595,13 @@ async def _run_parent_attempt(
             verify_result=verify,
             admitted_entries=[entry],
         )
-        break  # one admission per attempt — mirrors the legacy semantics
+        # Don't break — keep the conversation open so the agent can chase
+        # further improvements within the same attempt. Every admitted
+        # entry is later merged into the shared library via ``insert_pareto``.
+        _append_turn_feedback(
+            conversation,
+            _admission_continuation_feedback(entry, budget),
+        )
 
     return admitted
 

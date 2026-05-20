@@ -71,6 +71,10 @@ _OUTPUT_PROTOCOL_PATHS = {
     True: _PROMPTS_DIR / "autotune2_output_protocol_leaf.txt",
     False: _PROMPTS_DIR / "autotune2_output_protocol_parent.txt",
 }
+_USER_PROMPT_PATHS = {
+    "tile_shrink": _PROMPTS_DIR / "autotune2_user_tile_shrink.txt",
+    "parallel": _PROMPTS_DIR / "autotune2_user_parallel.txt",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -277,53 +281,6 @@ def build_autotune2_system_prompt(
     )
 
 
-_USER_PROMPT_TEMPLATE = """\
-## Node: {node_name}
-
-You are tuning node ``{node_name}``. The pass-1 design below is verified
-correct against the PyTorch reference; your task is to propose a
-*different* DSL implementation that explores a new point in the
-(cycles, on_chip_memory) tradeoff space.
-
-### Required function signature
-
-```python
-{function_signature}
-```
-
-### PyTorch reference (semantics)
-
-```python
-{pytorch_reference}
-```
-
-### Dimensions
-
-{dims_block}
-
-### Tensors
-
-{tensors_block}
-
-### Pass-1 verified design
-
-```python
-{baseline_dsl}
-```
-{variant_section}{accepted_section}{budget_section}
-### Your task
-
-Propose a DSL implementation that:
-
-  - Is functionally equivalent to the PyTorch reference (gold-checked).
-  - Differs structurally from the pass-1 design and from any
-    already-accepted variants{accepted_hint}.
-  - Declares the boundary contracts your design exposes to the parent.{parent_hint}
-
-Emit your YAML + python blocks per the output protocol.
-"""
-
-
 _VARIANT_SECTION_TEMPLATE = """
 
 ### Child variant libraries
@@ -351,18 +308,23 @@ def build_autotune2_user_prompt(
     baseline_dsl: str,
     dims_block: str,
     tensors_block: str,
+    fewshot: str = "tile_shrink",
     child_variant_blocks: dict[str, str] | None = None,
     accepted_summary: str = "",
     budget_block: str = "",
 ) -> str:
     """Self-contained autotune2 user prompt for one (node, attempt) pair.
 
+    ``fewshot`` selects which per-agent user-prompt template to load
+    from ``prompts/`` — currently ``"tile_shrink"`` and ``"parallel"``,
+    matching the system-prompt agents in
+    ``build_autotune2_system_prompt``. Each template carries the same
+    placeholders but specializes the "Your task" framing toward the
+    agent's recipe (tile-shrink vs. parallelism).
+
     ``baseline_dsl`` is the DSL the LLM is asked to vary. For single-pass
     autotune2 this is always the pass-1 baseline; multi-pass / branching
-    expansion supplies any prior library entry's DSL. The prompt's
-    "Pass-1 verified design" heading is preserved for now (it's accurate
-    in single-pass mode); chunk 3 may rename it once non-pass-1 baselines
-    are actually fed in.
+    expansion supplies any prior library entry's DSL.
 
     ``accepted_summary`` is the empty string on the first attempt; on
     subsequent fresh attempts it is the rendered Pareto-front summary
@@ -373,6 +335,15 @@ def build_autotune2_user_prompt(
     describing this attempt's on-chip memory budget (the per-attempt
     parallel-fan-out signal in ``search_leaf`` / ``search_parent``).
     """
+    assert fewshot in _USER_PROMPT_PATHS, (
+        f"build_autotune2_user_prompt: fewshot must be one of "
+        f"{sorted(_USER_PROMPT_PATHS.keys())!r}, got {fewshot!r}"
+    )
+    template_path = _USER_PROMPT_PATHS[fewshot]
+    assert template_path.exists(), (
+        f"build_autotune2_user_prompt: required template not found at "
+        f"{template_path}"
+    )
     if is_leaf:
         assert not child_variant_blocks, (
             "build_autotune2_user_prompt: leaf prompts must not include "
@@ -392,7 +363,7 @@ def build_autotune2_user_prompt(
         f"\n\n### Already-accepted variants for this node\n\n{accepted_summary}\n"
         if accepted_summary else ""
     )
-    return _USER_PROMPT_TEMPLATE.format(
+    return template_path.read_text().format(
         node_name=node_name,
         function_signature=function_signature,
         pytorch_reference=pytorch_reference,

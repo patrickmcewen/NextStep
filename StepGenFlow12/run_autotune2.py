@@ -630,6 +630,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
                 max_turns_per_attempt=spec["max_turns_per_attempt"],
                 attempt_budgets_bytes=spec["attempt_budgets_bytes"],
                 check_order=args.check_order,
+                fewshot=spec["fewshot"],
             ),
             node_stamps=node_stamps,
             initial_libraries=prior_libraries,
