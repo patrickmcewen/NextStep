@@ -223,20 +223,97 @@ def _resolve_pass_specs(
 
 
 def _build_system_prompts(
-    tree, *, dsl_code: str, fewshot: str,
+    tree, *, dsl_code: str, fewshot: str, max_tile: int | None = None,
 ) -> dict[str, str]:
     """Build ``{node_path: system_prompt}`` for one fewshot variant.
 
     Rebuilt per pass when multi-pass fewshots differ, so each pass's
     LLM agent sees the worked-example pack matching its goal.
+
+    ``max_tile`` (when set) routes through ``build_autotune2_system_prompt``
+    to inject the same pass-1 max-tile addendum so the autotune2 LLM
+    knows about the bound.
     """
     from src.autotune2.prompts import build_autotune2_system_prompt
     return {
         node.path: build_autotune2_system_prompt(
             is_leaf=node.is_leaf, dsl_code=dsl_code, fewshot=fewshot,
+            max_tile=max_tile,
         )
         for node in tree.iter_topological()
     }
+
+
+def _resolve_max_tile(
+    pass1_contracts: dict, *, cli_max_tile: int | None,
+) -> int | None:
+    """Reconcile a CLI ``--max-tile`` value with the bounds baked into
+    each loaded Pass-1 ``Contract``.
+
+    Pass-1 stamps every recorded contract with its ``max_tile`` field
+    (or ``None`` when max-tile mode was off). All non-root contracts of
+    a single run share that value; if the user passes ``--max-tile N``
+    on the CLI it must either match the contracts' value, or the
+    contracts must be unset (so autotune2 can add a bound that pass-1
+    did not impose).
+
+    Returns the resolved max_tile (``None`` if off).
+    """
+    contract_values = {c.max_tile for c in pass1_contracts.values()}
+    assert len(contract_values) <= 1, (
+        f"loaded pass-1 contracts disagree on max_tile: {contract_values!r}. "
+        "All non-root contracts of one pass-1 run should share the same "
+        "value — investigate the checkpoint."
+    )
+    contract_max_tile = next(iter(contract_values)) if contract_values else None
+    if cli_max_tile is None:
+        return contract_max_tile
+    assert isinstance(cli_max_tile, int) and cli_max_tile >= 1, (
+        f"--max-tile must be a positive int, got {cli_max_tile!r}"
+    )
+    if contract_max_tile is None:
+        return cli_max_tile
+    assert cli_max_tile == contract_max_tile, (
+        f"--max-tile={cli_max_tile} disagrees with the bound baked into "
+        f"the loaded pass-1 contracts (max_tile={contract_max_tile}). "
+        "Pass-1 ran under a different bound; either rerun pass-1 with the "
+        "new bound or drop --max-tile to reuse the existing one."
+    )
+    return cli_max_tile
+
+
+def _activate_max_tile_dsl(max_tile: int) -> str:
+    """Install ``step_dsl_max_tile`` as ``sys.modules['step_dsl']`` with
+    the requested bound, and return the LLM-facing DSL source (with
+    ``MAX_TILE_ROW`` / ``MAX_TILE_COL`` substituted to ``max_tile``).
+
+    Mirrors the orchestrator's pass-1 hook
+    (``orchestrator._refactor_one_node_pass1``, lines 2450-2454) and the
+    pass-1 agent factory's prompt substitution
+    (``agents.make_pass1_agent``, lines 530-541) so what the autotune2
+    LLM reads is what the runtime enforces.
+    """
+    assert isinstance(max_tile, int) and max_tile >= 1, (
+        f"_activate_max_tile_dsl: max_tile must be positive int, got {max_tile!r}"
+    )
+    from src import step_dsl_max_tile as _step_dsl_max_tile_mod
+    _step_dsl_max_tile_mod.MAX_TILE_ROW = int(max_tile)
+    _step_dsl_max_tile_mod.MAX_TILE_COL = int(max_tile)
+    if sys.modules.get("step_dsl") is not _step_dsl_max_tile_mod:
+        sys.modules["step_dsl"] = _step_dsl_max_tile_mod
+    from src.prompts import _STEP_DSL_MAX_TILE_PY
+    dsl_code = _STEP_DSL_MAX_TILE_PY.read_text()
+    dsl_code = dsl_code.replace(
+        "MAX_TILE_ROW = 1\n", f"MAX_TILE_ROW = {int(max_tile)}\n", 1
+    )
+    dsl_code = dsl_code.replace(
+        "MAX_TILE_COL = 1\n", f"MAX_TILE_COL = {int(max_tile)}\n", 1
+    )
+    assert f"MAX_TILE_ROW = {int(max_tile)}" in dsl_code, (
+        "max_tile substitution failed: literal 'MAX_TILE_ROW = 1\\n' not "
+        "found in step_dsl_max_tile.py source. Did the default change?"
+    )
+    return dsl_code
 
 
 def _load_pass1_state(
@@ -437,6 +514,20 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         cli_args=args,
     )
 
+    # Reconcile CLI --max-tile against the bound baked into the loaded
+    # pass-1 contracts. When on, install step_dsl_max_tile as
+    # sys.modules['step_dsl'] (so _exec_dsl_ref / _build_dsl_scaffold see
+    # the bounded variant when verifying LLM-emitted code) and rebuild
+    # state['dsl_code'] from the substituted source so the autotune2
+    # system prompt shows the LLM what the runtime will enforce.
+    max_tile = _resolve_max_tile(
+        state["pass1_contracts"], cli_max_tile=args.max_tile,
+    )
+    if max_tile is not None:
+        state["dsl_code"] = _activate_max_tile_dsl(max_tile)
+        print(f"autotune2: max-tile mode active (MAX_TILE_ROW = "
+              f"MAX_TILE_COL = {max_tile})")
+
     # The scorer's closed-over ``tensors`` dict has to match the per-node
     # arg names the synthetic wrapper references (e.g. ``tensors["Q"]``)
     # — see ``build_synthetic_wrapper_for_node``. The driver rebuilds the
@@ -516,6 +607,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         )
         system_prompts = _build_system_prompts(
             state["tree"], dsl_code=state["dsl_code"], fewshot=spec["fewshot"],
+            max_tile=max_tile,
         )
         print(
             f"autotune2: pass {pass_idx} '{spec['name']}' — "
@@ -578,6 +670,8 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    from src.process_group import setup_process_group
+    setup_process_group()
     parser = argparse.ArgumentParser(
         description="StepGenFlow autotune2 — bottom-up tree-DP autotuner "
                     "with per-node Pareto libraries + rust top-K promotion",
@@ -658,6 +752,19 @@ def main() -> int:
              "prompt (default: tile_shrink). 'parallel' swaps in the "
              "shared-vs-independent parallelism examples and uses "
              "autotune2_system_parallel.txt as the template.",
+    )
+    parser.add_argument(
+        "--max-tile", type=int, default=None, metavar="N",
+        help="Run autotune2 against step_dsl_max_tile.py with both "
+             "MAX_TILE_ROW and MAX_TILE_COL set to N. Mirrors run.py's "
+             "--max-tile and applies the same load/store/tile-growing-"
+             "reshape/stub-call bounds, plus the pass-1 max-tile "
+             "addendum in the autotune2 system prompt. Default: derive "
+             "from the bound baked into the loaded pass-1 contracts (so "
+             "autotune2 inherits whatever pass-1 used). When set "
+             "explicitly, must match the contracts' value, or the "
+             "contracts must be unset (so autotune2 can add a bound "
+             "pass-1 did not impose).",
     )
     args = parser.parse_args()
 

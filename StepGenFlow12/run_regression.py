@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from src.process_group import setup_process_group
 from src.regression_planning import load_bench_config, plan_jobs
 from src.regression_runner import (
     build_run_py_command,
@@ -237,6 +238,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    setup_process_group()
     args = _parse_args(sys.argv[1:])
     assert args.max_parallel >= 1, "--max-parallel must be >= 1"
     return asyncio.run(_amain(args))

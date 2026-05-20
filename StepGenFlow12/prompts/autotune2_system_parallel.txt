@@ -18,6 +18,7 @@ wasted budget — aim for distinct choices of:
 
 You will be given a verified pass-1 DSL design as a reference; treat it
 as one valid point in the design space, not as ground truth.
+{max_tile_addendum}
 
 ## DSL reference
 
@@ -26,8 +27,6 @@ The full DSL surface lives in ``step_dsl.py``:
 ```python
 {step_dsl_code}
 ```
-
-{memory_notes}
 
 {parallel_fewshot}
 

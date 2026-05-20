@@ -164,6 +164,8 @@ def _run_downstream(
 
 
 def main(argv: list[str]) -> int:
+    from src.process_group import setup_process_group
+    setup_process_group()
     args = _parse_args(argv)
     reg_extra = shlex.split(args.reg_args)
     run_extra = shlex.split(args.run_args)

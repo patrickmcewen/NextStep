@@ -204,7 +204,8 @@ def render_variant_block(
 
 
 def build_autotune2_system_prompt(
-    *, is_leaf: bool, dsl_code: str, fewshot: str = "tile_shrink"
+    *, is_leaf: bool, dsl_code: str, fewshot: str = "tile_shrink",
+    max_tile: int | None = None,
 ) -> str:
     """Self-contained autotune2 system prompt.
 
@@ -227,11 +228,21 @@ def build_autotune2_system_prompt(
     from ``prompts/autotune2_output_protocol_{leaf,parent}.txt`` based on
     ``is_leaf``). ``str.replace`` is used instead of ``str.format``
     because the protocol fragments contain literal YAML braces.
+
+    ``max_tile`` (when set) substitutes the same pass-1 max-tile
+    addendum (``src.agents._MAX_TILE_ADDENDUM_TEMPLATE``) into the
+    ``{max_tile_addendum}`` placeholder so the autotune2 LLM sees the
+    same load/store/reshape/stub-call bounds it would see in pass-1.
+    When ``None``, the placeholder collapses to an empty string.
     """
     assert dsl_code, "build_autotune2_system_prompt: dsl_code must be non-empty"
     assert fewshot in ("tile_shrink", "parallel"), (
         f"build_autotune2_system_prompt: fewshot must be 'tile_shrink' or "
         f"'parallel', got {fewshot!r}"
+    )
+    assert max_tile is None or (isinstance(max_tile, int) and max_tile >= 1), (
+        f"build_autotune2_system_prompt: max_tile must be a positive int or "
+        f"None, got {max_tile!r}"
     )
     if fewshot == "tile_shrink":
         system_path = _SYSTEM_PROMPT_PATH
@@ -251,12 +262,18 @@ def build_autotune2_system_prompt(
     memory_notes = _MEMORY_NOTES_PATH.read_text().replace(
         "{step_dsl_memory_code}", _STEP_DSL_MEMORY_PY.read_text()
     ).rstrip()
+    from src.agents import _MAX_TILE_ADDENDUM_TEMPLATE
+    max_tile_addendum = (
+        _MAX_TILE_ADDENDUM_TEMPLATE.format(max_tile=int(max_tile))
+        if max_tile is not None else ""
+    )
     return (
         system_path.read_text()
         .replace("{step_dsl_code}", dsl_code)
         .replace("{memory_notes}", memory_notes)
         .replace(fewshot_placeholder, fewshot_path.read_text().rstrip())
         .replace("{output_protocol}", protocol_path.read_text().rstrip())
+        .replace("{max_tile_addendum}", max_tile_addendum)
     )
 
 

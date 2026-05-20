@@ -12,9 +12,11 @@ import sys
 
 from src.autotune import run_autotune
 from src.config_loader import load_llm_config
+from src.process_group import setup_process_group
 
 
 def main():
+    setup_process_group()
     parser = argparse.ArgumentParser(description="Autotune a verified STeP build_graph.")
     parser.add_argument("kernel", help="Kernel name (must match StepDB bench_config.yaml)")
     parser.add_argument("preset", help="Preset name")

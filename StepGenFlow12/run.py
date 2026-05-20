@@ -7,6 +7,7 @@ import sys
 
 from src.config_loader import load_llm_config
 from src.orchestrator import run_kernel
+from src.process_group import setup_process_group
 
 
 def _build_autotune_options(args, autotune_cfg: dict) -> dict:
@@ -31,6 +32,7 @@ def _build_autotune_options(args, autotune_cfg: dict) -> dict:
 
 
 def main():
+    setup_process_group()
     parser = argparse.ArgumentParser(description="StepGenFlow — generate STeP programs from PyTorch references")
     parser.add_argument("kernel", help="Kernel name from StepDB (e.g., element_wise_add)")
     parser.add_argument("preset", help="Preset name (e.g., small)")

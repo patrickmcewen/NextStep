@@ -165,7 +165,8 @@ def _seal_unused_branches(graph):
 
 
 def _offchip_load_or_restream(graph, underlying, stride, out_shape_tiled,
-                              tile_row, tile_col, transposed=False, par_dispatch=1):
+                              tile_row, tile_col, transposed=False, par_dispatch=1,
+                              start_tile_idx=0):
     # Normal path: ``underlying`` is an off-chip tensor → LinearOffChipLoad.
     # Failsafe: ``underlying`` is an on-chip stream (StepOps node or _BranchRef
     # tuple) — the refactor-time dataflow gate in orchestrator.py is the
@@ -184,7 +185,8 @@ def _offchip_load_or_restream(graph, underlying, stride, out_shape_tiled,
                                   out_shape_tiled=tuple(out_shape_tiled),
                                   tile_row=tile_row, tile_col=tile_col,
                                   transposed=transposed,
-                                  par_dispatch=par_dispatch)
+                                  par_dispatch=par_dispatch,
+                                  start_tile_idx=start_tile_idx)
         graph.add_node(node)
         return node
     import warnings
@@ -746,6 +748,7 @@ def _h_offchip_load(state, target, call):
     tile_col   = _src(_arg(call, 4, "tile_col"))
     transposed = _arg(call, 5, "transposed")
     par_dispatch = _arg_or_default(call, 6, "par_dispatch", "1")
+    start_tile_idx = _arg_or_default(call, 7, "start_tile_idx", "0")
     extra = f", transposed={_src(transposed)}" if transposed is not None else ""
     # Route through the failsafe wrapper: it does LinearOffChipLoad +
     # graph.add_node when `underlying` is a torch.Tensor, and falls back to a
@@ -754,7 +757,7 @@ def _h_offchip_load(state, target, call):
         f"{target} = _offchip_load_or_restream(graph, {underlying}, "
         f"stride=tuple({stride}), out_shape_tiled=tuple({out_shape}), "
         f"tile_row={tile_row}, tile_col={tile_col}, "
-        f"par_dispatch={par_dispatch}{extra})\n"
+        f"par_dispatch={par_dispatch}, start_tile_idx={start_tile_idx}{extra})\n"
     )
 
 
