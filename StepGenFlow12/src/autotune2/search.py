@@ -663,6 +663,7 @@ def render_library_as_variant_summaries(
                         output_contracts=dict(out_key),
                         cycles=entry.cycles,
                         on_chip=entry.on_chip,
+                        cycle_source=entry.cycle_source,
                     ))
                 idx += 1
     return summaries
@@ -712,6 +713,7 @@ async def _seed_baseline(
     sim_manager: SimulationManager,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
+    prior_baseline: DesignEntry | None = None,
 ) -> tuple[DesignEntry, str]:
     """Insert the pass-1 baseline with identity contracts into the library.
 
@@ -725,6 +727,16 @@ async def _seed_baseline(
     ``SimulationResult.breakdown`` (empty when the manager wraps a test
     stub without ``.breakdown``). Callers thread the breakdown into the
     budgeted user prompt via ``_budget_block``.
+
+    When ``prior_baseline`` is supplied (multi-pass: this node already had
+    its pass-1 baseline scored in an earlier pass), reuse its
+    cycles/on_chip/cycle_source/breakdown instead of re-invoking the
+    simulator. The composed source is deterministic in
+    (pass1_dsl, descendant_dsls, parent_contract) and the simulator is
+    deterministic in the hw config (shared across passes), so re-scoring
+    would only duplicate the prior measurement. Under rust-backed managers
+    it would additionally append a duplicate calibration record, which
+    breaks the curation agent's no-duplicate-record_id invariant.
     """
     identity_in = _identity_input_contracts(parent_contract)
     output_names = tuple(f"out_{i}" for i in range(len(parent_contract.out_shapes)))
@@ -732,39 +744,57 @@ async def _seed_baseline(
         name: vanilla_contract_for(tuple(parent_contract.out_shapes[i]))
         for i, name in enumerate(output_names)
     }
-    wrapper = build_synthetic_wrapper_for_node(
-        node_name=node_name,
-        parent_contract=parent_contract,
-        input_contracts=identity_in,
-    )
-    composed = compose_source(
-        parent_dsl=wrapper + "\n" + pass1_dsl,
-        descendant_dsls_postorder=descendant_dsls,
-    )
-    ctx = SimContext(
-        node_path=node_path, variant_kind="baseline", is_root=False,
-    )
-    result = await sim_manager.score(ctx, composed)
-    assert result.error_feedback is None, (
-        f"_seed_baseline: simulation manager returned error_feedback "
-        f"for the pass-1 baseline at node {node_path!r}. Baseline "
-        f"scoring must succeed — the baseline is the rollback anchor for "
-        f"this node. Feedback was:\n{result.error_feedback}"
-    )
+    if prior_baseline is None:
+        wrapper = build_synthetic_wrapper_for_node(
+            node_name=node_name,
+            parent_contract=parent_contract,
+            input_contracts=identity_in,
+        )
+        composed = compose_source(
+            parent_dsl=wrapper + "\n" + pass1_dsl,
+            descendant_dsls_postorder=descendant_dsls,
+        )
+        ctx = SimContext(
+            node_path=node_path, variant_kind="baseline", is_root=False,
+        )
+        result = await sim_manager.score(ctx, composed)
+        assert result.error_feedback is None, (
+            f"_seed_baseline: simulation manager returned error_feedback "
+            f"for the pass-1 baseline at node {node_path!r}. Baseline "
+            f"scoring must succeed — the baseline is the rollback anchor for "
+            f"this node. Feedback was:\n{result.error_feedback}"
+        )
+        cycles = result.cycles
+        on_chip = result.on_chip
+        cycle_source = result.cycle_source
+        breakdown = result.breakdown
+    else:
+        assert prior_baseline.provenance == "pass1_baseline", (
+            f"_seed_baseline: prior_baseline must have "
+            f"provenance='pass1_baseline', got {prior_baseline.provenance!r}"
+        )
+        assert prior_baseline.cycles is not None and prior_baseline.cycles > 0, (
+            f"_seed_baseline: prior_baseline.cycles must be a positive int, "
+            f"got {prior_baseline.cycles!r} at node {node_path!r}"
+        )
+        cycles = prior_baseline.cycles
+        on_chip = prior_baseline.on_chip
+        cycle_source = prior_baseline.cycle_source
+        breakdown = prior_baseline.breakdown
     entry = DesignEntry(
         dsl=pass1_dsl,
         input_contracts=identity_in,
         output_contracts=identity_out,
-        cycles=result.cycles,
-        on_chip=result.on_chip,
-        cycle_source=result.cycle_source,
+        cycles=cycles,
+        on_chip=on_chip,
+        cycle_source=cycle_source,
         provenance="pass1_baseline",
-        breakdown=result.breakdown,
+        breakdown=breakdown,
         children_picks=dict(children_picks),
     )
     cell = library_cell(lib, identity_in, identity_out)
     cell.append(entry)
-    return entry, result.breakdown
+    return entry, breakdown
 
 
 def _on_chip_vanilla_shapes(parent_contract: Contract) -> dict[str, tuple[int, ...]]:
@@ -807,8 +837,9 @@ def _admission_continuation_feedback(
     the same per-node library via ``admit_to_cell``.
     """
     msg = (
-        f"Variant ACCEPTED at cycles={entry.cycles}, on_chip={entry.on_chip} "
-        f"bytes. It has been admitted to this node's library.\n\n"
+        f"Variant ACCEPTED at cycles={entry.cycles} ({entry.cycle_source}), "
+        f"on_chip={entry.on_chip} bytes. It has been admitted to this "
+        f"node's library.\n\n"
         "Now propose another DSL implementation that achieves **lower "
         "cycles** than the variant above"
     )
@@ -1226,6 +1257,7 @@ async def search_leaf(
     config: SearchConfig = SearchConfig(),
     system_prompt: str = "",
     initial_baselines: list[DesignEntry] | None = None,
+    prior_pass1_baseline: DesignEntry | None = None,
 ) -> NodeLibrary:
     """Populate one leaf node's library.
 
@@ -1270,6 +1302,7 @@ async def search_leaf(
             lib=lib, node_path=node.path, node_name=node.name,
             pass1_dsl=pass1_dsl, sim_manager=sim_manager,
             descendant_dsls=[], children_picks={},
+            prior_baseline=prior_pass1_baseline,
         )
     else:
         baseline, baseline_breakdown = await _seed_baseline(
@@ -1278,6 +1311,7 @@ async def search_leaf(
             pass1_dsl=pass1_dsl, sim_manager=sim_manager,
             descendant_dsls=[],
             children_picks={},
+            prior_baseline=prior_pass1_baseline,
         )
     _write_pass1_baseline_score(ckpt_dir, baseline)
 
@@ -1603,6 +1637,7 @@ async def search_parent(
     config: SearchConfig = SearchConfig(),
     system_prompt: str = "",
     initial_baselines: list[DesignEntry] | None = None,
+    prior_pass1_baseline: DesignEntry | None = None,
 ) -> NodeLibrary:
     """Populate one parent node's library.
 
@@ -1650,6 +1685,7 @@ async def search_parent(
             pass1_dsl=pass1_dsl,
             sim_manager=sim_manager, descendant_dsls=baseline_descendants,
             children_picks=children_picks_baseline,
+            prior_baseline=prior_pass1_baseline,
         )
     else:
         baseline, baseline_breakdown = await _seed_baseline(
@@ -1658,6 +1694,7 @@ async def search_parent(
             pass1_dsl=pass1_dsl, sim_manager=sim_manager,
             descendant_dsls=baseline_descendants,
             children_picks=children_picks_baseline,
+            prior_baseline=prior_pass1_baseline,
         )
     _write_pass1_baseline_score(ckpt_dir, baseline)
 
@@ -1742,40 +1779,62 @@ async def _seed_root_baseline(
     sim_manager: SimulationManager,
     descendant_dsls: list[str],
     children_picks: dict[str, DesignEntry],
+    prior_baseline: DesignEntry | None = None,
 ) -> tuple[DesignEntry, str]:
     """Like ``_seed_baseline`` but for the root (no synthetic wrapper, no
     parent_contract). The root's library has a single cell keyed by
     empty input/output contracts.
 
     Returns ``(entry, baseline_breakdown)`` — see ``_seed_baseline``.
+    ``prior_baseline`` short-circuits the simulator call when this node's
+    pass-1 baseline was already scored in a prior pass — same rationale
+    as ``_seed_baseline``.
     """
-    composed = compose_source(
-        parent_dsl=pass1_dsl,
-        descendant_dsls_postorder=descendant_dsls,
-    )
-    ctx = SimContext(
-        node_path=node_path, variant_kind="baseline", is_root=True,
-    )
-    result = await sim_manager.score(ctx, composed)
-    assert result.error_feedback is None, (
-        f"_seed_root_baseline: simulation manager returned error_feedback "
-        f"for the root pass-1 baseline at {node_path!r}. Baseline scoring "
-        f"must succeed. Feedback was:\n{result.error_feedback}"
-    )
+    if prior_baseline is None:
+        composed = compose_source(
+            parent_dsl=pass1_dsl,
+            descendant_dsls_postorder=descendant_dsls,
+        )
+        ctx = SimContext(
+            node_path=node_path, variant_kind="baseline", is_root=True,
+        )
+        result = await sim_manager.score(ctx, composed)
+        assert result.error_feedback is None, (
+            f"_seed_root_baseline: simulation manager returned error_feedback "
+            f"for the root pass-1 baseline at {node_path!r}. Baseline scoring "
+            f"must succeed. Feedback was:\n{result.error_feedback}"
+        )
+        cycles = result.cycles
+        on_chip = result.on_chip
+        cycle_source = result.cycle_source
+        breakdown = result.breakdown
+    else:
+        assert prior_baseline.provenance == "pass1_baseline", (
+            f"_seed_root_baseline: prior_baseline must have "
+            f"provenance='pass1_baseline', got {prior_baseline.provenance!r}"
+        )
+        assert prior_baseline.cycles is not None and prior_baseline.cycles > 0, (
+            f"_seed_root_baseline: prior_baseline.cycles must be a positive "
+            f"int, got {prior_baseline.cycles!r} at node {node_path!r}"
+        )
+        cycles = prior_baseline.cycles
+        on_chip = prior_baseline.on_chip
+        cycle_source = prior_baseline.cycle_source
+        breakdown = prior_baseline.breakdown
     entry = DesignEntry(
         dsl=pass1_dsl,
         input_contracts={},
         output_contracts={},
-        cycles=result.cycles,
-        on_chip=result.on_chip,
-        cycle_source=result.cycle_source,
+        cycles=cycles,
+        on_chip=on_chip,
+        cycle_source=cycle_source,
         provenance="pass1_baseline",
-        breakdown=result.breakdown,
+        breakdown=breakdown,
         children_picks=dict(children_picks),
     )
     cell = library_cell(lib, {}, {})
     cell.append(entry)
-    return entry, result.breakdown
+    return entry, breakdown
 
 
 # ---------------------------------------------------------------------------
@@ -1890,6 +1949,7 @@ async def autotune(
     max_baselines_per_node: int = 4,
     baseline_selection: str = "pareto_diverse",
     pass_subdir: str | None = None,
+    sim_pass_seconds: float | None = None,
 ) -> AutotuneResult:
     """Walk plan_tree bottom-up and search each node — in parallel where
     the tree shape allows.
@@ -1966,6 +2026,11 @@ async def autotune(
         ``<ckpt>/autotune2/<node>/<pass_subdir>/`` (node-major layout).
         ``None`` (default) keeps the single-pass layout
         ``<ckpt>/autotune2/<node>/``.
+      - ``sim_pass_seconds``: per-pass wall-clock budget forwarded to
+        every node manager's ``start_pass``. ``AnalyticalOnly`` ignores
+        it; ``RustAll`` re-arms its shared ``TimeBudget`` so rust calls
+        within this pass collectively respect the bound. ``None``
+        means unlimited.
 
     Returns the full ``{node_path: NodeLibrary}`` map plus the root path.
     """
@@ -2023,14 +2088,29 @@ async def autotune(
             else build_node_tensors_dict(parent_contract)
         )
         node_sim_manager = make_sim_manager(node_tensors)
+        # Arm the manager's per-pass time budget. AnalyticalOnly's
+        # ``start_pass`` is a no-op; rust-backed managers (RustAll +
+        # later AgentManager) wrap a TimeBudget shared across every
+        # node's manager via the factory closure, so calling
+        # ``start_pass`` from every node task with the same seconds is
+        # naturally idempotent — the last reset wins, and they all
+        # write the same value.
+        await node_sim_manager.start_pass(sim_pass_seconds)
         node_verifier = make_verifier(node, parent_contract, node_tensors)
 
         # Multi-pass branching: pull additional starting designs from the
         # prior pass's library for this node. Exclude the prior library's
         # own pass-1 baseline by object identity — this pass re-seeds its
         # own pass-1 baseline at index 0 via ``_seed_baseline``, and
-        # double-seeding wastes one branch slot on a duplicate.
+        # double-seeding wastes one branch slot on a duplicate. The prior
+        # pass-1 entry is also threaded through as ``prior_pass1_baseline``
+        # so the seed call can short-circuit the simulator: the composed
+        # source is deterministic across passes, so re-scoring just
+        # duplicates the prior measurement (and, under rust-backed
+        # managers, duplicates a calibration record — which breaks
+        # curation's no-duplicate-record_id invariant).
         node_initial_baselines: list[DesignEntry] | None = None
+        prior_pass1: DesignEntry | None = None
         if initial_libraries is not None and node.path in initial_libraries:
             prior_lib = initial_libraries[node.path]
             prior_pass1 = find_pass1_baseline_entry(prior_lib)
@@ -2054,6 +2134,7 @@ async def autotune(
                 config=config,
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
+                prior_pass1_baseline=prior_pass1,
             )
         else:
             # Parent: gather each child's pass-1 baseline entry. We must use
@@ -2081,6 +2162,7 @@ async def autotune(
                 config=config,
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
+                prior_pass1_baseline=prior_pass1,
             )
 
         # Multi-pass accumulator: merge the prior pass's entries for this

@@ -419,10 +419,15 @@ def _precompute_moe_routed(dims):
         for k in range(n_active):
             expert_onehot[b, k, expert_indices[b, k]] = 1
 
+    # Stack per-expert weights into single tensors so the DSL can index them
+    # via tensors["gate_weights"][i] and still get a StepRawTensor (the
+    # framework only wraps top-level torch.Tensor values, not Python lists).
+    # `t[i]` on a stacked tensor matches the list-indexing semantics used by
+    # reference.py / step_impl.py exactly, so this is a no-op for them.
     return {
-        "gate_weights": gate_weights,
-        "up_weights": up_weights,
-        "down_weights": down_weights,
+        "gate_weights": torch.stack(gate_weights, dim=0).contiguous(),
+        "up_weights": torch.stack(up_weights, dim=0).contiguous(),
+        "down_weights": torch.stack(down_weights, dim=0).contiguous(),
         "x": x,
         "router_w": router_w,
         "expert_indices": expert_indices,
@@ -957,4 +962,15 @@ def _precompute_qk_reshape_score(dims):
         "x": torch.randn(seq_len, hidden_size),
         "w": torch.randn(hidden_size, num_heads * head_dim),
         "k": torch.randn(seq_len, num_kv_heads, head_dim),
+    }
+
+
+@register("gemm_rms_norm")
+def _precompute_gemm_rms_norm(dims):
+    torch.manual_seed(SEED)
+    M, K, N = dims["M"], dims["K"], dims["N"]
+    return {
+        "A": torch.randn(M, K),
+        "B": torch.randn(K, N),
+        "eps": dims.get("eps", 1e-6),
     }

@@ -111,6 +111,13 @@ class VariantSummary:
     Stores only the contract metadata + Pareto coordinates — the DSL
     body of the variant is NOT shown (per HANDOFF.md: the LLM never
     sees stub bodies, only declarative contract metadata).
+
+    ``cycle_source`` is the tag of the simulator that produced
+    ``cycles`` — ``"analytical"`` (STeP timing model) or ``"rust"``
+    (cycle-approximate rust sim). Surfaced inline next to every
+    rendered cycle count so the LLM can tell which numbers in a
+    mixed-source library are directly comparable to each other (see
+    the mixed-source caveat in the autotune2 system prompt).
     """
 
     variant_index: int
@@ -118,6 +125,7 @@ class VariantSummary:
     output_contracts: dict[str, TensorContract]
     cycles: int
     on_chip: int
+    cycle_source: str = "analytical"
 
 
 def render_variant_block(
@@ -179,7 +187,9 @@ def render_variant_block(
     lines.append("  variants:")
     for v in variants:
         lines.append(
-            f"    [{v.variant_index}] cycles={v.cycles}, on_chip={v.on_chip}"
+            f"    [{v.variant_index}] "
+            f"cycles={v.cycles} ({v.cycle_source}), "
+            f"on_chip={v.on_chip}"
         )
         if v.input_contracts:
             lines.append("        input contracts:")
@@ -271,7 +281,7 @@ def build_autotune2_system_prompt(
         _MAX_TILE_ADDENDUM_TEMPLATE.format(max_tile=int(max_tile))
         if max_tile is not None else ""
     )
-    return (
+    rendered = (
         system_path.read_text()
         .replace("{step_dsl_code}", dsl_code)
         .replace("{memory_notes}", memory_notes)
@@ -279,6 +289,37 @@ def build_autotune2_system_prompt(
         .replace("{output_protocol}", protocol_path.read_text().rstrip())
         .replace("{max_tile_addendum}", max_tile_addendum)
     )
+    # Append the mixed-source caveat unconditionally — the agent never
+    # knows which simulation manager is wired up for its current run,
+    # and the inline ``(analytical|rust)`` tag on every rendered cycle
+    # value (see ``VariantSummary`` / ``render_accepted_summary``) only
+    # carries the right warning weight when this caveat is in scope.
+    return rendered + "\n" + _MIXED_SOURCE_CAVEAT
+
+
+_MIXED_SOURCE_CAVEAT = (
+    "## A note on mixed cycle sources\n\n"
+    "Every cycle count surfaced to you in this run carries an inline "
+    "tag — ``(analytical)`` or ``(rust)`` — identifying which simulator "
+    "produced it. ``analytical`` is the STeP closed-form timing model: "
+    "cheap, deterministic, and the source you saw in earlier autotune2 "
+    "runs. ``rust`` is the cycle-approximate rust simulator: slower, "
+    "more accurate, and the ground-truth target.\n\n"
+    "Different sources are NOT directly comparable. A variant with "
+    "``cycles=1000 (rust)`` is not guaranteed faster than one with "
+    "``cycles=1100 (analytical)``: the analytical model can over- or "
+    "under-estimate by 2x or more on some op patterns, and a library "
+    "may contain both source types when the per-pass rust budget runs "
+    "out mid-pass. Use the tag to:\n\n"
+    "  - rank within the same tag first (rust-vs-rust, analytical-vs-"
+    "analytical); cross-tag comparisons are only suggestive;\n"
+    "  - prefer designs that beat the pass-1 baseline by a meaningful "
+    "margin under whichever source the baseline was measured against, "
+    "not just by single-digit percentages that could be model noise;\n"
+    "  - assume the autotuner will rust-evaluate one final pick at the "
+    "end of the run as ground truth — your job is to expose a strong "
+    "Pareto front, not to micro-optimize a single cycle number.\n"
+)
 
 
 _VARIANT_SECTION_TEMPLATE = """
@@ -404,8 +445,14 @@ def render_accepted_summary(
         return ""
     lines: list[str] = []
     for idx, entry in enumerate(accepted):
+        # ``cycle_source`` is rendered inline so the LLM can tell which
+        # cycles values in a mixed-source library are directly
+        # comparable. ``getattr`` keeps loosely-typed test stubs that
+        # pass non-DesignEntry objects working (default = analytical).
+        source = getattr(entry, "cycle_source", "analytical")
         lines.append(
-            f"  [{idx}] cycles={entry.cycles}, on_chip={entry.on_chip}"
+            f"  [{idx}] cycles={entry.cycles} ({source}), "
+            f"on_chip={entry.on_chip}"
         )
         if entry.input_contracts:
             lines.append("        input contracts:")
@@ -581,3 +628,561 @@ def parse_autotune2_response(
 def contract_to_yaml_dict(c: TensorContract) -> dict:
     """Inverse of ``_parse_contract_yaml`` (for embedding in YAML fixtures)."""
     return {"reshape": list(c.reshape), "permutation": list(c.permutation)}
+
+
+# ---------------------------------------------------------------------------
+# CurationAgent / SimDecisionAgent prompts (PR4)
+# ---------------------------------------------------------------------------
+#
+# CurationAgent picks the K most predictive calibration records for a target
+# composed source; SimDecisionAgent (used by AgentManager) decides per-variant
+# whether to spend the per-pass Rust-simulator budget on this variant. Both
+# emit a fenced ```json block with a fixed schema — parsers fail-loud on any
+# deviation (CLAUDE.md style: no try/except on agent output).
+#
+# AgentManager itself is the wrapper that calls these two agents and falls
+# back to analytical scoring on any agent failure (LLM RPC error, parser
+# failure, etc.) — degradation is at the call-site boundary, the parsers
+# stay strict.
+
+
+_CURATION_SYSTEM_PROMPT = """\
+You rank past simulator-calibration records by how predictive they are for a
+new piece of DSL code. Each record carries a STeP DSL composed source plus
+two cycle measurements of that same source: the cheap analytical timing
+model's estimate, and the cycle-approximate Rust simulator's measurement.
+The ratio (rust / analytical) tells you how well the analytical model
+captured this particular code's runtime.
+
+You will receive:
+  - one target composed source (the code the caller wants to predict
+    cycles for),
+  - N candidate records (composed source + analytical_cycles + rust_cycles).
+
+Pick the K records most useful for predicting the target's analytical-vs-
+rust relationship.
+
+Signals to favour:
+  - records whose composed source uses the SAME DSL ops as the target
+    (especially ops the analytical model is known to mis-estimate:
+    `flat_reassemble`, `flat_partition`, `expert_addr_gen`, `dyn_offchip_*`),
+  - records with similar tile shapes / streaming dimensions,
+  - records where analytical and rust diverged (high information about the
+    model's blind spots) over records where they agreed (low information).
+
+Output ONLY a fenced ```json block of the shape:
+
+  ```json
+  {"record_ids": ["<id1>", "<id2>", ...]}
+  ```
+
+The list must contain EXACTLY K entries, each ID must appear in the
+candidate set, and no ID may repeat. No prose outside the fence.
+"""
+
+
+_SIM_DECISION_SYSTEM_PROMPT = """\
+You decide, per variant, whether the autotune2 search loop should spend its
+Rust-simulator budget on this variant or fall back to the cheap analytical
+timing model.
+
+The Rust simulator is ground truth but slow (seconds to hours). The
+analytical model is instant but can be off by 2x or more on some op
+patterns. You have a per-pass wall-clock budget shared across every node in
+the search; once it runs out the loop is forced to analytical regardless of
+what you say.
+
+You will receive per call:
+  - the variant's composed DSL source,
+  - the analytical estimate (cycles, on_chip bytes) for this variant,
+  - the node context (root vs non-root, baseline vs variant),
+  - the budget state (remaining_seconds, recent_rust_avg_sec),
+  - curated calibration records — past (analytical, rust) pairs on related
+    code, picked by the curation agent.
+
+Lean toward "rust" when:
+  - this is a baseline (anchors the Pareto for the whole pass),
+  - the curated records show large analytical-vs-rust divergence on similar
+    code,
+  - the analytical estimate is suspiciously good (large speedup over the
+    baseline analytical number),
+  - remaining_seconds comfortably exceeds recent_rust_avg_sec.
+
+Lean toward "analytical" when:
+  - the curated records show analytical and rust agreeing closely on
+    similar code,
+  - the variant's analytical cycles are far worse than the baseline
+    (likely regression, not worth measuring),
+  - remaining_seconds < 2 * recent_rust_avg_sec.
+
+Output ONLY a fenced ```json block of the shape:
+
+  ```json
+  {"decision": "rust", "reason": "<one short sentence>"}
+  ```
+
+`decision` must be exactly "rust" or "analytical". `reason` is for
+telemetry only — keep it under 25 words. No prose outside the fence.
+"""
+
+
+def build_curation_system_prompt() -> str:
+    """System prompt for the curation agent. Static — no inputs."""
+    return _CURATION_SYSTEM_PROMPT
+
+
+def build_sim_decision_system_prompt() -> str:
+    """System prompt for the in-loop simulation-decision agent. Static."""
+    return _SIM_DECISION_SYSTEM_PROMPT
+
+
+@dataclass(frozen=True)
+class CurationCandidate:
+    """One row the curation agent ranks.
+
+    ``record_id`` is a caller-chosen stable string (typically the
+    sha256-prefix of the composed source — same scheme as the on-disk
+    sources_dir filename). ``composed_source`` is the full DSL text the
+    record was measured against.
+    """
+
+    record_id: str
+    composed_source: str
+    analytical_cycles: int
+    rust_cycles: int
+    kernel: str
+    preset: str
+
+
+def build_curation_user_prompt(
+    *,
+    target_source: str,
+    candidates: list[CurationCandidate],
+    k: int,
+) -> str:
+    """Per-call user prompt for the curation agent.
+
+    Renders the target source + N candidate blocks + an explicit "pick K".
+    ``record_id`` strings are echoed exactly in the agent's reply, so they
+    must be plain text — no embedded whitespace or fence characters.
+    """
+    assert target_source, "build_curation_user_prompt: target_source must be non-empty"
+    assert candidates, (
+        "build_curation_user_prompt: candidates must be non-empty "
+        "(an empty candidate set has nothing to rank — the caller should "
+        "short-circuit before invoking the curation agent)"
+    )
+    assert isinstance(k, int) and 1 <= k <= len(candidates), (
+        f"build_curation_user_prompt: k must be 1 <= k <= len(candidates) "
+        f"(={len(candidates)}), got {k!r}"
+    )
+    seen_ids: set[str] = set()
+    for c in candidates:
+        assert isinstance(c, CurationCandidate), (
+            f"build_curation_user_prompt: every candidate must be a "
+            f"CurationCandidate, got {type(c).__name__}"
+        )
+        assert c.record_id and not any(ch.isspace() for ch in c.record_id), (
+            f"build_curation_user_prompt: record_id {c.record_id!r} must be "
+            f"non-empty with no whitespace (echoed verbatim in agent reply)"
+        )
+        assert c.record_id not in seen_ids, (
+            f"build_curation_user_prompt: duplicate record_id {c.record_id!r} "
+            f"in candidate list"
+        )
+        seen_ids.add(c.record_id)
+
+    blocks: list[str] = []
+    for c in candidates:
+        ratio = c.rust_cycles / c.analytical_cycles if c.analytical_cycles else 0.0
+        blocks.append(
+            f"### Record {c.record_id}\n"
+            "```\n"
+            f"{c.composed_source}\n"
+            "```\n"
+            f"analytical_cycles={c.analytical_cycles}, "
+            f"rust_cycles={c.rust_cycles}, ratio={ratio:.3f}, "
+            f"kernel={c.kernel}, preset={c.preset}\n"
+        )
+    return (
+        "## Target composed source\n\n"
+        "```\n"
+        f"{target_source}\n"
+        "```\n\n"
+        f"## Candidate records (N={len(candidates)})\n\n"
+        + "\n".join(blocks)
+        + f"\n## Pick K={k} records.\n"
+    )
+
+
+def build_sim_decision_user_prompt(
+    *,
+    node_path: str,
+    is_root: bool,
+    variant_kind: str,
+    attempt_index: int,
+    turn_index: int,
+    composed_source: str,
+    analytical_cycles: int,
+    analytical_on_chip: int,
+    remaining_seconds: float,
+    recent_rust_avg_sec: float,
+    consumed_seconds: float,
+    curated: list[CurationCandidate],
+) -> str:
+    """Per-call user prompt for the in-loop simulation-decision agent."""
+    assert variant_kind in ("baseline", "variant"), (
+        f"build_sim_decision_user_prompt: variant_kind must be 'baseline' "
+        f"or 'variant', got {variant_kind!r}"
+    )
+    if curated:
+        curated_block = "\n".join(
+            f"### Record {c.record_id}\n"
+            "```\n"
+            f"{c.composed_source}\n"
+            "```\n"
+            f"analytical_cycles={c.analytical_cycles}, "
+            f"rust_cycles={c.rust_cycles}, "
+            f"ratio="
+            f"{(c.rust_cycles / c.analytical_cycles if c.analytical_cycles else 0.0):.3f}"
+            f"\n"
+            for c in curated
+        )
+    else:
+        curated_block = "(no curated records available — cold start)\n"
+
+    # `inf` for unlimited budget renders as "inf"; the decision agent
+    # should read that as "no cap, run rust whenever it makes sense".
+    rem = (
+        "inf" if remaining_seconds == float("inf") else f"{remaining_seconds:.1f}"
+    )
+    return (
+        "## Variant context\n\n"
+        f"node_path={node_path}, is_root={is_root}, "
+        f"variant_kind={variant_kind}, "
+        f"attempt_index={attempt_index}, turn_index={turn_index}\n\n"
+        "## Composed source\n\n"
+        "```\n"
+        f"{composed_source}\n"
+        "```\n\n"
+        "## Analytical estimate\n\n"
+        f"cycles={analytical_cycles}, on_chip={analytical_on_chip} bytes\n\n"
+        "## Budget state\n\n"
+        f"remaining_seconds={rem}, "
+        f"recent_rust_avg_sec={recent_rust_avg_sec:.2f}, "
+        f"consumed_seconds={consumed_seconds:.2f}\n\n"
+        f"## Curated calibration evidence (K={len(curated)})\n\n"
+        f"{curated_block}\n"
+        "## Decide.\n"
+    )
+
+
+def parse_curation_response(
+    response_text: str,
+    *,
+    candidate_ids: list[str],
+    k: int,
+) -> list[str]:
+    """Extract the ranked record_id list from a curation-agent reply.
+
+    Fails loudly (AssertionError) on any schema deviation — missing fence,
+    wrong JSON shape, duplicate ID, ID not in ``candidate_ids``, or list
+    length != ``k``. The caller (``AgentManager``) catches the assertion at
+    the call-site boundary and falls back to analytical scoring; the
+    parser itself stays strict so prompt-drift bugs surface immediately
+    when CurationAgent is exercised directly.
+    """
+    import json as _json
+
+    body = _extract_fenced(response_text, "json")
+    assert body is not None, (
+        "parse_curation_response: response must contain a fenced ```json "
+        "block; none found. Raw response:\n" + response_text
+    )
+    parsed = _json.loads(body)
+    assert isinstance(parsed, dict), (
+        f"parse_curation_response: top-level JSON must be an object, got "
+        f"{type(parsed).__name__}"
+    )
+    assert "record_ids" in parsed, (
+        f"parse_curation_response: JSON missing required key 'record_ids'; "
+        f"got keys {sorted(parsed.keys())!r}"
+    )
+    record_ids = parsed["record_ids"]
+    assert isinstance(record_ids, list), (
+        f"parse_curation_response: 'record_ids' must be a list, got "
+        f"{type(record_ids).__name__}"
+    )
+    assert len(record_ids) == k, (
+        f"parse_curation_response: expected exactly {k} record_ids, got "
+        f"{len(record_ids)}: {record_ids!r}"
+    )
+    candidate_set = set(candidate_ids)
+    seen: set[str] = set()
+    for rid in record_ids:
+        assert isinstance(rid, str), (
+            f"parse_curation_response: every record_id must be a string, "
+            f"got {type(rid).__name__}={rid!r}"
+        )
+        assert rid in candidate_set, (
+            f"parse_curation_response: record_id {rid!r} is not in the "
+            f"candidate set (size {len(candidate_set)})"
+        )
+        assert rid not in seen, (
+            f"parse_curation_response: duplicate record_id {rid!r} in "
+            f"agent reply"
+        )
+        seen.add(rid)
+    return list(record_ids)
+
+
+def parse_sim_decision_response(response_text: str) -> tuple[str, str]:
+    """Extract ``(decision, reason)`` from a sim-decision-agent reply.
+
+    ``decision`` is asserted to be exactly ``"rust"`` or ``"analytical"``;
+    ``reason`` is whatever string the agent provided (trimmed). Schema
+    violations raise ``AssertionError``; the wrapping ``AgentManager``
+    catches at the call-site boundary and falls back to analytical.
+    """
+    import json as _json
+
+    body = _extract_fenced(response_text, "json")
+    assert body is not None, (
+        "parse_sim_decision_response: response must contain a fenced "
+        "```json block; none found. Raw response:\n" + response_text
+    )
+    parsed = _json.loads(body)
+    assert isinstance(parsed, dict), (
+        f"parse_sim_decision_response: top-level JSON must be an object, "
+        f"got {type(parsed).__name__}"
+    )
+    assert "decision" in parsed and "reason" in parsed, (
+        f"parse_sim_decision_response: JSON must carry both 'decision' "
+        f"and 'reason' keys; got {sorted(parsed.keys())!r}"
+    )
+    decision = parsed["decision"]
+    reason = parsed["reason"]
+    assert decision in ("rust", "analytical"), (
+        f"parse_sim_decision_response: 'decision' must be 'rust' or "
+        f"'analytical', got {decision!r}"
+    )
+    assert isinstance(reason, str), (
+        f"parse_sim_decision_response: 'reason' must be a string, got "
+        f"{type(reason).__name__}={reason!r}"
+    )
+    return decision, reason.strip()
+
+
+# ---------------------------------------------------------------------------
+# FinalPickAgent prompts (PR5)
+# ---------------------------------------------------------------------------
+#
+# FinalPickAgent runs once at the end of an autotune2 run. Given the root
+# Pareto front (one or more candidate variants, each with cycles + on_chip +
+# cycle_source + composed source) plus curated calibration evidence per
+# candidate, it picks the single variant most likely to have the lowest
+# true (rust-measured) cycle count. The picked variant is the one that gets
+# the run's single end-of-run rust evaluation, replacing today's
+# ``min_cycles`` deterministic tiebreaker for runs configured with
+# ``--root-pick=agent``. See HANDOFF design decision #6 + #8.
+#
+# Output protocol: same fenced ```json shape as the in-loop agents, with
+# a single integer ``variant_index`` selecting which of the rendered
+# candidates to use. Parser is strict (assertion-based); call-site
+# fallback to ``min_cycles`` lives in ``runtime.final_pick``.
+
+
+_FINAL_PICK_SYSTEM_PROMPT = """\
+You pick a single variant from the root Pareto front of an autotune2 run.
+The picked variant is rust-evaluated exactly once to produce the run's
+reported number, so your goal is to maximize the chance the picked variant
+has the lowest true (Rust-measured) cycle count among the candidates.
+
+Each candidate carries:
+  - an analytical or Rust-measured ``cycles`` number and an analytical
+    ``on_chip`` byte count,
+  - a ``cycle_source`` tag (``"analytical"`` or ``"rust"``) — Rust numbers
+    are ground truth; analytical numbers can be off by 2x or more on some
+    op patterns,
+  - its composed DSL source,
+  - a small set of curated past (analytical, Rust) calibration records on
+    related code, picked by the curation agent.
+
+Lean toward picking:
+  - the lowest-cycles Rust-sourced candidate when one exists — its number
+    is trustworthy and directly comparable to other Rust candidates,
+  - an analytical candidate only when its cycles are clearly lower than
+    every Rust candidate AND the curated records do NOT show the analytical
+    model under-predicting on similar code (low rust/analytical ratio
+    across the curated set),
+  - the one with smaller on_chip when two candidates are otherwise tied —
+    smaller on-chip footprint correlates with better data movement.
+
+Avoid picking:
+  - an analytical candidate whose cycles are suspiciously low while the
+    curated records show analytical heavily under-predicts on similar code
+    (high rust/analytical ratio) — the apparent speedup is likely a
+    modeling artifact,
+  - a Rust candidate whose cycles are dominated by another Rust candidate
+    on both axes.
+
+Output ONLY a fenced ```json block of the shape:
+
+  ```json
+  {"variant_index": 0, "reason": "<one short sentence>"}
+  ```
+
+``variant_index`` must be an integer in [0, N-1] where N is the number of
+candidates rendered in the user message. ``reason`` is for telemetry only —
+keep it under 25 words. No prose outside the fence.
+"""
+
+
+def build_final_pick_system_prompt() -> str:
+    """System prompt for the end-of-run final-pick agent. Static — no inputs."""
+    return _FINAL_PICK_SYSTEM_PROMPT
+
+
+@dataclass(frozen=True)
+class FinalPickCandidate:
+    """One root-Pareto entry rendered to the final-pick agent.
+
+    ``variant_index`` is the 0-based position in the rendered list and is
+    echoed verbatim in the agent's reply. ``curated`` is the curation
+    agent's per-candidate selection (may be empty on a cold-start run with
+    no prior calibration records).
+    """
+
+    variant_index: int
+    cycles: int
+    on_chip: int
+    cycle_source: str
+    composed_source: str
+    curated: list  # list[CurationCandidate]
+
+
+def build_final_pick_user_prompt(
+    *,
+    root_path: str,
+    kernel: str,
+    preset: str,
+    candidates: list,  # list[FinalPickCandidate]
+) -> str:
+    """Per-call user prompt for the final-pick agent.
+
+    Renders one block per candidate with cycles + cycle_source + on_chip,
+    its composed source, and the curation-agent-picked calibration evidence
+    for THIS candidate (cycle pair + composed source per record). The
+    ``variant_index`` of each candidate is its 0-based position in the
+    list and is what the agent echoes back.
+    """
+    assert candidates, (
+        "build_final_pick_user_prompt: candidates must be non-empty (the "
+        "caller short-circuits on an empty root Pareto front)"
+    )
+    seen_idx: set[int] = set()
+    for i, c in enumerate(candidates):
+        assert isinstance(c, FinalPickCandidate), (
+            f"build_final_pick_user_prompt: every candidate must be a "
+            f"FinalPickCandidate, got {type(c).__name__}"
+        )
+        assert c.variant_index == i, (
+            f"build_final_pick_user_prompt: candidates[{i}].variant_index="
+            f"{c.variant_index!r} must equal its list position {i}"
+        )
+        assert c.variant_index not in seen_idx, (
+            f"build_final_pick_user_prompt: duplicate variant_index "
+            f"{c.variant_index!r}"
+        )
+        seen_idx.add(c.variant_index)
+        assert c.cycle_source in ("analytical", "rust"), (
+            f"build_final_pick_user_prompt: candidates[{i}].cycle_source="
+            f"{c.cycle_source!r} must be 'analytical' or 'rust'"
+        )
+
+    blocks: list[str] = []
+    for c in candidates:
+        if c.curated:
+            curated_block = "\n".join(
+                f"  - record {r.record_id}: "
+                f"analytical_cycles={r.analytical_cycles}, "
+                f"rust_cycles={r.rust_cycles}, "
+                f"ratio="
+                f"{(r.rust_cycles / r.analytical_cycles if r.analytical_cycles else 0.0):.3f}, "
+                f"kernel={r.kernel}, preset={r.preset}\n"
+                f"    ```\n"
+                f"    {r.composed_source.rstrip().replace(chr(10), chr(10) + '    ')}\n"
+                f"    ```"
+                for r in c.curated
+            )
+        else:
+            curated_block = (
+                "  (no curated records — cold start or no prior measurements "
+                "on similar code)"
+            )
+        blocks.append(
+            f"### Candidate {c.variant_index}\n"
+            f"cycles={c.cycles} ({c.cycle_source}), on_chip={c.on_chip} bytes\n\n"
+            "Composed source:\n"
+            "```\n"
+            f"{c.composed_source}\n"
+            "```\n\n"
+            f"Curated calibration evidence (K={len(c.curated)}):\n"
+            f"{curated_block}\n"
+        )
+    return (
+        f"## Final-pick context\n\n"
+        f"root_path={root_path}, kernel={kernel}, preset={preset}\n\n"
+        f"## Root Pareto candidates (N={len(candidates)})\n\n"
+        + "\n".join(blocks)
+        + f"\n## Pick exactly one variant_index in [0, {len(candidates) - 1}].\n"
+    )
+
+
+def parse_final_pick_response(
+    response_text: str,
+    *,
+    num_candidates: int,
+) -> tuple[int, str]:
+    """Extract ``(variant_index, reason)`` from a final-pick-agent reply.
+
+    Fails loudly (AssertionError) on missing fence, wrong JSON shape,
+    out-of-range index, or non-integer index. The caller
+    (``runtime.final_pick(strategy="agent")``) catches at the call-site
+    boundary and falls back to the ``min_cycles`` deterministic pick.
+    """
+    import json as _json
+
+    assert num_candidates >= 1, (
+        f"parse_final_pick_response: num_candidates must be >= 1, got "
+        f"{num_candidates!r}"
+    )
+    body = _extract_fenced(response_text, "json")
+    assert body is not None, (
+        "parse_final_pick_response: response must contain a fenced ```json "
+        "block; none found. Raw response:\n" + response_text
+    )
+    parsed = _json.loads(body)
+    assert isinstance(parsed, dict), (
+        f"parse_final_pick_response: top-level JSON must be an object, got "
+        f"{type(parsed).__name__}"
+    )
+    assert "variant_index" in parsed and "reason" in parsed, (
+        f"parse_final_pick_response: JSON must carry both 'variant_index' "
+        f"and 'reason' keys; got {sorted(parsed.keys())!r}"
+    )
+    idx = parsed["variant_index"]
+    reason = parsed["reason"]
+    assert isinstance(idx, int) and not isinstance(idx, bool), (
+        f"parse_final_pick_response: 'variant_index' must be an int, got "
+        f"{type(idx).__name__}={idx!r}"
+    )
+    assert 0 <= idx < num_candidates, (
+        f"parse_final_pick_response: 'variant_index' must be in [0, "
+        f"{num_candidates - 1}], got {idx!r}"
+    )
+    assert isinstance(reason, str), (
+        f"parse_final_pick_response: 'reason' must be a string, got "
+        f"{type(reason).__name__}={reason!r}"
+    )
+    return idx, reason.strip()

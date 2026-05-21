@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from src.log_redirect import redirect_stdio_to, terminal_print
 from src.process_group import setup_process_group
 from src.regression_planning import load_bench_config, plan_jobs
 from src.regression_runner import (
@@ -141,7 +142,16 @@ async def _amain(args: argparse.Namespace) -> int:
     out_dir = init_output_dir(args.results_root)
     checkpoints_root = out_dir / "checkpoints"
     checkpoints_root.mkdir(parents=True, exist_ok=True)
-    log = setup_logging(out_dir / "regression.log")
+    # Redirect this driver's stdout/stderr into the same regression.log
+    # file the logger writes to, so any non-logger prints (subprocess
+    # stderr, library chatter) are captured. setup_logging notices the
+    # post-redirect non-TTY stdout and skips its tee-to-stdout handler so
+    # log lines are not duplicated.
+    log_path = out_dir / "regression.log"
+    redirected = redirect_stdio_to(log_path)
+    if redirected:
+        terminal_print(f"regression log -> {log_path}")
+    log = setup_logging(log_path)
 
     if args.subset:
         preset_mode = f"subset:{args.subset}"
@@ -234,6 +244,12 @@ async def _amain(args: argparse.Namespace) -> int:
         100.0 * overall_passed / len(results) if results else 0.0,
         wall,
     )
+    if redirected:
+        pct = 100.0 * overall_passed / len(results) if results else 0.0
+        terminal_print(
+            f"regression done — {overall_passed}/{len(results)} passed "
+            f"({pct:.1f}%) in {wall:.1f}s (log: {log_path})"
+        )
     return 0
 
 

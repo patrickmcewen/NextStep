@@ -3335,6 +3335,7 @@ async def run_kernel(
     stateless_refactor: bool = False,
     judge_enabled: bool = True,
     max_tile: int | None = None,
+    pregenerated_ts: str | None = None,
 ) -> dict:
     """Run the full pipeline for a single kernel + preset.
 
@@ -3493,8 +3494,11 @@ async def run_kernel(
         from src.prompts import _JUDGE_TEMPLATES
         judge_agents = {name: make_judge_agent(llm_config, name) for name in _JUDGE_TEMPLATES}
 
-    # Set up checkpoint directory
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    # Set up checkpoint directory. ``pregenerated_ts`` lets the caller
+    # (e.g. ``run.py``) decide the timestamp dir name up-front so it can
+    # install stdout/stderr redirection against the same path before
+    # ``run_kernel`` starts printing.
+    ts = pregenerated_ts or datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
     if checkpoint_dir is None:
         checkpoint_dir = str(Path("checkpoints") / ts)
     else:

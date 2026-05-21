@@ -1018,10 +1018,21 @@ def _h_binary_map_accum(state, target, call):
     rank = _arg_or_default(call, 2, "rank", "1")
     wt = _arg(call, 3, "weight_transposed")
     wt_s = f"weight_transposed={_src(wt)}" if wt is not None else ""
+    wt_bool = _src(wt) if wt is not None else "False"
     compute_bw = _arg_or_default(call, 4, "compute_bw", "1")
+    # init_fn sizes the Rust accumulator tile (sim/__init__.py reads tile_row/
+    # tile_col from init_fn.apply().shape), so it must equal the matmul output
+    # tile (a_row, b_col) — NOT a's input tile. `_dsl2step_init(a, 'elem')`
+    # silently undersizes the accumulator when b_col != a_col and the Rust sim
+    # then drains early with a nonsense cycle count.
+    init_expr = (
+        f"Zero(shape=(_dsl2step_in_tile({a}).shape[0], "
+        f"_dsl2step_in_tile({b}).shape[0 if {wt_bool} else 1]), "
+        f"dtype=_dsl2step_in_tile({a}).tile_dtype)"
+    )
     return _block(
         f"{target} = BinaryMapAccum(graph, {a}, {b}, "
-        f"fn=map_accum_fn.Matmul({wt_s}), init_fn=_dsl2step_init({a}, 'elem'), "
+        f"fn=map_accum_fn.Matmul({wt_s}), init_fn={init_expr}, "
         f"rank={rank}, write_back_mu=False, compute_bw={compute_bw})\n"
     )
 

@@ -29,11 +29,17 @@ STEP_TL_SRC = str(Path(__file__).resolve().parent.parent / "step_tl" / "src")
 STEP_TL_PROTO = str(Path(__file__).resolve().parent.parent / "step_tl" / "src" / "proto")
 
 SIM_TIMEOUT_SECONDS = 100000
-RTOL = 1e-3
-# Loosened from 1e-3 to 5e-3: tight enough to flag real correctness bugs, but
-# accommodates the FP accumulation floor for kernels with deep matmul+softmax
-# chains (e.g. generated_prefill_transformer/small bottoms out at max_abs=4.8e-3).
-ATOL = 5e-3
+# Tolerance for the sim-vs-gold correctness gate. Scales by max(|gold|) rather
+# than per-element |gold[i]|, because the f32 accumulation noise on sim[i] is
+# bounded by the *intermediates* getting summed into it (K-axis dot products
+# of weights ~N(0,1) and activations) — not by gold[i]. When cancellation
+# produces a small output from large intermediates (common in moe_routed,
+# softmax tails), a per-element rtol*|gold[i]| budget collapses to ~0 and a
+# bit-for-bit-noise-equivalent run gets flagged. Matches the metric in
+# validate_functional.py; threshold is one decade looser because the rust
+# path uses ndarray::dot whereas validate_functional.py runs torch.matmul
+# (identical to the gold), so it sees slightly more accumulation drift.
+REL_ERR_THRESHOLD = 1e-4
 
 
 @dataclass
@@ -277,13 +283,15 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     sim_tensor = sim_tensor.reshape(gold.shape)
 
     max_diff = (sim_tensor - gold).abs().max().item()
-    passed = torch.allclose(sim_tensor, gold, rtol=RTOL, atol=ATOL)
+    gold_scale = gold.abs().max().item() + 1e-12
+    rel_err = max_diff / gold_scale
+    passed = rel_err < REL_ERR_THRESHOLD
 
     if not passed:
         return EvalResult(
             kernel=kernel_name, preset=preset, stage="correctness", success=False,
             dims=dims,
-            error_message=f"Output incorrect: max_diff={max_diff}",
+            error_message=f"Output incorrect: max_diff={max_diff}, rel_err={rel_err:.2e} (threshold {REL_ERR_THRESHOLD:.0e})",
             cycle_time=float(cycles), max_diff=max_diff,
         )
 

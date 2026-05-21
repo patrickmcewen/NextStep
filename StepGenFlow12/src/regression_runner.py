@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -335,10 +336,16 @@ def write_summary(
 
 
 def setup_logging(log_path: Path) -> logging.Logger:
-    """Configure a dedicated logger that tees to stdout and `log_path`.
+    """Configure a dedicated logger that writes to `log_path` and (when
+    stdout is a TTY) also tees to stdout.
 
     Returns the runner's logger. Idempotent per `log_path`: handlers attached
     to a previous call on the same path are not duplicated.
+
+    The stdout StreamHandler is skipped when ``sys.stdout`` is not a TTY —
+    typically because ``run_regression.py`` installed a stdio redirect
+    (``src.log_redirect``) and fd 1/2 already point at this log file.
+    Adding the StreamHandler in that case would duplicate every log line.
     """
     logger = logging.getLogger("regression")
     logger.setLevel(logging.INFO)
@@ -350,8 +357,11 @@ def setup_logging(log_path: Path) -> logging.Logger:
         fh = logging.FileHandler(log_path)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
-    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-               for h in logger.handlers):
+    stdout_is_tty = sys.stdout.isatty()
+    if stdout_is_tty and not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    ):
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)
         logger.addHandler(sh)

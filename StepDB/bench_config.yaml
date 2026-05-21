@@ -2374,3 +2374,63 @@ hf__gpt2:
       batch_size: 1
       seq_len: 128
   origin: hf_import
+gemm_rms_norm:
+  problem: seed_kernels/gemm_rms_norm/reference.py
+  step_impl: null
+  params:
+  - M
+  - K
+  - N
+  - eps
+  presets:
+    tiny:
+      M: 16
+      K: 32
+      N: 16
+      eps: 1.0e-06
+    small:
+      M: 32
+      K: 48
+      N: 64
+      eps: 1.0e-06
+    square:
+      M: 64
+      K: 64
+      N: 64
+      eps: 1.0e-06
+    wide:
+      M: 32
+      K: 128
+      N: 256
+      eps: 1.0e-06
+    qwen_scale:
+      M: 128
+      K: 64
+      N: 128
+      eps: 1.0e-05
+    hidden_512:
+      M: 256
+      K: 512
+      N: 512
+      eps: 1.0e-06
+    hidden_1k:
+      M: 512
+      K: 1024
+      N: 1024
+      eps: 1.0e-06
+    single_big_tile:
+      M: 256
+      K: 256
+      N: 256
+      eps: 1.0e-06
+    big_tile_2x2:
+      M: 256
+      K: 512
+      N: 512
+      eps: 1.0e-06
+    big_tile_4x4:
+      M: 512
+      K: 1024
+      N: 1024
+      eps: 1.0e-06
+  origin: seed

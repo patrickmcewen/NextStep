@@ -274,6 +274,68 @@ def test_autotune_accumulates_prior_pass_library_into_snapshot(tmp_path):
     )
 
 
+def test_autotune_skips_baseline_score_when_prior_pass1_supplied(tmp_path):
+    """Multi-pass: when ``initial_libraries`` carries a prior pass-1 entry
+    for this node, the new pass must reuse that entry's cycles/on_chip
+    instead of re-invoking the simulator.
+
+    The composed source is deterministic in (pass1_dsl, descendant_dsls,
+    parent_contract), so re-scoring just duplicates the prior measurement.
+    Under a rust-backed manager it would also append a duplicate
+    calibration record, which trips the curation agent's
+    no-duplicate-record_id assertion.
+    """
+    tree, node = _single_leaf_tree()
+
+    # Tag every score call so we can prove the baseline path skipped it.
+    score_calls: list[str] = []
+
+    def tracking_score(_src):
+        score_calls.append("score")
+        return (10, 20)
+
+    prior_pass1 = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n",
+        input_contracts={}, output_contracts={},
+        cycles=4242, on_chip=99, cycle_source="rust",
+        provenance="pass1_baseline", breakdown="prior-bd",
+    )
+    prior_lib: NodeLibrary = {}
+    cell = library_cell(prior_lib, {}, {})
+    cell.append(prior_pass1)
+
+    kwargs = _baseline_invariant_inputs(node, tree)
+    kwargs["make_sim_manager"] = lambda _t: AnalyticalOnly(tracking_score)
+    result = asyncio.run(autotune(
+        ckpt_dir=tmp_path / "tune",
+        initial_libraries={node.path: prior_lib},
+        max_baselines_per_node=2,
+        baseline_selection="pareto_diverse",
+        pass_subdir="pass_1_parallel",
+        **kwargs,
+    ))
+
+    # The current pass's pass-1 baseline must carry the prior cycles/on_chip
+    # — proving the simulator was not consulted to re-derive them.
+    merged = result.libraries[node.path]
+    pass1_entries = [
+        e
+        for by_out in merged.values()
+        for cell in by_out.values() for e in cell
+        if e.provenance == "pass1_baseline"
+    ]
+    assert len(pass1_entries) == 1, pass1_entries
+    seeded = pass1_entries[0]
+    assert seeded.cycles == 4242, (
+        f"expected baseline cycles reused from prior pass (4242), got "
+        f"{seeded.cycles!r}. The seed call must short-circuit when "
+        f"prior_pass1_baseline is supplied."
+    )
+    assert seeded.on_chip == 99
+    assert seeded.cycle_source == "rust"
+    assert seeded.breakdown == "prior-bd"
+
+
 def test_autotune_no_initial_libraries_threads_none(tmp_path, monkeypatch):
     """Without ``initial_libraries``, search_leaf receives
     ``initial_baselines=None`` — no per-pass branching."""

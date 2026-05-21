@@ -149,6 +149,75 @@ def test_promote_top_k_runs_picks_concurrently():
     )
 
 
+def test_promote_top_k_reuses_entry_cycles_when_cycle_source_is_rust():
+    """PR2: entries whose cycles were already produced by the in-loop rust
+    simulator skip the post-hoc rust re-evaluation.
+
+    Mixed library: one entry tagged analytical, one tagged rust. The
+    rust evaluator must be invoked exactly once (for the analytical
+    entry); the rust entry's cycles flow through unchanged.
+    """
+    lib: NodeLibrary = {}
+    cell = library_cell(lib, {}, {})
+    cell.append(DesignEntry(
+        dsl="# analytical entry\n",
+        cycles=200, on_chip=10, provenance="A",
+        cycle_source="analytical",
+    ))
+    cell.append(DesignEntry(
+        dsl="# rust entry\n",
+        cycles=100, on_chip=20, provenance="R",
+        cycle_source="rust",
+    ))
+    rust_calls = []
+
+    def rust(src):
+        rust_calls.append(src)
+        return (50, 7.5)
+
+    results = promote_top_k(root_library=lib, k=2, rust_evaluate_fn=rust)
+    # Exactly one rust call — for the analytical-source entry only.
+    assert len(rust_calls) == 1
+    assert "analytical entry" in rust_calls[0]
+    # Result for the rust-source entry reuses entry.cycles (100) and
+    # uses 0.0 for rust_dur_ms (no fresh measurement available).
+    by_prov = {r.entry.provenance: r for r in results}
+    assert by_prov["R"].rust_cycles == 100
+    assert by_prov["R"].rust_dur_ms == 0.0
+    # Result for the analytical-source entry came from the fresh call.
+    assert by_prov["A"].rust_cycles == 50
+    assert by_prov["A"].rust_dur_ms == pytest.approx(7.5)
+    # Sorted by rust_cycles ascending: A (50) beats R (100).
+    assert [r.entry.provenance for r in results] == ["A", "R"]
+
+
+def test_promote_top_k_no_rust_call_when_all_entries_already_rust(tmp_path):
+    """When every Pareto pick is already rust-measured, promote_top_k must
+    not invoke rust at all — the ThreadPool is never even constructed
+    (zero pending calls).
+    """
+    lib: NodeLibrary = {}
+    cell = library_cell(lib, {}, {})
+    cell.append(DesignEntry(
+        dsl="# rust-1\n", cycles=80, on_chip=30,
+        provenance="r1", cycle_source="rust",
+    ))
+    cell.append(DesignEntry(
+        dsl="# rust-2\n", cycles=120, on_chip=15,
+        provenance="r2", cycle_source="rust",
+    ))
+
+    def rust(_src):
+        raise AssertionError(
+            "rust evaluator must not be called when every entry's "
+            "cycle_source is already 'rust'"
+        )
+
+    results = promote_top_k(root_library=lib, k=2, rust_evaluate_fn=rust)
+    assert [r.rust_cycles for r in results] == [80, 120]
+    assert all(r.rust_dur_ms == 0.0 for r in results)
+
+
 def test_promote_top_k_includes_descendants_in_composed_source():
     """Root entry with a children_picks reference should produce a composed
     source that includes the descendant DSL before the root DSL."""

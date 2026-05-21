@@ -261,7 +261,7 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     )
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
-    _assert_tile_kind(sd_ref, "offchip_load_ref (ref)")
+    _assert_elem_in(sd_ref, "offchip_load_ref (ref)", (Float16, Float32))
     # Re-wrap as StepRawTensor for the recursive call: offchip_load's
     # _assert_raw insists on the wrapper type even when invoked from inside
     # the DSL implementation. The wrap is a no-op semantically (same
@@ -884,8 +884,9 @@ def accum_retile_col(x, rank=1, *, compute_bw=1):
 
 
 def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
-    """Reduce `rank` stream dims, emitting a (1,1) all-ones ack tile per
-    remaining stream element. Output stays a Float tile (matches IR)."""
+    """Reduce `rank` stream dims, emitting a (1,1) ack tile per remaining
+    stream element. Output stream_dtype is fixed Tile(Uint64,(1,1)) — matches
+    the IR (see dsl_to_step._h_accum_signal_req_all_read)."""
     assert compute_bw >= 1, f"accum_signal_req_all_read: compute_bw must be >= 1, got {compute_bw}"
     sd, mask, orig = _step_meta(x, "accum_signal_req_all_read")
     _assert_elem_in(sd, "accum_signal_req_all_read", (Float16, Float32))
@@ -896,7 +897,7 @@ def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
     stream_shape = x.underlying_tensor.shape[: x.underlying_tensor.ndim - 2 - rank]
     result = torch.ones(*stream_shape, 1, 1)
     return StepTensor(
-        result, stream_dtype=Tile(sd.tile_dtype, (1, 1)),
+        result, stream_dtype=Tile(Uint64(), (1, 1)),
         dyn_mask=mask[:len(mask) - rank],
         dyn_origins=orig[:len(orig) - rank],
     )

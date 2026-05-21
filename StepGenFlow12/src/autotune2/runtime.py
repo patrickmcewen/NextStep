@@ -57,6 +57,12 @@ from src.autotune2.search import (
 # (composed_source) -> (cycles, dur_ms)
 RustEvaluateFn = Callable[[str], tuple[int, float]]
 
+# Raised by the ``build_rust_evaluate_fn`` closure when the rust functional
+# sim produces a tensor that doesn't match the PyTorch gold reference;
+# defined in ``sim_manager`` (where it's caught) to avoid an import cycle
+# back through ``search`` -> ``sim_manager``.
+from src.autotune2.sim_manager import RustOutputMismatch
+
 
 @dataclass
 class RustPromotionResult:
@@ -139,13 +145,19 @@ def promote_top_k(
     k: int,
     rust_evaluate_fn: RustEvaluateFn,
 ) -> list[RustPromotionResult]:
-    """Pick top-K and rust-evaluate each in parallel.
+    """Pick top-K and rust-evaluate each.
 
-    All picks are dispatched concurrently via a thread pool — each rust
+    Picks are dispatched concurrently via a thread pool — each rust
     evaluator call is dominated by a blocking ``subprocess.run`` on the
     rust sim, so threads parallelize the wall-clock cost cleanly. The
     closure built by ``build_rust_evaluate_fn`` writes per-call
     artifacts to a unique subdir so concurrent calls don't collide.
+    Entries whose ``cycle_source == "rust"`` are not re-evaluated —
+    their ``cycles`` was already produced by the same rust evaluator
+    in-loop, and a redundant rerun would burn budget without changing
+    the number. ``rust_dur_ms`` is read off the entry when present and
+    defaults to 0.0 when the entry was produced by a manager that
+    didn't record it (legacy snapshots, mocks).
 
     Results are returned sorted by rust_cycles (best first). The list
     length equals ``len(pick_top_k_pareto_entries(root_library, k))``;
@@ -158,14 +170,39 @@ def promote_top_k(
     picks = pick_top_k_pareto_entries(root_library, k)
     composed_sources = [_build_composed_source_for_entry(e) for e in picks]
 
-    # max_workers caps parallelism so a large top_k doesn't fork an
-    # arbitrarily large number of rust subprocesses. K is typically <=8
-    # in practice; cap at len(picks) so we never spin idle threads.
-    with ThreadPoolExecutor(max_workers=max(1, len(picks))) as ex:
-        rust_results = list(ex.map(rust_evaluate_fn, composed_sources))
+    # Two groups: entries that need a fresh rust call vs entries whose
+    # ``cycles`` was already produced by rust in-loop (cycle_source ==
+    # "rust"). The latter group reuses ``entry.cycles`` directly so we
+    # don't pay the rust budget twice for the same composed source.
+    needs_rust_idx = [
+        i for i, e in enumerate(picks) if e.cycle_source != "rust"
+    ]
+    needs_rust_sources = [composed_sources[i] for i in needs_rust_idx]
+    fresh_results: dict[int, tuple[int, float]] = {}
+    if needs_rust_sources:
+        # max_workers caps parallelism so a large top_k doesn't fork an
+        # arbitrarily large number of rust subprocesses. K is typically
+        # <=8 in practice; cap at the number of pending calls so we
+        # never spin idle threads.
+        with ThreadPoolExecutor(max_workers=len(needs_rust_sources)) as ex:
+            for i, result in zip(
+                needs_rust_idx,
+                ex.map(rust_evaluate_fn, needs_rust_sources),
+            ):
+                fresh_results[i] = result
 
     out: list[RustPromotionResult] = []
-    for entry, composed, (cycles, dur_ms) in zip(picks, composed_sources, rust_results):
+    for i, (entry, composed) in enumerate(zip(picks, composed_sources)):
+        if i in fresh_results:
+            cycles, dur_ms = fresh_results[i]
+        else:
+            # entry.cycles was rust-measured in-loop; reuse it. The
+            # rust_dur_ms attribute isn't part of DesignEntry today
+            # (it's only on SimulationResult), so default to 0.0 —
+            # the summary's "rust duration" column then reflects "this
+            # number came from a cached in-loop run, not a fresh rerun".
+            cycles = entry.cycles
+            dur_ms = 0.0
         out.append(RustPromotionResult(
             entry=entry,
             rust_cycles=cycles,
@@ -174,6 +211,360 @@ def promote_top_k(
         ))
     out.sort(key=lambda r: r.rust_cycles)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Final pick — one rust-evaluated variant from the root Pareto
+# ---------------------------------------------------------------------------
+
+
+def _root_pareto_entries(root_library: NodeLibrary) -> list[DesignEntry]:
+    """Flatten root cells and return the non-dominated entries on
+    ``(cycles, on_chip)``. Shared by ``final_pick`` and
+    ``final_pick_agent`` so both paths agree on the candidate set.
+    """
+    all_entries: list[DesignEntry] = []
+    for by_out in root_library.values():
+        for cell in by_out.values():
+            all_entries.extend(cell)
+    assert all_entries, (
+        "_root_pareto_entries: root_library has no entries; the search "
+        "driver must seed at least the pass-1 baseline before the final pick"
+    )
+    return [
+        e for e in all_entries
+        if not any(dominates(o, e) for o in all_entries if o is not e)
+    ]
+
+
+def _build_promotion_for_pick(
+    *,
+    picked: DesignEntry,
+    rust_evaluate_fn: RustEvaluateFn,
+) -> RustPromotionResult:
+    """Compose the source for ``picked`` and either reuse its rust-measured
+    cycles (when ``cycle_source == "rust"``) or invoke ``rust_evaluate_fn``
+    exactly once. Shared by ``final_pick`` and ``final_pick_agent``.
+    """
+    composed = _build_composed_source_for_entry(picked)
+    if picked.cycle_source == "rust":
+        cycles = picked.cycles
+        dur_ms = 0.0
+    else:
+        cycles, dur_ms = rust_evaluate_fn(composed)
+    return RustPromotionResult(
+        entry=picked,
+        rust_cycles=cycles,
+        rust_dur_ms=dur_ms,
+        composed_source=composed,
+    )
+
+
+def final_pick(
+    *,
+    root_library: NodeLibrary,
+    rust_evaluate_fn: RustEvaluateFn,
+    strategy: str = "min_cycles",
+) -> list[RustPromotionResult]:
+    """Pick exactly one root-Pareto entry and rust-evaluate it.
+
+    Replaces ``promote_top_k(k=N)`` with a single deterministic pick + one
+    ground-truth rust evaluation — the "comparable across all sim_mode
+    configs" number from HANDOFF design decision #6. The return shape is
+    a single-element ``list[RustPromotionResult]`` so
+    ``write_autotune2_summary`` keeps working unchanged.
+
+    Strategies
+    ----------
+    ``min_cycles``: lowest recorded ``cycles`` from the root Pareto front,
+        with ``on_chip`` as tiebreaker. When the library is mixed-source
+        (any entry has ``cycle_source == "rust"``), the pick is restricted
+        to rust-sourced entries — mixing analytical and rust cycles is
+        comparing incommensurable numbers (HANDOFF design decision #5).
+        When the picked entry was already rust-measured in-loop
+        (``cycle_source == "rust"``), its ``cycles`` is reused and
+        ``rust_dur_ms`` is 0.0; otherwise we invoke ``rust_evaluate_fn``
+        once for ground truth.
+
+    For ``strategy="agent"`` (FinalPickAgent — HANDOFF decision #8), see
+    the ``final_pick_agent`` async function below. The agent path is a
+    separate entry point because it must ``await`` the curation +
+    final-pick LLM calls; keeping the deterministic ``min_cycles`` path
+    synchronous avoids forcing every existing call site through an event
+    loop just to use the historical default.
+    """
+    assert strategy == "min_cycles", (
+        f"final_pick: only strategy='min_cycles' is supported by this "
+        f"sync entry point, got {strategy!r}. For 'agent', call "
+        f"final_pick_agent(...) — it's async because the curation + "
+        f"final-pick LLM calls have to be awaited."
+    )
+
+    nondom = _root_pareto_entries(root_library)
+    has_rust = any(e.cycle_source == "rust" for e in nondom)
+    candidates = (
+        [e for e in nondom if e.cycle_source == "rust"]
+        if has_rust else nondom
+    )
+    candidates.sort(key=lambda e: (e.cycles, e.on_chip))
+    picked = candidates[0]
+    return [_build_promotion_for_pick(
+        picked=picked, rust_evaluate_fn=rust_evaluate_fn,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Final pick — agent-driven (FinalPickAgent, HANDOFF design decision #8)
+# ---------------------------------------------------------------------------
+
+
+async def final_pick_agent(
+    *,
+    root_library: NodeLibrary,
+    rust_evaluate_fn: RustEvaluateFn,
+    curation_agent_fn,
+    final_pick_agent_fn,
+    fetch_candidates_fn,
+    root_path: str,
+    kernel: str,
+    preset: str,
+    curation_k: int = 4,
+    curation_max_candidates: int = 50,
+    log_warning: Callable[[str], None] = print,
+    telemetry_store=None,  # AgentDecisionStore | None
+    hw_config_hash: str = "",
+    run_id: str = "",
+) -> list[RustPromotionResult]:
+    """Agent-driven end-of-run final pick.
+
+    Walks the root Pareto front, asks the curation agent for the K most
+    predictive calibration records per candidate (cold-start tolerated),
+    feeds the full set to the final-pick agent, then either reuses
+    ``entry.cycles`` (when the picked entry is ``cycle_source == "rust"``)
+    or invokes ``rust_evaluate_fn`` exactly once. Returns the same
+    single-element ``list[RustPromotionResult]`` shape ``final_pick``
+    returns so ``write_autotune2_summary`` is path-independent.
+
+    Fall-back policy (mirrors ``AgentManager`` in ``sim_manager``): any
+    exception inside the agent call sequence — RPC error, parser
+    assertion, malformed curation pick — is caught at the call-site
+    boundary, logged via ``log_warning``, and the deterministic
+    ``min_cycles`` pick is used instead so the run still produces a
+    reportable number. The fenced-JSON parsers themselves stay strict.
+
+    Skipping the agent entirely when the Pareto front has exactly one
+    entry — there is nothing to pick. This also lets a degenerate root
+    library (e.g. only the seeded baseline survived) avoid an agent
+    round-trip for a foregone conclusion.
+    """
+    import time as _time
+    from src.autotune2.prompts import (
+        FinalPickCandidate,
+        build_curation_user_prompt,
+        build_final_pick_user_prompt,
+        parse_curation_response,
+        parse_final_pick_response,
+    )
+    from src.autotune2.sim_manager import _extract_agent_text
+
+    assert 1 <= curation_k <= curation_max_candidates, (
+        f"final_pick_agent: curation_k must be in [1, curation_max_candidates="
+        f"{curation_max_candidates}], got {curation_k!r}"
+    )
+
+    nondom = _root_pareto_entries(root_library)
+    nondom.sort(key=lambda e: (e.cycles, e.on_chip))
+
+    if len(nondom) == 1:
+        # Trivial Pareto — no decision to make. Promote it directly.
+        _emit_final_pick_telemetry(
+            telemetry_store=telemetry_store,
+            root_path=root_path, kernel=kernel, preset=preset,
+            hw_config_hash=hw_config_hash, run_id=run_id,
+            composed_source=_build_composed_source_for_entry(nondom[0]),
+            decision="pareto_short_circuit",
+            reason="single non-dominated entry; no agent round-trip needed",
+            curated_ids=[], num_candidates=0,
+            curation_dur_ms=-1.0, decision_dur_ms=-1.0,
+            picked_variant_index=0, num_pareto_entries=1,
+        )
+        return [_build_promotion_for_pick(
+            picked=nondom[0], rust_evaluate_fn=rust_evaluate_fn,
+        )]
+
+    composed_sources = [_build_composed_source_for_entry(e) for e in nondom]
+
+    # Telemetry fields we update along the way so the row reflects what
+    # actually happened, regardless of which branch we exit through.
+    picked_variant_index = -1
+    pick_reason = ""
+    total_curation_ms = 0.0
+    decision_ms = -1.0
+    # Per-candidate curated ids; we record the picked candidate's set
+    # post-hoc so the telemetry row answers "what evidence did the
+    # agent see for the variant it chose?"
+    per_candidate_curated_ids: list[list[str]] = []
+    per_candidate_num_available: list[int] = []
+    telemetry_decision = "picked"
+
+    try:
+        # Curate per candidate so each renders with its own evidence.
+        candidates: list[FinalPickCandidate] = []
+        for idx, (entry, composed) in enumerate(
+            zip(nondom, composed_sources),
+        ):
+            raw = list(fetch_candidates_fn(composed))[:curation_max_candidates]
+            per_candidate_num_available.append(len(raw))
+            if raw:
+                k = min(curation_k, len(raw))
+                curation_prompt = build_curation_user_prompt(
+                    target_source=composed, candidates=raw, k=k,
+                )
+                t0 = _time.perf_counter()
+                curation_reply = await curation_agent_fn(
+                    [{"role": "user", "content": curation_prompt}]
+                )
+                total_curation_ms += (_time.perf_counter() - t0) * 1000.0
+                picked_ids = parse_curation_response(
+                    _extract_agent_text(curation_reply),
+                    candidate_ids=[c.record_id for c in raw],
+                    k=k,
+                )
+                by_id = {c.record_id: c for c in raw}
+                curated = [by_id[i] for i in picked_ids]
+                per_candidate_curated_ids.append(list(picked_ids))
+            else:
+                curated = []
+                per_candidate_curated_ids.append([])
+            candidates.append(FinalPickCandidate(
+                variant_index=idx,
+                cycles=entry.cycles,
+                on_chip=entry.on_chip,
+                cycle_source=entry.cycle_source,
+                composed_source=composed,
+                curated=curated,
+            ))
+
+        user_prompt = build_final_pick_user_prompt(
+            root_path=root_path, kernel=kernel, preset=preset,
+            candidates=candidates,
+        )
+        t0 = _time.perf_counter()
+        pick_reply = await final_pick_agent_fn(
+            [{"role": "user", "content": user_prompt}]
+        )
+        decision_ms = (_time.perf_counter() - t0) * 1000.0
+        picked_idx, pick_reason = parse_final_pick_response(
+            _extract_agent_text(pick_reply), num_candidates=len(candidates),
+        )
+        picked_variant_index = picked_idx
+        picked = nondom[picked_idx]
+    except Exception as e:
+        # Fall back to the deterministic min_cycles pick so the run still
+        # produces a reportable number — same shape as AgentManager's
+        # in-loop fallback. Mixed-source restriction (rust-sourced
+        # entries only when any exist) mirrors ``final_pick``.
+        log_warning(
+            f"final_pick_agent: agent path failed; falling back to "
+            f"min_cycles. Error: {e!r}"
+        )
+        telemetry_decision = "fallback"
+        pick_reason = f"agent failure ({type(e).__name__}): {e!s}"[:400]
+        has_rust = any(e.cycle_source == "rust" for e in nondom)
+        fallback_pool = (
+            [e for e in nondom if e.cycle_source == "rust"]
+            if has_rust else list(nondom)
+        )
+        fallback_pool.sort(key=lambda e: (e.cycles, e.on_chip))
+        picked = fallback_pool[0]
+        picked_variant_index = nondom.index(picked)
+
+    # Picked-candidate context: use whatever per-candidate state we
+    # accumulated for this index (may be empty if the failure occurred
+    # before the picked candidate's curation ran).
+    picked_curated = (
+        per_candidate_curated_ids[picked_variant_index]
+        if 0 <= picked_variant_index < len(per_candidate_curated_ids) else []
+    )
+    picked_num_available = (
+        per_candidate_num_available[picked_variant_index]
+        if 0 <= picked_variant_index < len(per_candidate_num_available) else 0
+    )
+    _emit_final_pick_telemetry(
+        telemetry_store=telemetry_store,
+        root_path=root_path, kernel=kernel, preset=preset,
+        hw_config_hash=hw_config_hash, run_id=run_id,
+        composed_source=composed_sources[picked_variant_index],
+        decision=telemetry_decision,
+        reason=pick_reason,
+        curated_ids=picked_curated,
+        num_candidates=picked_num_available,
+        curation_dur_ms=(
+            total_curation_ms if total_curation_ms > 0 else -1.0
+        ),
+        decision_dur_ms=decision_ms,
+        picked_variant_index=picked_variant_index,
+        num_pareto_entries=len(nondom),
+    )
+
+    return [_build_promotion_for_pick(
+        picked=picked, rust_evaluate_fn=rust_evaluate_fn,
+    )]
+
+
+def _emit_final_pick_telemetry(
+    *,
+    telemetry_store,
+    root_path: str,
+    kernel: str,
+    preset: str,
+    hw_config_hash: str,
+    run_id: str,
+    composed_source: str,
+    decision: str,
+    reason: str,
+    curated_ids: list[str],
+    num_candidates: int,
+    curation_dur_ms: float,
+    decision_dur_ms: float,
+    picked_variant_index: int,
+    num_pareto_entries: int,
+) -> None:
+    """Write one final-pick telemetry row if a store is wired.
+
+    Fail-loud on a bad store, same as ``CalibrationStore.append`` —
+    a side-channel observability store that silently swallows writes
+    is worse than no store at all.
+    """
+    if telemetry_store is None:
+        return
+    import hashlib as _hashlib
+    from datetime import datetime as _dt, timezone as _tz
+    from src.autotune2.agent_telemetry import AgentDecisionRecord
+    source_hash = _hashlib.sha256(composed_source.encode("utf-8")).hexdigest()
+    record = AgentDecisionRecord(
+        stage="final_pick",
+        run_id=run_id,
+        kernel=kernel,
+        preset=preset,
+        hw_config_hash=hw_config_hash,
+        node_path=root_path,
+        is_root=True,
+        timestamp=_dt.now(_tz.utc).isoformat(),
+        composed_source_hash=source_hash,
+        variant_kind="",
+        attempt_index=-1,
+        turn_index=-1,
+        decision=decision,
+        reason=reason,
+        curated_record_ids=list(curated_ids),
+        num_candidates_available=int(num_candidates),
+        curation_dur_ms=float(curation_dur_ms),
+        decision_dur_ms=float(decision_dur_ms),
+        picked_variant_index=int(picked_variant_index),
+        num_pareto_entries=int(num_pareto_entries),
+    )
+    telemetry_store.append(record)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +578,7 @@ def write_autotune2_summary(
     rust_promotions: list[RustPromotionResult],
     out_path: Path,
     include_sources: bool = False,
+    root_pick_strategy: str | None = None,
 ) -> None:
     """Emit a JSON summary of an autotune2 run.
 
@@ -199,6 +591,11 @@ def write_autotune2_summary(
         analytical-vs-rust cycle comparison
       - ``best_rust_entry``: the lowest rust_cycles entry (or None if
         no promotions)
+      - ``root_pick_strategy``: which root-pick path produced the
+        ``rust_winners`` list — ``"final_pick:<strategy>"``,
+        ``"top_k:<k>"``, or ``None`` when the caller didn't tag it.
+        Lets downstream consumers tell which run mode produced the
+        reported number.
       - ``best_composed_source``: only when ``include_sources=True``;
         the source string of the rust-best entry (can be megabytes for
         large kernels)
@@ -236,6 +633,7 @@ def write_autotune2_summary(
         "root_pareto": root_pareto,
         "rust_winners": rust_winners,
         "best_rust_entry": rust_winners[0] if rust_winners else None,
+        "root_pick_strategy": root_pick_strategy,
     }
     if include_sources and rust_promotions:
         payload["best_composed_source"] = rust_promotions[0].composed_source
@@ -254,7 +652,7 @@ def build_rust_evaluate_fn(
     work_dir: Path,
     kernel_name: str,
     preset: str,
-    timing_only: bool = True,
+    timing_only: bool = False,
     max_total_compute_bw: int | None = None,
 ) -> RustEvaluateFn:
     """Build a rust evaluator that writes a temp DSL file and invokes
@@ -263,9 +661,18 @@ def build_rust_evaluate_fn(
     Lazy-imports the StepDB module so test environments without the rust
     toolchain can still import autotune2.runtime. The returned closure
     writes the composed source to ``work_dir / "step_impl.py"`` before
-    each call (overwrites prior contents). ``timing_only=True`` skips
-    correctness comparison (faster; matches the autotuner's analytical
-    role).
+    each call (overwrites prior contents). ``timing_only=False`` (the
+    default) runs the functional simulator and compares the produced
+    output tensor against the PyTorch reference — necessary to catch
+    structurally broken graphs that drain early and report a meaningless
+    cycle count (e.g. an undersized accumulator silently truncating a
+    matmul reduction). When the compare fails the closure raises
+    ``RustOutputMismatch`` carrying the offending cycles and ``max_diff``;
+    in-loop managers catch it and convert to LLM ``error_feedback``,
+    while ``promote_top_k`` / ``final_pick`` let it propagate so a
+    wrong-output winner can't be silently recorded. Pass
+    ``timing_only=True`` only when correctness is checked elsewhere
+    (e.g. a calibration-only script that just wants raw cycle numbers).
 
     ``max_total_compute_bw`` is forwarded to ``evaluate_kernel`` so each
     compute op's ``compute_bw`` is rescaled (in place) to sum to that
@@ -329,6 +736,20 @@ def build_rust_evaluate_fn(
         )
         dur_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Stage "correctness" is the only failure mode that means "the sim
+        # ran and produced a number, but the produced output is wrong" —
+        # raise a typed exception so callers can distinguish from sim-crash
+        # failures and turn it into actionable LLM feedback.
+        if not result.success and result.stage == "correctness":
+            raise RustOutputMismatch(
+                cycles=result.cycle_time if result.cycle_time is not None else float("nan"),
+                max_diff=result.max_diff if result.max_diff is not None else float("nan"),
+                message=(
+                    f"rust functional output diverged from gold for "
+                    f"kernel={kernel_name} preset={preset} at "
+                    f"{sub_work_dir}: {result.error_message}"
+                ),
+            )
         assert result.success, (
             f"build_rust_evaluate_fn: evaluate_kernel failed at stage "
             f"{result.stage!r} for kernel={kernel_name} preset={preset}: "

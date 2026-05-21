@@ -1,0 +1,143 @@
+def downtile(x, sub_r, sub_c):
+    """Split each (T_r, T_c) tile into a (T_r/sub_r) x (T_c/sub_c) grid of
+    (sub_r, sub_c) sub-tiles. Adds two new innermost stream dims for the
+    sub-grid (row-chunks outer, col-chunks inner).
+
+        stream (..., D)             tile (T_r, T_c)
+                      ->
+        stream (..., D, n_row, n_col)   tile (sub_r, sub_c)
+    """
+    tile_r, tile_c = int(x.shape[-2]), int(x.shape[-1])
+    assert tile_r % sub_r == 0 and tile_c % sub_c == 0, (
+        f"downtile: ({tile_r},{tile_c}) not divisible by ({sub_r},{sub_c})"
+    )
+    n_row = tile_r // sub_r
+    n_col = tile_c // sub_c
+    y = retile_streamify(x, chunk=sub_r, split_row=True)
+    y = retile_streamify(y, chunk=sub_c, split_row=False)
+    y = reshape_stream(y, chunk_size=n_col, rank=0)
+    y = reshape_stream(y, chunk_size=n_row, rank=1)
+    return y
+
+
+def tiled_reference(dims, tensors):
+    """GEMM with big-tile DRAM loads, one-big-tile on-chip working set,
+    and a two-stage K reduction.
+
+    Each side keeps only ONE big tile on chip (256 KB) by using offchip_load
+    with stride-0 broadcasts:
+      - A iterates (m_l, n_l, k_l) with n_l stride 0 (A doesn't depend on N).
+      - B iterates (m_l, n_l, k_l) with m_l stride 0 (B doesn't depend on M).
+    Each (m_l, n_l, k_l) outer step loads one big tile; each big-tile pair is
+    downtiled, matmul'd on (sub, sub) sub-tiles, and accumulated.
+
+    Natural stream order from this layout is (m_l, n_l, k_l, sub_r, sub_n, sub_c).
+    K splits across positions 2 and 5 — non-adjacent — so K is reduced in two
+    stages:
+      stage 1: binary_map_accum(rank=1)  matmul + sum sub_c.
+      stage 2: bufferize(rank=3) + restream to put k_l innermost,
+               then accum_add(rank=1) to sum k_l.
+    After stage 2 the stream is (m_l, n_l, sub_r, sub_n), which can't be
+    flattened directly to (M_small, N_small) because (m_l, sub_r) and
+    (n_l, sub_n) aren't adjacent. One final bufferize+restream rotates
+    the per-m_l buffer so order becomes (m_l, sub_r, n_l, sub_n) and the
+    two flattens recover the (M_small, N_small) layout for offchip_store.
+
+    SRAM per side: ~256 KB (big tile) + 4 MB (k_l reorder) + 4 MB (output
+    reorder) ≈ 8.5 MB total — vs. 128 MB for full rank=4 bufferize.
+    DRAM cost: 16x amplification on each side (re-reads big tiles across
+    the broadcast axis).
+    """
+    big = 256
+    sub = 16
+    n_row = n_col = big // sub          # 16
+
+    M_tiles = dims["M"] // big           # 16
+    K_tiles = dims["K"] // big           # 16
+    N_tiles = dims["N"] // big           # 16
+
+    sub_per_k = n_row * n_col            # 256 sub-tiles per big tile
+
+    # ------------------------------------------------------------------
+    # A: load big tiles in (m_l, n_l, k_l) order with N broadcast.
+    #    Each big tile of A is fetched from DRAM N_tiles times (16x amp).
+    # ------------------------------------------------------------------
+    A_load = offchip_load(
+        tensors["A"],
+        stride=(K_tiles, 0, 1),
+        out_shape_tiled=(M_tiles, N_tiles, K_tiles),
+        tile_row=big, tile_col=big,
+    )
+    A_buf = bufferize(downtile(A_load, sub, sub), rank=2)
+    # Per-buffer = one A big tile, (sub_mm, sub_kk) sub-tile grid (256 KB).
+    # Inner stream: (sub_r, sub_n_bcast, sub_c). A doesn't index sub_n.
+    A_stream = streamify(
+        A_buf,
+        stride=(n_col, 0, 1),
+        out_shape_tiled=(n_row, n_col, n_col),
+    )
+    # Combined: (1, M_tiles, N_tiles, K_tiles, n_row, n_col, n_col)
+    # Order:    (m_l,  n_l,    k_l,     sub_r, sub_n, sub_c)
+
+    # ------------------------------------------------------------------
+    # B: load big tiles in (m_l, n_l, k_l) order with M broadcast.
+    #    Each big tile of B is fetched M_tiles times (16x amp).
+    # ------------------------------------------------------------------
+    B_load = offchip_load(
+        tensors["B"],
+        stride=(0, 1, N_tiles),
+        out_shape_tiled=(M_tiles, N_tiles, K_tiles),
+        tile_row=big, tile_col=big,
+    )
+    B_buf = bufferize(downtile(B_load, sub, sub), rank=2)
+    # Per-buffer = one B big tile, (sub_kk, sub_nn) sub-tile grid (256 KB).
+    # Inner stream: (sub_r_bcast, sub_n, sub_c). B doesn't index sub_r.
+    B_stream = streamify(
+        B_buf,
+        stride=(0, 1, n_col),
+        out_shape_tiled=(n_row, n_col, n_col),
+    )
+    # Combined: matches A's 7-dim shape and order.
+
+    # ------------------------------------------------------------------
+    # Stage 1: per-big-tile matmul + reduce sub_c (inner K).
+    # ------------------------------------------------------------------
+    C_partial = binary_map_accum(A_stream, B_stream, rank=1)
+    # Stream: (1, M_tiles, N_tiles, K_tiles, n_row, n_col), tile (sub, sub).
+
+    # ------------------------------------------------------------------
+    # Stage 2: re-order so k_l is innermost, then reduce k_l.
+    # The intermediate buffer holds K_tiles partial (sub, sub) M-N
+    # sub-blocks for one (m_l, n_l) — 4 MB.
+    # ------------------------------------------------------------------
+    C_buf = bufferize(C_partial, rank=3)
+    # Folds (K_tiles, n_row, n_col). Outer (1, M_tiles, N_tiles).
+    # Per-buffer linear idx: k_l*sub_per_k + sub_r*n_col + sub_n.
+    C_re = streamify(
+        C_buf,
+        stride=(n_col, 1, sub_per_k),
+        out_shape_tiled=(n_row, n_col, K_tiles),
+    )
+    # Combined: (1, M_tiles, N_tiles, n_row, n_col, K_tiles). k_l innermost.
+    C_red = accum_add(C_re, rank=1)
+    # Stream: (1, M_tiles, N_tiles, n_row, n_col), tile (sub, sub).
+
+    # ------------------------------------------------------------------
+    # Output reorder: get (m_l, sub_r) and (n_l, sub_n) adjacent so the
+    # two flattens build (M_small, N_small).
+    # Buffer holds one M-row's worth of (n_l, sub_r, sub_n) outputs (4 MB).
+    # ------------------------------------------------------------------
+    out_buf = bufferize(C_red, rank=3)
+    # Folds (N_tiles, n_row, n_col). Outer (1, M_tiles).
+    # Per-buffer linear idx: n_l*sub_per_k + sub_r*n_col + sub_n.
+    out_re = streamify(
+        out_buf,
+        stride=(n_col, sub_per_k, 1),
+        out_shape_tiled=(n_row, N_tiles, n_col),
+    )
+    # Combined: (1, M_tiles, n_row, N_tiles, n_col).
+    out_re = flatten(out_re, min_rank=0, max_rank=1)  # (N_tiles, n_col) -> N_small
+    out_re = flatten(out_re, min_rank=1, max_rank=3)  # (1, M_tiles, n_row) -> M_small
+    # Stream: (M_small, N_small), tile (sub, sub).
+
+    return offchip_store(out_re)

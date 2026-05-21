@@ -4,8 +4,11 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 from src.config_loader import load_llm_config
+from src.log_redirect import redirect_stdio_to, terminal_print
 from src.orchestrator import run_kernel
 from src.process_group import setup_process_group
 
@@ -194,6 +197,20 @@ def main():
             autotune_cfg = json.load(f)
         autotune_options = _build_autotune_options(args, autotune_cfg)
 
+    # Pre-generate the timestamp dir so we can install stdio redirection
+    # against <ckpt>/<ts>/run.log before run_kernel starts printing. When
+    # stdout is not a TTY (e.g. run_regression.py spawned this run.py with
+    # piped stdout), redirect_stdio_to is a no-op so the parent's per-job
+    # log keeps receiving output.
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    base_ckpt = args.checkpoint_dir if args.checkpoint_dir else "checkpoints"
+    ckpt_ts_dir = Path(base_ckpt) / ts
+    ckpt_ts_dir.mkdir(parents=True, exist_ok=True)
+    log_path = ckpt_ts_dir / "run.log"
+    redirected = redirect_stdio_to(log_path)
+    if redirected:
+        terminal_print(f"run.py log -> {log_path}")
+
     result = asyncio.run(run_kernel(
         kernel_name=args.kernel,
         preset=args.preset,
@@ -220,6 +237,7 @@ def main():
         stateless_refactor=args.stateless_refactor,
         judge_enabled=not args.no_judge,
         max_tile=args.max_tile,
+        pregenerated_ts=ts,
     ))
 
     if result["success"]:
@@ -231,6 +249,9 @@ def main():
     else:
         print(f"\nFAILED — {args.kernel}/{args.preset}")
         print(f"  Final diagnosis: {result.get('final_diagnosis', 'N/A')}")
+    if redirected:
+        status = "SUCCESS" if result["success"] else "FAILED"
+        terminal_print(f"run.py {status} — {args.kernel}/{args.preset} (log: {log_path})")
     sys.exit(0 if result["success"] else 1)
 
 

@@ -793,3 +793,70 @@ def make_planner_agent(llm_config: dict) -> Agent:
         model=model,
         model_settings=_build_model_settings(llm_config),
     )
+
+
+def make_curation_agent(llm_config: dict) -> Agent:
+    """Create the autotune2 calibration-curation agent (PR4).
+
+    Ranks past (analytical, rust) calibration records by relevance to a
+    target composed source. Called as a sub-step of the in-loop
+    simulation-decision agent; system prompt is static.
+
+    The HANDOFF design notes this agent is meant to run on a cheaper
+    model (Haiku-class) since it's called per-variant. Production
+    callers can pass a separate ``llm_config`` profile pointed at the
+    cheap model; for first-cut deployment the same profile as the
+    main autotune2 agent is fine.
+    """
+    from src.autotune2.prompts import build_curation_system_prompt
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepAutotune2Curation",
+        instructions=build_curation_system_prompt(),
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_sim_decision_agent(llm_config: dict) -> Agent:
+    """Create the autotune2 in-loop simulation-decision agent (PR4).
+
+    Decides per-variant whether to spend the per-pass Rust-simulator
+    budget on this variant. Wrapped by ``AgentManager`` in
+    ``src/autotune2/sim_manager.py`` — see that wrapper's docstring for
+    the call sequence and the fall-back-to-analytical-on-failure path.
+    System prompt is static.
+    """
+    from src.autotune2.prompts import build_sim_decision_system_prompt
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepAutotune2SimDecision",
+        instructions=build_sim_decision_system_prompt(),
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
+def make_final_pick_agent(llm_config: dict) -> Agent:
+    """Create the autotune2 end-of-run final-pick agent (PR5).
+
+    Picks one variant from the root Pareto front for the run's single
+    ground-truth Rust evaluation. Wrapped by
+    ``runtime.final_pick(strategy="agent")``; system prompt is static.
+    Distinct from ``make_sim_decision_agent`` even though both look at
+    cycles + curated calibration evidence — the in-loop decision is
+    rust-vs-analytical per variant under a budget, the final pick is
+    "which one variant is the best in this Pareto front" with no budget
+    constraint and a fixed single Rust call.
+    """
+    from src.autotune2.prompts import build_final_pick_system_prompt
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepAutotune2FinalPick",
+        instructions=build_final_pick_system_prompt(),
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )

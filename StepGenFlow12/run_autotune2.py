@@ -143,12 +143,17 @@ def _resolve_attempt_budgets(
 _PASS_KNOBS = (
     "fewshot", "max_baselines_per_node", "baseline_selection",
     "attempt_budgets", "max_turns_per_attempt",
+    "sim_time_budget_seconds",
 )
 _PASS_SPEC_DEFAULTS = {
     "fewshot": "tile_shrink",
     "max_baselines_per_node": 4,
     "baseline_selection": "pareto_diverse",
     "max_turns_per_attempt": 16,
+    # ``None`` ⇒ unlimited. Only consulted when --sim-mode is rust (or
+    # any later mode that registers a TimeBudget); AnalyticalOnly
+    # ignores it.
+    "sim_time_budget_seconds": None,
 }
 
 
@@ -458,6 +463,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         build_real_agent_fn,
         build_real_verifier_factory_fn,
         build_rust_evaluate_fn,
+        final_pick,
         promote_top_k,
         write_autotune2_summary,
     )
@@ -501,6 +507,17 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     )
     ckpt_dir = outer_dir
 
+    # Install stdio redirect so the very chatty per-turn output (LLM
+    # usage lines, "Saved <node>.npy" prints, rust simulator stdout, etc.)
+    # lands in <snapshot>/autotune2.log instead of the user's terminal.
+    # No-op when stdout is not a TTY (e.g. driven by an outer harness).
+    from src.log_redirect import redirect_stdio_to, terminal_print
+    snapshot_ts_dir = outer_dir.parent.parent
+    log_path = snapshot_ts_dir / "autotune2.log"
+    _redirected = redirect_stdio_to(log_path)
+    if _redirected:
+        terminal_print(f"autotune2 log -> {log_path}")
+
     # Resolve the llm config the same way run.py does so api_key and any
     # other profile-only fields are filled in (the checkpoint's embedded
     # llm_config blob lacks api_key).
@@ -531,13 +548,162 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     # The scorer's closed-over ``tensors`` dict has to match the per-node
     # arg names the synthetic wrapper references (e.g. ``tensors["Q"]``)
     # — see ``build_synthetic_wrapper_for_node``. The driver rebuilds the
-    # scorer (wrapped in an ``AnalyticalOnly`` simulation manager) per
-    # node via this factory; the root falls back to the kernel-level
-    # dict passed in as ``root_tensors``. PR1 of the simulation-manager
-    # work locks the in-loop policy to ``AnalyticalOnly`` (behavior-
-    # equivalent to the legacy score_fn path) so the seam is in place
-    # without changing what the autotuner does today.
-    from src.autotune2.sim_manager import AnalyticalOnly
+    # scorer per node via this factory; the root falls back to the
+    # kernel-level dict passed in as ``root_tensors``.
+    #
+    # ``--sim-mode`` selects which simulation manager wraps the scorer:
+    #   * ``analytical`` (default): ``AnalyticalOnly`` — every variant
+    #     scored by the STeP timing model. Behavior-equivalent to the
+    #     pre-PR1 score_fn path.
+    #   * ``rust``: ``RustAll`` — every variant additionally rust-
+    #     evaluated until the per-pass time budget runs out, with paired
+    #     (analytical, rust) records appended to the calibration store.
+    from src.autotune2.agent_telemetry import AgentDecisionStore
+    from src.autotune2.calibration import CalibrationStore, hw_config_hash
+    from src.autotune2.sim_manager import (
+        AgentManager, AnalyticalOnly, DeterministicSplit, RustAll, TimeBudget,
+    )
+
+    assert args.sim_mode in (
+        "analytical", "rust", "deterministic-split", "agent",
+    ), (
+        f"--sim-mode must be one of analytical/rust/deterministic-split/"
+        f"agent, got {args.sim_mode!r}"
+    )
+    assert args.curation_max_candidates >= 1, (
+        f"--curation-max-candidates must be >= 1, got "
+        f"{args.curation_max_candidates!r}"
+    )
+    assert 1 <= args.curation_k <= args.curation_max_candidates, (
+        f"--curation-k must be in [1, --curation-max-candidates="
+        f"{args.curation_max_candidates}], got {args.curation_k!r}"
+    )
+
+    if args.sim_calibration_path:
+        calibration_path = Path(args.sim_calibration_path).resolve()
+    else:
+        calibration_path = ckpt_dir / "autotune2" / "calibration.jsonl"
+    calibration_store = CalibrationStore(path=calibration_path)
+    calibration_sources_dir = calibration_path.parent / "calibration_sources"
+    hw_hash = hw_config_hash(state["hw_config"])
+    run_id = ckpt_dir.name  # the new timestamp dir uniquely identifies this run
+
+    # Agent-decision telemetry — one row per AgentManager._decide call
+    # and per final_pick_agent invocation, sibling to calibration.jsonl
+    # so post-hoc audits can join the two stores by composed_source_hash.
+    # Only wired when an LLM-backed path is active (sim-mode=agent or
+    # root-pick=agent); analytical / rust / deterministic-split modes
+    # don't make any agent decisions to log.
+    needs_agent_telemetry = (
+        args.sim_mode == "agent" or args.root_pick == "agent"
+    )
+    if needs_agent_telemetry:
+        agent_decisions_path = (
+            calibration_path.parent / "agent_decisions.jsonl"
+        )
+        agent_decision_store = AgentDecisionStore(path=agent_decisions_path)
+    else:
+        agent_decision_store = None
+
+    # ``RustAll`` instances across nodes share one ``TimeBudget`` via this
+    # closure so the per-pass wall-clock cap is enforced collectively
+    # (not per-node). ``start_pass`` on any node manager resets it; the
+    # driver calls start_pass from every node task with the same seconds
+    # so the resets are idempotent.
+    shared_time_budget = TimeBudget(total_seconds=None)
+
+    # Built up-front (not after the autotune loop) so the RustAll factory
+    # below can capture it. ``promote_top_k`` reuses the same closure.
+    rust_evaluate = build_rust_evaluate_fn(
+        work_dir=ckpt_dir / "autotune2" / "_rust_work",
+        kernel_name=args.kernel,
+        preset=args.preset,
+        timing_only=not args.rust_functional_check,
+        max_total_compute_bw=args.compute_bw,
+    )
+
+    # Several modes need a per-target candidate-fetcher and one or more
+    # of {curation, decision, final-pick} agents. Build them up-front so
+    # every consumer captures the same callables.
+    #   * ``--sim-mode=agent``: curation + decision agents (AgentManager).
+    #   * ``--root-pick=agent``: curation + final-pick agents
+    #     (final_pick_agent).
+    # The candidate-fetcher is shared by both — it reads the calibration
+    # store filtered by hw_config_hash. The curation agent likewise is
+    # shared whenever either mode needs it.
+    curation_agent_fn = None
+    decision_agent_fn = None
+    final_pick_agent_fn = None
+    fetch_candidates_fn = None
+    needs_curation = (
+        args.sim_mode == "agent" or args.root_pick == "agent"
+    )
+    if needs_curation:
+        from src.agents import make_curation_agent
+        from src.autotune2.prompts import CurationCandidate
+        from agents import ReasoningItem, Runner
+        from src.autotune2.search import AgentResponse
+
+        def _make_agent_call(agent):
+            async def call(conversation: list) -> AgentResponse:
+                result = await Runner.run(agent, conversation)
+                reasoning_chunks: list[str] = []
+                for item in result.new_items:
+                    if isinstance(item, ReasoningItem):
+                        for summary in item.raw_item.summary:
+                            reasoning_chunks.append(summary.text)
+                return AgentResponse(
+                    text=result.final_output or "",
+                    reasoning="\n\n".join(reasoning_chunks),
+                    usage=result.context_wrapper.usage,
+                )
+            return call
+
+        curation_agent = make_curation_agent(state["llm_config"])
+        curation_agent_fn = _make_agent_call(curation_agent)
+
+        def fetch_candidates_fn(_target_source: str) -> list:
+            """Pull calibration records relevant to ``_target_source``.
+
+            Today: filter by hw_config_hash (handed to us free by
+            ``CalibrationStore.iter_records``), then cap at
+            ``args.curation_max_candidates`` so the curation prompt
+            stays bounded. Per the PR4 design discussion we
+            intentionally skip semantic prefiltering — the curation
+            agent is the prefilter. Revisit when the store gets big
+            enough that the iter result blows past the cap regularly.
+            """
+            records = list(
+                calibration_store.iter_records(hw_config_hash=hw_hash)
+            )[: args.curation_max_candidates]
+            candidates: list[CurationCandidate] = []
+            for r in records:
+                src_path = Path(r.composed_source_path)
+                if not src_path.exists():
+                    # Stale record (sources_dir got cleaned, JSONL kept).
+                    # Skip rather than crash — the agent's job is to rank
+                    # whatever is intact today.
+                    continue
+                source_text = src_path.read_text(encoding="utf-8")
+                candidates.append(CurationCandidate(
+                    record_id=src_path.stem,  # sha256 prefix; stable + unique
+                    composed_source=source_text,
+                    analytical_cycles=r.analytical_cycles,
+                    rust_cycles=r.rust_cycles,
+                    kernel=r.kernel,
+                    preset=r.preset,
+                ))
+            return candidates
+
+        if args.sim_mode == "agent":
+            from src.agents import make_sim_decision_agent
+            decision_agent = make_sim_decision_agent(state["llm_config"])
+            decision_agent_fn = _make_agent_call(decision_agent)
+
+        if args.root_pick == "agent":
+            from src.agents import make_final_pick_agent
+            final_pick_agent_inst = make_final_pick_agent(state["llm_config"])
+            final_pick_agent_fn = _make_agent_call(final_pick_agent_inst)
 
     def make_sim_manager(node_tensors: dict):
         score_fn = make_analytical_scorer(
@@ -545,7 +711,53 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             hw_config=state["hw_config"],
             max_total_compute_bw=args.compute_bw,
         )
-        return AnalyticalOnly(score_fn=score_fn)
+        if args.sim_mode == "analytical":
+            return AnalyticalOnly(score_fn=score_fn)
+        if args.sim_mode == "rust":
+            return RustAll(
+                score_fn=score_fn,
+                rust_evaluate_fn=rust_evaluate,
+                time_budget=shared_time_budget,
+                calibration_store=calibration_store,
+                sources_dir=calibration_sources_dir,
+                kernel=args.kernel,
+                preset=args.preset,
+                hw_config_hash=hw_hash,
+                compute_bw=args.compute_bw,
+                run_id=run_id,
+            )
+        if args.sim_mode == "deterministic-split":
+            return DeterministicSplit(
+                score_fn=score_fn,
+                rust_evaluate_fn=rust_evaluate,
+                time_budget=shared_time_budget,
+                calibration_store=calibration_store,
+                sources_dir=calibration_sources_dir,
+                kernel=args.kernel,
+                preset=args.preset,
+                hw_config_hash=hw_hash,
+                compute_bw=args.compute_bw,
+                run_id=run_id,
+            )
+        # agent
+        return AgentManager(
+            score_fn=score_fn,
+            rust_evaluate_fn=rust_evaluate,
+            time_budget=shared_time_budget,
+            calibration_store=calibration_store,
+            sources_dir=calibration_sources_dir,
+            kernel=args.kernel,
+            preset=args.preset,
+            hw_config_hash=hw_hash,
+            compute_bw=args.compute_bw,
+            run_id=run_id,
+            curation_agent_fn=curation_agent_fn,
+            decision_agent_fn=decision_agent_fn,
+            fetch_candidates_fn=fetch_candidates_fn,
+            max_curation_candidates=args.curation_max_candidates,
+            curation_k=args.curation_k,
+            telemetry_store=agent_decision_store,
+        )
 
     agent_factory = build_real_agent_fn(llm_config=state["llm_config"])
     # Per-node verifier factory. For the root the closure uses
@@ -579,6 +791,12 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         # identity-permutation) form, so reuse would produce cell-key
         # collisions. Increment this tag to invalidate again.
         "output_contracts_source": "derived_v1",
+        # Folding ``sim_mode`` into the stamp invalidates every node's
+        # cached library when the user toggles --sim-mode — analytical
+        # and rust cycle counts are not directly comparable, and a
+        # mixed-source library would silently merge incomparable
+        # numbers in the next pass's Pareto admission.
+        "sim_mode": args.sim_mode,
     }
 
     pass_specs = state["pass_specs"]
@@ -616,11 +834,15 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             state["tree"], dsl_code=state["dsl_code"], fewshot=spec["fewshot"],
             max_tile=max_tile,
         )
+        sim_seconds = spec["sim_time_budget_seconds"]
         print(
             f"autotune2: pass {pass_idx} '{spec['name']}' — "
             f"fewshot={spec['fewshot']}, "
             f"max_baselines_per_node={spec['max_baselines_per_node']}, "
-            f"baseline_selection={spec['baseline_selection']}"
+            f"baseline_selection={spec['baseline_selection']}, "
+            f"sim_mode={args.sim_mode}, "
+            f"sim_time_budget_seconds="
+            f"{'unlimited' if sim_seconds is None else sim_seconds}"
         )
         result = await autotune(
             plan_tree=state["tree"],
@@ -644,27 +866,54 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             max_baselines_per_node=spec["max_baselines_per_node"],
             baseline_selection=spec["baseline_selection"],
             pass_subdir=pass_subdir,
+            sim_pass_seconds=spec["sim_time_budget_seconds"],
         )
         prior_libraries = result.libraries
     assert result is not None, "pass loop produced no result"
 
-    rust_evaluate = build_rust_evaluate_fn(
-        work_dir=ckpt_dir / "autotune2" / "_rust_work",
-        kernel_name=args.kernel,
-        preset=args.preset,
-        timing_only=True,
-        max_total_compute_bw=args.compute_bw,
-    )
-    promotions = promote_top_k(
-        root_library=result.root_library(),
-        k=args.top_k,
-        rust_evaluate_fn=rust_evaluate,
-    )
+    if args.root_pick == "final_pick":
+        promotions = final_pick(
+            root_library=result.root_library(),
+            rust_evaluate_fn=rust_evaluate,
+            strategy="min_cycles",
+        )
+        root_pick_strategy = "final_pick:min_cycles"
+    elif args.root_pick == "agent":
+        from src.autotune2.runtime import final_pick_agent
+        assert curation_agent_fn is not None and final_pick_agent_fn is not None, (
+            "--root-pick=agent: curation + final-pick agent callables were "
+            "not constructed; the up-front agent-helper block should have "
+            "built them when args.root_pick == 'agent'."
+        )
+        promotions = await final_pick_agent(
+            root_library=result.root_library(),
+            rust_evaluate_fn=rust_evaluate,
+            curation_agent_fn=curation_agent_fn,
+            final_pick_agent_fn=final_pick_agent_fn,
+            fetch_candidates_fn=fetch_candidates_fn,
+            root_path=result.root_path,
+            kernel=args.kernel,
+            preset=args.preset,
+            curation_k=args.curation_k,
+            curation_max_candidates=args.curation_max_candidates,
+            telemetry_store=agent_decision_store,
+            hw_config_hash=hw_hash,
+            run_id=run_id,
+        )
+        root_pick_strategy = "final_pick:agent"
+    else:
+        promotions = promote_top_k(
+            root_library=result.root_library(),
+            k=args.top_k,
+            rust_evaluate_fn=rust_evaluate,
+        )
+        root_pick_strategy = f"top_k:{args.top_k}"
 
     summary_path = ckpt_dir / "autotune2_summary.json"
     write_autotune2_summary(
         autotune_result=result, rust_promotions=promotions,
         out_path=summary_path, include_sources=args.include_sources,
+        root_pick_strategy=root_pick_strategy,
     )
 
     print(f"\nautotune2 summary -> {summary_path}")
@@ -674,6 +923,8 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
               f"(analytical={best.entry.cycles}, "
               f"on_chip={best.entry.on_chip}B, "
               f"provenance={best.entry.provenance!r})")
+    if _redirected:
+        terminal_print(f"autotune2 done — summary: {summary_path}")
     return 0
 
 
@@ -739,9 +990,26 @@ def main() -> int:
              "correctness-first).",
     )
     parser.add_argument(
+        "--root-pick", default="final_pick",
+        choices=("final_pick", "top_k", "agent"),
+        help="How to choose the root-level variant(s) sent to the rust "
+             "simulator at end of run (default: final_pick). 'final_pick' "
+             "picks one entry from the root Pareto (lowest cycles, "
+             "restricted to rust-sourced entries when the library is "
+             "mixed) and rust-evaluates only that one — the resulting "
+             "number is comparable across sim modes per HANDOFF design "
+             "decision #6. 'agent' lets the FinalPickAgent choose one "
+             "entry from the root Pareto given per-entry curated "
+             "calibration evidence; falls back to the 'final_pick' "
+             "deterministic pick on any agent failure. 'top_k' uses the "
+             "legacy promote_top_k(k=--top-k) path for backward "
+             "compatibility with existing benchmark scripts.",
+    )
+    parser.add_argument(
         "--top-k", type=int, default=3,
         help="Number of root-level Pareto entries to promote through the "
-             "rust simulator (default: 3).",
+             "rust simulator (default: 3). Only consulted when "
+             "--root-pick=top_k.",
     )
     parser.add_argument(
         "--compute-bw", type=int, default=100_000,
@@ -760,6 +1028,60 @@ def main() -> int:
              "prompt (default: tile_shrink). 'parallel' swaps in the "
              "shared-vs-independent parallelism examples and uses "
              "autotune2_system_parallel.txt as the template.",
+    )
+    parser.add_argument(
+        "--sim-mode", default="analytical",
+        choices=("analytical", "rust", "deterministic-split", "agent"),
+        help="Which simulation manager wraps the per-node scorer "
+             "(default: analytical). 'analytical' = STeP timing model "
+             "only (legacy behavior). 'rust' = rust-evaluate every "
+             "variant until the per-pass time budget is exhausted. "
+             "'deterministic-split' = rust-evaluate just the baselines "
+             "(anchors the Pareto cheaply); variants stay analytical. "
+             "'agent' = an in-loop LLM decides per variant whether to "
+             "spend rust budget, conditioned on past (analytical, "
+             "rust) calibration records picked by a curation agent. "
+             "All non-analytical modes append paired records to the "
+             "calibration store and respect the per-pass budget set "
+             "by each pass spec's 'sim_time_budget_seconds' (null = "
+             "unlimited).",
+    )
+    parser.add_argument(
+        "--sim-calibration-path", default=None,
+        help="Path to the calibration JSONL store the rust-backed "
+             "simulation managers append paired (analytical, rust) "
+             "records to. Default: <ckpt>/autotune2/calibration.jsonl "
+             "inside the snapshotted run dir. Override to a project-"
+             "shared path to accumulate cross-kernel evidence for the "
+             "PR3 curation / decision agents.",
+    )
+    parser.add_argument(
+        "--curation-max-candidates", type=int, default=50,
+        help="Max calibration records the curation agent ranks per "
+             "variant (default: 50). Larger values let the LLM see "
+             "more divergence patterns at the cost of prompt size; "
+             "smaller values are faster but starve the agent of "
+             "signal. Only consulted when --sim-mode=agent or "
+             "--root-pick=agent.",
+    )
+    parser.add_argument(
+        "--curation-k", type=int, default=4,
+        help="Number of records the curation agent picks (subset of "
+             "the input; default: 4). Bounds the size of the evidence "
+             "block fed to the simulation-decision / final-pick agents. "
+             "Must satisfy 1 <= curation_k <= curation_max_candidates.",
+    )
+    parser.add_argument(
+        "--rust-functional-check", dest="rust_functional_check",
+        default=True, action=argparse.BooleanOptionalAction,
+        help="Run the rust simulator with the functional sim enabled and "
+             "compare its output tensor against the PyTorch gold reference "
+             "for every variant (default: enabled). Catches structurally "
+             "broken graphs that drain early and report meaningless cycle "
+             "counts (see binary_map_accum_init_shape memory). Pass "
+             "--no-rust-functional-check to skip the compare and record "
+             "cycle counts only — faster, but bogus low-cycle 'winners' "
+             "will not be flagged.",
     )
     parser.add_argument(
         "--max-tile", type=int, default=None, metavar="N",
