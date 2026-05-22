@@ -125,10 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
     # --- autotune2-only args (--at-* prefix) ------------------------------
     p.add_argument(
         "--at-autotune-config",
-        default="/workspace/NextStep/StepGenFlow12/autotune_config_2.json",
-        help="Path to autotune_config.json (hw_config, max_on_chip_memory, "
+        default="/workspace/NextStep/StepGenFlow12/autotune_configs.yaml",
+        help="Path to autotune config JSON/YAML (hw_config, max_on_chip_memory, "
              "attempt_budgets, optional passes:[...]). Default: "
-             "/workspace/NextStep/StepGenFlow12/autotune_config_2.json.",
+             "/workspace/NextStep/StepGenFlow12/autotune_configs.yaml.",
+    )
+    p.add_argument(
+        "--at-autotune-config-name",
+        default="autotune_config_2",
+        help="Named config to resolve when --at-autotune-config is YAML.",
     )
     p.add_argument("--at-max-turns-per-attempt", type=int, default=16)
     p.add_argument("--at-root-pick", default="final_pick",
@@ -211,6 +216,7 @@ def _build_autotune_cmd(
 
     # autotune2-only
     cmd += ["--autotune-config", args.at_autotune_config]
+    cmd += ["--autotune-config-name", args.at_autotune_config_name]
     cmd += ["--max-turns-per-attempt", str(args.at_max_turns_per_attempt)]
     cmd += ["--root-pick", args.at_root_pick]
     cmd += ["--top-k", str(args.at_top_k)]

@@ -318,9 +318,10 @@ def build_autotune_system_prompt(hw_constraints: dict,
     timing model scores.
 
     `template_name` selects which autotune prompt to use (e.g.,
-    "autotune_system.txt" for the generalist, "autotune_parallel_system.txt"
-    for the parallelism specialist). All templates share the same placeholder
-    set so injection logic is identical.
+    "autotune_system.txt" for the deprecated generalist,
+    "autotune/parallel/autotune_parallel_system.txt" for the parallelism
+    specialist). All templates share the same placeholder set so injection
+    logic is identical.
     """
     template_path = _PROMPTS_DIR / template_name
     assert template_path.exists(), f"autotune prompt not found: {template_path}"
@@ -337,7 +338,9 @@ def build_autotune_system_prompt(hw_constraints: dict,
     if "{step_dsl_memory_code}" in template:
         replacements["step_dsl_memory_code"] = _STEP_DSL_MEM_PY.read_text()
     if "{memory_notes}" in template:
-        memory_notes_path = _PROMPTS_DIR / "dsl_memory_notes.txt"
+        memory_notes_path = (
+            _PROMPTS_DIR / "autotune" / "shared" / "dsl_memory_notes.txt"
+        )
         assert memory_notes_path.exists(), (
             f"dsl_memory_notes.txt not found: {memory_notes_path}")
         replacements["memory_notes"] = memory_notes_path.read_text().replace(

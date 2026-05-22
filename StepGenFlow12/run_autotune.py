@@ -7,10 +7,10 @@ the kernel outer dir, or the extracted_code.py itself.
 
 import argparse
 import asyncio
-import json
 import sys
 
 from src.autotune import run_autotune
+from src.autotune_config_loader import load_autotune_config
 from src.config_loader import load_llm_config
 from src.process_group import setup_process_group
 
@@ -28,10 +28,12 @@ def main():
                              "Ignored if --config is given.")
     parser.add_argument("--config", default=None,
                         help="Explicit path to an LLM config JSON (overrides --model).")
-    parser.add_argument("--autotune-config", default="autotune_config.json",
-                        help="Autotune config JSON (hw_config, constraints, max_turns)")
+    parser.add_argument("--autotune-config", default="autotune_configs.yaml",
+                        help="Autotune config JSON/YAML (hw_config, constraints, max_turns)")
+    parser.add_argument("--autotune-config-name", default="autotune_config",
+                        help="Named config to resolve when --autotune-config is YAML.")
     parser.add_argument("--max-turns", type=int, default=None,
-                        help="Override max_turns from autotune_config.json")
+                        help="Override max_turns from the autotune config")
     parser.add_argument("--checkpoint-dir", default=None,
                         help="Override autotune checkpoint dir (default: checkpoints_autotune/<ts>)")
     parser.add_argument("--agent", choices=["general", "parallel"], default="general",
@@ -41,8 +43,9 @@ def main():
     args = parser.parse_args()
 
     llm_config = load_llm_config(args.config, args.model)
-    with open(args.autotune_config) as f:
-        autotune_config = json.load(f)
+    autotune_config = load_autotune_config(
+        args.autotune_config, args.autotune_config_name,
+    )
 
     result = asyncio.run(run_autotune(
         kernel_name=args.kernel,

@@ -833,7 +833,7 @@ async def run_autotune(
 
     Args:
         autotune_config: dict with keys ``hw_config``, ``constraints``,
-            ``max_turns`` (see autotune_config.json).
+            ``max_turns`` (see ``autotune_configs.yaml``).
         resume_from: path to the successful implementer checkpoint — a file,
             outer dir, or checkpoint root. See ``_resolve_resume_dsl_with_source``.
         max_turns: overrides ``autotune_config["max_turns"]`` if provided.

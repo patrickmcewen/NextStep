@@ -14,7 +14,7 @@ Pass-2 results already exist on disk (mirrors ``run.py``'s
   - kernel-level ``dims`` / ``llm_config`` from
     ``<outer_dir>/../config.json`` (the same config the original run
     used)
-  - ``hw_config`` from a separate ``autotune_config.json`` (path passed
+  - ``hw_config`` from a separate autotune config file (path passed
     via ``--autotune-config``)
   - ``tensors`` via ``precompute_tensors(kernel_name, dims)``
 
@@ -47,6 +47,8 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from src.autotune_config_loader import load_autotune_config
 
 
 def _snapshot_checkpoint_for_autotune2(
@@ -326,6 +328,7 @@ def _load_pass1_state(
     *,
     kernel: str,
     autotune_config_path: Path,
+    autotune_config_name: str | None,
     llm_config: dict,
     cli_args: argparse.Namespace,
 ) -> dict:
@@ -374,7 +377,9 @@ def _load_pass1_state(
     assert autotune_config_path.exists(), (
         f"--autotune-config not found: {autotune_config_path}"
     )
-    autotune_config = json.loads(autotune_config_path.read_text())
+    autotune_config = load_autotune_config(
+        autotune_config_path, autotune_config_name,
+    )
     for required in ("hw_config", "max_on_chip_memory", "attempt_budgets"):
         assert required in autotune_config, (
             f"{autotune_config_path}: missing required {required!r} key"
@@ -527,6 +532,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         outer_dir,
         kernel=args.kernel,
         autotune_config_path=Path(args.autotune_config).resolve(),
+        autotune_config_name=args.autotune_config_name,
         llm_config=llm_config,
         cli_args=args,
     )
@@ -971,10 +977,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--autotune-config",
-        default="/workspace/NextStep/StepGenFlow12/autotune_config_2.json",
-        help="Path to autotune_config.json carrying the 'hw_config' block "
-             "(same JSON run.py's --autotune-config consumes). Default: "
-             "/workspace/NextStep/StepGenFlow12/autotune_config_2.json.",
+        default="/workspace/NextStep/StepGenFlow12/autotune_configs.yaml",
+        help="Path to autotune config JSON/YAML carrying the 'hw_config' block "
+             "(same file run.py's --autotune-config consumes). Default: "
+             "/workspace/NextStep/StepGenFlow12/autotune_configs.yaml.",
+    )
+    parser.add_argument(
+        "--autotune-config-name",
+        default="autotune_config_2",
+        help="Named config to resolve when --autotune-config is YAML.",
     )
     parser.add_argument(
         "--model", default="gpt-oss-120b",
@@ -1000,7 +1011,7 @@ def main() -> int:
         help="Max LLM turns within a single fresh-conversation attempt "
              "(default: 16). Each turn within an attempt accumulates "
              "gate-failure feedback. The number of attempts per node is "
-             "set by len(attempt_budgets) in the autotune-config JSON.",
+             "set by len(attempt_budgets) in the autotune config.",
     )
     parser.add_argument(
         "--check-order", default="correctness-first",
@@ -1042,11 +1053,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--fewshot", default="tile_shrink",
-        choices=("tile_shrink", "parallel"),
+        choices=("tile_shrink", "parallel", "general"),
         help="Worked-example pack to inject into the autotune2 system "
-             "prompt (default: tile_shrink). 'parallel' swaps in the "
-             "shared-vs-independent parallelism examples and uses "
-             "autotune2_system_parallel.txt as the template.",
+             "prompt (default: tile_shrink). 'parallel' focuses on "
+             "shared-vs-independent parallelism; 'general' combines "
+             "tile-shrink and parallelism guidance.",
     )
     parser.add_argument(
         "--sim-mode", default="analytical",

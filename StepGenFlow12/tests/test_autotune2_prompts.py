@@ -1,5 +1,7 @@
 """Unit tests for autotune2 prompt assembly + response parsing."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -16,6 +18,42 @@ from src.autotune2.prompts import (
     render_contract_human,
     render_variant_block,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_active_autotune_prompt_files_are_grouped_by_agent():
+    prompt_root = PROJECT_ROOT / "prompts"
+    expected = {
+        "autotune/tile_shrink/autotune2_system.txt",
+        "autotune/tile_shrink/autotune2_user_tile_shrink.txt",
+        "autotune/tile_shrink/autotune_tile_shrink_fewshot.txt",
+        "autotune/parallel/autotune2_system_parallel.txt",
+        "autotune/parallel/autotune2_user_parallel.txt",
+        "autotune/parallel/autotune_parallel_fewshot.txt",
+        "autotune/parallel/autotune_parallel_system.txt",
+        "autotune/general/autotune2_system_general.txt",
+        "autotune/general/autotune2_user_general.txt",
+        "autotune/general/autotune_general_fewshot.txt",
+        "autotune/curation/system.txt",
+        "autotune/curation/user.txt",
+        "autotune/sim_manager/system.txt",
+        "autotune/sim_manager/user.txt",
+        "autotune/shared/autotune2_output_protocol_leaf.txt",
+        "autotune/shared/autotune2_output_protocol_parent.txt",
+        "autotune/shared/dsl_memory_notes.txt",
+    }
+    deprecated = {
+        "autotune_system.txt",
+        "autotune_memory_system.txt",
+    }
+
+    for rel in expected:
+        assert (prompt_root / rel).exists(), rel
+        assert not (prompt_root / Path(rel).name).exists(), rel
+    for rel in deprecated:
+        assert (prompt_root / rel).exists(), rel
 
 
 # --- render_contract_human ---------------------------------------------------
@@ -165,6 +203,43 @@ def test_system_prompt_embeds_tile_shrink_fewshot():
         )
 
 
+def test_general_system_prompt_merges_tile_shrink_and_parallel_guidance():
+    out = build_autotune2_system_prompt(
+        is_leaf=True, dsl_code="X", fewshot="general",
+    )
+    flat = " ".join(out.lower().split())
+    assert "optimization recipes" in flat
+    assert "Shrinking tile sizes" in out
+    assert "Applying parallelism" in out
+    assert "binary_map_accum" in out
+    assert "static_reassemble" in out
+    assert "reducing tile sizes" in flat
+    assert "headroom" in flat
+    assert "before applying parallelism" in flat
+    assert "Output protocol (leaf node)" in out
+
+
+def test_general_fewshot_file_imports_specialized_fewshots():
+    general_fewshot = (
+        PROJECT_ROOT
+        / "prompts"
+        / "autotune"
+        / "general"
+        / "autotune_general_fewshot.txt"
+    ).read_text()
+    assert "{tile_shrink_fewshot}" in general_fewshot
+    assert "{parallel_fewshot}" in general_fewshot
+    assert len(general_fewshot.splitlines()) < 60
+
+    rendered = build_autotune2_system_prompt(
+        is_leaf=True, dsl_code="X", fewshot="general",
+    )
+    assert "{tile_shrink_fewshot}" not in rendered
+    assert "{parallel_fewshot}" not in rendered
+    assert "rms_norm" in rendered
+    assert "GEMM with M-axis parallelism" in rendered
+
+
 # --- build_autotune2_user_prompt ---------------------------------------------
 
 
@@ -209,6 +284,18 @@ def test_user_prompt_specializes_per_fewshot():
     assert "tile-shrink" in shrink.lower()
     assert "tile-shrink" not in parallel.lower()
     assert "parallel" in parallel.lower()
+
+
+def test_general_user_prompt_combines_memory_and_parallelism_strategy():
+    out = build_autotune2_user_prompt(
+        is_leaf=True, fewshot="general", **_PROMPT_KWARGS,
+    )
+    flat = " ".join(out.lower().split())
+    assert "tile sizes" in flat
+    assert "parallelism" in flat
+    assert "headroom" in flat
+    assert "before applying parallelism" in flat
+    assert "minimize cycle latency" in flat
 
 
 def test_user_prompt_rejects_unknown_fewshot():
@@ -480,6 +567,19 @@ def test_contract_to_yaml_dict_round_trip_via_yaml():
 
 
 # --- CurationAgent / SimDecisionAgent prompts (PR4) --------------------------
+
+
+def test_curation_and_sim_manager_prompts_live_in_prompt_files():
+    prompt_root = PROJECT_ROOT / "prompts" / "autotune"
+    files = {
+        "curation/system.txt": "You rank past simulator-calibration records",
+        "curation/user.txt": "## Target composed source",
+        "sim_manager/system.txt": "You decide, per variant",
+        "sim_manager/user.txt": "## Variant context",
+    }
+    for rel, marker in files.items():
+        text = (prompt_root / rel).read_text()
+        assert marker in text, rel
 
 
 def _curation_candidates(n: int):

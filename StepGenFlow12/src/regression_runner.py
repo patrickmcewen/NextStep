@@ -47,6 +47,7 @@ def build_run_py_command(
     bundle_dir: Path | None = None,
     autotune: bool = False,
     autotune_config: str | None = None,
+    autotune_config_name: str | None = None,
     autotune_max_turns: int | None = None,
     autotune_agent: str | None = None,
     check_order: str | None = None,
@@ -76,6 +77,8 @@ def build_run_py_command(
         cmd += ["--autotune"]
         if autotune_config is not None:
             cmd += ["--autotune-config", autotune_config]
+        if autotune_config_name is not None:
+            cmd += ["--autotune-config-name", autotune_config_name]
         if autotune_max_turns is not None:
             cmd += ["--autotune-max-turns", str(autotune_max_turns)]
         if autotune_agent is not None:

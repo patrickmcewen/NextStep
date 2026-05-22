@@ -28,7 +28,8 @@ an existing `outer_<N>/` checkpoint as its positional argument:
 
 ```
 python run_autotune2.py /path/to/checkpoints/<ts>/<kernel>/outer_N \
-    [--autotune-config autotune_config_2.json] \
+    [--autotune-config autotune_configs.yaml] \
+    [--autotune-config-name autotune_config_2] \
     [--model gpt-oss-120b] [--config <llm_config.json>] \
     [--max-attempts 5] [--max-turns-per-attempt 16] \
     [--check-order correctness-first] \
@@ -48,11 +49,12 @@ The chosen `outer_<N>/` must contain:
   `dims`, and (when `--kernel` / `--preset` are not passed on the
   CLI) for the StepDB `kernel` / `preset` names.
 
-`--autotune-config` points at a JSON file containing one required
+`--autotune-config` points at a JSON or YAML file containing one required
 key `hw_config` (HBM channels, channel latency, PMU buffer sizes,
 `max_compute_bw`, `max_par_dispatch`, etc. — the same shape the
 implementer's timing model consumes). The default path is
-`autotune_config_2.json` at the repo root.
+`autotune_configs.yaml` at the repo root, with
+`--autotune-config-name autotune_config_2`.
 
 ### Checkpoint isolation
 
@@ -226,17 +228,18 @@ the same conversation before being abandoned for a fresh attempt.
 
 ### Prompt assembly
 
-The system prompt (`prompts/autotune2_system.txt`) is built per
-node from a template with three placeholders:
+The system prompt (`prompts/autotune/tile_shrink/autotune2_system.txt`
+or `prompts/autotune/parallel/autotune2_system_parallel.txt`) is built
+per node from a template with three placeholders:
 
 - `{step_dsl_code}` — the literal contents of `src/step_dsl.py`,
   the DSL surface reference;
-- `{memory_notes}` — `prompts/dsl_memory_notes.txt` with
+- `{memory_notes}` — `prompts/autotune/shared/dsl_memory_notes.txt` with
   `{step_dsl_memory_code}` substituted to the contents of
   `src/step_dsl_memory.py` (the on-chip / off-chip memory shim);
 - `{output_protocol}` — one of
-  `prompts/autotune2_output_protocol_{leaf,parent}.txt`, selected
-  by `node.is_leaf`.
+  `prompts/autotune/shared/autotune2_output_protocol_{leaf,parent}.txt`,
+  selected by `node.is_leaf`.
 
 The system prompt is baked into the agent at construction (per
 node, via `agent_factory(system_prompt)`); the user prompt is
@@ -610,7 +613,8 @@ top level when promotion finishes.
 | flag | default | role |
 |---|---|---|
 | `--kernel` / `--preset` | from source `<ts>/config.json` | StepDB names |
-| `--autotune-config` | `autotune_config_2.json` | path to JSON with `hw_config` |
+| `--autotune-config` | `autotune_configs.yaml` | path to JSON/YAML with `hw_config` |
+| `--autotune-config-name` | `autotune_config_2` | YAML config name to resolve |
 | `--model` / `--config` | `gpt-oss-120b` | LLM profile or explicit config path |
 | `--checkpoint-dir` | parent of source `<ts>/` | base for snapshot copy |
 | `--max-turns-per-attempt` | 16 | turns within one fresh conversation |

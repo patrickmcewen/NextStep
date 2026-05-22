@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.autotune_config_loader import load_autotune_config
 from src.config_loader import load_llm_config
 from src.log_redirect import redirect_stdio_to, terminal_print
 from src.orchestrator import run_kernel
@@ -90,13 +91,15 @@ def main():
                              "Required when invoked from the AbstractionOpt outer flow.")
     parser.add_argument("--autotune", action="store_true",
                         help="Run the autotuner on each outer's verified build_graph.")
-    parser.add_argument("--autotune-config", default="autotune_config.json",
-                        help="Path to autotune_config JSON (hw_config, constraints, max_turns).")
+    parser.add_argument("--autotune-config", default="autotune_configs.yaml",
+                        help="Path to autotune config JSON/YAML (hw_config, constraints, max_turns).")
+    parser.add_argument("--autotune-config-name", default="autotune_config",
+                        help="Named config to resolve when --autotune-config is YAML.")
     parser.add_argument("--autotune-max-turns", type=int, default=None,
                         help="Override max_turns from autotune_config.")
     parser.add_argument("--autotune-agent", default="general",
                         help="Autotuner agent variant (e.g. 'general', 'parallel'). "
-                             "Ignored when autotune_config.json defines 'passes'. "
+                             "Ignored when the autotune config defines 'passes'. "
                              "Validated by the agent factory at run time.")
     parser.add_argument(
         "--check-order", default="correctness-first",
@@ -193,8 +196,9 @@ def main():
 
     autotune_options = None
     if args.autotune:
-        with open(args.autotune_config) as f:
-            autotune_cfg = json.load(f)
+        autotune_cfg = load_autotune_config(
+            args.autotune_config, args.autotune_config_name,
+        )
         autotune_options = _build_autotune_options(args, autotune_cfg)
 
     # Pre-generate the timestamp dir so we can install stdio redirection

@@ -1,0 +1,11 @@
+## Target composed source
+
+```
+{target_source}
+```
+
+## Candidate records (N={candidate_count})
+
+{candidate_blocks}
+
+## Pick K={k} records.

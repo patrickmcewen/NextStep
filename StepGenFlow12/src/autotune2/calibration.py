@@ -68,11 +68,13 @@ class CalibrationRecord:
     compute_bw: int
     timestamp: str  # ISO 8601
     run_id: str  # identifies the autotune2 run that produced this record
-    # Signed relative error of the analytical estimate vs the rust ground
-    # truth: (analytical_cycles - rust_cycles) / rust_cycles. Negative
-    # means analytical underestimated. Stored on disk (not a property) so
-    # offline analysis tools can grep/sort the JSONL directly. The writer
-    # computes this from cycle counts at append time.
+    # Signed percentage error of the analytical estimate vs the rust
+    # ground truth: 100 * (analytical_cycles - rust_cycles) / rust_cycles.
+    # Negative means analytical underestimated. Stored on disk (not a
+    # property) so offline analysis tools can grep/sort the JSONL
+    # directly. The writer computes this from cycle counts at append
+    # time. Units are *percent*, so e.g. -78.79 means analytical was
+    # 78.79% below rust.
     error_pct: float
 
     @property

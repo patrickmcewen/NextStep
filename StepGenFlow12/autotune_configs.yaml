@@ -1,0 +1,75 @@
+configs:
+  common_hw:
+    hw_config:
+      hbm_channels: 32
+      hbm_channel_latency: 2
+      hbm_init_interval: 2
+      hbm_addr_offset: 64
+      hbm_startup: 0
+      compute_bw: 64
+      pmu_buffer_bytes: 393216
+    constraints:
+      max_total_compute_bw: 4096
+      max_par_dispatch: 16
+      pmu_bw_bytes_per_cycle: 64
+
+  autotune_config:
+    base: common_hw
+    max_turns: 12
+    passes:
+      - agent: memory
+        max_turns: 12
+        feasibility:
+          on_chip_bytes: 393216
+      - agent: general
+        max_turns: 12
+        feasibility:
+          on_chip_bytes: 393216
+
+  autotune2_base:
+    base: common_hw
+    max_on_chip_memory: 5000000
+    attempt_budgets: [1.0, 0.5, 0.25, 0.1]
+    max_baselines_per_node: 4
+    baseline_selection: pareto_diverse
+    passes:
+      - name: tiling
+        fewshot: tile_shrink
+      - name: parallel
+        fewshot: parallel
+
+  autotune_config_2:
+    base: autotune2_base
+
+  autotune_config_3:
+    base: autotune2_base
+    max_on_chip_memory: 16777216
+    attempt_budgets: [null, 1.0, 0.5, 0.1]
+    passes:
+      - name: parallel
+        fewshot: parallel
+
+  autotune_config_moe:
+    base: autotune2_base
+    max_on_chip_memory: 25276420
+    passes:
+      - name: tiling
+        fewshot: tile_shrink
+        sim_time_budget_seconds: 1800
+      - name: parallel
+        fewshot: parallel
+        sim_time_budget_seconds: 1800
+
+  autotune_config_general:
+    base: common_hw
+    max_on_chip_memory: 5000000
+    attempt_budgets: [1.0, 0.5, 0.25, 0.1]
+    max_baselines_per_node: 4
+    baseline_selection: pareto_diverse
+    passes:
+      - agent: general
+        feasibility:
+          on_chip_bytes: 393216
+      - agent: general
+        feasibility:
+          on_chip_bytes: 393216

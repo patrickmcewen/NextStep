@@ -61,19 +61,55 @@ from src.autotune2.contracts import TensorContract, vanilla_contract_for
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROMPTS_DIR = _PROJECT_ROOT / "prompts"
-_SYSTEM_PROMPT_PATH = _PROMPTS_DIR / "autotune2_system.txt"
-_SYSTEM_PROMPT_PATH_PARALLEL = _PROMPTS_DIR / "autotune2_system_parallel.txt"
-_MEMORY_NOTES_PATH = _PROMPTS_DIR / "dsl_memory_notes.txt"
-_TILE_SHRINK_FEWSHOT_PATH = _PROMPTS_DIR / "autotune_tile_shrink_fewshot.txt"
-_PARALLEL_FEWSHOT_PATH = _PROMPTS_DIR / "autotune_parallel_fewshot.txt"
+_AUTOTUNE_PROMPTS_DIR = _PROMPTS_DIR / "autotune"
+_TILE_SHRINK_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "tile_shrink"
+_PARALLEL_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "parallel"
+_GENERAL_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "general"
+_CURATION_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "curation"
+_SIM_MANAGER_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "sim_manager"
+_SHARED_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "shared"
+_SYSTEM_PROMPT_PATH = _TILE_SHRINK_PROMPTS_DIR / "autotune2_system.txt"
+_SYSTEM_PROMPT_PATH_PARALLEL = (
+    _PARALLEL_PROMPTS_DIR / "autotune2_system_parallel.txt"
+)
+_SYSTEM_PROMPT_PATH_GENERAL = _GENERAL_PROMPTS_DIR / "autotune2_system_general.txt"
+_MEMORY_NOTES_PATH = _SHARED_PROMPTS_DIR / "dsl_memory_notes.txt"
+_TILE_SHRINK_FEWSHOT_PATH = (
+    _TILE_SHRINK_PROMPTS_DIR / "autotune_tile_shrink_fewshot.txt"
+)
+_PARALLEL_FEWSHOT_PATH = _PARALLEL_PROMPTS_DIR / "autotune_parallel_fewshot.txt"
+_GENERAL_FEWSHOT_PATH = _GENERAL_PROMPTS_DIR / "autotune_general_fewshot.txt"
+_CURATION_SYSTEM_PROMPT_PATH = _CURATION_PROMPTS_DIR / "system.txt"
+_CURATION_USER_PROMPT_PATH = _CURATION_PROMPTS_DIR / "user.txt"
+_SIM_DECISION_SYSTEM_PROMPT_PATH = _SIM_MANAGER_PROMPTS_DIR / "system.txt"
+_SIM_DECISION_USER_PROMPT_PATH = _SIM_MANAGER_PROMPTS_DIR / "user.txt"
+_STEP_DSL_IR_OP_GROUPS_PATH = _SHARED_PROMPTS_DIR / "step_dsl_ir_op_groups.txt"
 _STEP_DSL_MEMORY_PY = _PROJECT_ROOT / "src" / "step_dsl_memory.py"
 _OUTPUT_PROTOCOL_PATHS = {
-    True: _PROMPTS_DIR / "autotune2_output_protocol_leaf.txt",
-    False: _PROMPTS_DIR / "autotune2_output_protocol_parent.txt",
+    True: _SHARED_PROMPTS_DIR / "autotune2_output_protocol_leaf.txt",
+    False: _SHARED_PROMPTS_DIR / "autotune2_output_protocol_parent.txt",
 }
 _USER_PROMPT_PATHS = {
-    "tile_shrink": _PROMPTS_DIR / "autotune2_user_tile_shrink.txt",
-    "parallel": _PROMPTS_DIR / "autotune2_user_parallel.txt",
+    "tile_shrink": _TILE_SHRINK_PROMPTS_DIR / "autotune2_user_tile_shrink.txt",
+    "parallel": _PARALLEL_PROMPTS_DIR / "autotune2_user_parallel.txt",
+    "general": _GENERAL_PROMPTS_DIR / "autotune2_user_general.txt",
+}
+_SYSTEM_PROMPT_SPECS = {
+    "tile_shrink": (
+        _SYSTEM_PROMPT_PATH,
+        _TILE_SHRINK_FEWSHOT_PATH,
+        "{tile_shrink_fewshot}",
+    ),
+    "parallel": (
+        _SYSTEM_PROMPT_PATH_PARALLEL,
+        _PARALLEL_FEWSHOT_PATH,
+        "{parallel_fewshot}",
+    ),
+    "general": (
+        _SYSTEM_PROMPT_PATH_GENERAL,
+        _GENERAL_FEWSHOT_PATH,
+        "{general_fewshot}",
+    ),
 }
 
 
@@ -226,22 +262,29 @@ def build_autotune2_system_prompt(
     ``fewshot`` selects which worked-example pack to inject and which
     system-prompt template to load:
 
-      - ``"tile_shrink"`` (default): ``autotune2_system.txt`` +
-        ``autotune_tile_shrink_fewshot.txt`` (placeholder
-        ``{tile_shrink_fewshot}``). The load/consumer/reduction-order
-        rewrite recipe.
-      - ``"parallel"``: ``autotune2_system_parallel.txt`` +
-        ``autotune_parallel_fewshot.txt`` (placeholder
-        ``{parallel_fewshot}``). Shared vs. independent parallelism
-        worked examples.
+      - ``"tile_shrink"`` (default):
+        ``prompts/autotune/tile_shrink/autotune2_system.txt`` +
+        ``prompts/autotune/tile_shrink/autotune_tile_shrink_fewshot.txt``
+        (placeholder ``{tile_shrink_fewshot}``). The load/consumer/
+        reduction-order rewrite recipe.
+      - ``"parallel"``:
+        ``prompts/autotune/parallel/autotune2_system_parallel.txt`` +
+        ``prompts/autotune/parallel/autotune_parallel_fewshot.txt``
+        (placeholder ``{parallel_fewshot}``). Shared vs. independent
+        parallelism worked examples.
+      - ``"general"``:
+        ``prompts/autotune/general/autotune2_system_general.txt`` +
+        ``prompts/autotune/general/autotune_general_fewshot.txt``
+        (placeholder ``{general_fewshot}``). Merged tile-shrink and
+        parallelism guidance.
 
     Other placeholders are identical across variants: ``{step_dsl_code}``
     (the DSL surface, passed in), ``{memory_notes}`` (loaded from
-    ``prompts/dsl_memory_notes.txt`` and shared with
-    ``autotune_memory_system.txt``), and ``{output_protocol}`` (loaded
-    from ``prompts/autotune2_output_protocol_{leaf,parent}.txt`` based on
-    ``is_leaf``). ``str.replace`` is used instead of ``str.format``
-    because the protocol fragments contain literal YAML braces.
+    ``prompts/autotune/shared/dsl_memory_notes.txt``), and
+    ``{output_protocol}`` (loaded from
+    ``prompts/autotune/shared/autotune2_output_protocol_{leaf,parent}.txt``
+    based on ``is_leaf``). ``str.replace`` is used instead of
+    ``str.format`` because the protocol fragments contain literal YAML braces.
 
     ``max_tile`` (when set) substitutes the same pass-1 max-tile
     addendum (``src.agents._MAX_TILE_ADDENDUM_TEMPLATE``) into the
@@ -250,22 +293,15 @@ def build_autotune2_system_prompt(
     When ``None``, the placeholder collapses to an empty string.
     """
     assert dsl_code, "build_autotune2_system_prompt: dsl_code must be non-empty"
-    assert fewshot in ("tile_shrink", "parallel"), (
-        f"build_autotune2_system_prompt: fewshot must be 'tile_shrink' or "
-        f"'parallel', got {fewshot!r}"
+    assert fewshot in _SYSTEM_PROMPT_SPECS, (
+        f"build_autotune2_system_prompt: fewshot must be one of "
+        f"{sorted(_SYSTEM_PROMPT_SPECS.keys())!r}, got {fewshot!r}"
     )
     assert max_tile is None or (isinstance(max_tile, int) and max_tile >= 1), (
         f"build_autotune2_system_prompt: max_tile must be a positive int or "
         f"None, got {max_tile!r}"
     )
-    if fewshot == "tile_shrink":
-        system_path = _SYSTEM_PROMPT_PATH
-        fewshot_path = _TILE_SHRINK_FEWSHOT_PATH
-        fewshot_placeholder = "{tile_shrink_fewshot}"
-    else:
-        system_path = _SYSTEM_PROMPT_PATH_PARALLEL
-        fewshot_path = _PARALLEL_FEWSHOT_PATH
-        fewshot_placeholder = "{parallel_fewshot}"
+    system_path, fewshot_path, fewshot_placeholder = _SYSTEM_PROMPT_SPECS[fewshot]
     protocol_path = _OUTPUT_PROTOCOL_PATHS[is_leaf]
     for path in (system_path, protocol_path,
                  _MEMORY_NOTES_PATH, fewshot_path,
@@ -281,11 +317,17 @@ def build_autotune2_system_prompt(
         _MAX_TILE_ADDENDUM_TEMPLATE.format(max_tile=int(max_tile))
         if max_tile is not None else ""
     )
+    fewshot_text = (
+        fewshot_path.read_text()
+        .replace("{tile_shrink_fewshot}", _TILE_SHRINK_FEWSHOT_PATH.read_text().rstrip())
+        .replace("{parallel_fewshot}", _PARALLEL_FEWSHOT_PATH.read_text().rstrip())
+        .rstrip()
+    )
     rendered = (
         system_path.read_text()
         .replace("{step_dsl_code}", dsl_code)
         .replace("{memory_notes}", memory_notes)
-        .replace(fewshot_placeholder, fewshot_path.read_text().rstrip())
+        .replace(fewshot_placeholder, fewshot_text)
         .replace("{output_protocol}", protocol_path.read_text().rstrip())
         .replace("{max_tile_addendum}", max_tile_addendum)
     )
@@ -357,8 +399,8 @@ def build_autotune2_user_prompt(
     """Self-contained autotune2 user prompt for one (node, attempt) pair.
 
     ``fewshot`` selects which per-agent user-prompt template to load
-    from ``prompts/`` — currently ``"tile_shrink"`` and ``"parallel"``,
-    matching the system-prompt agents in
+    from ``prompts/autotune/<agent>/`` — currently ``"tile_shrink"``,
+    ``"parallel"``, and ``"general"``, matching the system-prompt agents in
     ``build_autotune2_system_prompt``. Each template carries the same
     placeholders but specializes the "Your task" framing toward the
     agent's recipe (tile-shrink vs. parallelism).
@@ -646,94 +688,41 @@ def contract_to_yaml_dict(c: TensorContract) -> dict:
 # stay strict.
 
 
-_CURATION_SYSTEM_PROMPT = """\
-You rank past simulator-calibration records by how predictive they are for a
-new piece of DSL code. Each record carries a STeP DSL composed source plus
-two cycle measurements of that same source: the cheap analytical timing
-model's estimate, and the cycle-approximate Rust simulator's measurement.
-The ratio (rust / analytical) tells you how well the analytical model
-captured this particular code's runtime.
-
-You will receive:
-  - one target composed source (the code the caller wants to predict
-    cycles for),
-  - N candidate records (composed source + analytical_cycles + rust_cycles).
-
-Pick the K records most useful for predicting the target's analytical-vs-
-rust relationship.
-
-Signals to favour:
-  - records whose composed source uses the SAME DSL ops as the target
-    (especially ops the analytical model is known to mis-estimate:
-    `flat_reassemble`, `flat_partition`, `expert_addr_gen`, `dyn_offchip_*`),
-  - records with similar tile shapes / streaming dimensions,
-  - records where analytical and rust diverged (high information about the
-    model's blind spots) over records where they agreed (low information).
-
-Output ONLY a fenced ```json block of the shape:
-
-  ```json
-  {"record_ids": ["<id1>", "<id2>", ...]}
-  ```
-
-The list must contain EXACTLY K entries, each ID must appear in the
-candidate set, and no ID may repeat. No prose outside the fence.
-"""
-
-
-_SIM_DECISION_SYSTEM_PROMPT = """\
-You decide, per variant, whether the autotune2 search loop should spend its
-Rust-simulator budget on this variant or fall back to the cheap analytical
-timing model.
-
-The Rust simulator is ground truth but slow (seconds to hours). The
-analytical model is instant but can be off by 2x or more on some op
-patterns. You have a per-pass wall-clock budget shared across every node in
-the search; once it runs out the loop is forced to analytical regardless of
-what you say.
-
-You will receive per call:
-  - the variant's composed DSL source,
-  - the analytical estimate (cycles, on_chip bytes) for this variant,
-  - the node context (root vs non-root, baseline vs variant),
-  - the budget state (remaining_seconds, recent_rust_avg_sec),
-  - curated calibration records — past (analytical, rust) pairs on related
-    code, picked by the curation agent.
-
-Lean toward "rust" when:
-  - this is a baseline (anchors the Pareto for the whole pass),
-  - the curated records show large analytical-vs-rust divergence on similar
-    code,
-  - the analytical estimate is suspiciously good (large speedup over the
-    baseline analytical number),
-  - remaining_seconds comfortably exceeds recent_rust_avg_sec.
-
-Lean toward "analytical" when:
-  - the curated records show analytical and rust agreeing closely on
-    similar code,
-  - the variant's analytical cycles are far worse than the baseline
-    (likely regression, not worth measuring),
-  - remaining_seconds < 2 * recent_rust_avg_sec.
-
-Output ONLY a fenced ```json block of the shape:
-
-  ```json
-  {"decision": "rust", "reason": "<one short sentence>"}
-  ```
-
-`decision` must be exactly "rust" or "analytical". `reason` is for
-telemetry only — keep it under 25 words. No prose outside the fence.
-"""
-
-
 def build_curation_system_prompt() -> str:
-    """System prompt for the curation agent. Static — no inputs."""
-    return _CURATION_SYSTEM_PROMPT
+    """System prompt for the curation agent. Static — no inputs.
+
+    The DSL ↔ IR op-group reference (shared with the sim-decision agent
+    so both agents reason about op identity the same way) is loaded from
+    ``prompts/autotune/shared/step_dsl_ir_op_groups.txt`` and substituted
+    into the ``{step_dsl_ir_op_groups}`` placeholder at the bottom of the
+    template.
+    """
+    assert _CURATION_SYSTEM_PROMPT_PATH.exists(), (
+        f"curation system prompt not found: {_CURATION_SYSTEM_PROMPT_PATH}"
+    )
+    assert _STEP_DSL_IR_OP_GROUPS_PATH.exists(), (
+        f"DSL ↔ IR op-group reference not found: {_STEP_DSL_IR_OP_GROUPS_PATH}"
+    )
+    return _CURATION_SYSTEM_PROMPT_PATH.read_text().replace(
+        "{step_dsl_ir_op_groups}", _STEP_DSL_IR_OP_GROUPS_PATH.read_text().rstrip()
+    )
 
 
 def build_sim_decision_system_prompt() -> str:
-    """System prompt for the in-loop simulation-decision agent. Static."""
-    return _SIM_DECISION_SYSTEM_PROMPT
+    """System prompt for the in-loop simulation-decision agent. Static.
+
+    Shares the ``{step_dsl_ir_op_groups}`` placeholder + reference file
+    with ``build_curation_system_prompt``; see that builder's docstring.
+    """
+    assert _SIM_DECISION_SYSTEM_PROMPT_PATH.exists(), (
+        f"sim-decision system prompt not found: {_SIM_DECISION_SYSTEM_PROMPT_PATH}"
+    )
+    assert _STEP_DSL_IR_OP_GROUPS_PATH.exists(), (
+        f"DSL ↔ IR op-group reference not found: {_STEP_DSL_IR_OP_GROUPS_PATH}"
+    )
+    return _SIM_DECISION_SYSTEM_PROMPT_PATH.read_text().replace(
+        "{step_dsl_ir_op_groups}", _STEP_DSL_IR_OP_GROUPS_PATH.read_text().rstrip()
+    )
 
 
 @dataclass(frozen=True)
@@ -804,14 +793,15 @@ def build_curation_user_prompt(
             f"rust_cycles={c.rust_cycles}, ratio={ratio:.3f}, "
             f"kernel={c.kernel}, preset={c.preset}\n"
         )
+    assert _CURATION_USER_PROMPT_PATH.exists(), (
+        f"curation user prompt not found: {_CURATION_USER_PROMPT_PATH}"
+    )
     return (
-        "## Target composed source\n\n"
-        "```\n"
-        f"{target_source}\n"
-        "```\n\n"
-        f"## Candidate records (N={len(candidates)})\n\n"
-        + "\n".join(blocks)
-        + f"\n## Pick K={k} records.\n"
+        _CURATION_USER_PROMPT_PATH.read_text()
+        .replace("{target_source}", target_source)
+        .replace("{candidate_count}", str(len(candidates)))
+        .replace("{candidate_blocks}", "\n".join(blocks))
+        .replace("{k}", str(k))
     )
 
 
@@ -856,24 +846,24 @@ def build_sim_decision_user_prompt(
     rem = (
         "inf" if remaining_seconds == float("inf") else f"{remaining_seconds:.1f}"
     )
+    assert _SIM_DECISION_USER_PROMPT_PATH.exists(), (
+        f"sim-decision user prompt not found: {_SIM_DECISION_USER_PROMPT_PATH}"
+    )
     return (
-        "## Variant context\n\n"
-        f"node_path={node_path}, is_root={is_root}, "
-        f"variant_kind={variant_kind}, "
-        f"attempt_index={attempt_index}, turn_index={turn_index}\n\n"
-        "## Composed source\n\n"
-        "```\n"
-        f"{composed_source}\n"
-        "```\n\n"
-        "## Analytical estimate\n\n"
-        f"cycles={analytical_cycles}, on_chip={analytical_on_chip} bytes\n\n"
-        "## Budget state\n\n"
-        f"remaining_seconds={rem}, "
-        f"recent_rust_avg_sec={recent_rust_avg_sec:.2f}, "
-        f"consumed_seconds={consumed_seconds:.2f}\n\n"
-        f"## Curated calibration evidence (K={len(curated)})\n\n"
-        f"{curated_block}\n"
-        "## Decide.\n"
+        _SIM_DECISION_USER_PROMPT_PATH.read_text()
+        .replace("{node_path}", node_path)
+        .replace("{is_root}", str(is_root))
+        .replace("{variant_kind}", variant_kind)
+        .replace("{attempt_index}", str(attempt_index))
+        .replace("{turn_index}", str(turn_index))
+        .replace("{composed_source}", composed_source)
+        .replace("{analytical_cycles}", str(analytical_cycles))
+        .replace("{analytical_on_chip}", str(analytical_on_chip))
+        .replace("{remaining_seconds}", rem)
+        .replace("{recent_rust_avg_sec}", f"{recent_rust_avg_sec:.2f}")
+        .replace("{consumed_seconds}", f"{consumed_seconds:.2f}")
+        .replace("{curated_count}", str(len(curated)))
+        .replace("{curated_block}", curated_block)
     )
 
 

@@ -699,7 +699,7 @@ def _append_calibration(
         compute_bw=int(compute_bw),
         timestamp=datetime.now(timezone.utc).isoformat(),
         run_id=run_id,
-        error_pct=(int(analytical_cycles) - rust_int) / rust_int,
+        error_pct=100.0 * (int(analytical_cycles) - rust_int) / rust_int,
     )
     store.append(record)
 

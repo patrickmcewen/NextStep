@@ -64,8 +64,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # Autotune pass-through to run.py
     p.add_argument("--autotune", action="store_true",
                    help="Enable per-outer autotune in each run.py invocation.")
-    p.add_argument("--autotune-config", default="autotune_config.json",
-                   help="Pass-through path to autotune_config JSON.")
+    p.add_argument("--autotune-config", default="autotune_configs.yaml",
+                   help="Pass-through path to autotune config JSON/YAML.")
+    p.add_argument("--autotune-config-name", default="autotune_config",
+                   help="Pass-through named config for YAML autotune configs.")
     p.add_argument("--autotune-max-turns", type=int, default=None,
                    help="Pass-through override for autotune max_turns.")
     p.add_argument("--autotune-agent", default=None, choices=[None, "general", "parallel"],
@@ -175,6 +177,7 @@ async def _amain(args: argparse.Namespace) -> int:
         "check_order": args.check_order,
         "autotune": args.autotune,
         "autotune_config": args.autotune_config,
+        "autotune_config_name": args.autotune_config_name,
         "autotune_max_turns": args.autotune_max_turns,
         "autotune_agent": args.autotune_agent,
         "bench_config": str(args.bench_config),
@@ -199,6 +202,7 @@ async def _amain(args: argparse.Namespace) -> int:
             bundle_dir=args.bundle_dir,
             autotune=args.autotune,
             autotune_config=args.autotune_config,
+            autotune_config_name=args.autotune_config_name,
             autotune_max_turns=args.autotune_max_turns,
             autotune_agent=args.autotune_agent,
             check_order=args.check_order,
