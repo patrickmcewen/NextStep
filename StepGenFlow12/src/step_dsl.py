@@ -650,6 +650,17 @@ def unary_sub_imm(x, constant, *, compute_bw=1):
     return _identity_unary(x, "unary_sub_imm", lambda t: t - constant)
 
 
+def unary_max_imm(x, constant, *, compute_bw=1):
+    """Element-wise max against a scalar: ``out = max(x, constant)``.
+
+    The canonical use is ReLU (``constant=0.0``). Lowered to
+    ``UnaryMap(fn=MaxImmediate)``; the Rust sim dispatches MaxConstant under
+    the F32→F32 unary arm only.
+    """
+    assert compute_bw >= 1, f"unary_max_imm: compute_bw must be >= 1, got {compute_bw}"
+    return _identity_unary(x, "unary_max_imm", lambda t: torch.clamp_min(t, constant))
+
+
 def unary_rowwise_sum(x, *, compute_bw=1):
     assert compute_bw >= 1, f"unary_rowwise_sum: compute_bw must be >= 1, got {compute_bw}"
     return _identity_unary(x, "unary_rowwise_sum",
@@ -1758,7 +1769,7 @@ DSL_FUNCTIONS = {
     "binary_map_accum",
     # Unary compute
     "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
-    "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_rowwise_sum",
+    "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_max_imm", "unary_rowwise_sum",
     "unary_mask_row", "unary_select_to_scalar", "unary_to_const_int",
     # Accumulation
     "accum_add", "accum_mul", "accum_max", "accum_retile_row", "accum_retile_col",

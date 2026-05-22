@@ -41,6 +41,7 @@ _UNARY_MAP = {
     "unary_mul_imm":           "MulImmediate",
     "unary_add_imm":           "AddImmediate",
     "unary_sub_imm":           "SubImmediate",
+    "unary_max_imm":           "MaxImmediate",
     "unary_rowwise_sum":       "RowWiseSum",
     "unary_select_to_scalar":  "SelectToScalar",
     "unary_to_const_int":      "ToConstInt",
@@ -984,7 +985,7 @@ def _make_binary_map(map_class):
 def _make_unary_map(map_class):
     def handler(state, target, call):
         x = _src(_arg(call, 0, "x"))
-        if map_class in ("MulImmediate", "AddImmediate", "SubImmediate", "ToConstInt"):
+        if map_class in ("MulImmediate", "AddImmediate", "SubImmediate", "MaxImmediate", "ToConstInt"):
             c = _src(_arg(call, 1, "constant"))
             fn_str = f"map_fn.{map_class}({c})"
             compute_bw = _arg_or_default(call, 2, "compute_bw", "1")
