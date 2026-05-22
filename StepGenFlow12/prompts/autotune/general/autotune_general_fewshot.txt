@@ -1,0 +1,22 @@
+# General autotune recipe guide
+
+This agent combines the tile-shrink and parallelism recipes. Do not apply
+both mechanically. First decide whether the current candidate needs memory
+relief, more compute parallelism, more load parallelism, or a balanced mix.
+
+Reducing tile sizes is the main way to satisfy the on-chip memory budget.
+Parallelism can improve cycles, but it may also increase the live tile
+footprint by replicating consumers, buffers, or broadcast operands. When a
+candidate is close to the memory limit, first reduce tile sizes enough to
+create headroom before applying parallelism. Then re-check the full graph's
+on-chip footprint and HBM traffic. The best variant often uses moderate
+tile sizes plus a modest `par_factor`, not maximum tiles or maximum
+parallelism in isolation.
+
+## Tile-shrink recipe
+
+{tile_shrink_fewshot}
+
+## Parallelism recipe
+
+{parallel_fewshot}
