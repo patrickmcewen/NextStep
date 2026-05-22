@@ -24,6 +24,7 @@ import pytest
 from src.autotune2.agent_telemetry import (
     AgentDecisionRecord,
     AgentDecisionStore,
+    write_sim_manager_system_prompts,
 )
 
 
@@ -124,3 +125,19 @@ def test_concurrent_appends_do_not_interleave(tmp_path: Path):
     assert len(rows) == 64
     reasons = sorted(r.reason for r in rows)
     assert reasons == sorted(f"r{i}" for i in range(64))
+
+
+def test_write_sim_manager_system_prompts(tmp_path: Path):
+    write_sim_manager_system_prompts(
+        tmp_path / "autotune2",
+        curator_system_prompt="curator system",
+        sim_manager_system_prompt="sim manager system",
+    )
+
+    prompt_dir = tmp_path / "autotune2" / "sim_manager_system_prompts"
+    assert (prompt_dir / "curator_system_prompt.txt").read_text() == (
+        "curator system"
+    )
+    assert (prompt_dir / "sim_manager_system_prompt.txt").read_text() == (
+        "sim manager system"
+    )

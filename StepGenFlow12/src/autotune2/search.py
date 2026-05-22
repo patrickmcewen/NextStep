@@ -1166,6 +1166,7 @@ async def _run_leaf_attempt(
         sim_ctx = SimContext(
             node_path=node.path, variant_kind="variant", is_root=is_root,
             attempt_index=attempt_index, turn_index=turn,
+            turn_artifact_dir=turn_dir,
         )
         result = await sim_manager.score(sim_ctx, composed)
         if result.error_feedback is not None:
@@ -1543,6 +1544,7 @@ async def _run_parent_attempt(
         sim_ctx = SimContext(
             node_path=node.path, variant_kind="variant", is_root=is_root,
             attempt_index=attempt_index, turn_index=turn,
+            turn_artifact_dir=turn_dir,
         )
         result = await sim_manager.score(sim_ctx, composed)
         if result.error_feedback is not None:

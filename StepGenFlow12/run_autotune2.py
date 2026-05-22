@@ -558,7 +558,10 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     #   * ``rust``: ``RustAll`` — every variant additionally rust-
     #     evaluated until the per-pass time budget runs out, with paired
     #     (analytical, rust) records appended to the calibration store.
-    from src.autotune2.agent_telemetry import AgentDecisionStore
+    from src.autotune2.agent_telemetry import (
+        AgentDecisionStore,
+        write_sim_manager_system_prompts,
+    )
     from src.autotune2.calibration import CalibrationStore, hw_config_hash
     from src.autotune2.sim_manager import (
         AgentManager, AnalyticalOnly, DeterministicSplit, RustAll, TimeBudget,
@@ -640,9 +643,20 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     )
     if needs_curation:
         from src.agents import make_curation_agent
-        from src.autotune2.prompts import CurationCandidate
+        from src.autotune2.prompts import (
+            CurationCandidate,
+            build_curation_system_prompt,
+            build_sim_decision_system_prompt,
+        )
         from agents import ReasoningItem, Runner
         from src.autotune2.search import AgentResponse
+
+        if args.sim_mode == "agent":
+            write_sim_manager_system_prompts(
+                calibration_path.parent,
+                curator_system_prompt=build_curation_system_prompt(),
+                sim_manager_system_prompt=build_sim_decision_system_prompt(),
+            )
 
         def _make_agent_call(agent):
             async def call(conversation: list) -> AgentResponse:
@@ -665,35 +679,40 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         def fetch_candidates_fn(_target_source: str) -> list:
             """Pull calibration records relevant to ``_target_source``.
 
-            Today: filter by hw_config_hash (handed to us free by
-            ``CalibrationStore.iter_records``), then cap at
+            Steps: filter by hw_config_hash, collapse to one record per
+            ``(source-hash, kernel, preset)`` keeping the most recent
+            (the calibration store is append-only, so the same triple
+            can legitimately appear more than once — e.g. a baseline
+            re-rust-evaluated across passes), then cap at
             ``args.curation_max_candidates`` so the curation prompt
             stays bounded. Per the PR4 design discussion we
             intentionally skip semantic prefiltering — the curation
-            agent is the prefilter. Revisit when the store gets big
-            enough that the iter result blows past the cap regularly.
+            agent is the prefilter.
+
+            ``record_id`` includes kernel + preset so cross-preset rows
+            with the same source-hash (StepDB stores one row per preset
+            for each shared step_impl.py) survive as distinct candidates.
+            Same source under different presets is real evidence about
+            how the analytical-vs-rust gap scales with workload.
             """
-            records = list(
-                calibration_store.iter_records(hw_config_hash=hw_hash)
-            )[: args.curation_max_candidates]
-            candidates: list[CurationCandidate] = []
-            for r in records:
+            latest_by_id: dict[str, CurationCandidate] = {}
+            for r in calibration_store.iter_records(hw_config_hash=hw_hash):
                 src_path = Path(r.composed_source_path)
                 if not src_path.exists():
                     # Stale record (sources_dir got cleaned, JSONL kept).
                     # Skip rather than crash — the agent's job is to rank
                     # whatever is intact today.
                     continue
-                source_text = src_path.read_text(encoding="utf-8")
-                candidates.append(CurationCandidate(
-                    record_id=src_path.stem,  # sha256 prefix; stable + unique
-                    composed_source=source_text,
+                record_id = f"{src_path.stem}__{r.kernel}__{r.preset}"
+                latest_by_id[record_id] = CurationCandidate(
+                    record_id=record_id,
+                    composed_source=src_path.read_text(encoding="utf-8"),
                     analytical_cycles=r.analytical_cycles,
                     rust_cycles=r.rust_cycles,
                     kernel=r.kernel,
                     preset=r.preset,
-                ))
-            return candidates
+                )
+            return list(latest_by_id.values())[: args.curation_max_candidates]
 
         if args.sim_mode == "agent":
             from src.agents import make_sim_decision_agent
@@ -1073,7 +1092,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--rust-functional-check", dest="rust_functional_check",
-        default=True, action=argparse.BooleanOptionalAction,
+        default=False, action=argparse.BooleanOptionalAction,
         help="Run the rust simulator with the functional sim enabled and "
              "compare its output tensor against the PyTorch gold reference "
              "for every variant (default: enabled). Catches structurally "

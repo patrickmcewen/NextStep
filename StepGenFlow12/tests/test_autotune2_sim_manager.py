@@ -41,13 +41,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _ctx(node_path: str = "root", *, is_root: bool = True) -> SimContext:
+def _ctx(
+    node_path: str = "root",
+    *,
+    is_root: bool = True,
+    turn_index: int = 0,
+) -> SimContext:
     return SimContext(
         node_path=node_path,
         variant_kind="variant",
         is_root=is_root,
         attempt_index=0,
-        turn_index=0,
+        turn_index=turn_index,
     )
 
 
@@ -484,6 +489,7 @@ def _make_agent_manager(
     fetch_candidates_fn=None,
     log_warning=None,
     telemetry_store=None,
+    turn_artifact_dir_fn=None,
     max_curation_candidates: int | None = None,
     curation_k: int | None = None,
 ):
@@ -519,6 +525,7 @@ def _make_agent_manager(
         log_warning=(log_warning if log_warning is not None
                      else warnings.append),
         telemetry_store=telemetry_store,
+        turn_artifact_dir_fn=turn_artifact_dir_fn,
     )
     if max_curation_candidates is not None:
         kwargs["max_curation_candidates"] = max_curation_candidates
@@ -880,6 +887,90 @@ def test_agent_manager_writes_telemetry_on_rust_decision(tmp_path):
         b"def t(): return 1"
     ).hexdigest()
     assert warnings == []
+
+
+def test_agent_manager_writes_per_turn_curation_and_decision_artifacts(
+    tmp_path,
+):
+    """When AgentManager invokes both LLM helpers, each call is persisted
+    under the caller's turn directory for post-hoc prompt inspection.
+    """
+    from src.autotune2.prompts import CurationCandidate
+    from src.autotune2.search import AgentResponse
+
+    candidates = [
+        CurationCandidate(
+            record_id=f"rec{i:02d}", composed_source=f"# s{i}\n",
+            analytical_cycles=10 + i, rust_cycles=20 + i,
+            kernel="k", preset="p",
+        )
+        for i in range(4)
+    ]
+
+    async def curation_fn(_conv):
+        return AgentResponse(
+            text=_curation_reply(["rec00", "rec01", "rec02", "rec03"]),
+            reasoning="curation reasoning",
+        )
+
+    async def decision_fn(_conv):
+        return AgentResponse(
+            text=_decision_reply("analytical", "model already accurate"),
+            reasoning="decision reasoning",
+        )
+
+    turn_dir = tmp_path / "root" / "attempt_0" / "turn_5"
+    mgr, _b, _s, _, warnings = _make_agent_manager(
+        tmp_path,
+        fetch_candidates_fn=lambda _src: candidates,
+        curation_fn=curation_fn,
+        decision_fn=decision_fn,
+        total_seconds=60.0,
+        turn_artifact_dir_fn=lambda ctx: turn_dir,
+    )
+
+    result = _run(mgr.score(_ctx(turn_index=5), "def t(): pass"))
+
+    assert result.cycle_source == "analytical"
+    curator_dir = turn_dir / "sim_manager" / "curator"
+    decision_dir = turn_dir / "sim_manager" / "sim_manager"
+    assert "## Target composed source" in (
+        curator_dir / "user_prompt.txt"
+    ).read_text()
+    assert "rec00" in (curator_dir / "response.txt").read_text()
+    assert (curator_dir / "reasoning.txt").read_text() == "curation reasoning"
+    assert "variant_kind=variant" in (
+        decision_dir / "user_prompt.txt"
+    ).read_text()
+    assert "model already accurate" in (
+        decision_dir / "response.txt"
+    ).read_text()
+    assert (decision_dir / "reasoning.txt").read_text() == "decision reasoning"
+    assert warnings == []
+
+
+def test_agent_manager_writes_decision_artifact_on_cold_start(tmp_path):
+    """Cold-start skips curation, but the sim-decision prompt/response
+    still lands under the turn's sim_manager directory.
+    """
+    async def decision_fn(_conv):
+        return _decision_reply("analytical", "cold start skip")
+
+    turn_dir = tmp_path / "root" / "attempt_0" / "turn_0"
+    mgr, _b, _s, _, _ = _make_agent_manager(
+        tmp_path,
+        decision_fn=decision_fn,
+        total_seconds=60.0,
+        turn_artifact_dir_fn=lambda ctx: turn_dir,
+    )
+
+    result = _run(mgr.score(_ctx(), "def t(): pass"))
+
+    assert result.cycle_source == "analytical"
+    assert not (turn_dir / "sim_manager" / "curator").exists()
+    decision_dir = turn_dir / "sim_manager" / "sim_manager"
+    assert (decision_dir / "user_prompt.txt").exists()
+    assert "cold start skip" in (decision_dir / "response.txt").read_text()
 
 
 def test_agent_manager_writes_telemetry_on_analytical_decision(tmp_path):

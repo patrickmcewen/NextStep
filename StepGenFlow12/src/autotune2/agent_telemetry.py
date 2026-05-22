@@ -141,3 +141,58 @@ class AgentDecisionStore:
                     continue
                 data = json.loads(line)
                 yield AgentDecisionRecord(**data)
+
+
+def _response_text(response: object) -> str:
+    if isinstance(response, str):
+        return response
+    text = getattr(response, "text", None)
+    assert isinstance(text, str), (
+        f"agent response must be a string or carry a string .text field; "
+        f"got {type(response).__name__}"
+    )
+    return text
+
+
+def write_agent_call_artifacts(
+    call_dir: Path,
+    *,
+    user_prompt: str,
+    agent_response: object,
+) -> None:
+    """Persist one helper-agent prompt/response call.
+
+    ``call_dir`` is the leaf directory for a single helper, e.g.
+    ``turn_5/sim_manager/curator`` or
+    ``turn_5/sim_manager/sim_manager``. The file names mirror the main
+    autotune2 turn layout so existing inspection habits still apply.
+    """
+    from src.token_accounting import write_turn_tokens
+
+    call_dir = Path(call_dir)
+    call_dir.mkdir(parents=True, exist_ok=True)
+    (call_dir / "user_prompt.txt").write_text(user_prompt)
+    (call_dir / "response.txt").write_text(_response_text(agent_response))
+    reasoning = getattr(agent_response, "reasoning", "")
+    if reasoning:
+        (call_dir / "reasoning.txt").write_text(reasoning)
+    usage = getattr(agent_response, "usage", None)
+    if usage is not None:
+        write_turn_tokens(call_dir, usage, kind="main")
+
+
+def write_sim_manager_system_prompts(
+    autotune2_dir: Path,
+    *,
+    curator_system_prompt: str,
+    sim_manager_system_prompt: str,
+) -> None:
+    """Write the static helper-agent system prompts for an autotune2 run."""
+    prompt_dir = Path(autotune2_dir) / "sim_manager_system_prompts"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    (prompt_dir / "curator_system_prompt.txt").write_text(
+        curator_system_prompt
+    )
+    (prompt_dir / "sim_manager_system_prompt.txt").write_text(
+        sim_manager_system_prompt
+    )

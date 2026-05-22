@@ -85,6 +85,7 @@ class SimContext:
     is_root: bool
     attempt_index: int = -1  # -1 for baseline scoring (no attempt context)
     turn_index: int = -1  # -1 for baseline scoring
+    turn_artifact_dir: Path | None = None
 
 
 @dataclass
@@ -679,6 +680,11 @@ def _append_calibration(
     rust_dur_ms: float,
 ) -> None:
     from src.autotune2.calibration import CalibrationRecord
+    rust_int = int(rust_cycles)
+    assert rust_int > 0, (
+        f"_append_calibration: rust_cycles must be > 0 to compute "
+        f"error_pct relative to ground truth, got {rust_int!r}"
+    )
     record = CalibrationRecord(
         node_path=ctx.node_path,
         is_root=ctx.is_root,
@@ -687,12 +693,13 @@ def _append_calibration(
         composed_source_path=str(source_path),
         analytical_cycles=int(analytical_cycles),
         analytical_on_chip=int(analytical_on_chip),
-        rust_cycles=int(rust_cycles),
+        rust_cycles=rust_int,
         rust_dur_ms=float(rust_dur_ms),
         hw_config_hash=hw_hash,
         compute_bw=int(compute_bw),
         timestamp=datetime.now(timezone.utc).isoformat(),
         run_id=run_id,
+        error_pct=(int(analytical_cycles) - rust_int) / rust_int,
     )
     store.append(record)
 
@@ -711,6 +718,7 @@ AgentCallFn = Callable[[list[dict]], Awaitable[object]]
 # CalibrationStore directly (lets the run-script filter by hw_config_hash,
 # cap candidate count, etc.).
 FetchCandidatesFn = Callable[[str], list]
+TurnArtifactDirFn = Callable[[SimContext], Path | None]
 
 
 class AgentManager:
@@ -776,6 +784,7 @@ class AgentManager:
         max_curation_candidates: int = DEFAULT_MAX_CURATION_CANDIDATES,
         curation_k: int = DEFAULT_CURATION_K,
         telemetry_store=None,  # AgentDecisionStore | None — None disables telemetry
+        turn_artifact_dir_fn: TurnArtifactDirFn | None = None,
     ) -> None:
         assert max_curation_candidates >= 1, (
             f"AgentManager: max_curation_candidates must be >= 1, "
@@ -802,6 +811,7 @@ class AgentManager:
         self._max_curation_candidates = int(max_curation_candidates)
         self._curation_k = int(curation_k)
         self._telemetry_store = telemetry_store
+        self._turn_artifact_dir_fn = turn_artifact_dir_fn
 
     async def start_pass(
         self, time_budget_seconds: float | None,
@@ -978,6 +988,7 @@ class AgentManager:
             self._fetch_candidates_fn(composed_source)
         )[: self._max_curation_candidates]
         num_available = len(candidates)
+        turn_artifact_dir = self._turn_artifact_dir(ctx)
 
         curation_dur_ms = -1.0
         if candidates:
@@ -992,6 +1003,12 @@ class AgentManager:
                 [{"role": "user", "content": curation_user_prompt}]
             )
             curation_dur_ms = (time.perf_counter() - t0) * 1000.0
+            self._write_agent_artifacts(
+                turn_artifact_dir=turn_artifact_dir,
+                agent_dir_name="curator",
+                user_prompt=curation_user_prompt,
+                agent_response=curation_reply,
+            )
             curation_text = _extract_agent_text(curation_reply)
             picked_ids = parse_curation_response(
                 curation_text,
@@ -1027,6 +1044,12 @@ class AgentManager:
             [{"role": "user", "content": decision_user_prompt}]
         )
         decision_dur_ms = (time.perf_counter() - t0) * 1000.0
+        self._write_agent_artifacts(
+            turn_artifact_dir=turn_artifact_dir,
+            agent_dir_name="sim_manager",
+            user_prompt=decision_user_prompt,
+            agent_response=decision_reply,
+        )
         decision_text = _extract_agent_text(decision_reply)
         decision, reason = parse_sim_decision_response(decision_text)
         return DecisionOutcome(
@@ -1081,6 +1104,32 @@ class AgentManager:
             decision_dur_ms=float(decision_dur_ms),
         )
         self._telemetry_store.append(record)
+
+    def _turn_artifact_dir(self, ctx: SimContext) -> Path | None:
+        if ctx.turn_artifact_dir is not None:
+            return Path(ctx.turn_artifact_dir)
+        if self._turn_artifact_dir_fn is None:
+            return None
+        path = self._turn_artifact_dir_fn(ctx)
+        return None if path is None else Path(path)
+
+    def _write_agent_artifacts(
+        self,
+        *,
+        turn_artifact_dir: Path | None,
+        agent_dir_name: str,
+        user_prompt: str,
+        agent_response: object,
+    ) -> None:
+        if turn_artifact_dir is None:
+            return
+        from src.autotune2.agent_telemetry import write_agent_call_artifacts
+
+        write_agent_call_artifacts(
+            Path(turn_artifact_dir) / "sim_manager" / agent_dir_name,
+            user_prompt=user_prompt,
+            agent_response=agent_response,
+        )
 
 
 @dataclass(frozen=True)

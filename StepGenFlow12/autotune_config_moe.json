@@ -13,11 +13,13 @@
     "passes": [
         {
             "name": "tiling",
-            "fewshot": "tile_shrink"
+            "fewshot": "tile_shrink",
+            "sim_time_budget_seconds": 1800
         },
         {
             "name": "parallel",
-            "fewshot": "parallel"
+            "fewshot": "parallel",
+            "sim_time_budget_seconds": 1800
         }
     ]
 }
