@@ -666,6 +666,11 @@ def unary_silu(x, *, compute_bw=1):
     return _identity_unary(x, "unary_silu", F.silu)
 
 
+def unary_tanh(x, *, compute_bw=1):
+    assert compute_bw >= 1, f"unary_tanh: compute_bw must be >= 1, got {compute_bw}"
+    return _identity_unary(x, "unary_tanh", torch.tanh)
+
+
 def unary_square(x, *, compute_bw=1):
     assert compute_bw >= 1, f"unary_square: compute_bw must be >= 1, got {compute_bw}"
     return _identity_unary(x, "unary_square", lambda t: t ** 2)
@@ -700,6 +705,14 @@ def unary_add_imm(x, constant, *, compute_bw=1):
 def unary_sub_imm(x, constant, *, compute_bw=1):
     assert compute_bw >= 1, f"unary_sub_imm: compute_bw must be >= 1, got {compute_bw}"
     return _identity_unary(x, "unary_sub_imm", lambda t: t - constant)
+
+
+def unary_pow_imm(x, constant, *, compute_bw=1):
+    """Mirrors step_dsl.unary_pow_imm: ``out = x ** constant`` for int/float."""
+    assert compute_bw >= 1, f"unary_pow_imm: compute_bw must be >= 1, got {compute_bw}"
+    assert isinstance(constant, (int, float)), \
+        f"unary_pow_imm: constant must be int or float, got {type(constant)}"
+    return _identity_unary(x, "unary_pow_imm", lambda t: torch.pow(t, constant))
 
 
 def unary_max_imm(x, constant, *, compute_bw=1):
@@ -1876,8 +1889,9 @@ DSL_FUNCTIONS = {
     # Fused compute
     "binary_map_accum",
     # Unary compute
-    "unary_silu", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
-    "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_max_imm", "unary_rowwise_sum",
+    "unary_silu", "unary_tanh", "unary_square", "unary_exp", "unary_rsqrt", "unary_pow2",
+    "unary_mul_imm", "unary_add_imm", "unary_sub_imm", "unary_max_imm",
+    "unary_pow_imm", "unary_rowwise_sum",
     "unary_mask_row", "unary_select_to_scalar", "unary_to_const_int",
     # Accumulation
     "accum_add", "accum_mul", "accum_max", "accum_retile_row", "accum_retile_col",
