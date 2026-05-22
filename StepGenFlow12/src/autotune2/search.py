@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable
@@ -170,13 +171,23 @@ def _coerce_agent_response(result) -> AgentResponse:
 
 @dataclass
 class SearchConfig:
-    max_turns_per_attempt: int = 3
-    """Max LLM turns within a single attempt before giving up and starting fresh.
+    time_limit_seconds: float = 1800.0
+    """Wall-clock limit for one autotuner pass.
 
-    Each turn inside an attempt accumulates assistant responses + gate
-    feedback in the same conversation, mirroring pass-1's refactor_final
-    loop. Exhausting this budget on an attempt aborts that attempt.
+    The same deadline is shared by every node and every attempt in the
+    pass. A search loop starts a new LLM turn only while the deadline has
+    remaining time; work already in-flight is allowed to finish so turn
+    artifacts and feedback stay coherent.
     """
+
+    clock: Callable[[], float] = time.monotonic
+    """Clock used to enforce ``time_limit_seconds``. Tests inject a
+    deterministic clock; production uses ``time.monotonic``."""
+
+    ace_context: object | None = None
+    """Optional AceContextManager. When set and enabled, attempts are split
+    into logged ``session_<N>/turn_<M>`` windows and the manager refreshes
+    context between windows."""
 
     attempt_budgets_bytes: list[int | None] = field(
         default_factory=lambda: [None]
@@ -207,6 +218,47 @@ class SearchConfig:
     ``build_autotune2_system_prompt``. One of ``"tile_shrink"`` or
     ``"parallel"``.
     """
+
+
+class PassDeadline:
+    """Shared pass-level wall-clock deadline.
+
+    The start time is captured lazily on first use so tests can build a
+    config before the coroutine starts without losing virtual time.
+    """
+
+    def __init__(
+        self,
+        *,
+        seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        assert isinstance(seconds, (int, float)) and seconds > 0, (
+            f"PassDeadline: seconds must be a positive number, got {seconds!r}"
+        )
+        self._seconds = float(seconds)
+        self._clock = clock
+        self._start: float | None = None
+
+    def _now(self) -> float:
+        now = float(self._clock())
+        if self._start is None:
+            self._start = now
+        return now
+
+    @property
+    def remaining_seconds(self) -> float:
+        return self._seconds - (self._now() - self._start)
+
+    def can_start_turn(self) -> bool:
+        return self.remaining_seconds > 0
+
+
+def _turn_indices_until_deadline(deadline: PassDeadline) -> Iterable[int]:
+    turn = 0
+    while deadline.can_start_turn():
+        yield turn
+        turn += 1
 
 
 @dataclass(frozen=True)
@@ -945,6 +997,61 @@ def _write_turn_artifacts(
         }, indent=2))
 
 
+def _ace_enabled(config: SearchConfig) -> bool:
+    ace = config.ace_context
+    return bool(ace is not None and getattr(ace, "enabled", False))
+
+
+def _turn_artifact_dir(
+    attempt_dir: Path,
+    *,
+    ace_on: bool,
+    session_index: int,
+    session_turn: int,
+    global_turn: int,
+) -> Path:
+    if ace_on:
+        return attempt_dir / f"session_{session_index}" / f"turn_{session_turn}"
+    return attempt_dir / f"turn_{global_turn}"
+
+
+def _ace_turn_event(
+    *,
+    node: PlanNode,
+    is_leaf: bool,
+    is_root: bool,
+    baseline_index: int,
+    attempt_index: int,
+    budget: int | None,
+    session_index: int,
+    session_turn: int,
+    global_turn: int,
+    status: str,
+    entry: DesignEntry | None = None,
+) -> dict:
+    event = {
+        "node_path": node.path,
+        "node_name": node.name,
+        "is_leaf": bool(is_leaf),
+        "is_root": bool(is_root),
+        "baseline_index": int(baseline_index),
+        "attempt_index": int(attempt_index),
+        "budget": budget,
+        "session_index": int(session_index),
+        "session_turn": int(session_turn),
+        "global_turn": int(global_turn),
+        "status": status,
+    }
+    if entry is not None:
+        event.update({
+            "cycles": entry.cycles,
+            "on_chip": entry.on_chip,
+            "cycle_source": entry.cycle_source,
+            "provenance": entry.provenance,
+        })
+    return event
+
+
 def _budget_label(budget: int | None) -> str:
     """Filesystem/provenance-safe label for a per-attempt budget.
 
@@ -1027,10 +1134,10 @@ async def _run_leaf_attempt(
     prompt_inputs: NodePromptInputs,
     config: SearchConfig,
     baseline_accepted: list[DesignEntry],
+    pass_deadline: PassDeadline,
     baseline_breakdown: str = "",
 ) -> list[DesignEntry]:
-    """Run one leaf attempt (one fresh conversation, up to
-    ``max_turns_per_attempt`` turns) under the given on-chip budget.
+    """Run one leaf attempt under the pass-level wall-clock deadline.
 
     Returns the list of DesignEntries admitted on this attempt (may be
     empty). The caller merges them into the shared per-node library via
@@ -1055,37 +1162,114 @@ async def _run_leaf_attempt(
     output_vanilla_shapes = (
         {} if is_root else _output_vanilla_shapes(parent_contract)
     )
-    accepted_summary = render_accepted_summary(
-        baseline_accepted,
-        arg_vanilla_shapes=arg_vanilla_shapes,
-        output_vanilla_shapes=output_vanilla_shapes,
-    )
-    user_prompt = build_autotune2_user_prompt(
-        is_leaf=True,
-        node_name=node.name,
-        function_signature=prompt_inputs.function_signature,
-        pytorch_reference=prompt_inputs.pytorch_reference,
-        baseline_dsl=baseline_dsl,
-        dims_block=prompt_inputs.dims_block,
-        tensors_block=prompt_inputs.tensors_block,
-        fewshot=config.fewshot,
-        accepted_summary=accepted_summary,
-        budget_block=_budget_block(budget, baseline_breakdown),
-    )
-    conversation: list[dict] = [{"role": "user", "content": user_prompt}]
     blabel = _budget_label(budget)
     admitted: list[DesignEntry] = []
+    ace = config.ace_context if _ace_enabled(config) else None
+    ace_context_text = ace.context_text() if ace is not None else ""
+    session_index = 0
+    session_turn = 0
+    ace_events: list[dict] = []
+    ace_metadata = {
+        "node_path": node.path,
+        "node_name": node.name,
+        "is_leaf": True,
+        "is_root": is_root,
+        "baseline_index": baseline_index,
+        "attempt_index": attempt_index,
+        "budget": budget,
+        "fewshot": config.fewshot,
+    }
 
-    for turn in range(config.max_turns_per_attempt):
+    def _build_user_prompt() -> str:
+        accepted_summary = render_accepted_summary(
+            baseline_accepted + admitted,
+            arg_vanilla_shapes=arg_vanilla_shapes,
+            output_vanilla_shapes=output_vanilla_shapes,
+        )
+        return build_autotune2_user_prompt(
+            is_leaf=True,
+            node_name=node.name,
+            function_signature=prompt_inputs.function_signature,
+            pytorch_reference=prompt_inputs.pytorch_reference,
+            baseline_dsl=baseline_dsl,
+            dims_block=prompt_inputs.dims_block,
+            tensors_block=prompt_inputs.tensors_block,
+            fewshot=config.fewshot,
+            accepted_summary=accepted_summary,
+            budget_block=_budget_block(budget, baseline_breakdown),
+            ace_context=ace_context_text,
+        )
+
+    conversation: list[dict] = [{"role": "user", "content": _build_user_prompt()}]
+    if ace is not None:
+        ace.write_session_start(
+            attempt_dir, session_index=session_index, metadata=ace_metadata,
+        )
+
+    async def _refresh_ace_session_if_needed() -> None:
+        nonlocal ace_context_text, session_index, session_turn, ace_events, conversation
+        if ace is None:
+            return
+        if session_turn < ace.refresh_interval_turns:
+            return
+        ace_context_text = await ace.refresh(
+            attempt_dir,
+            completed_session_index=session_index,
+            next_session_index=session_index + 1,
+            events=ace_events,
+            metadata=ace_metadata,
+        )
+        session_index += 1
+        session_turn = 0
+        ace_events = []
+        ace.write_session_start(
+            attempt_dir, session_index=session_index, metadata=ace_metadata,
+        )
+        conversation = [{"role": "user", "content": _build_user_prompt()}]
+
+    async def _record_ace(
+        status: str,
+        global_turn: int,
+        entry: DesignEntry | None = None,
+    ) -> None:
+        nonlocal session_turn
+        if ace is None:
+            return
+        event = _ace_turn_event(
+            node=node,
+            is_leaf=True,
+            is_root=is_root,
+            baseline_index=baseline_index,
+            attempt_index=attempt_index,
+            budget=budget,
+            session_index=session_index,
+            session_turn=session_turn,
+            global_turn=global_turn,
+            status=status,
+            entry=entry,
+        )
+        ace_events.append(event)
+        ace.write_turn_event(attempt_dir, event)
+        session_turn += 1
+
+    for turn in _turn_indices_until_deadline(pass_deadline):
+        await _refresh_ace_session_if_needed()
         assert conversation[-1]["role"] == "user", (
             "search_leaf: expected last conversation message to be a user "
             "turn before invoking the agent"
         )
         turn_user_prompt = conversation[-1]["content"]
         agent_response = _coerce_agent_response(await agent(conversation))
+        await asyncio.sleep(0)
         response = agent_response.text
         conversation.append({"role": "assistant", "content": response})
-        turn_dir = attempt_dir / f"turn_{turn}"
+        turn_dir = _turn_artifact_dir(
+            attempt_dir,
+            ace_on=ace is not None,
+            session_index=session_index,
+            session_turn=session_turn,
+            global_turn=turn,
+        )
 
         try:
             parsed = parse_autotune2_response(response, is_leaf=True)
@@ -1101,6 +1285,7 @@ async def _run_leaf_attempt(
                 "Please re-emit the YAML and python blocks exactly per "
                 "the output protocol described in the system prompt."
             ))
+            await _record_ace("PARSE_FAIL", turn)
             continue
 
         compliance_feedback = _compliance_preflight_feedback(
@@ -1115,6 +1300,7 @@ async def _run_leaf_attempt(
                 extracted_code=parsed.dsl,
             )
             _append_turn_feedback(conversation, compliance_feedback)
+            await _record_ace("COMPLIANCE_FAIL", turn)
             continue
 
         try:
@@ -1138,6 +1324,7 @@ async def _run_leaf_attempt(
                 "leave the last two reshape axes in place; the leading "
                 "stream axes may be factored/permuted freely."
             ))
+            await _record_ace("WRAPPER_BUILD_FAIL", turn)
             continue
 
         composed = compose_source(
@@ -1161,6 +1348,7 @@ async def _run_leaf_attempt(
                 "that addresses the issues:\n\n"
                 f"{verify.feedback}"
             ))
+            await _record_ace("VERIFY_FAIL", turn)
             continue
 
         sim_ctx = SimContext(
@@ -1182,6 +1370,7 @@ async def _run_leaf_attempt(
                 ),
             )
             _append_turn_feedback(conversation, result.error_feedback)
+            await _record_ace("SCORE_FAIL", turn)
             continue
 
         if budget is not None and result.on_chip > budget:
@@ -1208,6 +1397,7 @@ async def _run_leaf_attempt(
                     f"```\n{result.breakdown}\n```"
                 )
             _append_turn_feedback(conversation, feedback)
+            await _record_ace("OVER_BUDGET", turn)
             continue
 
         entry = DesignEntry(
@@ -1241,6 +1431,7 @@ async def _run_leaf_attempt(
             conversation,
             _admission_continuation_feedback(entry, budget),
         )
+        await _record_ace("ACCEPTED", turn, entry)
 
     return admitted
 
@@ -1259,6 +1450,7 @@ async def search_leaf(
     system_prompt: str = "",
     initial_baselines: list[DesignEntry] | None = None,
     prior_pass1_baseline: DesignEntry | None = None,
+    pass_deadline: PassDeadline | None = None,
 ) -> NodeLibrary:
     """Populate one leaf node's library.
 
@@ -1291,6 +1483,11 @@ async def search_leaf(
         "search_leaf: SearchConfig.attempt_budgets_bytes must contain at "
         "least one entry (use [None] for a single unlimited attempt)"
     )
+    if pass_deadline is None:
+        pass_deadline = PassDeadline(
+            seconds=config.time_limit_seconds,
+            clock=config.clock,
+        )
     lib: NodeLibrary = {}
     is_root = parent_contract is None
 
@@ -1335,6 +1532,7 @@ async def search_leaf(
             prompt_inputs=prompt_inputs,
             config=config,
             baseline_accepted=[b],
+            pass_deadline=pass_deadline,
             baseline_breakdown=b.breakdown,
         )
         for b_idx, b in enumerate(baselines)
@@ -1375,12 +1573,13 @@ async def _run_parent_attempt(
     prompt_inputs: NodePromptInputs,
     config: SearchConfig,
     baseline_accepted: list[DesignEntry],
+    pass_deadline: PassDeadline,
     baseline_breakdown: str = "",
 ) -> list[DesignEntry]:
-    """One parent attempt — fresh conversation, up to
-    ``max_turns_per_attempt`` turns, scoped to a single on-chip-memory
-    budget. Returns admitted DesignEntries (merged into the shared lib
-    by the caller).
+    """One parent attempt scoped to the pass-level wall-clock deadline.
+
+    Returns admitted DesignEntries (merged into the shared lib by the
+    caller).
 
     Children's full Pareto fronts are exposed to the LLM via
     ``child_blocks``; the agent autonomously picks one variant_index
@@ -1402,38 +1601,116 @@ async def _run_parent_attempt(
     output_vanilla_shapes = (
         {} if is_root else _output_vanilla_shapes(parent_contract)
     )
-    accepted_summary = render_accepted_summary(
-        baseline_accepted,
-        arg_vanilla_shapes=arg_vanilla_shapes,
-        output_vanilla_shapes=output_vanilla_shapes,
-    )
-    user_prompt = build_autotune2_user_prompt(
-        is_leaf=False,
-        node_name=node.name,
-        function_signature=prompt_inputs.function_signature,
-        pytorch_reference=prompt_inputs.pytorch_reference,
-        baseline_dsl=baseline_dsl,
-        dims_block=prompt_inputs.dims_block,
-        tensors_block=prompt_inputs.tensors_block,
-        fewshot=config.fewshot,
-        child_variant_blocks=child_blocks,
-        accepted_summary=accepted_summary,
-        budget_block=_budget_block(budget, baseline_breakdown),
-    )
-    conversation: list[dict] = [{"role": "user", "content": user_prompt}]
     blabel = _budget_label(budget)
     admitted: list[DesignEntry] = []
+    ace = config.ace_context if _ace_enabled(config) else None
+    ace_context_text = ace.context_text() if ace is not None else ""
+    session_index = 0
+    session_turn = 0
+    ace_events: list[dict] = []
+    ace_metadata = {
+        "node_path": node.path,
+        "node_name": node.name,
+        "is_leaf": False,
+        "is_root": is_root,
+        "baseline_index": baseline_index,
+        "attempt_index": attempt_index,
+        "budget": budget,
+        "fewshot": config.fewshot,
+        "child_paths": [child.path for child in node.children],
+    }
 
-    for turn in range(config.max_turns_per_attempt):
+    def _build_user_prompt() -> str:
+        accepted_summary = render_accepted_summary(
+            baseline_accepted + admitted,
+            arg_vanilla_shapes=arg_vanilla_shapes,
+            output_vanilla_shapes=output_vanilla_shapes,
+        )
+        return build_autotune2_user_prompt(
+            is_leaf=False,
+            node_name=node.name,
+            function_signature=prompt_inputs.function_signature,
+            pytorch_reference=prompt_inputs.pytorch_reference,
+            baseline_dsl=baseline_dsl,
+            dims_block=prompt_inputs.dims_block,
+            tensors_block=prompt_inputs.tensors_block,
+            fewshot=config.fewshot,
+            child_variant_blocks=child_blocks,
+            accepted_summary=accepted_summary,
+            budget_block=_budget_block(budget, baseline_breakdown),
+            ace_context=ace_context_text,
+        )
+
+    conversation: list[dict] = [{"role": "user", "content": _build_user_prompt()}]
+    if ace is not None:
+        ace.write_session_start(
+            attempt_dir, session_index=session_index, metadata=ace_metadata,
+        )
+
+    async def _refresh_ace_session_if_needed() -> None:
+        nonlocal ace_context_text, session_index, session_turn, ace_events, conversation
+        if ace is None:
+            return
+        if session_turn < ace.refresh_interval_turns:
+            return
+        ace_context_text = await ace.refresh(
+            attempt_dir,
+            completed_session_index=session_index,
+            next_session_index=session_index + 1,
+            events=ace_events,
+            metadata=ace_metadata,
+        )
+        session_index += 1
+        session_turn = 0
+        ace_events = []
+        ace.write_session_start(
+            attempt_dir, session_index=session_index, metadata=ace_metadata,
+        )
+        conversation = [{"role": "user", "content": _build_user_prompt()}]
+
+    async def _record_ace(
+        status: str,
+        global_turn: int,
+        entry: DesignEntry | None = None,
+    ) -> None:
+        nonlocal session_turn
+        if ace is None:
+            return
+        event = _ace_turn_event(
+            node=node,
+            is_leaf=False,
+            is_root=is_root,
+            baseline_index=baseline_index,
+            attempt_index=attempt_index,
+            budget=budget,
+            session_index=session_index,
+            session_turn=session_turn,
+            global_turn=global_turn,
+            status=status,
+            entry=entry,
+        )
+        ace_events.append(event)
+        ace.write_turn_event(attempt_dir, event)
+        session_turn += 1
+
+    for turn in _turn_indices_until_deadline(pass_deadline):
+        await _refresh_ace_session_if_needed()
         assert conversation[-1]["role"] == "user", (
             "search_parent: expected last conversation message to be a "
             "user turn before invoking the agent"
         )
         turn_user_prompt = conversation[-1]["content"]
         agent_response = _coerce_agent_response(await agent(conversation))
+        await asyncio.sleep(0)
         response = agent_response.text
         conversation.append({"role": "assistant", "content": response})
-        turn_dir = attempt_dir / f"turn_{turn}"
+        turn_dir = _turn_artifact_dir(
+            attempt_dir,
+            ace_on=ace is not None,
+            session_index=session_index,
+            session_turn=session_turn,
+            global_turn=turn,
+        )
 
         try:
             parsed = parse_autotune2_response(
@@ -1452,6 +1729,7 @@ async def _run_parent_attempt(
                 "Please re-emit the YAML and python blocks exactly per "
                 "the output protocol described in the system prompt."
             ))
+            await _record_ace("PARSE_FAIL", turn)
             continue
 
         try:
@@ -1475,6 +1753,7 @@ async def _run_parent_attempt(
                 "Refer to the child variant tables in the user prompt "
                 "and pick a valid variant_index per child."
             ))
+            await _record_ace("BAD_CHILD_PICK", turn)
             continue
 
         compliance_feedback = _compliance_preflight_feedback(
@@ -1489,6 +1768,7 @@ async def _run_parent_attempt(
                 extracted_code=parsed.dsl,
             )
             _append_turn_feedback(conversation, compliance_feedback)
+            await _record_ace("COMPLIANCE_FAIL", turn)
             continue
 
         try:
@@ -1512,6 +1792,7 @@ async def _run_parent_attempt(
                 "leave the last two reshape axes in place; the leading "
                 "stream axes may be factored/permuted freely."
             ))
+            await _record_ace("WRAPPER_BUILD_FAIL", turn)
             continue
 
         descendants: list[str] = []
@@ -1540,6 +1821,7 @@ async def _run_parent_attempt(
                 "that addresses the issues:\n\n"
                 f"{verify.feedback}"
             ))
+            await _record_ace("VERIFY_FAIL", turn)
             continue
         sim_ctx = SimContext(
             node_path=node.path, variant_kind="variant", is_root=is_root,
@@ -1560,6 +1842,7 @@ async def _run_parent_attempt(
                 ),
             )
             _append_turn_feedback(conversation, result.error_feedback)
+            await _record_ace("SCORE_FAIL", turn)
             continue
 
         if budget is not None and result.on_chip > budget:
@@ -1586,6 +1869,7 @@ async def _run_parent_attempt(
                     f"```\n{result.breakdown}\n```"
                 )
             _append_turn_feedback(conversation, feedback)
+            await _record_ace("OVER_BUDGET", turn)
             continue
 
         entry = DesignEntry(
@@ -1620,6 +1904,7 @@ async def _run_parent_attempt(
             conversation,
             _admission_continuation_feedback(entry, budget),
         )
+        await _record_ace("ACCEPTED", turn, entry)
 
     return admitted
 
@@ -1640,6 +1925,7 @@ async def search_parent(
     system_prompt: str = "",
     initial_baselines: list[DesignEntry] | None = None,
     prior_pass1_baseline: DesignEntry | None = None,
+    pass_deadline: PassDeadline | None = None,
 ) -> NodeLibrary:
     """Populate one parent node's library.
 
@@ -1669,6 +1955,11 @@ async def search_parent(
         "search_parent: SearchConfig.attempt_budgets_bytes must contain at "
         "least one entry (use [None] for a single unlimited attempt)"
     )
+    if pass_deadline is None:
+        pass_deadline = PassDeadline(
+            seconds=config.time_limit_seconds,
+            clock=config.clock,
+        )
     lib: NodeLibrary = {}
     is_root = parent_contract is None
 
@@ -1751,6 +2042,7 @@ async def search_parent(
             prompt_inputs=prompt_inputs,
             config=config,
             baseline_accepted=[b],
+            pass_deadline=pass_deadline,
             baseline_breakdown=b.breakdown,
         )
         for b_idx, b in enumerate(baselines)
@@ -1951,7 +2243,6 @@ async def autotune(
     max_baselines_per_node: int = 4,
     baseline_selection: str = "pareto_diverse",
     pass_subdir: str | None = None,
-    sim_pass_seconds: float | None = None,
 ) -> AutotuneResult:
     """Walk plan_tree bottom-up and search each node — in parallel where
     the tree shape allows.
@@ -2028,16 +2319,18 @@ async def autotune(
         ``<ckpt>/autotune2/<node>/<pass_subdir>/`` (node-major layout).
         ``None`` (default) keeps the single-pass layout
         ``<ckpt>/autotune2/<node>/``.
-      - ``sim_pass_seconds``: per-pass wall-clock budget forwarded to
-        every node manager's ``start_pass``. ``AnalyticalOnly`` ignores
-        it; ``RustAll`` re-arms its shared ``TimeBudget`` so rust calls
-        within this pass collectively respect the bound. ``None``
-        means unlimited.
+      - ``config.time_limit_seconds``: pass-level wall-clock limit shared
+        by every node and attempt. The driver does not start a new LLM
+        turn after this deadline expires.
 
     Returns the full ``{node_path: NodeLibrary}`` map plus the root path.
     """
     root_path = plan_tree.root.path
     tasks: dict[str, asyncio.Task] = {}
+    pass_deadline = PassDeadline(
+        seconds=config.time_limit_seconds,
+        clock=config.clock,
+    )
 
     async def _search_node(node: PlanNode) -> NodeLibrary:
         # Wait for every child's task before doing any work on this node.
@@ -2090,14 +2383,14 @@ async def autotune(
             else build_node_tensors_dict(parent_contract)
         )
         node_sim_manager = make_sim_manager(node_tensors)
-        # Arm the manager's per-pass time budget. AnalyticalOnly's
+        # Arm the manager's per-pass time limit. AnalyticalOnly's
         # ``start_pass`` is a no-op; rust-backed managers (RustAll +
         # later AgentManager) wrap a TimeBudget shared across every
         # node's manager via the factory closure, so calling
         # ``start_pass`` from every node task with the same seconds is
         # naturally idempotent — the last reset wins, and they all
         # write the same value.
-        await node_sim_manager.start_pass(sim_pass_seconds)
+        await node_sim_manager.start_pass(config.time_limit_seconds)
         node_verifier = make_verifier(node, parent_contract, node_tensors)
 
         # Multi-pass branching: pull additional starting designs from the
@@ -2137,6 +2430,7 @@ async def autotune(
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
                 prior_pass1_baseline=prior_pass1,
+                pass_deadline=pass_deadline,
             )
         else:
             # Parent: gather each child's pass-1 baseline entry. We must use
@@ -2165,6 +2459,7 @@ async def autotune(
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
                 prior_pass1_baseline=prior_pass1,
+                pass_deadline=pass_deadline,
             )
 
         # Multi-pass accumulator: merge the prior pass's entries for this

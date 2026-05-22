@@ -42,6 +42,16 @@ from src.planner import PlanNode, Tree
 # --- shared fixtures (mirrors test_autotune2_search.py) ---------------------
 
 
+class _TickingClock:
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        now = self._now
+        self._now += 1.0
+        return now
+
+
 def _stub_prompt_inputs(node_name: str = "node") -> NodePromptInputs:
     return NodePromptInputs(
         function_signature=f"def {node_name}(x, *, out_shapes):",
@@ -116,7 +126,9 @@ def _baseline_invariant_inputs(node, tree):
         prompt_inputs={node.path: _stub_prompt_inputs("solo")},
         system_prompts={node.path: "sys"},
         config=SearchConfig(
-            max_turns_per_attempt=1, attempt_budgets_bytes=[None],
+            time_limit_seconds=1.0,
+            attempt_budgets_bytes=[None],
+            clock=_TickingClock(),
         ),
     )
 
@@ -372,7 +384,7 @@ def _load_run_autotune2_module():
 
 def _cli_args(**overrides) -> argparse.Namespace:
     """Stub CLI namespace with only the fields _resolve_pass_specs reads."""
-    base = dict(fewshot="tile_shrink", max_turns_per_attempt=16)
+    base = dict(fewshot="tile_shrink", time_limit_seconds=120.0)
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -397,7 +409,7 @@ def test_resolve_pass_specs_absent_block_synthesizes_single_pass():
     assert s["fewshot"] == "tile_shrink"
     assert s["max_baselines_per_node"] == 4
     assert s["baseline_selection"] == "pareto_diverse"
-    assert s["max_turns_per_attempt"] == 16
+    assert s["time_limit_seconds"] == 120.0
     assert s["attempt_budgets_bytes"] == [None, 512]
 
 
@@ -494,8 +506,31 @@ def test_resolve_pass_specs_cli_fallback_for_unspecified_top_level():
         "passes": [{"name": "only"}],
     }
     specs, _ = mod._resolve_pass_specs(
-        cfg, cli_args=_cli_args(fewshot="parallel", max_turns_per_attempt=8),
+        cfg, cli_args=_cli_args(fewshot="parallel", time_limit_seconds=120.0),
         source="test",
     )
     assert specs[0]["fewshot"] == "parallel"
-    assert specs[0]["max_turns_per_attempt"] == 8
+    assert specs[0]["time_limit_seconds"] == 120.0
+
+
+def test_resolve_pass_specs_uses_time_limit_instead_of_turn_limit():
+    """Pass specs expose wall-clock pass limits, not per-attempt turn caps."""
+    mod = _load_run_autotune2_module()
+    cfg = {
+        "hw_config": {},
+        "max_on_chip_memory": 1000,
+        "attempt_budgets": [None],
+        "time_limit_seconds": 180.0,
+        "passes": [
+            {"name": "tiling"},
+            {"name": "parallel", "time_limit_seconds": 90.0},
+        ],
+    }
+    specs, _ = mod._resolve_pass_specs(
+        cfg, cli_args=_cli_args(time_limit_seconds=120.0), source="test",
+    )
+
+    assert specs[0]["time_limit_seconds"] == 180.0
+    assert specs[1]["time_limit_seconds"] == 90.0
+    assert "max_turns_per_attempt" not in specs[0]
+    assert "max_turns_per_attempt" not in specs[1]

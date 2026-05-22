@@ -5,10 +5,10 @@ and (for parents) a library of Pareto-optimal child variants, propose a
 *structurally different* DSL design that explores a new point in the
 (cycles, on_chip_memory) tradeoff space.
 
-The autotuner samples your proposals across many turns and admits each
-Pareto-non-dominated variant to a library used by upstream parents.
-Duplicate designs (identical structure to one already in the library) are
-wasted budget — aim for distinct choices of:
+The autotuner samples your proposals until the pass time limit expires and
+admits each Pareto-non-dominated variant to a library used by upstream
+parents. Duplicate designs (identical structure to one already in the
+library) waste the pass budget — aim for distinct choices of:
 
   - tile sizes and parallelism (Parallelize / StaticReassemble factors)
   - on-chip vs streaming layout (which tensors materialize, which stay

@@ -144,18 +144,16 @@ def _resolve_attempt_budgets(
 
 _PASS_KNOBS = (
     "fewshot", "max_baselines_per_node", "baseline_selection",
-    "attempt_budgets", "max_turns_per_attempt",
-    "sim_time_budget_seconds",
+    "attempt_budgets", "time_limit_seconds", "ace_context_enabled",
+    "ace_refresh_interval_turns",
 )
 _PASS_SPEC_DEFAULTS = {
     "fewshot": "tile_shrink",
     "max_baselines_per_node": 4,
     "baseline_selection": "pareto_diverse",
-    "max_turns_per_attempt": 16,
-    # ``None`` ⇒ unlimited. Only consulted when --sim-mode is rust (or
-    # any later mode that registers a TimeBudget); AnalyticalOnly
-    # ignores it.
-    "sim_time_budget_seconds": None,
+    "time_limit_seconds": 1800.0,
+    "ace_context_enabled": False,
+    "ace_refresh_interval_turns": 4,
 }
 
 
@@ -178,7 +176,11 @@ def _resolve_pass_specs(
     # lose to top-level config (top-level is a config-file decision).
     cli_overrides = {
         "fewshot": cli_args.fewshot,
-        "max_turns_per_attempt": cli_args.max_turns_per_attempt,
+        "time_limit_seconds": cli_args.time_limit_seconds,
+        "ace_context_enabled": getattr(cli_args, "ace_context", False),
+        "ace_refresh_interval_turns": getattr(
+            cli_args, "ace_refresh_interval_turns", 4,
+        ),
     }
     config_defaults: dict = {}
     for knob in _PASS_KNOBS:
@@ -220,6 +222,23 @@ def _resolve_pass_specs(
                 continue
             if knob in p:
                 spec[knob] = p[knob]
+        assert isinstance(spec["time_limit_seconds"], (int, float)) and (
+            spec["time_limit_seconds"] > 0
+        ), (
+            f"{source} passes[{i}].time_limit_seconds must be a positive "
+            f"number, got {spec['time_limit_seconds']!r}"
+        )
+        spec["time_limit_seconds"] = float(spec["time_limit_seconds"])
+        assert isinstance(spec["ace_context_enabled"], bool), (
+            f"{source} passes[{i}].ace_context_enabled must be a bool, "
+            f"got {spec['ace_context_enabled']!r}"
+        )
+        assert isinstance(spec["ace_refresh_interval_turns"], int) and (
+            spec["ace_refresh_interval_turns"] >= 1
+        ), (
+            f"{source} passes[{i}].ace_refresh_interval_turns must be an "
+            f"integer >= 1, got {spec['ace_refresh_interval_turns']!r}"
+        )
         budgets = p.get("attempt_budgets", top_level_budgets)
         spec["attempt_budgets_bytes"] = _resolve_attempt_budgets(
             budgets, max_on_chip_memory,
@@ -472,6 +491,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         promote_top_k,
         write_autotune2_summary,
     )
+    from src.autotune2.ace_context import AceContextConfig, AceContextManager
     from src.autotune2.search import SearchConfig, autotune
     from src.config_loader import load_llm_config
 
@@ -562,7 +582,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     #     scored by the STeP timing model. Behavior-equivalent to the
     #     pre-PR1 score_fn path.
     #   * ``rust``: ``RustAll`` — every variant additionally rust-
-    #     evaluated until the per-pass time budget runs out, with paired
+    #     evaluated until the per-pass time limit runs out, with paired
     #     (analytical, rust) records appended to the calibration store.
     from src.autotune2.agent_telemetry import (
         AgentDecisionStore,
@@ -859,15 +879,27 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             state["tree"], dsl_code=state["dsl_code"], fewshot=spec["fewshot"],
             max_tile=max_tile,
         )
-        sim_seconds = spec["sim_time_budget_seconds"]
+        ace_context = None
+        if spec["ace_context_enabled"]:
+            playbook_path = (
+                ckpt_dir / "autotune2" / "ace_context"
+                / f"pass_{pass_idx}_{spec['name']}_{spec['fewshot']}.md"
+            )
+            ace_context = AceContextManager(AceContextConfig(
+                enabled=True,
+                refresh_interval_turns=spec["ace_refresh_interval_turns"],
+                playbook_path=playbook_path,
+            ))
         print(
             f"autotune2: pass {pass_idx} '{spec['name']}' — "
             f"fewshot={spec['fewshot']}, "
             f"max_baselines_per_node={spec['max_baselines_per_node']}, "
             f"baseline_selection={spec['baseline_selection']}, "
             f"sim_mode={args.sim_mode}, "
-            f"sim_time_budget_seconds="
-            f"{'unlimited' if sim_seconds is None else sim_seconds}"
+            f"time_limit_seconds={spec['time_limit_seconds']}, "
+            f"ace_context_enabled={spec['ace_context_enabled']}, "
+            f"ace_refresh_interval_turns="
+            f"{spec['ace_refresh_interval_turns']}"
         )
         result = await autotune(
             plan_tree=state["tree"],
@@ -881,17 +913,17 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             prompt_inputs=state["prompt_inputs"],
             system_prompts=system_prompts,
             config=SearchConfig(
-                max_turns_per_attempt=spec["max_turns_per_attempt"],
+                time_limit_seconds=spec["time_limit_seconds"],
                 attempt_budgets_bytes=spec["attempt_budgets_bytes"],
                 check_order=args.check_order,
                 fewshot=spec["fewshot"],
+                ace_context=ace_context,
             ),
             node_stamps=node_stamps,
             initial_libraries=prior_libraries,
             max_baselines_per_node=spec["max_baselines_per_node"],
             baseline_selection=spec["baseline_selection"],
             pass_subdir=pass_subdir,
-            sim_pass_seconds=spec["sim_time_budget_seconds"],
         )
         prior_libraries = result.libraries
     assert result is not None, "pass loop produced no result"
@@ -1007,11 +1039,25 @@ def main() -> int:
              "timestamp dir (typically <repo>/checkpoints/).",
     )
     parser.add_argument(
-        "--max-turns-per-attempt", type=int, default=16,
-        help="Max LLM turns within a single fresh-conversation attempt "
-             "(default: 16). Each turn within an attempt accumulates "
-             "gate-failure feedback. The number of attempts per node is "
-             "set by len(attempt_budgets) in the autotune config.",
+        "--time-limit-seconds", type=float, default=1800.0,
+        help="Wall-clock limit for each autotuner pass (default: 1800). "
+             "The search loop starts no new LLM turns after the pass "
+             "deadline expires. Per-pass config entries override this.",
+    )
+    parser.add_argument(
+        "--ace-context",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable ACE-style context refresh for autotune2 attempts. "
+             "Each lane starts a new logged session after "
+             "--ace-refresh-interval-turns completed turns; per-pass "
+             "config entries may override this.",
+    )
+    parser.add_argument(
+        "--ace-refresh-interval-turns", type=int, default=4,
+        help="Completed turns per lane before the shared ACE context "
+             "manager refreshes the playbook and starts a new session "
+             "(default: 4).",
     )
     parser.add_argument(
         "--check-order", default="correctness-first",
@@ -1065,7 +1111,7 @@ def main() -> int:
         help="Which simulation manager wraps the per-node scorer "
              "(default: analytical). 'analytical' = STeP timing model "
              "only (legacy behavior). 'rust' = rust-evaluate every "
-             "variant until the per-pass time budget is exhausted. "
+             "variant until the per-pass time limit is exhausted. "
              "'deterministic-split' = rust-evaluate just the baselines "
              "(anchors the Pareto cheaply); variants stay analytical. "
              "'agent' = an in-loop LLM decides per variant whether to "
@@ -1073,8 +1119,7 @@ def main() -> int:
              "rust) calibration records picked by a curation agent. "
              "All non-analytical modes append paired records to the "
              "calibration store and respect the per-pass budget set "
-             "by each pass spec's 'sim_time_budget_seconds' (null = "
-             "unlimited).",
+             "by each pass spec's 'time_limit_seconds'.",
     )
     parser.add_argument(
         "--sim-calibration-path", default=None,

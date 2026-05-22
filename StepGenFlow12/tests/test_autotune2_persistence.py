@@ -34,6 +34,16 @@ from src.planner import PlanNode, Tree
 # --- fixtures ----------------------------------------------------------------
 
 
+class _TickingClock:
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        now = self._now
+        self._now += 1.0
+        return now
+
+
 def _entry(
     *,
     dsl: str = "def f(): pass",
@@ -422,7 +432,11 @@ def test_autotune_skips_already_completed_nodes_on_resume(tmp_path: Path):
             make_verifier=lambda _node, _pc, _t: verifier,
             prompt_inputs=prompts,
             system_prompts=sys_prompts,
-            config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+            config=SearchConfig(
+                time_limit_seconds=1.0,
+                attempt_budgets_bytes=[None]*1,
+                clock=_TickingClock(),
+            ),
             node_stamps=stamps,
         ))
 
@@ -503,7 +517,11 @@ def test_autotune_reruns_node_when_stamp_changes(tmp_path: Path):
             root_tensors={}, agent_factory=lambda _sp: agent,
             make_verifier=make_verifier,
             prompt_inputs=prompts, system_prompts=sys_prompts,
-            config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+            config=SearchConfig(
+                time_limit_seconds=1.0,
+                attempt_budgets_bytes=[None]*1,
+                clock=_TickingClock(),
+            ),
             node_stamps=stamps,
         ))
 

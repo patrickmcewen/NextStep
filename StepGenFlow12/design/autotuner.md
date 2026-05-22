@@ -221,10 +221,12 @@ The root falls back to the kernel-level `root_tensors` dict
 
 ## Per-turn loop
 
-Each per-node search runs up to `max_attempts` fresh-conversation
-attempts. Each attempt opens with the autotune2 user prompt and
-runs up to `max_turns_per_attempt` parse-and-verify turns within
-the same conversation before being abandoned for a fresh attempt.
+Each autotune2 pass runs under one shared `time_limit_seconds`
+deadline. Per-node attempts keep proposing parse-and-verify turns while
+the pass deadline allows new turns. When ACE context refresh is enabled,
+an attempt is split into `session_<N>/turn_<M>` windows; the shared
+curator refreshes the playbook between windows and the lane starts a new
+multi-turn conversation with the refreshed context.
 
 ### Prompt assembly
 

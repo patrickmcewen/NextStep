@@ -395,6 +395,7 @@ def build_autotune2_user_prompt(
     child_variant_blocks: dict[str, str] | None = None,
     accepted_summary: str = "",
     budget_block: str = "",
+    ace_context: str = "",
 ) -> str:
     """Self-contained autotune2 user prompt for one (node, attempt) pair.
 
@@ -446,6 +447,10 @@ def build_autotune2_user_prompt(
         f"\n\n### Already-accepted variants for this node\n\n{accepted_summary}\n"
         if accepted_summary else ""
     )
+    ace_context_section = (
+        f"\n\n### Learned optimization context\n\n{ace_context.strip()}\n"
+        if ace_context.strip() else ""
+    )
     return template_path.read_text().format(
         node_name=node_name,
         function_signature=function_signature,
@@ -455,7 +460,7 @@ def build_autotune2_user_prompt(
         tensors_block=tensors_block,
         variant_section=variant_section,
         accepted_section=accepted_section,
-        budget_section=budget_block,
+        budget_section=budget_block + ace_context_section,
         accepted_hint=_ACCEPTED_HINT if accepted_summary else "",
         parent_hint="" if is_leaf else _PARENT_HINT_TEXT,
     )

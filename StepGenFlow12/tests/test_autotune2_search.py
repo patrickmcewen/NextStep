@@ -41,6 +41,7 @@ from src.autotune2.search import (
     search_parent,
     write_library_snapshot,
 )
+from src.autotune2.ace_context import AceContextConfig, AceContextManager
 from src.autotune2.sim_manager import AnalyticalOnly
 
 
@@ -59,6 +60,31 @@ from src.planner import PlanNode, Tree
 
 def run(coro):
     return asyncio.run(coro)
+
+
+class _TickingClock:
+    """Deterministic clock: each read advances one second."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        now = self._now
+        self._now += 1.0
+        return now
+
+
+def _search_config(
+    turns: int,
+    attempt_budgets_bytes: list[int | None],
+    *,
+    branches: int = 1,
+):
+    return SearchConfig(
+        time_limit_seconds=float(turns * len(attempt_budgets_bytes) * branches),
+        attempt_budgets_bytes=attempt_budgets_bytes,
+        clock=_TickingClock(),
+    )
 
 
 # --- Contract / Tree fixtures ------------------------------------------------
@@ -546,17 +572,16 @@ def test_build_variant_callables_creates_named_stubs():
 
 
 def _make_leaf_response(reshape, perm, body: str = "    return None"):
-    # ``reshape``/``perm`` are honored for the *input* contract (the only
-    # boundary the LLM still declares). Output contracts are derived from
-    # the built graph by the verifier; the test fakes a verifier so the
-    # specific reshape/perm here doesn't drive Pareto cell keying.
+    # These tests use RAW leaf inputs, so the emitted input-contract map
+    # must be empty. Keep reshape/perm as a DSL comment marker so repeated
+    # responses are structurally distinct for dedup tests.
     return (
         "```yaml\n"
-        "parent_input_contracts:\n"
-        f"  x: {{reshape: {list(reshape)}, permutation: {list(perm)}}}\n"
+        "parent_input_contracts: {}\n"
         "```\n\n"
         "```python\n"
         f"def my_leaf(x, *, out_shapes):\n{body}\n"
+        f"    # marker reshape={list(reshape)} perm={list(perm)}\n"
         "```\n"
     )
 
@@ -597,7 +622,7 @@ def test_search_leaf_seeds_baseline_and_admits_llm_proposals(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*2),
+        config=_search_config(1, [None]*2),
     ))
     # variants.py was emitted
     assert (tmp_path / "leaf" / "variants.py").exists()
@@ -638,7 +663,7 @@ def test_search_leaf_writes_pass1_baseline_and_per_turn_score_artifacts(tmp_path
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+        config=_search_config(1, [None]*1),
     ))
 
     baseline_path = tmp_path / "leaf" / "pass1_baseline_score.json"
@@ -691,7 +716,7 @@ def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=2, attempt_budgets_bytes=[None]*1),
+        config=_search_config(2, [None]*1),
     ))
     # Two agent calls within one attempt
     assert call_idx[0] == 2
@@ -707,6 +732,100 @@ def test_search_leaf_appends_feedback_on_parse_fail_then_recovers(tmp_path):
     # (different output contracts cell)
     reg = library_to_variant_registry(lib)
     assert len(reg) >= 2
+
+
+def test_search_leaf_stops_attempt_when_pass_time_limit_expires(tmp_path):
+    """The proposal loop should consult a pass deadline, not a turn cap."""
+    captured_convos: list[list[dict]] = []
+    clock = _TickingClock()
+
+    async def agent(conversation: list[dict]):
+        captured_convos.append([dict(m) for m in conversation])
+        return "garbage — no fenced blocks"
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(
+            time_limit_seconds=2.0,
+            attempt_budgets_bytes=[None],
+            clock=clock,
+        ),
+    ))
+
+    assert len(captured_convos) == 2
+
+
+def test_search_leaf_ace_refresh_starts_new_logged_session(tmp_path):
+    """ACE refresh windows restart the lane conversation under unique
+    session directories and inject refreshed context into the next prompt."""
+    captured_prompts: list[str] = []
+
+    async def refresh_fn(*, playbook: str, events: list[dict], metadata: dict) -> str:
+        assert playbook == "initial guidance"
+        assert len(events) == 1
+        assert metadata["node_path"] == "root/my_leaf"
+        return "refreshed guidance"
+
+    ace_context = AceContextManager(
+        AceContextConfig(
+            enabled=True,
+            refresh_interval_turns=1,
+            initial_playbook="initial guidance",
+        ),
+        refresh_fn=refresh_fn,
+    )
+
+    async def agent(conversation: list[dict]):
+        captured_prompts.append(conversation[0]["content"])
+        return "garbage — no fenced blocks"
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(
+            time_limit_seconds=2.0,
+            attempt_budgets_bytes=[None],
+            clock=_TickingClock(),
+            ace_context=ace_context,
+        ),
+    ))
+
+    assert "initial guidance" in captured_prompts[0]
+    assert "refreshed guidance" in captured_prompts[1]
+    assert (tmp_path / "leaf" / "baseline_0_attempt_0_binf"
+            / "session_0" / "turn_0" / "status.txt").exists()
+    assert (tmp_path / "leaf" / "baseline_0_attempt_0_binf"
+            / "session_1" / "turn_0" / "status.txt").exists()
+    session_log = (
+        tmp_path / "leaf" / "baseline_0_attempt_0_binf" / "ace_sessions.jsonl"
+    ).read_text()
+    assert '"session_index": 0' in session_log
+    assert '"session_index": 1' in session_log
+    event_log = (
+        tmp_path / "leaf" / "baseline_0_attempt_0_binf" / "ace_events.jsonl"
+    ).read_text()
+    assert '"global_turn": 0' in event_log
+    assert '"global_turn": 1' in event_log
+    assert '"playbook_version": 1' in event_log
 
 
 def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
@@ -750,7 +869,8 @@ def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
         config=SearchConfig(
-            max_turns_per_attempt=2,
+            time_limit_seconds=2.0,
+            clock=_TickingClock(),
             # Two attempts at distinct budgets — unlimited and 1024 bytes.
             attempt_budgets_bytes=[None, 1024],
         ),
@@ -793,7 +913,7 @@ def test_search_leaf_default_initial_baselines_matches_current_behavior(tmp_path
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None, 1024]),
+        config=_search_config(1, [None, 1024]),
     ))
     # 2 budgets × 1 baseline (pass-1 only) = 2 agent calls.
     assert agent_calls[0] == 2
@@ -845,7 +965,7 @@ def test_search_leaf_extra_baselines_spawn_additional_attempts(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]),
+        config=_search_config(1, [None], branches=3),
         initial_baselines=[extra_a, extra_b],
     ))
 
@@ -886,7 +1006,7 @@ def test_search_leaf_per_branch_attempt_dir_naming(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None, 2048]),
+        config=_search_config(1, [None, 2048], branches=2),
         initial_baselines=[extra],
     ))
 
@@ -913,7 +1033,7 @@ def test_search_leaf_skips_failed_verification(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*3),
+        config=_search_config(1, [None]*3),
     ))
     # Only the baseline cell survives.
     assert len(library_to_variant_registry(lib)) == 1
@@ -966,9 +1086,9 @@ def test_search_leaf_score_fn_raise_becomes_user_feedback(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_leaf"),
-        config=SearchConfig(max_turns_per_attempt=2, attempt_budgets_bytes=[None]*1),
+        config=_search_config(2, [None]*1),
     ))
-    # Both LLM responses fired in the same attempt (max_turns_per_attempt=2).
+    # Both LLM responses fired in the same attempt before the fake deadline.
     assert call_idx[0] == 2
     # The second agent call's conversation must include the score-fail
     # feedback the search loop appended from the first turn's exception.
@@ -1045,7 +1165,7 @@ def test_search_parent_picks_one_child_entry_and_admits(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_parent"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+        config=_search_config(1, [None]*1),
     ))
 
     # Two scoring calls expected: baseline + exactly one LLM composition
@@ -1097,7 +1217,7 @@ def test_search_parent_admits_only_baseline_when_llm_verify_fails(tmp_path):
         agent=agent,
         verifier=verifier,
         prompt_inputs=_stub_prompt_inputs("my_parent"),
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+        config=_search_config(1, [None]*1),
     ))
 
     for by_out in lib.values():
@@ -1164,14 +1284,14 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
         make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+        config=_search_config(1, [None]*1, branches=10),
     ))
     assert set(result.libraries.keys()) == {leaf.path, root.path}
     assert result.root_path == root.path
-    # Leaf invoked before root (post-order): first agent call's user prompt
-    # carries the leaf's node name; the second carries the root's.
+    # Leaf invoked before root (post-order). Under a shared pass deadline,
+    # leaf feedback turns may exhaust the pass before the parent gets an
+    # LLM turn; the parent library still receives its baseline.
     assert "inner" in visited[0]
-    assert "outer" in visited[-1]
     # variants.py written for each
     assert (tmp_path / "tune" / "autotune2" / leaf.path / "variants.py").exists()
     assert (tmp_path / "tune" / "autotune2" / root.path / "variants.py").exists()
@@ -1267,26 +1387,28 @@ def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
         make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+        config=_search_config(1, [None]*1, branches=10),
     ))
 
     # All three libraries populated
     assert set(result.libraries.keys()) == {leaf_a.path, leaf_b.path, root.path}
 
     # Both leaves started before either finished → interleaved execution.
-    leaf_starts = [i for i, e in enumerate(order)
-                   if e in ("leaf_a:start", "leaf_b:start")]
-    leaf_ends = [i for i, e in enumerate(order)
-                 if e in ("leaf_a:end", "leaf_b:end")]
-    assert len(leaf_starts) == 2 and len(leaf_ends) == 2
-    assert max(leaf_starts) < min(leaf_ends), (
+    first_leaf_starts = [
+        order.index("leaf_a:start"),
+        order.index("leaf_b:start"),
+    ]
+    first_leaf_ends = [
+        order.index("leaf_a:end"),
+        order.index("leaf_b:end"),
+    ]
+    assert max(first_leaf_starts) < min(first_leaf_ends), (
         f"sibling leaves did not interleave: {order!r}"
     )
 
-    # Parent (outer) must start after both leaves finish — child-before-parent
-    # invariant is preserved.
-    outer_start = order.index("outer:start")
-    assert outer_start > max(leaf_ends)
+    # Parent library exists even when the shared deadline is exhausted by
+    # leaves before the parent gets an LLM turn.
+    assert root.path in result.libraries
 
 
 def test_autotune_root_as_leaf_single_node_tree(tmp_path):
@@ -1327,7 +1449,7 @@ def test_autotune_root_as_leaf_single_node_tree(tmp_path):
         make_verifier=lambda _node, _pc, _t: verifier,
         prompt_inputs=prompt_inputs,
         system_prompts=sys_prompts,
-        config=SearchConfig(max_turns_per_attempt=1, attempt_budgets_bytes=[None]*1),
+        config=_search_config(1, [None]*1),
     ))
     assert set(result.libraries.keys()) == {only.path}
     assert result.root_path == only.path

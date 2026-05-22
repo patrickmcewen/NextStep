@@ -73,10 +73,11 @@ PR2 changes:
     `search._search_node`, which awaits `node_sim_manager.start_pass(...)`
     on every node task — idempotent because every RustAll node-manager
     shares one TimeBudget via factory closure.
-- `src/autotune2/search.py` — `autotune(...)` gets a new
-  `sim_pass_seconds: float | None` keyword; `_search_node` awaits
-  `start_pass(sim_pass_seconds)` before fanout. `VariantSummary` now
-  carries `cycle_source`, threaded in by `render_library_as_variant_summaries`.
+- `src/autotune2/search.py` — `SearchConfig.time_limit_seconds` is the
+  pass-level wall-clock limit. `_search_node` awaits
+  `start_pass(config.time_limit_seconds)` before fanout. `VariantSummary`
+  now carries `cycle_source`, threaded in by
+  `render_library_as_variant_summaries`.
 - `src/autotune2/prompts.py` — `VariantSummary.cycle_source` rendered
   inline as `cycles=N (analytical|rust)`; `render_accepted_summary`
   does the same; `build_autotune2_system_prompt` appends a
@@ -89,9 +90,9 @@ PR2 changes:
 - `run_autotune2.py`
   - CLI: `--sim-mode {analytical, rust}` (default analytical),
     `--sim-calibration-path` (default `<ckpt>/autotune2/calibration.jsonl`).
-  - Pass-spec knob: `sim_time_budget_seconds` (null = unlimited).
-    Registered in `_PASS_KNOBS` + `_PASS_SPEC_DEFAULTS`, forwarded to
-    each `autotune(...)` call as `sim_pass_seconds=spec[...]`.
+  - Pass-spec knob: `time_limit_seconds`.
+    Registered in `_PASS_KNOBS` + `_PASS_SPEC_DEFAULTS`, forwarded via
+    `SearchConfig.time_limit_seconds`.
   - `make_sim_manager` factory now constructs `RustAll` (with shared
     `TimeBudget`, shared `CalibrationStore`, content-addressed sources
     dir) when `--sim-mode=rust`, else `AnalyticalOnly` as before.
@@ -498,7 +499,7 @@ works in a real autotune2 invocation (the test suite covers the unit
 behavior but doesn't exercise the StepDB rust subprocess):
 
 - `python run_autotune2.py <existing outer_dir> --sim-mode rust` with a
-  small `sim_time_budget_seconds` (e.g. `60`) on the smallest available
+  small `time_limit_seconds` (e.g. `60`) on the smallest available
   kernel. Confirm `<ckpt>/autotune2/calibration.jsonl` accumulates
   records and `<ckpt>/autotune2/calibration_sources/` fills with
   sha256-named files.
