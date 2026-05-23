@@ -1331,3 +1331,152 @@ def _precompute_kernelbench_opt_1p3b(dims):
     )
     out["causal_mask"] = causal_mask
     return out
+
+
+# ---------------------------------------------------------------------------
+# kernelbench_reformer_enwik8 — KernelBench Level 4 / Problem 13.
+# ---------------------------------------------------------------------------
+
+def _stack_reformer_block(sd, L, key_template):
+    """Matrix-shaped per-layer params: stacked form is >=3-D, slice ``[i]`` is >=2-D."""
+    return torch.stack(
+        [sd[key_template.format(l=l)].detach().clone().contiguous() for l in range(L)],
+        dim=0,
+    ).contiguous()
+
+
+def _stack_reformer_block_vec(sd, L, key_template):
+    """Vector-shaped per-layer params (``(D,)``): pad to ``(L, 1, D)`` so a
+    per-layer slice ``[i]`` is ``(1, D)`` — 2-D, as required by StepGenFlow's
+    on-chip ``rank >= 2`` invariant. ``F.layer_norm`` callers ``.squeeze(0)`` at use."""
+    return torch.stack(
+        [
+            sd[key_template.format(l=l)].detach().clone().contiguous().unsqueeze(0)
+            for l in range(L)
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def _stack_reformer_qkv(sd, L, attn_types):
+    """Build per-layer (L, D, D) q_w, k_w, v_w tensors. Local layers carry
+    distinct ``query/key/value``; LSH layers share ``query_key`` for both q_w
+    and k_w slots (the forward branches on attn_type to decide whether to
+    length-normalise K). Duplication keeps the per-layer tensor signature
+    uniform without changing the math."""
+    q_list, k_list, v_list = [], [], []
+    for l in range(L):
+        if attn_types[l] == "local":
+            q = sd[f"reformer.encoder.layers.{l}.attention.self_attention.query.weight"]
+            k = sd[f"reformer.encoder.layers.{l}.attention.self_attention.key.weight"]
+            v = sd[f"reformer.encoder.layers.{l}.attention.self_attention.value.weight"]
+        else:  # lsh
+            qk = sd[f"reformer.encoder.layers.{l}.attention.self_attention.query_key.weight"]
+            v = sd[f"reformer.encoder.layers.{l}.attention.self_attention.value.weight"]
+            q = qk
+            k = qk
+        q_list.append(q.detach().clone().contiguous())
+        k_list.append(k.detach().clone().contiguous())
+        v_list.append(v.detach().clone().contiguous())
+    return (
+        torch.stack(q_list, dim=0).contiguous(),
+        torch.stack(k_list, dim=0).contiguous(),
+        torch.stack(v_list, dim=0).contiguous(),
+    )
+
+
+@register("kernelbench_reformer_enwik8")
+def _precompute_kernelbench_reformer_enwik8(dims):
+    # RNG order MUST match
+    # seed_kernels/kernelbench/level4/reformer_enwik8/reference.py:
+    #   seed -> ReformerModelWithLMHead(config)  (consumes all weight RNG
+    #                                             internally)
+    #        -> torch.randint(0, V, (B, T))      for input_ids
+    from transformers import ReformerConfig, ReformerModelWithLMHead
+
+    attn_layers = ["local" if c == "l" else "lsh" for c in dims["ATTN_LAYERS"]]
+    assert len(attn_layers) == dims["L"]
+    assert dims["AE0"] + dims["AE1"] == dims["D"]
+    assert dims["AX0"] * dims["AX1"] == dims["MAX_POS"]
+
+    torch.manual_seed(SEED)
+    cfg = ReformerConfig(
+        vocab_size=dims["V"],
+        hidden_size=dims["D"],
+        num_attention_heads=dims["H"],
+        attention_head_size=dims["D_HEAD"],
+        feed_forward_size=dims["FF"],
+        num_hidden_layers=dims["L"],
+        attn_layers=attn_layers,
+        axial_pos_embds=True,
+        axial_pos_shape=(dims["AX0"], dims["AX1"]),
+        axial_pos_embds_dim=(dims["AE0"], dims["AE1"]),
+        max_position_embeddings=dims["MAX_POS"],
+        num_buckets=dims.get("NUM_BUCKETS", 8),
+        num_hashes=1,
+        lsh_attn_chunk_length=dims["LSH_CL"],
+        local_attn_chunk_length=dims["LOC_CL"],
+        lsh_num_chunks_before=1,
+        lsh_num_chunks_after=0,
+        local_num_chunks_before=1,
+        local_num_chunks_after=0,
+        chunk_size_lm_head=0,
+        chunk_size_feed_forward=0,
+        hash_seed=SEED,
+        is_decoder=True,
+        use_cache=False,
+        pad_token_id=0,
+        hidden_dropout_prob=0.0,
+        lsh_attention_probs_dropout_prob=0.0,
+        local_attention_probs_dropout_prob=0.0,
+        hidden_act="relu",
+        layer_norm_eps=1e-12,
+        axial_norm_std=1.0,
+        tie_word_embeddings=False,
+    )
+    model = ReformerModelWithLMHead(cfg)
+    sd = {k: v.detach() for k, v in model.state_dict().items()}
+    L = dims["L"]
+
+    # Axial position embeddings reshaped to drop their size-1 axes — see
+    # reference.get_inputs for the (T <= AX1) eval-mode derivation.
+    axial_pos_0 = (
+        sd["reformer.embeddings.position_embeddings.weights.0"][0, 0]
+        .clone().contiguous().unsqueeze(0)
+    )  # (1, AE0)
+    axial_pos_1 = (
+        sd["reformer.embeddings.position_embeddings.weights.1"][0]
+        .clone().contiguous()
+    )  # (AX1, AE1)
+
+    block_attn_q_w, block_attn_k_w, block_attn_v_w = _stack_reformer_qkv(sd, L, attn_layers)
+
+    out = {
+        "input_ids": None,  # filled after weights, to match reference's RNG order
+        "axial_pos_0": axial_pos_0,
+        "axial_pos_1": axial_pos_1,
+        "wte": sd["reformer.embeddings.word_embeddings.weight"].clone().contiguous(),
+        # Per-layer attention.
+        "block_attn_ln_w": _stack_reformer_block_vec(sd, L, "reformer.encoder.layers.{l}.attention.layer_norm.weight"),
+        "block_attn_ln_b": _stack_reformer_block_vec(sd, L, "reformer.encoder.layers.{l}.attention.layer_norm.bias"),
+        "block_attn_q_w": block_attn_q_w,
+        "block_attn_k_w": block_attn_k_w,
+        "block_attn_v_w": block_attn_v_w,
+        "block_attn_out_w": _stack_reformer_block(sd, L, "reformer.encoder.layers.{l}.attention.output.dense.weight"),
+        # Per-layer FFN.
+        "block_ff_ln_w": _stack_reformer_block_vec(sd, L, "reformer.encoder.layers.{l}.feed_forward.layer_norm.weight"),
+        "block_ff_ln_b": _stack_reformer_block_vec(sd, L, "reformer.encoder.layers.{l}.feed_forward.layer_norm.bias"),
+        "block_ff_dense_w": _stack_reformer_block(sd, L, "reformer.encoder.layers.{l}.feed_forward.dense.dense.weight"),
+        "block_ff_dense_b": _stack_reformer_block_vec(sd, L, "reformer.encoder.layers.{l}.feed_forward.dense.dense.bias"),
+        "block_ff_out_w": _stack_reformer_block(sd, L, "reformer.encoder.layers.{l}.feed_forward.output.dense.weight"),
+        "block_ff_out_b": _stack_reformer_block_vec(sd, L, "reformer.encoder.layers.{l}.feed_forward.output.dense.bias"),
+        # Final encoder LN (over 2*D) — stored as (1, 2D) so offchip_load
+        # (>=2-D underlying) can consume it. Reference squeezes back at use.
+        "enc_ln_w": sd["reformer.encoder.layer_norm.weight"].clone().contiguous().unsqueeze(0),
+        "enc_ln_b": sd["reformer.encoder.layer_norm.bias"].clone().contiguous().unsqueeze(0),
+        # LM head decoder (bias=False; lm_head.bias is allocated by HF but
+        # never used in forward).
+        "lm_head_w": sd["lm_head.decoder.weight"].clone().contiguous(),
+    }
+    out["input_ids"] = torch.randint(0, dims["V"], (dims["B"], dims["T"]))
+    return out

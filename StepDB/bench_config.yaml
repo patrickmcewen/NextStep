@@ -2721,3 +2721,99 @@ kernelbench_opt_1p3b:
       H: 32
       I: 8192
   origin: seed
+
+kernelbench_reformer_enwik8:
+  problem: seed_kernels/kernelbench/level4/reformer_enwik8/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - D
+  - L
+  - H
+  - D_HEAD
+  - FF
+  - AX0
+  - AX1
+  - AE0
+  - AE1
+  - MAX_POS
+  - LSH_CL
+  - LOC_CL
+  - ATTN_LAYERS
+  - NUM_BUCKETS
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 16
+      D: 32
+      L: 4
+      H: 2
+      D_HEAD: 16
+      FF: 64
+      AX0: 2
+      AX1: 8
+      AE0: 8
+      AE1: 24
+      MAX_POS: 16
+      LSH_CL: 8
+      LOC_CL: 8
+      ATTN_LAYERS: lLlL
+      NUM_BUCKETS: 8
+    small:
+      B: 2
+      T: 16
+      V: 32
+      D: 64
+      L: 4
+      H: 4
+      D_HEAD: 16
+      FF: 128
+      AX0: 2
+      AX1: 16
+      AE0: 16
+      AE1: 48
+      MAX_POS: 32
+      LSH_CL: 16
+      LOC_CL: 16
+      ATTN_LAYERS: llLl
+      NUM_BUCKETS: 8
+    medium:
+      B: 4
+      T: 32
+      V: 64
+      D: 64
+      L: 6
+      H: 4
+      D_HEAD: 16
+      FF: 128
+      AX0: 4
+      AX1: 32
+      AE0: 16
+      AE1: 48
+      MAX_POS: 128
+      LSH_CL: 32
+      LOC_CL: 16
+      ATTN_LAYERS: lLllLl
+      NUM_BUCKETS: 8
+    reformer_enwik8_bs32_seq256:
+      B: 32
+      T: 256
+      V: 258
+      D: 1024
+      L: 12
+      H: 8
+      D_HEAD: 128
+      FF: 4096
+      AX0: 128
+      AX1: 512
+      AE0: 256
+      AE1: 768
+      MAX_POS: 65536
+      LSH_CL: 256
+      LOC_CL: 128
+      ATTN_LAYERS: llLlllLlllLl
+      NUM_BUCKETS: 512
+  origin: seed
