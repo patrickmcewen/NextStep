@@ -72,3 +72,23 @@ def test_load_autotune_config_reads_named_yaml_config(tmp_path: Path):
             "hbm_init_interval": 2,
         },
     }
+
+
+def test_load_autotune_config_treats_missing_suffixless_path_as_yaml_name(tmp_path: Path):
+    path = tmp_path / "autotune_configs.yaml"
+    path.write_text(yaml.safe_dump({
+        "configs": {
+            "base": {"hw_config": {"hbm_channels": 32}},
+            "autotune_config_general": {
+                "base": "base",
+                "fewshot": "general",
+            },
+        },
+    }))
+
+    resolved = load_autotune_config(tmp_path / "autotune_config_general")
+
+    assert resolved == {
+        "hw_config": {"hbm_channels": 32},
+        "fewshot": "general",
+    }

@@ -770,10 +770,21 @@ def test_search_leaf_ace_refresh_starts_new_logged_session(tmp_path):
     session directories and inject refreshed context into the next prompt."""
     captured_prompts: list[str] = []
 
-    async def refresh_fn(*, playbook: str, events: list[dict], metadata: dict) -> str:
+    async def refresh_fn(
+        *,
+        playbook: str,
+        events: list[dict],
+        metadata: dict,
+        attempt_dir: Path,
+        completed_session_index: int,
+        next_session_index: int,
+    ) -> str:
         assert playbook == "initial guidance"
         assert len(events) == 1
         assert metadata["node_path"] == "root/my_leaf"
+        assert completed_session_index == 0
+        assert next_session_index == 1
+        assert attempt_dir.name == "baseline_0_attempt_0_binf"
         return "refreshed guidance"
 
     ace_context = AceContextManager(

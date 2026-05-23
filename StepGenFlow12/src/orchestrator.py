@@ -520,7 +520,9 @@ def _run_graph_correctness(code, kernel_name, dims, tensors, *,
     The candidate is exec'd as ``build_graph(dims, tensors)`` and the
     resulting graph is dispatched through the STeP simulator. Simulator
     failures are re-raised with node + user-code context so the LLM gets
-    actionable feedback.
+    actionable feedback. Reducing-diamond deadlocks that wedged the rust
+    sim under the old ``channel_depth=2`` are no longer a concern — the
+    eval pipeline runs at depth=1024.
     """
     from timing_and_emulator.functional import execute
     graph, output_op = _exec_build_graph(code, dims, tensors)
@@ -916,7 +918,17 @@ def _classify_value(value: ast.AST,
             return _classify_value(value.func.value, name_to_source, blackbox_set)
         return _SRC_NON_TENSOR
     if isinstance(value, ast.Subscript):
-        if isinstance(value.value, ast.Name) and value.value.id == "tensors":
+        # Walk chained subscripts down to the base: ``tensors["w"][layer]`` is
+        # the standard idiom for per-layer parameter lists, and the element is
+        # still a raw tensor. Treating it as ``_SRC_NON_TENSOR`` would let the
+        # parent forward the raw tensor straight into a DSL consumer without
+        # an ``offchip_load``, and Pass-1 would paper over the missing load by
+        # wrapping the child's slot as ``StepTensor`` (pass1 PASSes, pass2
+        # crashes with ``StepRawTensor``).
+        base = value.value
+        while isinstance(base, ast.Subscript):
+            base = base.value
+        if isinstance(base, ast.Name) and base.id == "tensors":
             return _SRC_RAW_TENSORS
         return _SRC_NON_TENSOR
     if isinstance(value, ast.Name):
@@ -1302,7 +1314,7 @@ def _make_translation_post_validator(kernel_name: str, dims: dict,
         log(f"      [translate-check] verifying STeP graph correctness...")
         try:
             result = _run_graph_correctness(step_code, kernel_name, dims, tensors)
-        except Exception:
+        except Exception as exc:
             err = traceback.format_exc()
             _write(check_dir / "graph_error.txt", err)
             log(f"      [translate-check] graph execution FAILED: {_error_summary(err)}")
@@ -1412,7 +1424,7 @@ async def _gate_correctness(code, kernel_name, dims, tensors, executor,
             ),
             shape_trace,
         )
-    except Exception:
+    except Exception as exc:
         shape_trace = _trace_buf.getvalue()
         if shape_trace:
             _write(turn_dir / "shape_trace.txt", shape_trace)
@@ -2085,7 +2097,7 @@ async def _refactor_one_node(*, node, dims, root_kernel, ckpt_root,
 # Pass-1 plumbing (Task 8) — pre-order walk with blackbox stubs
 # ---------------------------------------------------------------------------
 
-def _build_node_index(tree, tensors: dict):
+def _build_node_index(tree, tensors: dict, dims: dict | None = None):
     """Walk the tree once, instantiate each node's Module, extract per-node
     NodeSignature.
 
@@ -2145,7 +2157,11 @@ def _build_node_index(tree, tensors: dict):
             exec(node.reference_code, ns)
             assert "Model" in ns, (
                 f"node {node.path!r}: reference_code must define class Model(nn.Module)")
-            model_instance = ns["Model"]()
+            # get_init_inputs supplies compile-time Model.__init__ args (e.g.
+            # n_head as a Python int). Defaults to [] for kernels that don't
+            # need any.
+            init_inputs = ns.get("get_init_inputs", lambda d: [])(dims) if dims is not None else []
+            model_instance = ns["Model"](*init_inputs)
             ref_modules[node.path] = model_instance
 
             if parent_canonical_inputs is None:
@@ -2160,7 +2176,7 @@ def _build_node_index(tree, tensors: dict):
             else:
                 canonical_inputs = parent_canonical_inputs
 
-            sig = extract_signature(node.reference_code, canonical_inputs)
+            sig = extract_signature(node.reference_code, canonical_inputs, init_inputs)
             signatures[node.path] = sig
 
         if not node.children:
@@ -2185,7 +2201,11 @@ def _build_node_index(tree, tensors: dict):
         exec(node.refactored_code, parent_ns)
         assert "Model" in parent_ns, (
             f"node {node.path!r}: refactored_code must define class Model(nn.Module)")
-        parent_model = parent_ns["Model"]()
+        # Same get_init_inputs convention as the standard path above.
+        parent_init_inputs = (
+            parent_ns.get("get_init_inputs", lambda d: [])(dims) if dims is not None else []
+        )
+        parent_model = parent_ns["Model"](*parent_init_inputs)
 
         # Map child attribute name -> child path for hook dispatch
         child_by_name = {c.name: c for c in node.children}
@@ -2460,13 +2480,18 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
         few_shot_examples=few_shot_examples,
         max_tile=max_tile,
     )
+    # __judge_enabled__ mirrors the top-level run_kernel(judge_enabled=...)
+    # / --no-judge flag. The non-pass1 refactor path already honors this via
+    # __refactor_judge_agent__ being None; pass1 has its own judge agent so
+    # it must consult the flag explicitly.
+    judge_enabled = getattr(agent_factory, "__judge_enabled__", True)
     judge_agent = make_pass1_judge_agent(
         llm_config,
         is_leaf=is_leaf,
         child_blackbox_block=child_blackbox_block,
         contract_block=contract_block,
         function_signature=function_signature,
-    )
+    ) if judge_enabled else None
 
     # extra_required_ops = child names (each stub must appear textually in the code)
     extra_required_ops = tuple(
@@ -2918,7 +2943,7 @@ async def refactor_tree(*, tree, dims, root_kernel, ckpt_root,
             "(c) extend the contract design to dict-style modules.")
 
     # Precompute per-node signatures and instantiate Modules once.
-    signatures, ref_modules = _build_node_index(tree, tensors)
+    signatures, ref_modules = _build_node_index(tree, tensors, dims)
 
     # Pass 1: pre-order walk.
     pass1 = await _pass1_walk(
@@ -3588,6 +3613,7 @@ async def run_kernel(
             stateless_refactor=stateless_refactor,
             few_shot_examples=few_shot_examples,
             max_tile=max_tile,
+            judge_enabled=judge_enabled,
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3729,6 +3755,7 @@ async def _run_outer_iteration_body(
     stateless_refactor: bool = False,
     few_shot_examples: list | None = None,
     max_tile: int | None = None,
+    judge_enabled: bool = True,
     _log=None,
 ) -> dict:
     """Run a single outer iteration of the pipeline (lowering + translation).
@@ -3849,6 +3876,7 @@ async def _run_outer_iteration_body(
         _agent_factory.__llm_config__ = llm_config
         _agent_factory.__few_shot_examples__ = few_shot_examples
         _agent_factory.__max_tile__ = max_tile
+        _agent_factory.__judge_enabled__ = judge_enabled
 
         log(f"  Planner phase (plan + per-node refactor)")
         print(f"{tag} Planner phase starting")

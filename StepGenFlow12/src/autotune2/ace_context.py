@@ -111,6 +111,9 @@ class AceContextManager:
                     playbook=self._playbook,
                     events=list(events),
                     metadata=dict(metadata),
+                    attempt_dir=Path(attempt_dir),
+                    completed_session_index=int(completed_session_index),
+                    next_session_index=int(next_session_index),
                 )
                 if hasattr(updated, "__await__"):
                     updated = await updated

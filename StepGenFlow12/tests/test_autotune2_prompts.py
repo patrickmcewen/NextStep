@@ -1,5 +1,6 @@
 """Unit tests for autotune2 prompt assembly + response parsing."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -658,11 +659,21 @@ def test_parse_curation_response_picks_listed_ids():
     assert out == ["rec01", "rec03"]
 
 
+def test_parse_curation_response_accepts_raw_json_object():
+    from src.autotune2.prompts import parse_curation_response
+    out = parse_curation_response(
+        '{"record_ids": ["rec01", "rec03"]}',
+        candidate_ids=["rec00", "rec01", "rec02", "rec03"],
+        k=2,
+    )
+    assert out == ["rec01", "rec03"]
+
+
 def test_parse_curation_response_rejects_missing_fence():
     from src.autotune2.prompts import parse_curation_response
-    with pytest.raises(AssertionError, match="fenced ```json"):
+    with pytest.raises(json.JSONDecodeError):
         parse_curation_response(
-            '{"record_ids": ["a"]}',
+            'not json',
             candidate_ids=["a"], k=1,
         )
 
@@ -761,6 +772,15 @@ def test_parse_sim_decision_response_accepts_both_decisions():
         assert reason == "ok"
 
 
+def test_parse_sim_decision_response_accepts_raw_json_object():
+    from src.autotune2.prompts import parse_sim_decision_response
+    decision, reason = parse_sim_decision_response(
+        '{"decision": "rust", "reason": "provider omitted fence"}'
+    )
+    assert decision == "rust"
+    assert reason == "provider omitted fence"
+
+
 def test_parse_sim_decision_response_rejects_unknown_decision():
     from src.autotune2.prompts import parse_sim_decision_response
     body = '```json\n{"decision": "maybe", "reason": "hmm"}\n```'
@@ -773,6 +793,79 @@ def test_parse_sim_decision_response_rejects_missing_keys():
     body = '```json\n{"decision": "rust"}\n```'
     with pytest.raises(AssertionError, match="'decision' and 'reason'"):
         parse_sim_decision_response(body)
+
+
+def test_build_ace_context_curator_prompts_render_from_autotune_prompt_dir():
+    from src.autotune2.prompts import (
+        build_ace_context_curator_system_prompt,
+        build_ace_context_curator_user_prompt,
+    )
+
+    system = build_ace_context_curator_system_prompt()
+    assert "autotune2 context curator" in system.lower()
+    assert "{current_playbook}" not in system
+
+    user = build_ace_context_curator_user_prompt(
+        current_playbook=(
+            "## STRATEGIES\n"
+            "[gen-00001] helpful=0 harmful=0 :: keep tile reuse local"
+        ),
+        events=[{
+            "node_path": "root/leaf",
+            "status": "ACCEPTED",
+            "session_index": 1,
+            "session_turn": 0,
+            "global_turn": 4,
+            "cycles": 10,
+            "on_chip": 20,
+        }],
+        metadata={"node_path": "root/leaf", "fewshot": "tile_shrink"},
+        turn_summaries=[{
+            "session_index": 1,
+            "session_turn": 0,
+            "status": "ACCEPTED",
+            "status_text": "ACCEPTED",
+            "score": {"entries": [{"cycles": 10, "on_chip": 20}]},
+        }],
+    )
+    assert "root/leaf" in user
+    assert "keep tile reuse local" in user
+    assert '"global_turn": 4' in user
+    assert '"score"' in user
+    assert "{events_json}" not in user
+
+
+def test_parse_ace_context_curator_response_extracts_playbook():
+    from src.autotune2.prompts import parse_ace_context_curator_response
+
+    response = (
+        "```json\n"
+        "{\"playbook\": \"## STRATEGIES\\n"
+        "[gen-00001] helpful=0 harmful=0 :: prefer fused loads\", "
+        "\"notes\": \"added one bullet\"}\n"
+        "```"
+    )
+    playbook = parse_ace_context_curator_response(response)
+    assert "prefer fused loads" in playbook
+
+
+def test_parse_ace_context_curator_response_accepts_raw_json_object():
+    from src.autotune2.prompts import parse_ace_context_curator_response
+
+    response = (
+        "{\"playbook\": \"## STRATEGIES\\n"
+        "[gen-00001] helpful=0 harmful=0 :: accept raw JSON\", "
+        "\"notes\": \"provider omitted fence\"}"
+    )
+    playbook = parse_ace_context_curator_response(response)
+    assert "accept raw JSON" in playbook
+
+
+def test_parse_ace_context_curator_response_rejects_empty_playbook():
+    from src.autotune2.prompts import parse_ace_context_curator_response
+
+    with pytest.raises(AssertionError, match="non-empty"):
+        parse_ace_context_curator_response("```json\n{\"playbook\": \"\"}\n```")
 
 
 def test_curation_and_decision_system_prompts_are_static_and_nonempty():

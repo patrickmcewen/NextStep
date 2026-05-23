@@ -949,6 +949,76 @@ def test_agent_manager_writes_per_turn_curation_and_decision_artifacts(
     assert warnings == []
 
 
+def test_agent_manager_repairs_curation_schema_error_once(tmp_path):
+    from src.autotune2.prompts import CurationCandidate
+
+    candidates = [
+        CurationCandidate(
+            record_id=f"rec{i:02d}", composed_source=f"# s{i}\n",
+            analytical_cycles=10 + i, rust_cycles=20 + i,
+            kernel="k", preset="p",
+        )
+        for i in range(4)
+    ]
+    curation_convos = []
+
+    async def curation_fn(conv):
+        curation_convos.append([dict(m) for m in conv])
+        if len(curation_convos) == 1:
+            return _curation_reply(["missing", "rec01", "rec02", "rec03"])
+        assert "failed schema validation" in conv[-1]["content"]
+        assert "missing" in conv[-1]["content"]
+        return _curation_reply(["rec00", "rec01", "rec02", "rec03"])
+
+    async def decision_fn(_conv):
+        return _decision_reply("analytical", "repaired curation")
+
+    turn_dir = tmp_path / "root" / "attempt_0" / "turn_0"
+    mgr, _b, _s, _, warnings = _make_agent_manager(
+        tmp_path,
+        fetch_candidates_fn=lambda _src: candidates,
+        curation_fn=curation_fn,
+        decision_fn=decision_fn,
+        total_seconds=60.0,
+        turn_artifact_dir_fn=lambda ctx: turn_dir,
+    )
+
+    result = _run(mgr.score(_ctx(), "def t(): pass"))
+
+    assert result.cycle_source == "analytical"
+    assert len(curation_convos) == 2
+    assert (turn_dir / "sim_manager" / "curator_repair_1"
+            / "response.txt").exists()
+    assert warnings == []
+
+
+def test_agent_manager_repairs_decision_schema_error_once(tmp_path):
+    decision_convos = []
+
+    async def decision_fn(conv):
+        decision_convos.append([dict(m) for m in conv])
+        if len(decision_convos) == 1:
+            return '{"decision": "maybe", "reason": "invalid"}'
+        assert "failed schema validation" in conv[-1]["content"]
+        return _decision_reply("rust", "repaired decision")
+
+    turn_dir = tmp_path / "root" / "attempt_0" / "turn_0"
+    mgr, _b, _s, _, warnings = _make_agent_manager(
+        tmp_path,
+        decision_fn=decision_fn,
+        total_seconds=60.0,
+        turn_artifact_dir_fn=lambda ctx: turn_dir,
+    )
+
+    result = _run(mgr.score(_ctx(), "def t(): pass"))
+
+    assert result.cycle_source == "rust"
+    assert len(decision_convos) == 2
+    assert (turn_dir / "sim_manager" / "sim_manager_repair_1"
+            / "response.txt").exists()
+    assert warnings == []
+
+
 def test_agent_manager_writes_decision_artifact_on_cold_start(tmp_path):
     """Cold-start skips curation, but the sim-decision prompt/response
     still lands under the turn's sim_manager directory.
@@ -971,6 +1041,58 @@ def test_agent_manager_writes_decision_artifact_on_cold_start(tmp_path):
     decision_dir = turn_dir / "sim_manager" / "sim_manager"
     assert (decision_dir / "user_prompt.txt").exists()
     assert "cold start skip" in (decision_dir / "response.txt").read_text()
+
+
+def test_agent_manager_writes_failure_artifact_when_curation_parse_fails(
+    tmp_path,
+):
+    """If curation returns an invalid id, the sim-decision agent is skipped;
+    the turn directory should say that explicitly instead of containing only
+    a curator subdirectory.
+    """
+    from src.autotune2.prompts import CurationCandidate
+
+    candidates = [
+        CurationCandidate(
+            record_id="rec00", composed_source="# s0\n",
+            analytical_cycles=10, rust_cycles=20,
+            kernel="k", preset="p",
+        )
+    ]
+
+    async def curation_fn(_conv):
+        return _curation_reply(["missing"])
+
+    decision_calls = []
+
+    async def decision_fn(_conv):
+        decision_calls.append(_conv)
+        return _decision_reply("rust")
+
+    turn_dir = tmp_path / "root" / "attempt_0" / "turn_0"
+    mgr, _b, _s, _, warnings = _make_agent_manager(
+        tmp_path,
+        fetch_candidates_fn=lambda _src: candidates,
+        curation_fn=curation_fn,
+        decision_fn=decision_fn,
+        total_seconds=60.0,
+        turn_artifact_dir_fn=lambda ctx: turn_dir,
+    )
+
+    result = _run(mgr.score(_ctx(), "def t(): pass"))
+
+    assert result.cycle_source == "analytical"
+    assert decision_calls == []
+    assert warnings
+    base_dir = turn_dir / "sim_manager"
+    error = json.loads((base_dir / "error.json").read_text())
+    assert error["error_type"] == "AssertionError"
+    assert "parse_curation_response" in error["message"]
+    decision_status = (
+        base_dir / "sim_manager" / "status.txt"
+    ).read_text()
+    assert "SKIPPED" in decision_status
+    assert "sim-decision agent did not complete" in decision_status
 
 
 def test_agent_manager_writes_telemetry_on_analytical_decision(tmp_path):

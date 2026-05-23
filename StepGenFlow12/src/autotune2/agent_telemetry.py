@@ -159,6 +159,7 @@ def write_agent_call_artifacts(
     *,
     user_prompt: str,
     agent_response: object,
+    status: str = "RESPONSE_RECORDED",
 ) -> None:
     """Persist one helper-agent prompt/response call.
 
@@ -173,12 +174,46 @@ def write_agent_call_artifacts(
     call_dir.mkdir(parents=True, exist_ok=True)
     (call_dir / "user_prompt.txt").write_text(user_prompt)
     (call_dir / "response.txt").write_text(_response_text(agent_response))
+    (call_dir / "status.txt").write_text(status)
     reasoning = getattr(agent_response, "reasoning", "")
     if reasoning:
         (call_dir / "reasoning.txt").write_text(reasoning)
     usage = getattr(agent_response, "usage", None)
     if usage is not None:
         write_turn_tokens(call_dir, usage, kind="main")
+
+
+def write_agent_failure_artifacts(
+    sim_manager_dir: Path,
+    *,
+    error: Exception,
+) -> None:
+    """Persist why the helper-agent sequence fell back to analytical."""
+    sim_manager_dir = Path(sim_manager_dir)
+    sim_manager_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "error_type": type(error).__name__,
+        "message": str(error),
+    }
+    (sim_manager_dir / "error.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True)
+    )
+    decision_dir = sim_manager_dir / "sim_manager"
+    decision_dir.mkdir(parents=True, exist_ok=True)
+    status_path = decision_dir / "status.txt"
+    if (decision_dir / "response.txt").exists():
+        status = (
+            "FAILED: sim-decision agent response was recorded, but the "
+            f"agent decision path fell back before completion: "
+            f"{type(error).__name__}: {error}"
+        )
+    else:
+        status = (
+            "SKIPPED: sim-decision agent did not complete because the "
+            f"agent decision path failed earlier: {type(error).__name__}: "
+            f"{error}"
+        )
+    status_path.write_text(status)
 
 
 def write_sim_manager_system_prompts(

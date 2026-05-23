@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import hashlib
 import time
 import traceback as _tb
@@ -953,6 +954,7 @@ class AgentManager:
                 f"node={ctx.node_path!r} variant_kind={ctx.variant_kind!r}; "
                 f"falling back to analytical. Error: {e!r}"
             )
+            self._write_failure_artifacts(ctx=ctx, error=e)
             return DecisionOutcome(
                 decision="fallback",
                 reason=f"agent failure ({type(e).__name__}): {e!s}"[:400],
@@ -1010,11 +1012,42 @@ class AgentManager:
                 agent_response=curation_reply,
             )
             curation_text = _extract_agent_text(curation_reply)
-            picked_ids = parse_curation_response(
-                curation_text,
-                candidate_ids=[c.record_id for c in candidates],
-                k=curation_k,
-            )
+            candidate_ids = [c.record_id for c in candidates]
+            try:
+                picked_ids = parse_curation_response(
+                    curation_text,
+                    candidate_ids=candidate_ids,
+                    k=curation_k,
+                )
+            except (AssertionError, json.JSONDecodeError) as e:
+                repair_prompt = _schema_repair_prompt(
+                    error=e,
+                    expected_json=(
+                        '{"record_ids": ["<record_id_1>", '
+                        '"<record_id_2>", "..."]}'
+                    ),
+                    allowed_ids=candidate_ids,
+                )
+                repair_conversation = [
+                    {"role": "user", "content": curation_user_prompt},
+                    {"role": "assistant", "content": curation_text},
+                    {"role": "user", "content": repair_prompt},
+                ]
+                t1 = time.perf_counter()
+                curation_reply = await self._curation_fn(repair_conversation)
+                curation_dur_ms += (time.perf_counter() - t1) * 1000.0
+                self._write_agent_artifacts(
+                    turn_artifact_dir=turn_artifact_dir,
+                    agent_dir_name="curator_repair_1",
+                    user_prompt=repair_prompt,
+                    agent_response=curation_reply,
+                )
+                curation_text = _extract_agent_text(curation_reply)
+                picked_ids = parse_curation_response(
+                    curation_text,
+                    candidate_ids=candidate_ids,
+                    k=curation_k,
+                )
             by_id = {c.record_id: c for c in candidates}
             curated = [by_id[i] for i in picked_ids]
             curated_ids = list(picked_ids)
@@ -1051,7 +1084,33 @@ class AgentManager:
             agent_response=decision_reply,
         )
         decision_text = _extract_agent_text(decision_reply)
-        decision, reason = parse_sim_decision_response(decision_text)
+        try:
+            decision, reason = parse_sim_decision_response(decision_text)
+        except (AssertionError, json.JSONDecodeError) as e:
+            repair_prompt = _schema_repair_prompt(
+                error=e,
+                expected_json=(
+                    '{"decision": "rust|analytical", '
+                    '"reason": "<25 word reason>"}'
+                ),
+                allowed_ids=[],
+            )
+            repair_conversation = [
+                {"role": "user", "content": decision_user_prompt},
+                {"role": "assistant", "content": decision_text},
+                {"role": "user", "content": repair_prompt},
+            ]
+            t1 = time.perf_counter()
+            decision_reply = await self._decision_fn(repair_conversation)
+            decision_dur_ms += (time.perf_counter() - t1) * 1000.0
+            self._write_agent_artifacts(
+                turn_artifact_dir=turn_artifact_dir,
+                agent_dir_name="sim_manager_repair_1",
+                user_prompt=repair_prompt,
+                agent_response=decision_reply,
+            )
+            decision_text = _extract_agent_text(decision_reply)
+            decision, reason = parse_sim_decision_response(decision_text)
         return DecisionOutcome(
             decision=decision,
             reason=reason,
@@ -1131,6 +1190,22 @@ class AgentManager:
             agent_response=agent_response,
         )
 
+    def _write_failure_artifacts(
+        self,
+        *,
+        ctx: SimContext,
+        error: Exception,
+    ) -> None:
+        turn_artifact_dir = self._turn_artifact_dir(ctx)
+        if turn_artifact_dir is None:
+            return
+        from src.autotune2.agent_telemetry import write_agent_failure_artifacts
+
+        write_agent_failure_artifacts(
+            Path(turn_artifact_dir) / "sim_manager",
+            error=error,
+        )
+
 
 @dataclass(frozen=True)
 class DecisionOutcome:
@@ -1167,3 +1242,25 @@ def _extract_agent_text(reply: object) -> str:
         f"{type(reply).__name__}={reply!r}"
     )
     return text
+
+
+def _schema_repair_prompt(
+    *,
+    error: Exception,
+    expected_json: str,
+    allowed_ids: list[str],
+) -> str:
+    prompt = (
+        "Your previous response failed schema validation.\n\n"
+        f"Error:\n{type(error).__name__}: {error}\n\n"
+        "Re-emit only a JSON object matching this schema. Do not include "
+        "markdown, commentary, or code fences.\n\n"
+        f"{expected_json}\n"
+    )
+    if allowed_ids:
+        prompt += (
+            "\nAllowed record_ids, copy exactly from this list:\n"
+            + json.dumps(allowed_ids, indent=2)
+            + "\n"
+        )
+    return prompt

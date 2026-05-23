@@ -57,6 +57,13 @@ def resolve_config(configs: dict, name: str) -> dict:
 def load_autotune_config(path: str | Path, config_name: str | None = None) -> dict:
     """Load a JSON config or a named config from an inherited YAML file."""
     path = Path(path)
+    if not path.exists() and path.suffix == "":
+        yaml_path = path.with_name("autotune_configs.yaml")
+        assert yaml_path.exists(), (
+            f"autotune config not found: {path}; also looked for named "
+            f"config {path.name!r} in {yaml_path}"
+        )
+        return load_autotune_config(yaml_path, path.name)
     assert path.exists(), f"autotune config not found: {path}"
     if path.suffix == ".json":
         return json.loads(path.read_text())

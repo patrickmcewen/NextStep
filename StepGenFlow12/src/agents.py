@@ -819,6 +819,19 @@ def make_curation_agent(llm_config: dict) -> Agent:
     )
 
 
+def make_ace_context_curator_agent(llm_config: dict) -> Agent:
+    """Create the autotune2 ACE playbook curator agent."""
+    from src.autotune2.prompts import build_ace_context_curator_system_prompt
+    client = make_client(llm_config)
+    model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
+    return Agent(
+        name="StepAutotune2AceContextCurator",
+        instructions=build_ace_context_curator_system_prompt(),
+        model=model,
+        model_settings=_build_model_settings(llm_config),
+    )
+
+
 def make_sim_decision_agent(llm_config: dict) -> Agent:
     """Create the autotune2 in-loop simulation-decision agent (PR4).
 

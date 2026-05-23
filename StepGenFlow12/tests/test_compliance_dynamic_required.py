@@ -315,6 +315,36 @@ def parent(x, weight, *, out_shapes):
     assert rawness["inner"] == (False,)
 
 
+def test_extractor_classifies_chained_subscript_on_tensors_as_raw():
+    """``tensors["w"][layer]`` (per-layer parameter lists, the GPT-2 idiom)
+    must classify as raw, not on-chip.
+
+    Regression: a Subscript-on-Subscript only matched ``tensors[k]`` (Name
+    base) and fell through to ``_SRC_NON_TENSOR``. That caused pass1 to wrap
+    the child slot as ``StepTensor`` so ``repeat_static(block_ln1_w, ...)``
+    silently succeeded, while pass2's full composition handed the child a
+    real ``StepRawTensor`` and crashed on ``_step_meta``.
+    """
+    code = '''
+def tiled_reference(dims, tensors):
+    for layer in range(2):
+        ctx = attention_block(
+            x, tensors["block_ln1_w"][layer], tensors["block_ln1_b"][layer],
+            out_shapes=((4, 1, 8),),
+        )
+    return offchip_store(ctx)
+'''
+    rawness = _extract_call_site_rawness(
+        code,
+        child_names=("attention_block",),
+        blackbox_names=("attention_block",),
+    )
+    # x is unknown (no prior binding) — but the two chained subscripts must
+    # both be raw.
+    assert rawness["attention_block"][1] is True, rawness
+    assert rawness["attention_block"][2] is True, rawness
+
+
 def test_extractor_handles_dsl_producer_arg():
     """An arg whose name was assigned from a DSL producer is on-chip."""
     code = '''

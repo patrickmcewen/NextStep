@@ -560,9 +560,10 @@ def check_children_runnable(children: list, dims: dict) -> None:
             inputs = tuple(inputs)
         elif not isinstance(inputs, tuple):
             inputs = (inputs,)
+        child_init_inputs = ns.get("get_init_inputs", lambda d: [])(dims)
         try:
             with torch.no_grad():
-                ns["Model"]()(*inputs)
+                ns["Model"](*child_init_inputs)(*inputs)
         except Exception as exc:
             raise GuardFailure(
                 f"child {child.name!r}: Model()(*get_inputs(dims)) crashed: "
@@ -607,9 +608,12 @@ def check_compose(original_reference_code: str,
         )
         inputs = (dims, tensors)
 
+    # Per-Model init args (e.g. compile-time integers like n_head). Defaults to
+    # [] so kernels without get_init_inputs keep the old Model() behavior.
+    orig_init_inputs = orig_ns.get("get_init_inputs", lambda d: [])(dims)
     with torch.no_grad():
         if "Model" in orig_ns:
-            original_out = orig_ns["Model"]()(*inputs)
+            original_out = orig_ns["Model"](*orig_init_inputs)(*inputs)
         else:
             assert "compute_gold" in orig_ns
             if tensors is not None:
@@ -635,9 +639,12 @@ def check_compose(original_reference_code: str,
         ) from exc
     assert "Model" in new_ns, "refactored parent code must define class Model"
 
+    # Refactored parent inherits the original's get_init_inputs (planner copies
+    # it verbatim); fall back to the original's init_inputs if absent.
+    new_init_inputs = new_ns.get("get_init_inputs", lambda d: orig_init_inputs)(dims)
     try:
         with torch.no_grad():
-            refactored_out = new_ns["Model"]()(*inputs)
+            refactored_out = new_ns["Model"](*new_init_inputs)(*inputs)
     except Exception as exc:
         raise GuardFailure(
             f"compose check failed: refactored parent's forward() crashed when "
@@ -690,13 +697,16 @@ def check_children_called_with_tensors_only(refactored_parent_code: str,
     elif not isinstance(inputs, tuple):
         inputs = (inputs,)
 
+    parent_init_inputs = orig_ns.get("get_init_inputs", lambda d: [])(dims)
     new_ns: dict = {}
     for child in children:
         child_ns: dict = {}
         exec(child.reference_code, child_ns)
         new_ns[f"{_camel_case(child.name)}Model"] = child_ns["Model"]
     exec(refactored_parent_code, new_ns)
-    parent_model = new_ns["Model"]()
+    parent_model = new_ns["Model"](
+        *(new_ns.get("get_init_inputs", lambda d: parent_init_inputs)(dims))
+    )
 
     child_attr_names = {c.name for c in children}
     captured: dict = {}

@@ -652,6 +652,7 @@ def build_rust_evaluate_fn(
     work_dir: Path,
     kernel_name: str,
     preset: str,
+    tensors: dict | None = None,
     timing_only: bool = False,
     max_total_compute_bw: int | None = None,
 ) -> RustEvaluateFn:
@@ -685,12 +686,22 @@ def build_rust_evaluate_fn(
     subdirectory so concurrent evaluations (``promote_top_k`` runs them
     in parallel) don't overwrite each other's ``step_impl.py`` /
     ``graph.pb`` / sim outputs.
+
+    ``tensors`` is the default tensor dictionary passed into
+    ``evaluate_kernel``. Non-root autotune nodes can override it per call
+    via ``evaluate(..., tensors_override=node_tensors)`` so their synthetic
+    wrappers resolve contract-local inputs such as ``normed_2`` or ``Q``
+    instead of StepDB's root-kernel precompute dict.
     """
     import threading
     _counter = {"i": 0}
     _counter_lock = threading.Lock()
 
-    def evaluate(composed_source: str) -> tuple[int, float]:
+    def evaluate(
+        composed_source: str,
+        *,
+        tensors_override: dict | None = None,
+    ) -> tuple[int, float]:
         import sys
         import time
         from pathlib import Path as _Path
@@ -733,6 +744,9 @@ def build_rust_evaluate_fn(
             timing_only=timing_only,
             step_impl_source=step_source,
             max_total_compute_bw=max_total_compute_bw,
+            tensors_override=(
+                tensors if tensors_override is None else tensors_override
+            ),
         )
         dur_ms = (time.perf_counter() - t0) * 1000.0
 

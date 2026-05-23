@@ -393,9 +393,6 @@ def _load_pass1_state(
     run_config = json.loads(run_config_path.read_text())
     dims = run_config["dims"]
 
-    assert autotune_config_path.exists(), (
-        f"--autotune-config not found: {autotune_config_path}"
-    )
     autotune_config = load_autotune_config(
         autotune_config_path, autotune_config_name,
     )
@@ -492,6 +489,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         write_autotune2_summary,
     )
     from src.autotune2.ace_context import AceContextConfig, AceContextManager
+    from src.autotune2.ace_curator import build_ace_context_refresh_fn
     from src.autotune2.search import SearchConfig, autotune
     from src.config_loader import load_llm_config
 
@@ -588,7 +586,11 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         AgentDecisionStore,
         write_sim_manager_system_prompts,
     )
-    from src.autotune2.calibration import CalibrationStore, hw_config_hash
+    from src.autotune2.calibration import (
+        CalibrationOverlayStore,
+        CalibrationStore,
+        hw_config_hash,
+    )
     from src.autotune2.sim_manager import (
         AgentManager, AnalyticalOnly, DeterministicSplit, RustAll, TimeBudget,
     )
@@ -612,7 +614,16 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         calibration_path = Path(args.sim_calibration_path).resolve()
     else:
         calibration_path = ckpt_dir / "autotune2" / "calibration.jsonl"
-    calibration_store = CalibrationStore(path=calibration_path)
+    calibration_append_store = CalibrationStore(path=calibration_path)
+    seed_stores = []
+    if args.sim_calibration_seed_path:
+        seed_path = Path(args.sim_calibration_seed_path).resolve()
+        if seed_path != calibration_path:
+            seed_stores.append(CalibrationStore(path=seed_path))
+    calibration_store = CalibrationOverlayStore(
+        seed_stores=seed_stores,
+        append_store=calibration_append_store,
+    )
     calibration_sources_dir = calibration_path.parent / "calibration_sources"
     hw_hash = hw_config_hash(state["hw_config"])
     run_id = ckpt_dir.name  # the new timestamp dir uniquely identifies this run
@@ -627,9 +638,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         args.sim_mode == "agent" or args.root_pick == "agent"
     )
     if needs_agent_telemetry:
-        agent_decisions_path = (
-            calibration_path.parent / "agent_decisions.jsonl"
-        )
+        agent_decisions_path = ckpt_dir / "autotune2" / "agent_decisions.jsonl"
         agent_decision_store = AgentDecisionStore(path=agent_decisions_path)
     else:
         agent_decision_store = None
@@ -647,6 +656,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         work_dir=ckpt_dir / "autotune2" / "_rust_work",
         kernel_name=args.kernel,
         preset=args.preset,
+        tensors=state["tensors"],
         timing_only=not args.rust_functional_check,
         max_total_compute_bw=args.compute_bw,
     )
@@ -679,7 +689,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
 
         if args.sim_mode == "agent":
             write_sim_manager_system_prompts(
-                calibration_path.parent,
+                ckpt_dir / "autotune2",
                 curator_system_prompt=build_curation_system_prompt(),
                 sim_manager_system_prompt=build_sim_decision_system_prompt(),
             )
@@ -756,12 +766,18 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             hw_config=state["hw_config"],
             max_total_compute_bw=args.compute_bw,
         )
+        def node_rust_evaluate(composed_source: str):
+            return rust_evaluate(
+                composed_source,
+                tensors_override=node_tensors,
+            )
+
         if args.sim_mode == "analytical":
             return AnalyticalOnly(score_fn=score_fn)
         if args.sim_mode == "rust":
             return RustAll(
                 score_fn=score_fn,
-                rust_evaluate_fn=rust_evaluate,
+                rust_evaluate_fn=node_rust_evaluate,
                 time_budget=shared_time_budget,
                 calibration_store=calibration_store,
                 sources_dir=calibration_sources_dir,
@@ -774,7 +790,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         if args.sim_mode == "deterministic-split":
             return DeterministicSplit(
                 score_fn=score_fn,
-                rust_evaluate_fn=rust_evaluate,
+                rust_evaluate_fn=node_rust_evaluate,
                 time_budget=shared_time_budget,
                 calibration_store=calibration_store,
                 sources_dir=calibration_sources_dir,
@@ -787,7 +803,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         # agent
         return AgentManager(
             score_fn=score_fn,
-            rust_evaluate_fn=rust_evaluate,
+            rust_evaluate_fn=node_rust_evaluate,
             time_budget=shared_time_budget,
             calibration_store=calibration_store,
             sources_dir=calibration_sources_dir,
@@ -854,6 +870,35 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
 
     prior_libraries: dict | None = None
     result = None  # type: ignore[assignment]
+    ace_context_refresh_fn = None
+    if any(spec["ace_context_enabled"] for spec in pass_specs):
+        from agents import ReasoningItem, Runner
+        from src.agents import make_ace_context_curator_agent
+        from src.autotune2.prompts import build_ace_context_curator_system_prompt
+        from src.autotune2.search import AgentResponse
+
+        ace_agent = make_ace_context_curator_agent(state["llm_config"])
+
+        async def ace_agent_call(conversation: list) -> AgentResponse:
+            result = await Runner.run(ace_agent, conversation)
+            reasoning_chunks: list[str] = []
+            for item in result.new_items:
+                if isinstance(item, ReasoningItem):
+                    for summary in item.raw_item.summary:
+                        reasoning_chunks.append(summary.text)
+            return AgentResponse(
+                text=result.final_output or "",
+                reasoning="\n\n".join(reasoning_chunks),
+                usage=result.context_wrapper.usage,
+            )
+
+        ace_context_refresh_fn = build_ace_context_refresh_fn(ace_agent_call)
+        ace_prompt_dir = ckpt_dir / "autotune2" / "ace_context"
+        ace_prompt_dir.mkdir(parents=True, exist_ok=True)
+        (ace_prompt_dir / "curator_system_prompt.txt").write_text(
+            build_ace_context_curator_system_prompt()
+        )
+
     for pass_idx, spec in enumerate(pass_specs):
         pass_subdir = (
             f"pass_{pass_idx}_{spec['name']}" if is_multi_pass else None
@@ -881,6 +926,9 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         )
         ace_context = None
         if spec["ace_context_enabled"]:
+            assert ace_context_refresh_fn is not None, (
+                "ACE context enabled but curator refresh function was not built"
+            )
             playbook_path = (
                 ckpt_dir / "autotune2" / "ace_context"
                 / f"pass_{pass_idx}_{spec['name']}_{spec['fewshot']}.md"
@@ -889,7 +937,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
                 enabled=True,
                 refresh_interval_turns=spec["ace_refresh_interval_turns"],
                 playbook_path=playbook_path,
-            ))
+            ), refresh_fn=ace_context_refresh_fn)
         print(
             f"autotune2: pass {pass_idx} '{spec['name']}' — "
             f"fewshot={spec['fewshot']}, "
@@ -1047,14 +1095,14 @@ def main() -> int:
     parser.add_argument(
         "--ace-context",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable ACE-style context refresh for autotune2 attempts. "
              "Each lane starts a new logged session after "
              "--ace-refresh-interval-turns completed turns; per-pass "
              "config entries may override this.",
     )
     parser.add_argument(
-        "--ace-refresh-interval-turns", type=int, default=4,
+        "--ace-refresh-interval-turns", type=int, default=10,
         help="Completed turns per lane before the shared ACE context "
              "manager refreshes the playbook and starts a new session "
              "(default: 4).",
@@ -1106,7 +1154,7 @@ def main() -> int:
              "tile-shrink and parallelism guidance.",
     )
     parser.add_argument(
-        "--sim-mode", default="analytical",
+        "--sim-mode", default="agent",
         choices=("analytical", "rust", "deterministic-split", "agent"),
         help="Which simulation manager wraps the per-node scorer "
              "(default: analytical). 'analytical' = STeP timing model "
@@ -1123,12 +1171,20 @@ def main() -> int:
     )
     parser.add_argument(
         "--sim-calibration-path", default=None,
-        help="Path to the calibration JSONL store the rust-backed "
-             "simulation managers append paired (analytical, rust) "
-             "records to. Default: <ckpt>/autotune2/calibration.jsonl "
-             "inside the snapshotted run dir. Override to a project-"
-             "shared path to accumulate cross-kernel evidence for the "
-             "PR3 curation / decision agents.",
+        help="Path to the run-local calibration JSONL store the "
+             "rust-backed simulation managers append paired "
+             "(analytical, rust) records to. Default: "
+             "<ckpt>/autotune2/calibration.jsonl inside the snapshotted "
+             "run dir.",
+    )
+    parser.add_argument(
+        "--sim-calibration-seed-path",
+        default="/workspace/NextStep/StepDB/calibration_empty.jsonl",
+        help="Optional read-only calibration JSONL used to seed the "
+             "curation / decision agents. New records are not appended "
+             "here unless this path is also passed as "
+             "--sim-calibration-path. Pass an empty string to disable "
+             "seed calibration.",
     )
     parser.add_argument(
         "--curation-max-candidates", type=int, default=50,

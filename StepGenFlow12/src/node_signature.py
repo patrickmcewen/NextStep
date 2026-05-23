@@ -112,11 +112,12 @@ class NodeSignature:
         return tuple(shapes)
 
 
-def extract_signature(reference_code: str, canonical_inputs: dict) -> NodeSignature:
+def extract_signature(reference_code: str, canonical_inputs: dict,
+                      init_inputs: tuple | list = ()) -> NodeSignature:
     namespace: dict = {}
     exec(reference_code, namespace)
     assert "Model" in namespace, "reference_code must define a class Model(nn.Module)"
-    model = namespace["Model"]()
+    model = namespace["Model"](*init_inputs)
     assert isinstance(model, nn.Module)
 
     forward_sig = inspect.signature(model.forward)

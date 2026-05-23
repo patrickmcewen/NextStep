@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from src.autotune2.runtime import (
     RustPromotionResult,
     _derive_output_contracts_from_graph,
     _extract_node_def_block,
+    build_rust_evaluate_fn,
     build_real_verifier_factory_fn,
     pick_top_k_pareto_entries,
     promote_top_k,
@@ -87,6 +90,47 @@ def test_pick_top_k_rejects_k_zero():
 
 
 # --- promote_top_k -----------------------------------------------------------
+
+
+def test_build_rust_evaluate_fn_forwards_node_tensors_override(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeEvalResult:
+        success = True
+        stage = "success"
+        cycle_time = 123.0
+        max_diff = 0.0
+        error_message = None
+
+    fake_evaluate_mod = types.ModuleType("evaluate")
+
+    def fake_evaluate_kernel(**kwargs):
+        captured.update(kwargs)
+        return FakeEvalResult()
+
+    fake_evaluate_mod.evaluate_kernel = fake_evaluate_kernel
+    monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate_mod)
+
+    import src.dsl_to_step as dsl_to_step
+
+    monkeypatch.setattr(
+        dsl_to_step,
+        "translate",
+        lambda _source: "def build_graph(dims, tensors):\n    pass\n",
+    )
+
+    node_tensors = {"normed_2": object()}
+    rust_eval = build_rust_evaluate_fn(
+        work_dir=tmp_path,
+        kernel_name="prefill_transformer_simple",
+        preset="small",
+        timing_only=True,
+    )
+
+    cycles, _dur_ms = rust_eval("# dsl", tensors_override=node_tensors)
+
+    assert cycles == 123
+    assert captured["tensors_override"] is node_tensors
 
 
 def test_promote_top_k_runs_rust_per_pick_and_sorts_by_rust_cycles():

@@ -161,3 +161,35 @@ class CalibrationStore:
                 if hw_config_hash is not None and record.hw_config_hash != hw_config_hash:
                     continue
                 yield record
+
+
+class CalibrationOverlayStore:
+    """Read seed calibration records plus run-local records, append locally.
+
+    This lets autotune2 use a shared StepDB calibration corpus as prior
+    evidence without mutating it during every experiment. New rust
+    measurements append only to ``append_store``; ``iter_records`` sees
+    seed stores first, then records accumulated in the current run.
+    """
+
+    def __init__(
+        self,
+        *,
+        seed_stores: list[CalibrationStore],
+        append_store: CalibrationStore,
+    ) -> None:
+        self._seed_stores = list(seed_stores)
+        self._append_store = append_store
+
+    @property
+    def path(self) -> Path:
+        return self._append_store.path
+
+    def append(self, record: CalibrationRecord) -> None:
+        self._append_store.append(record)
+
+    def iter_records(
+        self, *, hw_config_hash: str | None = None,
+    ) -> Iterator[CalibrationRecord]:
+        for store in [*self._seed_stores, self._append_store]:
+            yield from store.iter_records(hw_config_hash=hw_config_hash)

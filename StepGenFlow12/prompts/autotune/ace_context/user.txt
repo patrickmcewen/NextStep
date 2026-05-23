@@ -1,0 +1,25 @@
+## Current Playbook
+
+{current_playbook}
+
+## Refresh Metadata
+
+```json
+{metadata_json}
+```
+
+## Completed Turn Events
+
+```json
+{events_json}
+```
+
+## Turn Artifact Summaries
+
+```json
+{turn_summaries_json}
+```
+
+Return the complete updated playbook. Preserve useful existing bullets, remove
+or rewrite misleading guidance when the evidence contradicts it, and add only
+lessons that are likely to help the next multi-turn autotune2 session.

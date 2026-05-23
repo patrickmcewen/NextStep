@@ -51,6 +51,7 @@ agent loop as a feedback message.
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -66,6 +67,7 @@ _TILE_SHRINK_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "tile_shrink"
 _PARALLEL_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "parallel"
 _GENERAL_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "general"
 _CURATION_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "curation"
+_ACE_CONTEXT_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "ace_context"
 _SIM_MANAGER_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "sim_manager"
 _SHARED_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "shared"
 _SYSTEM_PROMPT_PATH = _TILE_SHRINK_PROMPTS_DIR / "autotune2_system.txt"
@@ -81,6 +83,8 @@ _PARALLEL_FEWSHOT_PATH = _PARALLEL_PROMPTS_DIR / "autotune_parallel_fewshot.txt"
 _GENERAL_FEWSHOT_PATH = _GENERAL_PROMPTS_DIR / "autotune_general_fewshot.txt"
 _CURATION_SYSTEM_PROMPT_PATH = _CURATION_PROMPTS_DIR / "system.txt"
 _CURATION_USER_PROMPT_PATH = _CURATION_PROMPTS_DIR / "user.txt"
+_ACE_CONTEXT_CURATOR_SYSTEM_PROMPT_PATH = _ACE_CONTEXT_PROMPTS_DIR / "system.txt"
+_ACE_CONTEXT_CURATOR_USER_PROMPT_PATH = _ACE_CONTEXT_PROMPTS_DIR / "user.txt"
 _SIM_DECISION_SYSTEM_PROMPT_PATH = _SIM_MANAGER_PROMPTS_DIR / "system.txt"
 _SIM_DECISION_USER_PROMPT_PATH = _SIM_MANAGER_PROMPTS_DIR / "user.txt"
 _STEP_DSL_IR_OP_GROUPS_PATH = _SHARED_PROMPTS_DIR / "step_dsl_ir_op_groups.txt"
@@ -890,10 +894,9 @@ def parse_curation_response(
     import json as _json
 
     body = _extract_fenced(response_text, "json")
-    assert body is not None, (
-        "parse_curation_response: response must contain a fenced ```json "
-        "block; none found. Raw response:\n" + response_text
-    )
+    if body is None:
+        body = response_text.strip()
+    assert body, "parse_curation_response: response must contain JSON"
     parsed = _json.loads(body)
     assert isinstance(parsed, dict), (
         f"parse_curation_response: top-level JSON must be an object, got "
@@ -942,10 +945,9 @@ def parse_sim_decision_response(response_text: str) -> tuple[str, str]:
     import json as _json
 
     body = _extract_fenced(response_text, "json")
-    assert body is not None, (
-        "parse_sim_decision_response: response must contain a fenced "
-        "```json block; none found. Raw response:\n" + response_text
-    )
+    if body is None:
+        body = response_text.strip()
+    assert body, "parse_sim_decision_response: response must contain JSON"
     parsed = _json.loads(body)
     assert isinstance(parsed, dict), (
         f"parse_sim_decision_response: top-level JSON must be an object, "
@@ -966,6 +968,85 @@ def parse_sim_decision_response(response_text: str) -> tuple[str, str]:
         f"{type(reason).__name__}={reason!r}"
     )
     return decision, reason.strip()
+
+
+# ---------------------------------------------------------------------------
+# ACE context curator prompts
+# ---------------------------------------------------------------------------
+
+
+def build_ace_context_curator_system_prompt() -> str:
+    """System prompt for refreshing the shared autotune2 ACE playbook."""
+    assert _ACE_CONTEXT_CURATOR_SYSTEM_PROMPT_PATH.exists(), (
+        f"ACE context curator system prompt not found: "
+        f"{_ACE_CONTEXT_CURATOR_SYSTEM_PROMPT_PATH}"
+    )
+    return _ACE_CONTEXT_CURATOR_SYSTEM_PROMPT_PATH.read_text()
+
+
+def build_ace_context_curator_user_prompt(
+    *,
+    current_playbook: str,
+    events: list[dict],
+    metadata: dict,
+    turn_summaries: list[dict],
+) -> str:
+    """Render one ACE playbook-refresh request.
+
+    The prompt is intentionally data-heavy and format-light: Python prepares
+    stable JSON for events/metadata/turn summaries, while the template text
+    tells the curator how to distill those facts into playbook bullets.
+    """
+    assert events, (
+        "build_ace_context_curator_user_prompt: events must be non-empty"
+    )
+    assert isinstance(metadata, dict), (
+        "build_ace_context_curator_user_prompt: metadata must be a dict"
+    )
+    assert isinstance(turn_summaries, list), (
+        "build_ace_context_curator_user_prompt: turn_summaries must be a list"
+    )
+    assert _ACE_CONTEXT_CURATOR_USER_PROMPT_PATH.exists(), (
+        f"ACE context curator user prompt not found: "
+        f"{_ACE_CONTEXT_CURATOR_USER_PROMPT_PATH}"
+    )
+    playbook = current_playbook.strip() or "(empty playbook)"
+    return (
+        _ACE_CONTEXT_CURATOR_USER_PROMPT_PATH.read_text()
+        .replace("{current_playbook}", playbook)
+        .replace("{metadata_json}", json.dumps(metadata, indent=2, sort_keys=True))
+        .replace("{events_json}", json.dumps(events, indent=2, sort_keys=True))
+        .replace(
+            "{turn_summaries_json}",
+            json.dumps(turn_summaries, indent=2, sort_keys=True),
+        )
+    )
+
+
+def parse_ace_context_curator_response(response_text: str) -> str:
+    """Extract the next playbook from an ACE context curator reply."""
+    body = _extract_fenced(response_text, "json")
+    if body is None:
+        body = response_text.strip()
+    assert body, (
+        "parse_ace_context_curator_response: response must contain JSON; "
+        "got empty response"
+    )
+    parsed = json.loads(body)
+    assert isinstance(parsed, dict), (
+        f"parse_ace_context_curator_response: top-level JSON must be an "
+        f"object, got {type(parsed).__name__}"
+    )
+    assert "playbook" in parsed, (
+        f"parse_ace_context_curator_response: JSON missing required key "
+        f"'playbook'; got keys {sorted(parsed.keys())!r}"
+    )
+    playbook = parsed["playbook"]
+    assert isinstance(playbook, str) and playbook.strip(), (
+        "parse_ace_context_curator_response: 'playbook' must be a "
+        "non-empty string"
+    )
+    return playbook.strip()
 
 
 # ---------------------------------------------------------------------------
