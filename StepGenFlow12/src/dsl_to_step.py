@@ -165,65 +165,6 @@ def _seal_unused_branches(graph):
         for idx in range(n_branches):
             if idx not in used:
                 ConsumerContext(graph, (node, idx))
-
-
-def _offchip_load_or_restream(graph, underlying, stride, out_shape_tiled,
-                              tile_row, tile_col, transposed=False, par_dispatch=1,
-                              start_tile_idx=0):
-    # Normal path: ``underlying`` is an off-chip tensor → LinearOffChipLoad.
-    # Failsafe: ``underlying`` is an on-chip stream (StepOps node or _BranchRef
-    # tuple) — the refactor-time dataflow gate in orchestrator.py is the
-    # primary defense; this is the backstop that keeps the graph buildable.
-    # Lower to a restream-style decomposition so the output stream still has
-    # shape ``out_shape_tiled`` and tile ``(tile_row, tile_col)``. Stride is
-    # scaled from offchip_load's tile-units convention to the element-units
-    # the bufferized stream uses, then extended with ``(tile_col, 1)`` to
-    # walk the new tile in row-major order. Semantic equivalence assumes the
-    # on-chip buffer's layout matches the off-chip tensor's vanilla
-    # row-major layout, which is typically true but not guaranteed; verify
-    # correctness downstream.
-    if not isinstance(underlying, (_StepOps, _BranchRef)):
-        node = LinearOffChipLoad(underlying,
-                                  stride=tuple(stride),
-                                  out_shape_tiled=tuple(out_shape_tiled),
-                                  tile_row=tile_row, tile_col=tile_col,
-                                  transposed=transposed,
-                                  par_dispatch=par_dispatch,
-                                  start_tile_idx=start_tile_idx)
-        graph.add_node(node)
-        return node
-    import warnings
-    warnings.warn(
-        f"offchip_load: underlying is an on-chip stream "
-        f"({type(underlying).__name__}); substituting a restream lowering. "
-        f"The refactor should use streamify / retile_streamify / restream — "
-        f"this backstop keeps the graph buildable but downstream correctness "
-        f"is not guaranteed.",
-        stacklevel=2,
-    )
-    rs1 = RetileStreamify(graph, underlying, split_row=True, chunk=1)
-    rs2 = RetileStreamify(graph, rs1, split_row=False, chunk=1)
-    # NB: `Stream.rank == len(shape) - 1` (the "above innermost" convention),
-    # but `Bufferize.rank` is "how many stream dims to fold into the buffer".
-    # For a 1-stream-dim input these differ — `.rank` would give 0 and trip the
-    # `rank > 0` assert. Use `len(shape)` so we always buffer the full stream.
-    buf = Bufferize(graph, rs2, rank=len(rs2.stream.shape))
-    tile_area = tile_row * tile_col
-    scaled_stride = tuple(s * tile_area for s in stride) + (tile_col, 1)
-    extended_shape = tuple(out_shape_tiled) + (tile_row, tile_col)
-    sm = Streamify(graph, buf, stride=scaled_stride, out_shape_tiled=extended_shape)
-    rcol = Accum(graph, sm,
-                  output_stream_dtype=_dsl2step_out_tile(sm, 'col', 1),
-                  fn=accum_fn.RetileCol(), init_fn=_dsl2step_init(sm, 'col'),
-                  accum_rank=1, write_back_mu=False, compute_bw=1)
-    rrow = Accum(graph, rcol,
-                  output_stream_dtype=_dsl2step_out_tile(rcol, 'row', 1),
-                  fn=accum_fn.RetileRow(), init_fn=_dsl2step_init(rcol, 'row'),
-                  accum_rank=1, write_back_mu=False, compute_bw=1)
-    # Prepend the leading (1,) that LinearOffChipLoad emits as the tensor batch
-    # dim — without it, downstream ops sized for offchip_load's output (e.g.
-    # `flatten(min_rank=1, max_rank=2)`) see one fewer stream dim and crash.
-    return PromoteOuter(graph, rrow)
 """
 
 
@@ -765,7 +706,7 @@ def _h_offchip_load(state, target, call):
     # graph.add_node when `underlying` is a torch.Tensor, and falls back to a
     # restream lowering (with warning) when it's an on-chip stream.
     return _block(
-        f"{target} = _offchip_load_or_restream(graph, {underlying}, "
+        f"{target} = LinearOffChipLoad({underlying}, "
         f"stride=tuple({stride}), out_shape_tiled=tuple({out_shape}), "
         f"tile_row={tile_row}, tile_col={tile_col}, "
         f"par_dispatch={par_dispatch}, start_tile_idx={start_tile_idx}{extra})\n"
