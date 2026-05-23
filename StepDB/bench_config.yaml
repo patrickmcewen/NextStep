@@ -2434,3 +2434,290 @@ gemm_rms_norm:
       N: 1024
       eps: 1.0e-06
   origin: seed
+kernelbench_mlp:
+  problem: seed_kernels/kernelbench/level3/mlp/reference.py
+  step_impl: null
+  params:
+  - B
+  - D_in
+  - D_h1
+  - D_h2
+  - D_out
+  presets:
+    tiny:
+      B: 4
+      D_in: 16
+      D_h1: 16
+      D_h2: 16
+      D_out: 8
+    small:
+      B: 8
+      D_in: 32
+      D_h1: 32
+      D_h2: 32
+      D_out: 16
+    medium:
+      B: 16
+      D_in: 64
+      D_h1: 64
+      D_h2: 64
+      D_out: 32
+    wide:
+      B: 32
+      D_in: 128
+      D_h1: 128
+      D_h2: 128
+      D_out: 64
+    hidden_512:
+      B: 32
+      D_in: 512
+      D_h1: 512
+      D_h2: 512
+      D_out: 256
+    hidden_1k:
+      B: 32
+      D_in: 1024
+      D_h1: 1024
+      D_h2: 1024
+      D_out: 512
+  origin: seed
+kernelbench_gpt2:
+  problem: seed_kernels/kernelbench/level4/gpt2/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - P
+  - D
+  - L
+  - H
+  - I
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 32
+      P: 16
+      D: 16
+      L: 2
+      H: 2
+      I: 32
+    small:
+      B: 2
+      T: 16
+      V: 64
+      P: 32
+      D: 32
+      L: 2
+      H: 2
+      I: 64
+    medium:
+      B: 4
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 2
+      H: 4
+      I: 128
+    wide:
+      B: 4
+      T: 64
+      V: 256
+      P: 128
+      D: 128
+      L: 2
+      H: 4
+      I: 512
+    deep:
+      B: 2
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 6
+      H: 4
+      I: 128
+    gpt2_bs32_seq256:
+      B: 32
+      T: 256
+      V: 50257
+      P: 1024
+      D: 768
+      L: 12
+      H: 12
+      I: 3072
+    gpt2_bs1024_seq32:
+      B: 1024
+      T: 32
+      V: 50257
+      P: 1024
+      D: 768
+      L: 12
+      H: 12
+      I: 3072
+    gpt2_bs1_seq1023:
+      B: 1
+      T: 1023
+      V: 50257
+      P: 1024
+      D: 768
+      L: 12
+      H: 12
+      I: 3072
+  origin: seed
+kernelbench_bart_large:
+  problem: seed_kernels/kernelbench/level4/bart_large/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - P
+  - D
+  - L
+  - H
+  - I
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 32
+      P: 16
+      D: 16
+      L: 2
+      H: 2
+      I: 32
+    small:
+      B: 2
+      T: 16
+      V: 64
+      P: 32
+      D: 32
+      L: 2
+      H: 2
+      I: 64
+    medium:
+      B: 4
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 2
+      H: 4
+      I: 128
+    deep:
+      B: 2
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 6
+      H: 4
+      I: 128
+    bart_large_bs32_seq256:
+      B: 32
+      T: 256
+      V: 50265
+      P: 1024
+      D: 1024
+      L: 12
+      H: 16
+      I: 4096
+    bart_large_bs1024_seq32:
+      B: 1024
+      T: 32
+      V: 50265
+      P: 1024
+      D: 1024
+      L: 12
+      H: 16
+      I: 4096
+    bart_large_bs1_seq1023:
+      B: 1
+      T: 1023
+      V: 50265
+      P: 1024
+      D: 1024
+      L: 12
+      H: 16
+      I: 4096
+  origin: seed
+kernelbench_opt_1p3b:
+  problem: seed_kernels/kernelbench/level4/opt_1p3b/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - P
+  - D
+  - L
+  - H
+  - I
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 32
+      P: 16
+      D: 16
+      L: 2
+      H: 2
+      I: 32
+    small:
+      B: 2
+      T: 16
+      V: 64
+      P: 32
+      D: 32
+      L: 2
+      H: 2
+      I: 64
+    medium:
+      B: 4
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 2
+      H: 4
+      I: 128
+    deep:
+      B: 2
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 6
+      H: 4
+      I: 128
+    opt_1p3b_bs32_seq256:
+      B: 32
+      T: 256
+      V: 50272
+      P: 2048
+      D: 2048
+      L: 24
+      H: 32
+      I: 8192
+    opt_1p3b_bs1_seq2047:
+      B: 1
+      T: 2047
+      V: 50272
+      P: 2048
+      D: 2048
+      L: 24
+      H: 32
+      I: 8192
+    opt_1p3b_bs512_seq32:
+      B: 512
+      T: 32
+      V: 50272
+      P: 2048
+      D: 2048
+      L: 24
+      H: 32
+      I: 8192
+  origin: seed

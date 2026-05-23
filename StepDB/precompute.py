@@ -974,3 +974,360 @@ def _precompute_gemm_rms_norm(dims):
         "B": torch.randn(K, N),
         "eps": dims.get("eps", 1e-6),
     }
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Level 3 / Problem 1: 3-Linear MLP with ReLU
+# ---------------------------------------------------------------------------
+
+@register("kernelbench_mlp")
+def _precompute_kernelbench_mlp(dims):
+    # RNG order MUST match seed_kernels/kernelbench/level3/mlp/reference.py:
+    #   seed -> Linear(D_in,D_h1) -> Linear(D_h1,D_h2) -> Linear(D_h2,D_out)
+    #     -> torch.rand(B, D_in)
+    torch.manual_seed(SEED)
+    B = dims["B"]
+    D_in = dims["D_in"]
+    D_h1 = dims["D_h1"]
+    D_h2 = dims["D_h2"]
+    D_out = dims["D_out"]
+
+    fc1 = torch.nn.Linear(D_in, D_h1)
+    fc2 = torch.nn.Linear(D_h1, D_h2)
+    fc3 = torch.nn.Linear(D_h2, D_out)
+    x = torch.rand(B, D_in)
+
+    # Biases reshaped to (1, D) so they are >=2-D and loadable by offchip_load.
+    # Same broadcast semantics as 1-D in PyTorch.
+    return {
+        "x": x,
+        "w1": fc1.weight.detach().clone().contiguous(),
+        "b1": fc1.bias.detach().clone().contiguous().unsqueeze(0),
+        "w2": fc2.weight.detach().clone().contiguous(),
+        "b2": fc2.bias.detach().clone().contiguous().unsqueeze(0),
+        "w3": fc3.weight.detach().clone().contiguous(),
+        "b3": fc3.bias.detach().clone().contiguous().unsqueeze(0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# KernelBench Level 4 / Problem 7: GPT-2 full forward
+# ---------------------------------------------------------------------------
+
+
+def _stack_gpt2_block(sd, L, key_template):
+    """Matrix-shaped per-layer params: ``[i]`` is already ≥2-D after stacking."""
+    return torch.stack(
+        [sd[key_template.format(l=l)].detach().clone().contiguous() for l in range(L)],
+        dim=0,
+    ).contiguous()
+
+
+def _stack_gpt2_block_vec(sd, L, key_template):
+    """Vector-shaped per-layer params (``(D,)``): pad to ``(L, 1, D)`` so a
+    per-layer slice ``[i]`` is ``(1, D)`` — 2-D, as required by StepGenFlow's
+    on-chip ``rank >= 2`` invariant. Matmul ``+ bias`` broadcasts unchanged;
+    ``F.layer_norm`` callers ``.squeeze(0)`` at use."""
+    return torch.stack(
+        [
+            sd[key_template.format(l=l)].detach().clone().contiguous().unsqueeze(0)
+            for l in range(L)
+        ],
+        dim=0,
+    ).contiguous()
+
+
+@register("kernelbench_gpt2")
+def _precompute_kernelbench_gpt2(dims):
+    # RNG order MUST match seed_kernels/kernelbench/level4/gpt2/reference.py:
+    #   seed -> GPT2LMHeadModel(config)  (consumes all weight RNG internally)
+    #        -> torch.randint(0, V, (B, T))    for input_ids
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    torch.manual_seed(SEED)
+    cfg = GPT2Config(
+        vocab_size=dims["V"],
+        n_positions=dims["P"],
+        n_embd=dims["D"],
+        n_layer=dims["L"],
+        n_head=dims["H"],
+        n_inner=dims["I"],
+        activation_function="gelu_new",
+        resid_pdrop=0.0,
+        attn_pdrop=0.0,
+        embd_pdrop=0.0,
+    )
+    model = GPT2LMHeadModel(cfg)
+    sd = {k: v.detach() for k, v in model.state_dict().items()}
+    L = dims["L"]
+    D = dims["D"]
+
+    # Fused QKV weight (L, D, 3D) and bias (L, 1, 3D) get pre-split column-wise
+    # into three (L, D, D) / (L, 1, D) tensors so the DSL leaf can do three
+    # independent linears — see reference.get_inputs for rationale.
+    c_attn_w_stacked = _stack_gpt2_block(sd, L, "transformer.h.{l}.attn.c_attn.weight")
+    c_attn_b_stacked = _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.attn.c_attn.bias")
+    c_attn_w_q, c_attn_w_k, c_attn_w_v = (t.contiguous() for t in c_attn_w_stacked.split(D, dim=-1))
+    c_attn_b_q, c_attn_b_k, c_attn_b_v = (t.contiguous() for t in c_attn_b_stacked.split(D, dim=-1))
+
+    out = {
+        "input_ids": None,    # filled after weights, to match reference's RNG order
+        "causal_mask": None,  # filled after weights, also RNG-free but kept adjacent to input_ids
+        "wte": sd["transformer.wte.weight"].clone().contiguous(),
+        "wpe": sd["transformer.wpe.weight"].clone().contiguous(),
+        # LN affine + matmul biases stored as (L, 1, D) so per-layer [i]
+        # slices stay ≥2-D. Matrix weights are stacked as-is.
+        "block_ln1_w": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.ln_1.weight"),
+        "block_ln1_b": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.ln_1.bias"),
+        "block_c_attn_w_q": c_attn_w_q,
+        "block_c_attn_w_k": c_attn_w_k,
+        "block_c_attn_w_v": c_attn_w_v,
+        "block_c_attn_b_q": c_attn_b_q,
+        "block_c_attn_b_k": c_attn_b_k,
+        "block_c_attn_b_v": c_attn_b_v,
+        "block_c_proj_w": _stack_gpt2_block(sd, L, "transformer.h.{l}.attn.c_proj.weight"),
+        "block_c_proj_b": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.attn.c_proj.bias"),
+        "block_ln2_w": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.ln_2.weight"),
+        "block_ln2_b": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.ln_2.bias"),
+        "block_mlp_fc_w": _stack_gpt2_block(sd, L, "transformer.h.{l}.mlp.c_fc.weight"),
+        "block_mlp_fc_b": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.mlp.c_fc.bias"),
+        "block_mlp_proj_w": _stack_gpt2_block(sd, L, "transformer.h.{l}.mlp.c_proj.weight"),
+        "block_mlp_proj_b": _stack_gpt2_block_vec(sd, L, "transformer.h.{l}.mlp.c_proj.bias"),
+        # Final LN params reshaped to (1, D) so offchip_load (>=2-D underlying)
+        # can consume them. The reference squeezes back to 1-D for F.layer_norm.
+        "ln_f_w": sd["transformer.ln_f.weight"].clone().contiguous().unsqueeze(0),
+        "ln_f_b": sd["transformer.ln_f.bias"].clone().contiguous().unsqueeze(0),
+    }
+    # input_ids draws last, after all weights — see reference.get_inputs.
+    out["input_ids"] = torch.randint(0, dims["V"], (dims["B"], dims["T"]))
+
+    # Additive causal mask: shape (T, T), 0 on/below diagonal, -inf above.
+    # RNG-free; built here so the STeP impl can offchip-load it instead of
+    # fabricating a tensor inside Model.forward.
+    T = dims["T"]
+    causal_mask = torch.zeros(T, T, dtype=torch.float32)
+    causal_mask.masked_fill_(
+        torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1),
+        float("-inf"),
+    )
+    out["causal_mask"] = causal_mask
+    return out
+
+
+def _stack_bart_block(sd, L, key_template):
+    """Matrix-shaped per-layer params: stacked form is ≥3-D, slice ``[i]`` is ≥2-D."""
+    return torch.stack(
+        [sd[key_template.format(l=l)].detach().clone().contiguous() for l in range(L)],
+        dim=0,
+    ).contiguous()
+
+
+def _stack_bart_block_vec(sd, L, key_template):
+    """Vector-shaped per-layer params (``(D,)``): pad to ``(L, 1, D)`` so a
+    per-layer slice ``[i]`` is ``(1, D)`` — 2-D, as required by StepGenFlow's
+    on-chip ``rank >= 2`` invariant. Matmul ``+ bias`` broadcasts unchanged;
+    ``F.layer_norm`` callers ``.squeeze(0)`` at use."""
+    return torch.stack(
+        [
+            sd[key_template.format(l=l)].detach().clone().contiguous().unsqueeze(0)
+            for l in range(L)
+        ],
+        dim=0,
+    ).contiguous()
+
+
+@register("kernelbench_bart_large")
+def _precompute_kernelbench_bart_large(dims):
+    # RNG order MUST match seed_kernels/kernelbench/level4/bart_large/reference.py:
+    #   seed -> BartForCausalLM(config)  (consumes all weight RNG internally,
+    #                                     including unused encoder_attn + the
+    #                                     pre-tying lm_head weight)
+    #        -> torch.randint(0, V, (B, T))   for input_ids
+    from transformers import BartConfig, BartForCausalLM
+
+    torch.manual_seed(SEED)
+    cfg = BartConfig(
+        vocab_size=dims["V"],
+        d_model=dims["D"],
+        encoder_layers=dims["L"],
+        decoder_layers=dims["L"],
+        encoder_attention_heads=dims["H"],
+        decoder_attention_heads=dims["H"],
+        encoder_ffn_dim=dims["I"],
+        decoder_ffn_dim=dims["I"],
+        max_position_embeddings=dims["P"],
+        activation_function="gelu",
+        scale_embedding=False,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        is_decoder=True,
+        pad_token_id=1,
+        use_cache=False,
+    )
+    model = BartForCausalLM(cfg)
+    sd = {k: v.detach() for k, v in model.state_dict().items()}
+    L = dims["L"]
+
+    out = {
+        "input_ids": None,    # filled after weights, to match reference's RNG order
+        "causal_mask": None,  # RNG-free, kept adjacent to input_ids
+        "wte": sd["model.decoder.embed_tokens.weight"].clone().contiguous(),
+        # BartLearnedPositionalEmbedding adds +2 to position ids and sizes the
+        # table as (max_position_embeddings + 2, D). We keep the full table.
+        "wpe": sd["model.decoder.embed_positions.weight"].clone().contiguous(),
+        # Layernorm-after-embedding params reshaped to (1, D) so offchip_load
+        # (which requires a ≥2-D underlying) can consume them.
+        "layernorm_embedding_w": (
+            sd["model.decoder.layernorm_embedding.weight"].clone().contiguous().unsqueeze(0)
+        ),
+        "layernorm_embedding_b": (
+            sd["model.decoder.layernorm_embedding.bias"].clone().contiguous().unsqueeze(0)
+        ),
+        # Self-attn projections — separate q/k/v/out (BART uses nn.Linear, not
+        # Conv1D), so no fused-QKV column split is needed.
+        "block_self_attn_w_q": _stack_bart_block(sd, L, "model.decoder.layers.{l}.self_attn.q_proj.weight"),
+        "block_self_attn_w_k": _stack_bart_block(sd, L, "model.decoder.layers.{l}.self_attn.k_proj.weight"),
+        "block_self_attn_w_v": _stack_bart_block(sd, L, "model.decoder.layers.{l}.self_attn.v_proj.weight"),
+        "block_self_attn_w_out": _stack_bart_block(sd, L, "model.decoder.layers.{l}.self_attn.out_proj.weight"),
+        "block_self_attn_b_q": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.q_proj.bias"),
+        "block_self_attn_b_k": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.k_proj.bias"),
+        "block_self_attn_b_v": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.v_proj.bias"),
+        "block_self_attn_b_out": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.out_proj.bias"),
+        "block_self_attn_ln_w": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.self_attn_layer_norm.weight"),
+        "block_self_attn_ln_b": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.self_attn_layer_norm.bias"),
+        # FFN.
+        "block_fc1_w": _stack_bart_block(sd, L, "model.decoder.layers.{l}.fc1.weight"),
+        "block_fc1_b": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.fc1.bias"),
+        "block_fc2_w": _stack_bart_block(sd, L, "model.decoder.layers.{l}.fc2.weight"),
+        "block_fc2_b": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.fc2.bias"),
+        # Post-FFN final LN.
+        "block_final_ln_w": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.final_layer_norm.weight"),
+        "block_final_ln_b": _stack_bart_block_vec(sd, L, "model.decoder.layers.{l}.final_layer_norm.bias"),
+    }
+    # input_ids draws last, after all weights — see reference.get_inputs.
+    out["input_ids"] = torch.randint(0, dims["V"], (dims["B"], dims["T"]))
+
+    # Additive causal mask: shape (T, T), 0 on/below diagonal, -inf above.
+    # RNG-free; built here so the STeP impl can offchip-load it instead of
+    # fabricating a tensor inside Model.forward.
+    T = dims["T"]
+    causal_mask = torch.zeros(T, T, dtype=torch.float32)
+    causal_mask.masked_fill_(
+        torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1),
+        float("-inf"),
+    )
+    out["causal_mask"] = causal_mask
+    return out
+
+
+def _stack_opt_block(sd, L, key_template):
+    """Matrix-shaped per-layer params: stacked form is >=3-D, slice ``[i]`` is >=2-D."""
+    return torch.stack(
+        [sd[key_template.format(l=l)].detach().clone().contiguous() for l in range(L)],
+        dim=0,
+    ).contiguous()
+
+
+def _stack_opt_block_vec(sd, L, key_template):
+    """Vector-shaped per-layer params (``(D,)``): pad to ``(L, 1, D)`` so a
+    per-layer slice ``[i]`` is ``(1, D)`` — 2-D, as required by StepGenFlow's
+    on-chip ``rank >= 2`` invariant. Matmul ``+ bias`` broadcasts unchanged;
+    ``F.layer_norm`` callers ``.squeeze(0)`` at use."""
+    return torch.stack(
+        [
+            sd[key_template.format(l=l)].detach().clone().contiguous().unsqueeze(0)
+            for l in range(L)
+        ],
+        dim=0,
+    ).contiguous()
+
+
+@register("kernelbench_opt_1p3b")
+def _precompute_kernelbench_opt_1p3b(dims):
+    # RNG order MUST match seed_kernels/kernelbench/level4/opt_1p3b/reference.py:
+    #   seed -> OPTForCausalLM(config)  (consumes all weight RNG internally,
+    #                                    including the pre-tying lm_head weight)
+    #        -> torch.randint(0, V, (B, T))   for input_ids
+    from transformers import OPTConfig, OPTForCausalLM
+
+    torch.manual_seed(SEED)
+    cfg = OPTConfig(
+        vocab_size=dims["V"],
+        hidden_size=dims["D"],
+        ffn_dim=dims["I"],
+        num_hidden_layers=dims["L"],
+        num_attention_heads=dims["H"],
+        max_position_embeddings=dims["P"],
+        word_embed_proj_dim=dims["D"],  # OPT-1.3b has no project_in/project_out.
+        activation_function="relu",
+        do_layer_norm_before=True,
+        _remove_final_layer_norm=False,
+        enable_bias=True,
+        layer_norm_elementwise_affine=True,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        layerdrop=0.0,
+        tie_word_embeddings=True,
+        use_cache=False,
+        pad_token_id=1,
+    )
+    model = OPTForCausalLM(cfg)
+    sd = {k: v.detach() for k, v in model.state_dict().items()}
+    L = dims["L"]
+
+    out = {
+        "input_ids": None,    # filled after weights, to match reference's RNG order
+        "causal_mask": None,  # RNG-free, kept adjacent to input_ids
+        "wte": sd["model.decoder.embed_tokens.weight"].clone().contiguous(),
+        # OPTLearnedPositionalEmbedding sizes the table as
+        # (max_position_embeddings + 2, D) for the +2 offset baked into its forward.
+        "wpe": sd["model.decoder.embed_positions.weight"].clone().contiguous(),
+        # Per-layer self-attention PRE-norm (do_layer_norm_before=True).
+        "block_self_attn_ln_w": _stack_opt_block_vec(
+            sd, L, "model.decoder.layers.{l}.self_attn_layer_norm.weight"
+        ),
+        "block_self_attn_ln_b": _stack_opt_block_vec(
+            sd, L, "model.decoder.layers.{l}.self_attn_layer_norm.bias"
+        ),
+        # OPT uses nn.Linear (weight shape (out, in)); q/k/v/out are stored
+        # separately (no fused-QKV like GPT-2's Conv1D).
+        "block_self_attn_w_q": _stack_opt_block(sd, L, "model.decoder.layers.{l}.self_attn.q_proj.weight"),
+        "block_self_attn_w_k": _stack_opt_block(sd, L, "model.decoder.layers.{l}.self_attn.k_proj.weight"),
+        "block_self_attn_w_v": _stack_opt_block(sd, L, "model.decoder.layers.{l}.self_attn.v_proj.weight"),
+        "block_self_attn_w_out": _stack_opt_block(sd, L, "model.decoder.layers.{l}.self_attn.out_proj.weight"),
+        "block_self_attn_b_q": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.q_proj.bias"),
+        "block_self_attn_b_k": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.k_proj.bias"),
+        "block_self_attn_b_v": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.v_proj.bias"),
+        "block_self_attn_b_out": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.self_attn.out_proj.bias"),
+        # Per-layer FFN PRE-norm (this is OPT's per-layer ``final_layer_norm`` —
+        # it sits between attention and FFN, distinct from the decoder-level
+        # final LN extracted below).
+        "block_final_ln_w": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.final_layer_norm.weight"),
+        "block_final_ln_b": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.final_layer_norm.bias"),
+        # FFN.
+        "block_fc1_w": _stack_opt_block(sd, L, "model.decoder.layers.{l}.fc1.weight"),
+        "block_fc1_b": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.fc1.bias"),
+        "block_fc2_w": _stack_opt_block(sd, L, "model.decoder.layers.{l}.fc2.weight"),
+        "block_fc2_b": _stack_opt_block_vec(sd, L, "model.decoder.layers.{l}.fc2.bias"),
+        # Decoder-level final LayerNorm (applied after the last decoder layer
+        # when do_layer_norm_before=True and not _remove_final_layer_norm).
+        # Stored as (1, D) so offchip_load (>=2-D underlying) can consume it.
+        "decoder_ln_w": sd["model.decoder.final_layer_norm.weight"].clone().contiguous().unsqueeze(0),
+        "decoder_ln_b": sd["model.decoder.final_layer_norm.bias"].clone().contiguous().unsqueeze(0),
+    }
+    # input_ids draws last, after all weights — see reference.get_inputs.
+    out["input_ids"] = torch.randint(0, dims["V"], (dims["B"], dims["T"]))
+
+    # Additive causal mask: shape (T, T), 0 on/below diagonal, -inf above.
+    # RNG-free; built here so the STeP impl can offchip-load it instead of
+    # fabricating a tensor inside Model.forward.
+    T = dims["T"]
+    causal_mask = torch.zeros(T, T, dtype=torch.float32)
+    causal_mask.masked_fill_(
+        torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1),
+        float("-inf"),
+    )
+    out["causal_mask"] = causal_mask
+    return out

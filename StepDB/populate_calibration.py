@@ -54,6 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import sympy
+import yaml
 
 STEPDB_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(STEPDB_DIR))
@@ -70,8 +71,9 @@ from timing_and_emulator.timing import DEFAULT_HW_CONFIG  # noqa: E402
 
 DEFAULT_STORE = STEPDB_DIR / "calibration.jsonl"
 DEFAULT_AUTOTUNE_CONFIG = (
-    STEPDB_DIR.parent / "StepGenFlow12" / "autotune_config_2.json"
+    STEPDB_DIR.parent / "StepGenFlow12" / "autotune_configs.yaml"
 )
+DEFAULT_AUTOTUNE_CONFIG_NAME = "autotune_config_2"
 
 # Mirrors CalibrationRecord field set in
 # StepGenFlow12/src/autotune2/calibration.py. Kept in sync with
@@ -89,15 +91,79 @@ def _hw_config_hash(hw_config: dict) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
-def _load_hw_config(autotune_config_path: Path | None) -> dict:
+def _merge_recursive(base: dict, override: dict) -> dict:
+    """Deep-merge ``override`` into ``base``. Pure data, no mutation."""
+    from copy import deepcopy
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _merge_recursive(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _resolve_yaml_config(configs: dict, name: str) -> dict:
+    """Resolve one named config from a YAML ``configs:`` block, applying
+    ``base`` entries recursively. Mirrors
+    ``StepGenFlow12/src/autotune_config_loader.resolve_config`` so the
+    script reads the same hw_config autotune2 would see; we don't import
+    it to keep StepDB decoupled from StepGenFlow12."""
+    assert name in configs, (
+        f"autotune config {name!r} not found; available: {sorted(configs)}"
+    )
+    raw = configs[name]
+    bases = raw.get("base", [])
+    if isinstance(bases, str):
+        bases = [bases]
+    resolved: dict = {}
+    for base_name in bases:
+        assert base_name != name, (
+            f"autotune config {name!r}: config cannot inherit from itself"
+        )
+        resolved = _merge_recursive(resolved, _resolve_yaml_config(configs, base_name))
+    override = {k: v for k, v in raw.items() if k != "base"}
+    return _merge_recursive(resolved, override)
+
+
+def _load_hw_config(
+    autotune_config_path: Path | None, config_name: str | None,
+) -> dict:
+    """Load and return the ``hw_config`` block.
+
+    Supports both the legacy single-config JSON shape and the new
+    inheritance YAML shape with a named entry. When loading YAML, the
+    caller must pass ``config_name`` (or set a ``default:`` key in the
+    YAML), since the file holds multiple configs.
+    """
     if autotune_config_path is None:
         return dict(DEFAULT_HW_CONFIG)
     assert autotune_config_path.exists(), (
         f"--autotune-config not found: {autotune_config_path}"
     )
-    data = json.loads(autotune_config_path.read_text())
+    text = autotune_config_path.read_text()
+    if autotune_config_path.suffix == ".json":
+        data = json.loads(text)
+    else:
+        assert autotune_config_path.suffix in (".yaml", ".yml"), (
+            f"--autotune-config must be .json, .yaml, or .yml: "
+            f"{autotune_config_path}"
+        )
+        yaml_root = yaml.safe_load(text)
+        configs = yaml_root.get("configs", yaml_root)
+        name = config_name or yaml_root.get("default")
+        assert isinstance(name, str) and name, (
+            f"{autotune_config_path}: pass --autotune-config-name or set "
+            f"a 'default:' key in the YAML"
+        )
+        data = _resolve_yaml_config(configs, name)
     assert "hw_config" in data, (
-        f"{autotune_config_path}: missing 'hw_config' key"
+        f"{autotune_config_path}: missing 'hw_config' key (resolved "
+        f"config: {sorted(data)})"
     )
     return data["hw_config"]
 
@@ -250,10 +316,16 @@ def main() -> None:
     )
     p.add_argument(
         "--autotune-config", type=Path, default=DEFAULT_AUTOTUNE_CONFIG,
-        help=f"autotune_config.json whose 'hw_config' block is hashed "
-             f"into CalibrationRecord.hw_config_hash. Must match what "
-             f"your autotune2 runs use, or the records will be filtered "
-             f"out. Default: {DEFAULT_AUTOTUNE_CONFIG}.",
+        help=f"JSON or YAML file whose 'hw_config' block is hashed into "
+             f"CalibrationRecord.hw_config_hash. Must match what your "
+             f"autotune2 runs use, or the records will be filtered out. "
+             f"Default: {DEFAULT_AUTOTUNE_CONFIG}.",
+    )
+    p.add_argument(
+        "--autotune-config-name", default=DEFAULT_AUTOTUNE_CONFIG_NAME,
+        help=f"Named config to resolve when --autotune-config is a YAML "
+             f"file with a 'configs:' block (ignored for JSON). "
+             f"Default: {DEFAULT_AUTOTUNE_CONFIG_NAME!r}.",
     )
     p.add_argument(
         "--compute-bw", type=int, default=100000,
@@ -263,7 +335,7 @@ def main() -> None:
     args = p.parse_args()
 
     config = load_config()
-    hw_config = _load_hw_config(args.autotune_config)
+    hw_config = _load_hw_config(args.autotune_config, args.autotune_config_name)
     sources_dir = args.store.parent / "calibration_sources"
     args.store.parent.mkdir(parents=True, exist_ok=True)
 

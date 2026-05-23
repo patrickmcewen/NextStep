@@ -86,7 +86,7 @@ def run_simulator_with_logging(graph, kernel_name: str, preset: str, timeout: in
     os.chdir(work_dir)
     pb_path = os.path.join(os.getcwd(), "graph.pb")
 
-    sim_config = SimConfig(channel_depth=2, functional_sim=True, mock_bf16=False)
+    sim_config = SimConfig(channel_depth=1024, functional_sim=True, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,

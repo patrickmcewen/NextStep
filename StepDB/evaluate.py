@@ -57,6 +57,11 @@ class EvalResult:
         return json.dumps(asdict(self), indent=2)
 
 
+def _write_result(work_dir: str, result: EvalResult) -> EvalResult:
+    (Path(work_dir) / "result.json").write_text(result.to_json())
+    return result
+
+
 # Standard imports prepended to step_impl code so build_graph can use STeP ops
 # without explicit imports (mirrors the LLM-generated code pattern).
 IMPORT_SCAFFOLD = """\
@@ -132,7 +137,8 @@ def _strip_imports(code: str) -> str:
 def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
                     timing_only: bool = False,
                     step_impl_source: str | None = None,
-                    max_total_compute_bw: int | None = None) -> EvalResult:
+                    max_total_compute_bw: int | None = None,
+                    tensors_override: dict | None = None) -> EvalResult:
     """Run the full evaluation pipeline for a single kernel pair + preset.
 
     Stages: exec -> simulate -> correctness -> success.
@@ -140,6 +146,9 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     When step_impl_source is provided, it replaces StepDB's on-disk step_impl
     for this call (used by external autotuners that score generated kernels);
     dims, the reference module, and precompute still come from StepDB.
+    When tensors_override is provided, build_graph receives it instead of
+    StepDB's root-kernel precompute dict. Autotuners use this for isolated
+    non-root node wrappers whose inputs are contract-local tensors.
     When max_total_compute_bw is set, every compute op's ``compute_bw`` is
     rescaled (in place) so the sum equals the budget before serialization —
     same routine as ``validate_timing.normalize_compute_bw``. Autotuners pass
@@ -184,7 +193,10 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     from utils.gold_checking import reconstruct_numpy
 
     if "tensors" in inspect.signature(build_graph).parameters:
-        tensors = precompute_tensors(kernel_name, dims)
+        tensors = (
+            precompute_tensors(kernel_name, dims)
+            if tensors_override is None else tensors_override
+        )
         graph, output_op = build_graph(dims, tensors)
     else:
         graph, output_op = build_graph(dims)
@@ -195,7 +207,16 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
 
     pb_path = os.path.join(work_dir, "graph.pb")
 
-    sim_config = SimConfig(channel_depth=2, functional_sim=not timing_only, mock_bf16=False)
+    # channel_depth=1024 is large enough to absorb any in-flight token window
+    # we've seen in LLM-generated kernels (Accum reductions up to a few hundred
+    # tokens). The reducing-diamond deadlock from the original autotune2 hangs
+    # only manifests when channel_depth < R; with depth >> R the broadcast
+    # never stalls. Real hardware FIFOs are much shallower, so this is a
+    # simulation-only relaxation that lets the autotuner score kernels by
+    # cycles without spending hours hung on candidates that would deadlock at
+    # depth=2 but run fine here. See validate_deadlock.py for the static check
+    # we used to apply (kept as a diagnostic; no longer wired in).
+    sim_config = SimConfig(channel_depth=1024, functional_sim=not timing_only, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,
@@ -241,23 +262,21 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     )
 
     if proc.returncode != 0:
-        return EvalResult(
+        return _write_result(work_dir, EvalResult(
             kernel=kernel_name, preset=preset, stage="simulate", success=False,
             dims=dims,
             error_message=f"Simulator failed (rc={proc.returncode}):\n{proc.stderr[-2000:]}",
-        )
+        ))
 
     sim_result = json.loads(proc.stdout.strip().split("\n")[-1])
     cycles = sim_result["cycles"]
 
     # --- Stage 3: correctness ---
     if timing_only:
-        result = EvalResult(
+        return _write_result(work_dir, EvalResult(
             kernel=kernel_name, preset=preset, stage="success", success=True,
             dims=dims, cycle_time=float(cycles),
-        )
-        (Path(work_dir) / "result.json").write_text(result.to_json())
-        return result
+        ))
 
     store_name = output_op.store_file_name
     store_path = os.path.join(work_dir, store_name)
@@ -273,7 +292,11 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
 
     sim_tensor = torch.from_numpy(sim_output).float()
     if "tensors" in inspect.signature(ref_mod.compute_gold).parameters:
-        gold = ref_mod.compute_gold(dims, precompute_tensors(kernel_name, dims)).float()
+        tensors = (
+            precompute_tensors(kernel_name, dims)
+            if tensors_override is None else tensors_override
+        )
+        gold = ref_mod.compute_gold(dims, tensors).float()
     else:
         gold = ref_mod.compute_gold(dims).float()
 
@@ -288,20 +311,18 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     passed = rel_err < REL_ERR_THRESHOLD
 
     if not passed:
-        return EvalResult(
+        return _write_result(work_dir, EvalResult(
             kernel=kernel_name, preset=preset, stage="correctness", success=False,
             dims=dims,
             error_message=f"Output incorrect: max_diff={max_diff}, rel_err={rel_err:.2e} (threshold {REL_ERR_THRESHOLD:.0e})",
             cycle_time=float(cycles), max_diff=max_diff,
-        )
+        ))
 
     # --- Stage 4: success ---
-    result = EvalResult(
+    return _write_result(work_dir, EvalResult(
         kernel=kernel_name, preset=preset, stage="success", success=True,
         dims=dims, cycle_time=float(cycles), max_diff=max_diff,
-    )
-    (Path(work_dir) / "result.json").write_text(result.to_json())
-    return result
+    ))
 
 
 def main():

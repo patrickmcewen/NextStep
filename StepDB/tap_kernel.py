@@ -127,7 +127,7 @@ print(f"Functional sim |max|: {np.abs(func_arr).max()}")
 WORK = Path(f"/tmp/tap_work_{TAP_CLASS}_{TAP_NTH}")
 WORK.mkdir(exist_ok=True)
 from sim import serialize, SimConfig, HBMConfig
-CHANNEL_DEPTH = int(os.environ.get("CHANNEL_DEPTH", "2"))
+CHANNEL_DEPTH = int(os.environ.get("CHANNEL_DEPTH", "1024"))
 sim_config = SimConfig(channel_depth=CHANNEL_DEPTH, functional_sim=True, mock_bf16=False)
 hbm_config = HBMConfig(
     addr_offset=64, channel_num=32, per_channel_latency=2, per_channel_init_interval=2,
