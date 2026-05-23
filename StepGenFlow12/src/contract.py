@@ -25,16 +25,17 @@ to the invariant.
 Arg kinds
 ---------
 Each positional input is classified by ``arg_specs`` (parallel to
-``arg_names``). Three kinds are supported (see ``node_signature.py``):
-``TensorArg`` (a single tensor), ``ListOfTensorArg`` (a static list of
-identically-shaped tensors — per-expert weight stacks), and
-``ListOfIntArg`` (a static list of ints — per-batch sequence lengths).
-For tensor args, ``vanilla_shapes[i]`` and ``tiled_shapes[i]`` hold the
-tensor's vanilla / tile-stream shape. For list args those entries are
-``()`` — read ``arg_specs[i]`` to get the per-element shape and length.
-``tiled_values[i]`` is correspondingly a ``Tensor`` for tensor args,
-``list[Tensor]`` for ``ListOfTensorArg``, or ``list[int]`` for
-``ListOfIntArg``.
+``arg_names``). Four kinds are supported (see ``node_signature.py``):
+``TensorArg`` (a single tensor), ``IntArg`` (a Python int scalar),
+``ListOfTensorArg`` (a static list of identically-shaped tensors —
+per-expert weight stacks), and ``ListOfIntArg`` (a static list of ints
+— per-batch sequence lengths). For tensor args, ``vanilla_shapes[i]``
+and ``tiled_shapes[i]`` hold the tensor's vanilla / tile-stream shape.
+For ``IntArg`` / list args those entries are ``()`` — read
+``arg_specs[i]`` for the kind and (for list args) the per-element shape
+and length. ``tiled_values[i]`` is correspondingly a ``Tensor`` for
+tensor args, an ``int`` for ``IntArg``, ``list[Tensor]`` for
+``ListOfTensorArg``, or ``list[int]`` for ``ListOfIntArg``.
 """
 
 from dataclasses import dataclass
@@ -42,7 +43,8 @@ from typing import Any
 
 import torch
 
-from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
+from src.node_signature import (
+    ArgSpec, IntArg, ListOfIntArg, ListOfTensorArg, TensorArg)
 
 # STeP streams = (stream_dims..., tile_row, tile_col). Minimum stream rank
 # is 1 stream dim + 2 tile dims = 3.
@@ -120,13 +122,13 @@ class Contract:
         for i, spec in enumerate(self.arg_specs):
             if isinstance(spec, TensorArg):
                 continue
-            assert isinstance(spec, (ListOfTensorArg, ListOfIntArg)), (
+            assert isinstance(spec, (IntArg, ListOfTensorArg, ListOfIntArg)), (
                 f"Contract.arg_specs[{i}] has unsupported type "
                 f"{type(spec).__name__}")
             assert self.vanilla_shapes[i] == () and self.tiled_shapes[i] == (), (
-                f"Contract.arg_specs[{i}] is a list arg ({spec!r}); the "
+                f"Contract.arg_specs[{i}] is a non-tensor arg ({spec!r}); the "
                 f"corresponding vanilla_shapes/tiled_shapes entries must be "
-                f"`()` (read arg_specs for shape info). Got "
+                f"`()` (read arg_specs for kind / shape info). Got "
                 f"vanilla={self.vanilla_shapes[i]!r}, "
                 f"tiled={self.tiled_shapes[i]!r}")
         if self.max_tile is not None:

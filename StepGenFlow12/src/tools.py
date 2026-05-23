@@ -43,7 +43,7 @@ IMPORT_SCAFFOLD = _validate_functional_mod.IMPORT_SCAFFOLD
 from step_py.ops import StepOps
 
 from src.step_dsl import StepTensor, StepRawTensor, Tile, _elem_from_torch
-from src.node_signature import TensorArg, ListOfTensorArg
+from src.node_signature import IntArg, TensorArg, ListOfTensorArg
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +300,15 @@ def _wrap_on_chip_call_args(
     for value, spec, raw, tshape in zip(
         call_args, arg_specs, arg_is_raw, tiled_shapes
     ):
+        if isinstance(spec, IntArg):
+            # Host-side scalar: parent fed the child a Python int (e.g. a head
+            # count read out of ``dims``). It is neither raw nor on-chip — it
+            # never flows through a DSL op — so we pass it through unchanged
+            # and the child uses it directly in shape math / control flow.
+            assert isinstance(value, int) and not isinstance(value, bool), (
+                f"IntArg must be a Python int, got {type(value).__name__}")
+            wrapped.append(value)
+            continue
         if isinstance(spec, TensorArg):
             assert isinstance(value, torch.Tensor), (
                 f"TensorArg must be a torch.Tensor, got {type(value).__name__}")

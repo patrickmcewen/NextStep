@@ -676,15 +676,18 @@ def check_children_called_with_tensors_only(refactored_parent_code: str,
                                               children: list,
                                               dims: dict,
                                               original_reference_code: str) -> None:
-    """Every parent→child call site must pass tensors only.
+    """Every parent→child call site must pass a supported ArgSpec kind.
 
-    Pass-1 records each child call's args as a per-position ``(name, shape)``
-    contract and replays them through a blackbox stub; a Python int or other
-    scalar at any call-site position cannot be expressed in that contract or
-    in the DSL the child gets lowered to, so it has to be rejected here
-    rather than crashing later in ``_build_node_index``. Function-based
-    parents (``forward(self, dims, tensors)``) are skipped — they're already
-    rejected at ``refactor_tree`` entry.
+    Pass-1 records each child call's args as a per-position contract and
+    replays them through a blackbox stub. Anything outside the supported
+    ArgSpec set (``TensorArg``, ``IntArg``, ``ListOfTensorArg``,
+    ``ListOfIntArg``) cannot be expressed in that contract or in the DSL
+    the child gets lowered to, so it has to be rejected here rather than
+    crashing later in ``_build_node_index``. Python ``int`` scalars are
+    accepted (they classify as ``IntArg`` and the wrapper forwards them
+    unchanged); ``bool`` is rejected because there is no ``BoolArg``.
+    Function-based parents (``forward(self, dims, tensors)``) are skipped
+    — they're already rejected at ``refactor_tree`` entry.
     """
     if not has_class_model(original_reference_code):
         return
@@ -729,6 +732,24 @@ def check_children_called_with_tensors_only(refactored_parent_code: str,
             continue  # check_no_dead_children already covers unreached children
         for i, arg in enumerate(captured[child.name]):
             if isinstance(arg, torch.Tensor):
+                # Reject 0-D scalar tensors — they have no tile-stream
+                # representation. Direct the LLM to pass a Python int instead
+                # (which classifies as IntArg and forwards unchanged).
+                if arg.dim() == 0:
+                    raise GuardFailure(
+                        f"child {child.name!r} is called with a 0-D "
+                        f"torch.Tensor at position {i}; the DSL has no "
+                        f"scalar-tensor stream type. Pass the value as a "
+                        f"Python int instead (e.g. `dims[\"H\"]`, not "
+                        f"`torch.tensor(dims[\"H\"])`) so it classifies as "
+                        f"IntArg and the child receives it as a host-side "
+                        f"scalar."
+                    )
+                continue
+            # Python int scalar (IntArg). ``bool`` is an ``int`` subclass —
+            # reject it explicitly so a planner bug doesn't silently coerce
+            # ``True`` into ``IntArg(1)``.
+            if isinstance(arg, int) and not isinstance(arg, bool):
                 continue
             if isinstance(arg, list) and len(arg) > 0:
                 if all(isinstance(x, torch.Tensor) for x in arg):
@@ -762,11 +783,12 @@ def check_children_called_with_tensors_only(refactored_parent_code: str,
             raise GuardFailure(
                 f"child {child.name!r} is called with an unsupported arg at "
                 f"position {i} (type={type(arg).__name__}). Allowed kinds at "
-                f"a child call site: torch.Tensor, list[Tensor] (homogeneous "
-                f"shapes), list[int]. Python scalars cannot be recorded in "
-                f"the per-child contract — restructure so this position is "
-                f"a tensor (e.g. expand a per-expert loop over a one-hot "
-                f"routing tensor) or absorb the iteration into the child."
+                f"a child call site: torch.Tensor (rank >= 1), Python int "
+                f"(host-side scalar), list[Tensor] (homogeneous shapes), "
+                f"list[int]. Bools, floats, 0-D tensors, and other scalars "
+                f"are rejected — restructure so this position is one of the "
+                f"supported kinds (e.g. pass `dims[\"H\"]` as a Python int, "
+                f"not `torch.tensor(dims[\"H\"])` or `float(dims[\"H\"])`)."
             )
 
 

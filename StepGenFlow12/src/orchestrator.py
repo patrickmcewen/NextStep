@@ -2347,6 +2347,7 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
     children_signatures = [(m[0], m[2]) for m in children_meta]
 
     from src.node_signature import (
+        IntArg as _IntArg,
         ListOfIntArg as _ListOfIntArg,
         ListOfTensorArg as _ListOfTensorArg,
         TensorArg as _TensorArg,
@@ -2399,6 +2400,12 @@ async def _refactor_one_node_pass1(*, node, parent_contract, children_meta,
                 lines.append(
                     f"`{aname}`: vanilla shape {spec.shape}, "
                     f"tiled shape {tshape} — {tag}"
+                )
+            elif isinstance(spec, _IntArg):
+                lines.append(
+                    f"`{aname}`: Python int (host-side scalar) — use directly "
+                    f"in shape math / control flow (e.g. `D_head = D // {aname}`); "
+                    f"do NOT wrap it as a tensor or feed it into a DSL consumer."
                 )
             elif isinstance(spec, _ListOfTensorArg):
                 lines.append(

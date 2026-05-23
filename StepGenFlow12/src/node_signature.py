@@ -6,8 +6,13 @@ once, and report the names + per-arg specs of intermediate inputs, the
 per-output shapes (always plural — single-output forwards produce a
 1-tuple), and the names of internal Parameters (weights).
 
-Per-arg specs come in three flavors. Forwards may take any combination:
-- ``TensorArg(shape)``: a single ``torch.Tensor``.
+Per-arg specs come in four flavors. Forwards may take any combination:
+- ``TensorArg(shape)``: a single ``torch.Tensor`` (rank >= 1).
+- ``IntArg()``: a Python ``int`` scalar (e.g. a head count, a tile bound).
+  At the STeP target these are host-side constants — they flow through
+  the stub unchanged and the child uses them in shape math / control
+  flow, never as a stream tensor. 0-D ``torch.Tensor``s are rejected at
+  signature time; use ``IntArg`` instead.
 - ``ListOfTensorArg(length, elem_shape)``: a Python list of identically
   shaped tensors (e.g. per-expert weight stacks). At the STeP target
   these become per-element structural graph nodes — the list-ness is
@@ -32,6 +37,11 @@ class TensorArg:
 
 
 @dataclass(frozen=True)
+class IntArg:
+    pass
+
+
+@dataclass(frozen=True)
 class ListOfTensorArg:
     length: int
     elem_shape: tuple[int, ...]
@@ -42,18 +52,21 @@ class ListOfIntArg:
     length: int
 
 
-ArgSpec = Union[TensorArg, ListOfTensorArg, ListOfIntArg]
+ArgSpec = Union[TensorArg, IntArg, ListOfTensorArg, ListOfIntArg]
 
 
 def format_arg_spec(spec: ArgSpec) -> str:
     """Human-readable rendering used in Pass-1 prompts.
 
     ``TensorArg(shape=(M, N))`` → ``"vanilla shape (M, N)"``
+    ``IntArg()`` → ``"Python int (host-side scalar)"``
     ``ListOfTensorArg(length=N, elem_shape=(D, F))`` → ``"list[Tensor(D, F)] x N"``
     ``ListOfIntArg(length=B)`` → ``"list[int] x B"``
     """
     if isinstance(spec, TensorArg):
         return f"vanilla shape {spec.shape}"
+    if isinstance(spec, IntArg):
+        return "Python int (host-side scalar)"
     if isinstance(spec, ListOfTensorArg):
         return f"list[Tensor{spec.elem_shape}] x {spec.length}"
     assert isinstance(spec, ListOfIntArg)
@@ -62,12 +75,27 @@ def format_arg_spec(spec: ArgSpec) -> str:
 
 def classify_arg(name: str, value) -> ArgSpec:
     """Map one forward arg to an ArgSpec; assertion-fail on unsupported types."""
+    # Python int scalar (host-side knob: head count, tile bound, etc.). Checked
+    # before ``torch.Tensor`` because ``bool`` is an ``int`` subclass and we
+    # want both branches to reject it (no ``BoolArg`` spec exists).
+    if isinstance(value, int) and not isinstance(value, bool):
+        return IntArg()
     if isinstance(value, torch.Tensor):
+        # 0-D scalar tensors fundamentally cannot be tile streams (last two
+        # dims are the tile, by DSL definition). Reject loudly at signature
+        # time so the planner LLM re-rolls the reference instead of crashing
+        # deep in pass-1 wrap with ``tiled shape () must be rank >= 2``.
+        # Hosts that want to pass a scalar should use a Python int + IntArg.
+        assert value.dim() >= 1, (
+            f"forward arg {name!r} is a 0-D torch.Tensor; the DSL has no "
+            f"scalar-tensor stream type. Pass the value as a Python int "
+            f"instead — it will be classified as IntArg and forwarded to the "
+            f"child unchanged")
         return TensorArg(shape=tuple(value.shape))
     assert isinstance(value, list) and len(value) > 0, (
         f"forward arg {name!r} has unsupported type {type(value).__name__}; "
-        f"only torch.Tensor, non-empty list[Tensor], and non-empty list[int] "
-        f"are accepted")
+        f"only torch.Tensor (rank >= 1), Python int, non-empty list[Tensor], "
+        f"and non-empty list[int] are accepted")
     if all(isinstance(x, torch.Tensor) for x in value):
         elem_shape = tuple(value[0].shape)
         for i, x in enumerate(value):

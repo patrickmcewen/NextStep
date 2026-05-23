@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from src.blackbox_stub import make_stub, ContractRecorder
 from src.node_signature import (
+    IntArg,
     ListOfIntArg,
     ListOfTensorArg,
     TensorArg,
@@ -262,6 +263,57 @@ def test_stub_passes_list_of_int_through_unchanged():
     assert contract.tiled_values[1] == [2, 5, 3, 7]
     # tiled_values for the int list is a fresh copy, not the same reference.
     assert contract.tiled_values[1] is not num_token_list
+
+
+class _MultiHeadView(nn.Module):
+    """Mirrors the planner-emitted ``attention_layer`` shape — takes a Python
+    int (head count) alongside a tensor and uses it for shape math only."""
+    def forward(self, x, n_head):
+        B, T, D = x.shape
+        D_head = D // n_head
+        return x.view(B, T, n_head, D_head).sum(dim=2)
+
+
+def test_stub_passes_int_arg_through_unchanged():
+    """IntArg values flow through the stub as a Python int, and the contract
+    records them with `()` vanilla/tiled shape — the fix that unblocks the
+    transformer-kernel pass-1 wrap crash."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MultiHeadView(),
+        arg_names=("x", "n_head"),
+        arg_specs=(TensorArg(shape=(2, 4, 12)), IntArg()),
+        recorder=rec,
+    )
+    x = torch.randn(2, 4, 12)
+    out = stub(x.reshape(1, 2, 4, 12), 4, out_shapes=((1, 2, 4, 3),))
+    assert out.shape == (1, 2, 4, 3)
+
+    contract = rec.contract
+    assert contract.arg_specs == (TensorArg(shape=(2, 4, 12)), IntArg())
+    assert contract.vanilla_shapes == ((2, 4, 12), ())
+    assert contract.tiled_shapes == ((1, 2, 4, 12), ())
+    assert contract.tiled_values[1] == 4
+    assert isinstance(contract.tiled_values[1], int)
+
+
+def test_stub_rejects_tensor_for_int_arg():
+    """A parent that passes a Tensor where IntArg was declared fails loud at
+    the stub boundary — catches a planner contract regression early."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MultiHeadView(),
+        arg_names=("x", "n_head"),
+        arg_specs=(TensorArg(shape=(2, 4, 12)), IntArg()),
+        recorder=rec,
+    )
+    x = torch.randn(1, 2, 4, 12)
+    try:
+        stub(x, torch.tensor(4), out_shapes=((1, 2, 4, 3),))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised
 
 
 def test_stub_rejects_non_tensor_for_tensor_arg():

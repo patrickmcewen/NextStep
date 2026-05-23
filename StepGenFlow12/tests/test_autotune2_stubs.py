@@ -241,7 +241,7 @@ def test_variant_stub_list_arg_passthrough():
 
 
 def test_make_variant_stub_rejects_contract_on_list_arg():
-    with pytest.raises(AssertionError, match="list arg"):
+    with pytest.raises(AssertionError, match="non-tensor arg"):
         make_variant_stub(
             ref_module=nn.Identity(),
             arg_names=("ks",),

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from src.node_signature import (
+    IntArg,
     ListOfIntArg,
     ListOfTensorArg,
     TensorArg,
@@ -131,14 +132,54 @@ def test_classify_arg_rejects_empty_list():
         classify_arg("empty", [])
 
 
-def test_classify_arg_rejects_scalar_int():
+def test_classify_arg_scalar_int():
+    """Python ints are now first-class — used for head counts, tile bounds, etc."""
+    assert classify_arg("n_head", 12) == IntArg()
+
+
+def test_classify_arg_rejects_bool():
+    """``bool`` is an ``int`` subclass in Python; we reject it because there's
+    no ``BoolArg`` spec and silently classifying ``True`` as ``IntArg(1)`` would
+    hide a planner bug behind a true-as-1 coercion."""
     with pytest.raises(AssertionError, match="unsupported type"):
-        classify_arg("k", 7)
+        classify_arg("flag", True)
+
+
+def test_classify_arg_rejects_scalar_tensor():
+    """0-D ``torch.Tensor``s have no tile-stream representation — the planner
+    must pass scalars as Python ints (IntArg) instead, or the deep-stack
+    ``tiled shape () must be rank >= 2`` crash returns."""
+    with pytest.raises(AssertionError, match="0-D torch.Tensor"):
+        classify_arg("n_head_tensor", torch.tensor(12, dtype=torch.int64))
 
 
 def test_classify_arg_rejects_dict():
     with pytest.raises(AssertionError, match="unsupported type"):
         classify_arg("d", {"a": 1})
+
+
+# Reference module that takes a Python int alongside a tensor — exercises the
+# IntArg path end-to-end through ``extract_signature``.
+INT_INPUT_REF = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, n_head):
+        # n_head is a Python int — head count knob the parent passes down.
+        B, T, D = x.shape
+        D_head = D // n_head
+        return x.view(B, T, n_head, D_head).sum(dim=2)
+"""
+
+
+def test_extract_signature_with_int_input():
+    canonical_inputs = {"x": torch.randn(2, 4, 12), "n_head": 4}
+    sig = extract_signature(INT_INPUT_REF, canonical_inputs)
+    assert sig.arg_names == ("x", "n_head")
+    assert sig.arg_specs == (TensorArg(shape=(2, 4, 12)), IntArg())
+    assert sig.out_shapes == ((2, 4, 12 // 4),)
 
 
 # Reference module that takes the three supported arg kinds in one forward.

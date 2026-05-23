@@ -771,6 +771,7 @@ def build_pass1_user_prompt(
             "",
         ])
         from src.node_signature import (
+            IntArg as _IntArg,
             ListOfIntArg as _ListOfIntArg,
             ListOfTensorArg as _ListOfTensorArg,
             TensorArg as _TensorArg,
@@ -784,6 +785,13 @@ def build_pass1_user_prompt(
                 lines.append(
                     f"  `{arg_name}`: vanilla shape {spec.shape}, "
                     f"tiled shape declared by parent {tiled_shape} — {tag}"
+                )
+            elif isinstance(spec, _IntArg):
+                lines.append(
+                    f"  `{arg_name}`: Python int (host-side scalar). Use "
+                    f"directly in shape math / control flow (e.g. "
+                    f"`D_head = D // {arg_name}`); do NOT wrap it as a tensor "
+                    f"or feed it into a DSL consumer."
                 )
             elif isinstance(spec, _ListOfTensorArg):
                 lines.append(

@@ -67,7 +67,8 @@ import torch
 import torch.nn as nn
 
 from src.autotune2.contracts import TensorContract
-from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
+from src.node_signature import (
+    ArgSpec, IntArg, ListOfIntArg, ListOfTensorArg, TensorArg)
 from src.step_dsl import StepTensor, StepRawTensor, Tile, _elem_from_torch
 
 
@@ -168,8 +169,8 @@ def make_variant_stub(
         if not isinstance(spec, TensorArg):
             assert name not in input_contracts, (
                 f"make_variant_stub({variant_name!r}): arg {name!r} is a "
-                f"list arg ({type(spec).__name__}); list args cannot carry "
-                f"a contract, got {input_contracts[name]!r}"
+                f"non-tensor arg ({type(spec).__name__}); only TensorArg "
+                f"inputs can carry a contract, got {input_contracts[name]!r}"
             )
     for k in input_contracts:
         assert k in arg_names, (
@@ -213,6 +214,12 @@ def make_variant_stub(
                     vanilla_args.append(
                         invert_input_contract(value, spec.shape, contract)
                     )
+            elif isinstance(spec, IntArg):
+                assert isinstance(value, int) and not isinstance(value, bool), (
+                    f"variant stub {variant_name!r}: arg {name!r} declared "
+                    f"IntArg but received {type(value).__name__}"
+                )
+                vanilla_args.append(value)
             elif isinstance(spec, ListOfTensorArg):
                 assert isinstance(value, list) and len(value) == spec.length, (
                     f"variant stub {variant_name!r}: arg {name!r} declared "

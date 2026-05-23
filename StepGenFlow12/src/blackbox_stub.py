@@ -45,7 +45,8 @@ import torch
 import torch.nn as nn
 
 from src.contract import Contract
-from src.node_signature import ArgSpec, ListOfIntArg, ListOfTensorArg, TensorArg
+from src.node_signature import (
+    ArgSpec, IntArg, ListOfIntArg, ListOfTensorArg, TensorArg)
 from src.step_dsl import StepTensor, StepRawTensor, Tile, _elem_from_torch
 
 
@@ -58,14 +59,19 @@ def _vanillify(name: str, value, spec: ArgSpec):
     """Recover the underlying-reference input from a tile-stream value.
 
     Tensor args are reshape-recovered via ``.reshape(-1).reshape(vanilla)``;
-    list args pass through unchanged (their elements correspond to per-
-    iteration host-side loads in the DSL target, not stream tensors).
+    int / list args pass through unchanged (host-side scalars and per-
+    iteration host-side loads, not stream tensors).
     """
     if isinstance(spec, TensorArg):
         assert isinstance(value, torch.Tensor), (
             f"stub arg {name!r} was declared TensorArg but the parent "
             f"passed a {type(value).__name__}")
         return value.reshape(-1).reshape(spec.shape)
+    if isinstance(spec, IntArg):
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f"stub arg {name!r} was declared IntArg but the parent passed "
+            f"a {type(value).__name__}")
+        return value
     if isinstance(spec, ListOfTensorArg):
         assert isinstance(value, list) and len(value) == spec.length, (
             f"stub arg {name!r} was declared ListOfTensorArg(length={spec.length}) "
@@ -83,7 +89,7 @@ def _vanillify(name: str, value, spec: ArgSpec):
 
 
 def _tiled_shape_of(value, spec: ArgSpec) -> tuple[int, ...]:
-    """Tile-stream shape for tensor args; ``()`` for list args."""
+    """Tile-stream shape for tensor args; ``()`` for int / list args."""
     if isinstance(spec, TensorArg):
         return tuple(value.shape)
     return ()
@@ -105,9 +111,11 @@ def _unwrap_steptensor(v):
 
 
 def _clone_value(value, spec: ArgSpec):
-    """Detach-and-clone for tensor args; deep copy for list args."""
+    """Detach-and-clone for tensor args; copy for int / list args."""
     if isinstance(spec, TensorArg):
         return value.detach().clone()
+    if isinstance(spec, IntArg):
+        return int(value)
     if isinstance(spec, ListOfTensorArg):
         return [t.detach().clone() for t in value]
     assert isinstance(spec, ListOfIntArg)

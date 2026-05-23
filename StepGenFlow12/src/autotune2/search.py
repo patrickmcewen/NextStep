@@ -108,7 +108,7 @@ from src.autotune2.stubs import (
     make_variant_stub,
 )
 from src.contract import Contract
-from src.node_signature import ListOfIntArg, ListOfTensorArg, TensorArg
+from src.node_signature import IntArg, ListOfIntArg, ListOfTensorArg, TensorArg
 from src.planner import PlanNode, Tree
 
 
@@ -563,6 +563,11 @@ def build_node_tensors_dict(parent_contract: Contract) -> dict:
 
     For each list arg: the recorded ``tiled_values`` entry (already a
     ``list[Tensor]`` or ``list[int]``) passes through unchanged.
+
+    For each IntArg: the recorded ``tiled_values`` entry (a Python int)
+    is forwarded as-is — the autotuner's synthetic wrapper passes
+    ``tensors[name]`` straight to the node, and ``_wrap_input_tensors``
+    leaves non-Tensor values alone.
     """
     out: dict = {}
     for name, spec, val in zip(
@@ -577,6 +582,12 @@ def build_node_tensors_dict(parent_contract: Contract) -> dict:
                 f"{type(val).__name__}"
             )
             out[name] = val.reshape(spec.shape)
+        elif isinstance(spec, IntArg):
+            assert isinstance(val, int) and not isinstance(val, bool), (
+                f"build_node_tensors_dict: arg {name!r} is an IntArg but "
+                f"contract.tiled_values entry is {type(val).__name__}"
+            )
+            out[name] = val
         else:
             assert isinstance(spec, (ListOfTensorArg, ListOfIntArg)), (
                 f"build_node_tensors_dict: arg {name!r} has unsupported spec "

@@ -99,15 +99,74 @@ def test_guard_passes_when_all_args_are_tensors():
         _REFACTOR_TENSORS_ONLY, children, dims={}, original_reference_code=_PARENT_REF)
 
 
-def test_guard_rejects_python_int_at_call_site():
+def test_guard_accepts_python_int_at_call_site():
+    """Python int args at a child call site are now first-class (IntArg).
+
+    Before the IntArg fix, transformer kernels couldn't pass ``n_head`` to an
+    ``attention_layer`` child without using a 0-D scalar tensor, which
+    crashed pass-1 wrap. Now an int flows through unchanged."""
+    children = [_StubChild(name="adder", reference_code=_LEAF_REF_WITH_INT_ARG)]
+    check_children_called_with_tensors_only(
+        _REFACTOR_PASSES_INT, children, dims={}, original_reference_code=_PARENT_REF)
+
+
+_REFACTOR_PASSES_0D_TENSOR = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.adder = AdderModel()
+
+    def forward(self, x, y):
+        scalar = torch.tensor(3, dtype=torch.int64)
+        return self.adder(x, y, scalar)
+"""
+
+
+def test_guard_rejects_0d_tensor_at_call_site():
+    """0-D ``torch.Tensor``s have no tile-stream form — guide the LLM to
+    pass a Python int (IntArg) instead. This is the canonical mistake the
+    planner LLM makes when emitting transformer kernels."""
     children = [_StubChild(name="adder", reference_code=_LEAF_REF_WITH_INT_ARG)]
     with pytest.raises(GuardFailure) as exc_info:
         check_children_called_with_tensors_only(
-            _REFACTOR_PASSES_INT, children, dims={}, original_reference_code=_PARENT_REF)
+            _REFACTOR_PASSES_0D_TENSOR, children, dims={},
+            original_reference_code=_PARENT_REF)
     msg = str(exc_info.value)
     assert "adder" in msg
-    assert "position 2" in msg
-    assert "int" in msg
+    assert "0-D" in msg
+    assert "Python int" in msg
+
+
+_REFACTOR_PASSES_BOOL = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.adder = AdderModel()
+
+    def forward(self, x, y):
+        return self.adder(x, y, True)
+"""
+
+
+def test_guard_rejects_bool_at_call_site():
+    """``bool`` is an ``int`` subclass — explicitly reject so a planner bug
+    doesn't silently coerce ``True`` to ``IntArg(1)``."""
+    children = [_StubChild(name="adder", reference_code=_LEAF_REF_WITH_INT_ARG)]
+    with pytest.raises(GuardFailure) as exc_info:
+        check_children_called_with_tensors_only(
+            _REFACTOR_PASSES_BOOL, children, dims={},
+            original_reference_code=_PARENT_REF)
+    msg = str(exc_info.value)
+    assert "adder" in msg
+    assert "bool" in msg
 
 
 def test_guard_skipped_for_function_based_parent():
