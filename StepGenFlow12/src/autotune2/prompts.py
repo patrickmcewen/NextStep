@@ -80,6 +80,26 @@ _TILE_SHRINK_FEWSHOT_PATH = (
     _TILE_SHRINK_PROMPTS_DIR / "autotune_tile_shrink_fewshot.txt"
 )
 _PARALLEL_FEWSHOT_PATH = _PARALLEL_PROMPTS_DIR / "autotune_parallel_fewshot.txt"
+# Per-example DSL files inlined into the parallel few-shot via placeholders
+# (see _PARALLEL_FEWSHOT_EXAMPLES below). Each file is a validated
+# tiled_reference checked by StepDB/validate_functional_dsl.py.
+_PARALLEL_EXAMPLES_DIR = (
+    _PROJECT_ROOT.parent / "StepDB" / "examples" / "parallel"
+)
+_PARALLEL_FEWSHOT_EXAMPLES = {
+    "{gemm_seq_code}": _PARALLEL_EXAMPLES_DIR / "gemm_seq.py",
+    "{gemm_par_indep_code}": _PARALLEL_EXAMPLES_DIR / "gemm_par_indep.py",
+    "{gemm_par_shared_code}": _PARALLEL_EXAMPLES_DIR / "gemm_par_shared.py",
+    "{element_wise_add_seq_code}": _PARALLEL_EXAMPLES_DIR / "element_wise_add_seq.py",
+    "{element_wise_add_par_code}": _PARALLEL_EXAMPLES_DIR / "element_wise_add_par.py",
+    "{vector_reduce_sum_seq_code}": _PARALLEL_EXAMPLES_DIR / "vector_reduce_sum_seq.py",
+    "{vector_reduce_sum_par_code}": _PARALLEL_EXAMPLES_DIR / "vector_reduce_sum_par.py",
+    "{chained_unary_seq_code}": _PARALLEL_EXAMPLES_DIR / "chained_unary_seq.py",
+    "{chained_unary_par_code}": _PARALLEL_EXAMPLES_DIR / "chained_unary_par.py",
+    "{sdpa_core_max_seq_code}": _PARALLEL_EXAMPLES_DIR / "sdpa_core_max_seq.py",
+    "{sdpa_core_max_par_shallow_code}": _PARALLEL_EXAMPLES_DIR / "sdpa_core_max_par_shallow.py",
+    "{sdpa_core_max_par_deep_code}": _PARALLEL_EXAMPLES_DIR / "sdpa_core_max_par_deep.py",
+}
 _GENERAL_FEWSHOT_PATH = _GENERAL_PROMPTS_DIR / "autotune_general_fewshot.txt"
 _CURATION_SYSTEM_PROMPT_PATH = _CURATION_PROMPTS_DIR / "system.txt"
 _CURATION_USER_PROMPT_PATH = _CURATION_PROMPTS_DIR / "user.txt"
@@ -327,6 +347,20 @@ def build_autotune2_system_prompt(
         .replace("{parallel_fewshot}", _PARALLEL_FEWSHOT_PATH.read_text().rstrip())
         .rstrip()
     )
+    # Inline each parallel-fewshot example .py file at its placeholder. Done
+    # after the {parallel_fewshot} substitution so this works whether the
+    # selected fewshot pack is "parallel" (placeholders sit inline) or
+    # "general" (placeholders arrive via the nested {parallel_fewshot} swap).
+    for placeholder, example_path in _PARALLEL_FEWSHOT_EXAMPLES.items():
+        if placeholder not in fewshot_text:
+            continue
+        assert example_path.exists(), (
+            f"build_autotune2_system_prompt: parallel few-shot example "
+            f"missing at {example_path} (placeholder {placeholder})"
+        )
+        fewshot_text = fewshot_text.replace(
+            placeholder, example_path.read_text().rstrip()
+        )
     rendered = (
         system_path.read_text()
         .replace("{step_dsl_code}", dsl_code)

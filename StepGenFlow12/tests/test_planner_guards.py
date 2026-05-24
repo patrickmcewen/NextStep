@@ -129,7 +129,10 @@ class Model(nn.Module):
 def test_guard_rejects_0d_tensor_at_call_site():
     """0-D ``torch.Tensor``s have no tile-stream form — guide the LLM to
     pass a Python int (IntArg) instead. This is the canonical mistake the
-    planner LLM makes when emitting transformer kernels."""
+    planner LLM makes when emitting transformer kernels. The 0-D case is now
+    folded into the broader ``numel()==1`` rule (also covers
+    ``torch.tensor([x])`` evasion); the message still names the empty shape so
+    the LLM can identify the offending arg unambiguously."""
     children = [_StubChild(name="adder", reference_code=_LEAF_REF_WITH_INT_ARG)]
     with pytest.raises(GuardFailure) as exc_info:
         check_children_called_with_tensors_only(
@@ -137,8 +140,46 @@ def test_guard_rejects_0d_tensor_at_call_site():
             original_reference_code=_PARENT_REF)
     msg = str(exc_info.value)
     assert "adder" in msg
-    assert "0-D" in msg
+    assert "shape=()" in msg
     assert "Python int" in msg
+
+
+_REFACTOR_PASSES_1D_SINGLETON_TENSOR = """
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.adder = AdderModel()
+
+    def forward(self, x, y):
+        # Wrapping a Python int as a 1-D singleton tensor used to evade the
+        # 0-D guard, and pass-1 then crashed deep inside
+        # ``_wrap_on_chip_call_args`` with ``tiled shape (1,) must be rank
+        # >= 2``. The guard now rejects any singleton tensor — this is the
+        # canonical kernelbench_opt_1p3b outer_0 regression.
+        return self.adder(x, y, torch.tensor([3], dtype=torch.int64))
+"""
+
+
+def test_guard_rejects_1d_singleton_tensor_at_call_site():
+    """Rank-1 singleton tensors are the planner LLM's go-to evasion when the
+    0-D guard fires. They have no tile-stream form either (the on-chip wrap
+    needs the tile_row / tile_col 2 dims) — reject loudly with the same
+    ``pass as Python int`` hint so the LLM re-rolls the refactor."""
+    children = [_StubChild(name="adder", reference_code=_LEAF_REF_WITH_INT_ARG)]
+    with pytest.raises(GuardFailure) as exc_info:
+        check_children_called_with_tensors_only(
+            _REFACTOR_PASSES_1D_SINGLETON_TENSOR, children, dims={},
+            original_reference_code=_PARENT_REF)
+    msg = str(exc_info.value)
+    assert "adder" in msg
+    assert "Python int" in msg
+    # The error must reference singleton/1-element tensors specifically, not
+    # only the legacy 0-D wording — otherwise the LLM hits the same evasion.
+    assert "1-element" in msg or "singleton" in msg or "numel" in msg
 
 
 _REFACTOR_PASSES_BOOL = """

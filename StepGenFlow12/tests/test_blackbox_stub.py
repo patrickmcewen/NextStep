@@ -92,6 +92,67 @@ def test_recorder_only_captures_first_call():
     assert torch.equal(rec.contract.tiled_values[0], a)   # first call's value
 
 
+def test_stub_rejects_reinvocation_with_mismatched_input_tile_shape():
+    """A stub called again with a different input tile-stream shape must
+    fail loudly: the recorded contract only covers the first call's
+    shape, so the child's pass-1 is only validated against that shape.
+    A silent re-invocation with a different tile shape lets the bug
+    surface only at pass-2 (composed DSL) — too late.
+
+    This is the kernelbench_opt_1p3b bug: ``tiled_reference``'s loop
+    chains ``x = attention_block(x, ...)``; the iter-0 stub call sees
+    x with tile shape ``(1, B, T, 1, D)`` and declares ``out_shapes=
+    ((B, T, D),)``, so iter-1 hands x back with tile shape ``(B, T, D)``
+    which doesn't match the contract.
+    """
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a_iter0 = torch.randn(2, 2, 4, 2)        # tile-stream layout #1
+    b_iter0 = torch.randn(2, 2, 4, 2)
+    stub(a_iter0, b_iter0, out_shapes=((2, 2, 4, 2),))
+    a_iter1 = torch.randn(1, 4, 4, 2)        # same elem count, different tile shape
+    b_iter1 = torch.randn(2, 2, 4, 2)
+    try:
+        stub(a_iter1, b_iter1, out_shapes=((2, 2, 4, 2),))
+        raised = False
+    except AssertionError as e:
+        raised = True
+        msg = str(e)
+    assert raised, "stub must reject re-invocation with mismatched input tile shape"
+    assert "tiled" in msg and "a" in msg, (
+        f"error must point at the mismatched arg by name and mention tile "
+        f"shape; got: {msg!r}")
+
+
+def test_stub_rejects_reinvocation_with_mismatched_out_shapes():
+    """A stub called again with different ``out_shapes`` must fail —
+    the child only emits code for the first call's declared output
+    shape; a second call with a different shape would have no kernel
+    behind it.
+    """
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a = torch.randn(2, 2, 4, 2)
+    b = torch.randn(2, 2, 4, 2)
+    stub(a, b, out_shapes=((2, 2, 4, 2),))
+    try:
+        stub(a, b, out_shapes=((1, 4, 4, 2),))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised, "stub must reject re-invocation with mismatched out_shapes"
+
+
 def test_stub_returns_tuple_for_multi_output_ref():
     rec = ContractRecorder()
     stub = make_stub(

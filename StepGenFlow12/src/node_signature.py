@@ -81,16 +81,30 @@ def classify_arg(name: str, value) -> ArgSpec:
     if isinstance(value, int) and not isinstance(value, bool):
         return IntArg()
     if isinstance(value, torch.Tensor):
-        # 0-D scalar tensors fundamentally cannot be tile streams (last two
-        # dims are the tile, by DSL definition). Reject loudly at signature
-        # time so the planner LLM re-rolls the reference instead of crashing
-        # deep in pass-1 wrap with ``tiled shape () must be rank >= 2``.
-        # Hosts that want to pass a scalar should use a Python int + IntArg.
+        # Reject any single-element tensor as TensorArg:
+        #   - 0-D (``torch.tensor(x)``) has no tile-stream form at all
+        #     (``tiled shape () must be rank >= 2``).
+        #   - Higher-rank singletons (``torch.tensor([x])`` → shape (1,),
+        #     ``x.unsqueeze(0)`` → shape (1,1), …) are scalar-wraps in
+        #     disguise; the planner LLM reaches for them when the 0-D guard
+        #     fires and pass-1 then crashes in ``_wrap_on_chip_call_args``
+        #     with ``tiled shape (1,) must be rank >= 2`` once the captured
+        #     rank-1 input is classified on-chip (kernelbench_opt_1p3b
+        #     outer_0 regression). Keep this in sync with
+        #     ``check_children_called_with_tensors_only`` in planner.py so
+        #     the LLM gets the same rejection at both gates.
         assert value.dim() >= 1, (
             f"forward arg {name!r} is a 0-D torch.Tensor; the DSL has no "
             f"scalar-tensor stream type. Pass the value as a Python int "
             f"instead — it will be classified as IntArg and forwarded to the "
             f"child unchanged")
+        assert value.numel() != 1, (
+            f"forward arg {name!r} is a 1-element torch.Tensor "
+            f"(shape={tuple(value.shape)}); a singleton tensor has no "
+            f"tile-stream form (the on-chip wrap needs the last two dims to "
+            f"be the tile, and the singleton has no element to spread across "
+            f"them). Pass the value as a Python int instead — it will be "
+            f"classified as IntArg and forwarded to the child unchanged")
         return TensorArg(shape=tuple(value.shape))
     assert isinstance(value, list) and len(value) > 0, (
         f"forward arg {name!r} has unsupported type {type(value).__name__}; "
