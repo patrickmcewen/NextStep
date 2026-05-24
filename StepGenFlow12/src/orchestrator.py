@@ -51,7 +51,8 @@ from src.dsl_to_step import translate as _dsl_to_step_translate
 from src.token_accounting import write_turn_tokens, summarize as _summarize_tokens
 from agents import Runner
 
-from src.agents import (make_judge_agent, make_bundle_judge_agent,
+from src.agents import (build_dynamic_run_config,
+                        make_judge_agent, make_bundle_judge_agent,
                         make_pass_agent)
 from src.prompts import (LOWERING_PASSES, TRANSLATOR_PASSES, PIPELINES,
                          build_pass_user_prompt,
@@ -1241,7 +1242,10 @@ async def _run_judge(judge_agent, code: str, turn_dir: Path,
     """
     judge_prompt = f"Review this code:\n\n{context}\n```python\n{code}\n```" if context else \
                    f"Review this code for compliance:\n\n```python\n{code}\n```"
-    result = await Runner.run(judge_agent, [{"role": "user", "content": judge_prompt}])
+    judge_input = [{"role": "user", "content": judge_prompt}]
+    result = await Runner.run(
+        judge_agent, judge_input,
+        run_config=build_dynamic_run_config(judge_agent, judge_input))
     write_turn_tokens(turn_dir, result.context_wrapper.usage, kind="judge")
     tokens_used = 0
     if result.context_wrapper.usage is not None:
@@ -1691,7 +1695,9 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
         from openai import BadRequestError as _BadRequestError
         try:
-            run_result = await Runner.run(agent, conversation)
+            run_result = await Runner.run(
+                agent, conversation,
+                run_config=build_dynamic_run_config(agent, conversation))
         except _BadRequestError as exc:
             log(f"      LLM rejected request ({exc}); aborting this {pass_name} attempt.")
             _write(turn_dir / "status.txt", f"LLM_BAD_REQUEST: {exc}")

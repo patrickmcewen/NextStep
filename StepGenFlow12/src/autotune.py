@@ -27,7 +27,8 @@ import yaml
 
 from agents import Runner
 
-from src.agents import make_autotune_agent, make_judge_agent
+from src.agents import (build_dynamic_run_config,
+                        make_autotune_agent, make_judge_agent)
 from src.prompts import build_autotune_user_prompt, _format_tensors_description
 from src.tools import _exec_build_graph
 
@@ -945,7 +946,9 @@ async def run_autotune(
 
         _write(turn_dir / "user_prompt.txt", conversation[-1]["content"])
 
-        run_result = await Runner.run(agent, conversation)
+        run_result = await Runner.run(
+            agent, conversation,
+            run_config=build_dynamic_run_config(agent, conversation))
         assistant_text = run_result.final_output or ""
         conversation.append({"role": "assistant", "content": assistant_text})
         _write(turn_dir / "response.txt", assistant_text)

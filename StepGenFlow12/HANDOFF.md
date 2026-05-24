@@ -512,6 +512,14 @@ behavior but doesn't exercise the StepDB rust subprocess):
 ## Quick reference
 
 - Primary working dir: `/workspace/NextStep/StepGenFlow12`
+- LLM output budgeting: OpenRouter counts the requested output budget
+  (`max_tokens`, including hidden reasoning tokens) against the endpoint
+  context window. StepGenFlow12 now overlays every real `Runner.run(...)`
+  with `build_dynamic_run_config(...)`, which sets `max_tokens` to
+  `context_window_tokens - estimated_prompt_tokens - output_token_margin`
+  (defaults: `131072` and `4096`). If changing model profiles, set
+  `context_window_tokens` / `context_length` in the config when the endpoint
+  differs from 131k.
 - Test command:
   `bash -c "source /root/miniconda3/etc/profile.d/conda.sh && conda activate testenv && python -m pytest tests/test_autotune2_*.py --tb=line"`
 - Pre-existing failures to ignore when evaluating PR3/PR4/PR5: see

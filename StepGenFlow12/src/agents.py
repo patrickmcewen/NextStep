@@ -15,7 +15,10 @@ surface chain-of-thought as structured ``ReasoningItem``s rather than
 contaminating the response content.
 """
 
-from agents import Agent, AsyncOpenAI, ModelSettings, OpenAIChatCompletionsModel
+import tiktoken
+
+from agents import (Agent, AsyncOpenAI, ModelSettings,
+                    OpenAIChatCompletionsModel, RunConfig)
 from agents.retry import ModelRetrySettings, RetryPolicyContext, retry_policies
 from openai import APIError, APIStatusError
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
@@ -30,6 +33,115 @@ from src.prompts import (build_pass_system_prompt, build_judge_system_prompt,
 _PASS1_SYSTEM_TEMPLATE = "refactor_pass1_system.txt"
 _PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
 _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
+
+_DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
+_DEFAULT_OUTPUT_TOKEN_MARGIN = 4096
+_TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
+_CHAT_MESSAGE_OVERHEAD = 4
+_CHAT_REPLY_PRIMER = 2
+
+
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    assert isinstance(content, list), (
+        f"message content must be str or list, got {type(content).__name__}")
+    parts = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        else:
+            assert isinstance(item, dict), (
+                f"content list item must be str or dict, got {type(item).__name__}")
+            assert "text" in item, f"content dict lacks text field: {item!r}"
+            assert isinstance(item["text"], str), (
+                f"content text must be str, got {type(item['text']).__name__}")
+            parts.append(item["text"])
+    return "\n".join(parts)
+
+
+def _token_count(text: str) -> int:
+    assert isinstance(text, str), f"expected str, got {type(text).__name__}"
+    return len(_TOKEN_ENCODING.encode(text))
+
+
+def estimate_agent_prompt_tokens(agent, input_items) -> int:
+    """Estimate request input tokens for an Agents SDK call.
+
+    The estimate includes static agent instructions plus the current
+    conversation. It intentionally counts only text content; the StepGenFlow
+    LLM calls here are text-only prompts.
+    """
+    instructions = getattr(agent, "instructions", None) or ""
+    assert isinstance(instructions, str), (
+        "dynamic token budgeting requires static string agent instructions")
+
+    tokens = _token_count(instructions) + _CHAT_MESSAGE_OVERHEAD
+    if isinstance(input_items, str):
+        return tokens + _token_count(input_items) + _CHAT_MESSAGE_OVERHEAD + _CHAT_REPLY_PRIMER
+
+    assert isinstance(input_items, list), (
+        f"Runner input must be str or list, got {type(input_items).__name__}")
+    for message in input_items:
+        assert isinstance(message, dict), (
+            f"conversation item must be dict, got {type(message).__name__}")
+        assert "role" in message, f"conversation item lacks role: {message!r}"
+        assert "content" in message, f"conversation item lacks content: {message!r}"
+        role = message["role"]
+        assert isinstance(role, str), f"message role must be str, got {type(role).__name__}"
+        tokens += (
+            _CHAT_MESSAGE_OVERHEAD
+            + _token_count(role)
+            + _token_count(_content_text(message["content"]))
+        )
+    return tokens + _CHAT_REPLY_PRIMER
+
+
+def _agent_llm_config(agent) -> dict:
+    config = getattr(agent, "__llm_config__", None)
+    if config is None:
+        return {}
+    assert isinstance(config, dict), "agent.__llm_config__ must be a dict"
+    return config
+
+
+def compute_dynamic_max_tokens(
+    agent,
+    input_items,
+    *,
+    context_window_tokens: int | None = None,
+    output_token_margin: int | None = None,
+) -> int:
+    config = _agent_llm_config(agent)
+    if context_window_tokens is None:
+        context_window_tokens = int(config.get(
+            "context_window_tokens",
+            config.get("context_length", _DEFAULT_CONTEXT_WINDOW_TOKENS),
+        ))
+    if output_token_margin is None:
+        output_token_margin = int(config.get(
+            "output_token_margin", _DEFAULT_OUTPUT_TOKEN_MARGIN))
+
+    prompt_tokens = estimate_agent_prompt_tokens(agent, input_items)
+    max_tokens = context_window_tokens - prompt_tokens - output_token_margin
+    assert max_tokens > 0, (
+        "prompt leaves no room for output tokens after reserved margin: "
+        f"context_window_tokens={context_window_tokens}, "
+        f"prompt_tokens={prompt_tokens}, "
+        f"output_token_margin={output_token_margin}"
+    )
+    return max_tokens
+
+
+def build_dynamic_run_config(agent, input_items) -> RunConfig:
+    return RunConfig(
+        model_settings=ModelSettings(
+            max_tokens=compute_dynamic_max_tokens(agent, input_items)))
+
+
+def _with_llm_config(agent: Agent, llm_config: dict) -> Agent:
+    agent.__llm_config__ = llm_config
+    return agent
 
 
 # Addendum injected into the pass-1 system prompt when max-tile mode is on.
@@ -384,9 +496,10 @@ _RETRY_SETTINGS = ModelRetrySettings(
 def _build_model_settings(llm_config: dict) -> ModelSettings:
     """Construct per-call ModelSettings from llm_config.
 
-    `max_tokens` is always set: OpenRouter applies a silent ~16k output
-    cap when the caller omits it, which truncates reasoning-model turns
-    mid-thought.
+    `max_tokens` is set here as a baseline because OpenRouter applies a silent
+    ~16k output cap when the caller omits it. Real Runner.run call sites
+    overlay this with build_dynamic_run_config(), which computes a per-request
+    budget from the current prompt length.
 
     `include_usage=True` is required for non-OpenAI providers: ReasoningAwareModel
     upgrades non-streaming calls to streaming under the hood (see its docstring),
@@ -577,12 +690,12 @@ def make_pass_agent(llm_config: dict, pass_name: str,
         system_prompt = build_pass_system_prompt(
             pass_name, few_shot_examples=few_shot_examples)
 
-    return Agent(
+    return _with_llm_config(Agent(
         name=f"StepPass_{pass_name}",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 _AUTOTUNE_VARIANTS = {
@@ -609,12 +722,12 @@ def make_autotune_agent(llm_config: dict, hw_constraints: dict,
     system_prompt = build_autotune_system_prompt(
         hw_constraints, _AUTOTUNE_VARIANTS[variant])
 
-    return Agent(
+    return _with_llm_config(Agent(
         name=f"StepAutotune_{variant}",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_judge_agent(llm_config: dict, pass_name: str) -> Agent:
@@ -623,12 +736,12 @@ def make_judge_agent(llm_config: dict, pass_name: str) -> Agent:
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
     system_prompt = build_judge_system_prompt(pass_name)
 
-    return Agent(
+    return _with_llm_config(Agent(
         name=f"StepJudge_{pass_name}",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_bundle_judge_agent(llm_config: dict, compliance: dict) -> Agent:
@@ -642,12 +755,12 @@ def make_bundle_judge_agent(llm_config: dict, compliance: dict) -> Agent:
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
     system_prompt = build_bundle_judge_system_prompt(compliance)
 
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepJudge_bundle",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_pass1_agent(
@@ -716,12 +829,12 @@ def make_pass1_agent(
         few_shot_examples=few_shot_examples,
         max_tile=max_tile,
     )
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepPass_pass1",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_pass1_judge_agent(
@@ -749,12 +862,12 @@ def make_pass1_judge_agent(
         contract_block=contract_block,
         function_signature=function_signature,
     )
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepJudge_pass1",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_autotune2_agent(llm_config: dict, system_prompt: str) -> Agent:
@@ -771,12 +884,12 @@ def make_autotune2_agent(llm_config: dict, system_prompt: str) -> Agent:
     assert system_prompt, "make_autotune2_agent: system_prompt must be non-empty"
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepAutotune2",
         instructions=system_prompt,
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_planner_agent(llm_config: dict) -> Agent:
@@ -787,12 +900,12 @@ def make_planner_agent(llm_config: dict) -> Agent:
     """
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepPlanner",
         instructions=build_planner_system_prompt(),
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_curation_agent(llm_config: dict) -> Agent:
@@ -811,12 +924,12 @@ def make_curation_agent(llm_config: dict) -> Agent:
     from src.autotune2.prompts import build_curation_system_prompt
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepAutotune2Curation",
         instructions=build_curation_system_prompt(),
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_ace_context_curator_agent(llm_config: dict) -> Agent:
@@ -824,12 +937,12 @@ def make_ace_context_curator_agent(llm_config: dict) -> Agent:
     from src.autotune2.prompts import build_ace_context_curator_system_prompt
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepAutotune2AceContextCurator",
         instructions=build_ace_context_curator_system_prompt(),
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_sim_decision_agent(llm_config: dict) -> Agent:
@@ -844,12 +957,12 @@ def make_sim_decision_agent(llm_config: dict) -> Agent:
     from src.autotune2.prompts import build_sim_decision_system_prompt
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepAutotune2SimDecision",
         instructions=build_sim_decision_system_prompt(),
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)
 
 
 def make_final_pick_agent(llm_config: dict) -> Agent:
@@ -867,9 +980,9 @@ def make_final_pick_agent(llm_config: dict) -> Agent:
     from src.autotune2.prompts import build_final_pick_system_prompt
     client = make_client(llm_config)
     model = ReasoningAwareModel(model=llm_config["model"], openai_client=client)
-    return Agent(
+    return _with_llm_config(Agent(
         name="StepAutotune2FinalPick",
         instructions=build_final_pick_system_prompt(),
         model=model,
         model_settings=_build_model_settings(llm_config),
-    )
+    ), llm_config)

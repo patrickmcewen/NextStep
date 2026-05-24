@@ -320,6 +320,29 @@ def _forward_body_op_count(forward_node: ast.FunctionDef) -> int:
     return count
 
 
+def check_bodies_parseable(refactored_parent_code: str, children: list) -> None:
+    """All synthesized bodies must be valid Python.
+
+    Raised before any other guard runs so that a malformed LLM body becomes a
+    retryable GuardFailure (with the offending body's name + SyntaxError
+    details) rather than a fatal SyntaxError out of some downstream
+    ``ast.parse`` deep in another guard.
+    """
+    for child in children:
+        try:
+            ast.parse(child.reference_code)
+        except SyntaxError as exc:
+            raise GuardFailure(
+                f"child {child.name!r}: body is not valid Python ({exc})"
+            )
+    try:
+        ast.parse(refactored_parent_code)
+    except SyntaxError as exc:
+        raise GuardFailure(
+            f"refactored parent: body is not valid Python ({exc})"
+        )
+
+
 def check_anti_passthrough(children: list) -> None:
     """Each child's forward() must contain >=1 torch operation."""
     for child in children:
@@ -959,9 +982,16 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
             if isinstance(instructions, str):
                 (turn_dir / "system_prompt.txt").write_text(instructions)
 
+        from agents import Runner as _Runner
         from openai import BadRequestError as _BadRequestError
         try:
-            result = await runner_fn(agent, conversation)
+            if runner_fn is _Runner.run:
+                from src.agents import build_dynamic_run_config
+                result = await runner_fn(
+                    agent, conversation,
+                    run_config=build_dynamic_run_config(agent, conversation))
+            else:
+                result = await runner_fn(agent, conversation)
         except _BadRequestError as exc:
             log(f"[planner] node={path!r} attempt {attempt + 1}: LLM rejected request ({exc}) — falling through to leaf fallback")
             if turn_dir is not None:
@@ -1021,6 +1051,7 @@ async def plan(*, reference_code: str, dims: dict, agent, path: str,
         refactored_full = synthesize_reference_module(parsed.refactored_parent_code)
 
         try:
+            check_bodies_parseable(refactored_full, list(children_full))
             check_anti_passthrough(list(children_full))
             #check_anti_monolith(reference_code, refactored_full)
             check_no_dead_children(refactored_full, list(children_full))

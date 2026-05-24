@@ -797,14 +797,16 @@ def build_real_agent_fn(*, llm_config: dict):
     """
     from agents import ReasoningItem, Runner
 
-    from src.agents import make_autotune2_agent
+    from src.agents import build_dynamic_run_config, make_autotune2_agent
     from src.autotune2.search import AgentResponse
 
     def factory(system_prompt: str):
         agent = make_autotune2_agent(llm_config, system_prompt)
 
         async def call(conversation: list) -> AgentResponse:
-            result = await Runner.run(agent, conversation)
+            result = await Runner.run(
+                agent, conversation,
+                run_config=build_dynamic_run_config(agent, conversation))
             reasoning_chunks: list[str] = []
             for item in result.new_items:
                 if isinstance(item, ReasoningItem):
