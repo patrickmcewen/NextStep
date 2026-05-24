@@ -48,3 +48,18 @@ end_to_end_subparts:
   kv_cache_tile_append: mixtral_b64
   #moe_routed: large_d1k
 
+full_bench_set:
+  element_wise_add: large_4k
+  gemm: large_4k
+  rope: qwen_b64
+  rms_norm: qwen_scale
+  sdpa_core_max: long_ctx_512
+  gated_mlp: qwen_16x
+  moe_routed: large_d1k
+  basic_prefill_attention: small
+  prefill_transformer_simple: small
+  kernelbench_mlp: hidden_1k
+  kernelbench_gpt2: deep
+  kernelbench_bart_large: deep
+  kernelbench_opt_1p3b: deep
+

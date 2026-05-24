@@ -116,31 +116,30 @@ class ParsedSplit:
 _DECISION_RE = re.compile(r"^\s*DECISION:\s*(leaf|split)\s*$", re.MULTILINE)
 _CHILD_HEADER_RE = re.compile(r"^[ \t]*#\s*child:\s*(\w+)\s*$", re.MULTILINE)
 _PARENT_HEADER_RE = re.compile(r"^[ \t]*#\s*refactored parent\s*$", re.MULTILINE)
-_CODE_FENCE_RE = re.compile(r"^```(?:python|py)?\s*$", re.MULTILINE)
-_FENCED_BLOCK_RE = re.compile(
-    r"^```(?:python|py)?\s*\n(.*?)^```\s*$",
-    re.MULTILINE | re.DOTALL,
-)
+_CODE_FENCE_RE = re.compile(r"^```(?:python|py)?\s*$")
 
 
 def _strip_code_fences(body: str) -> str:
-    """Extract code from a body that may be wrapped in ``` fences.
+    """Strip ``` fence lines from an inter-marker slice and drop trailing prose.
 
-    If at least one fenced block ``` ```python ... ``` ``` is present, returns
-    only the concatenated contents of those blocks — discarding any prose
-    before, between, or after them. (LLMs sometimes append a trailing
-    "explanation" paragraph after the closing fence; that prose then ends up
-    in ast.parse and crashes downstream guards.)
+    Fences are not part of the protocol — splits are delimited by
+    ``# child:`` / ``# refactored parent`` headers. LLMs habitually wrap code
+    in ``` ```python ... ``` ``` anyway, sometimes putting the ``# child:``
+    header inside the fence (so the inter-marker slice ends up with an orphan
+    close + open pair, not a matched block) and sometimes outside; they also
+    occasionally append an "explanation" paragraph after the closing fence.
 
-    If no fenced block is present, returns the body unchanged (modulo strip).
+    Drop everything past the last fence — but only when ≥2 fences are present,
+    so a lone unclosed open fence doesn't take all the code with it. Then
+    strip remaining fence lines and dedent so uniformly indented slices (e.g.
+    nested under a markdown sub-bullet) line up at column 0.
     """
-    blocks = _FENCED_BLOCK_RE.findall(body)
-    if blocks:
-        return "\n\n".join(b.rstrip() for b in blocks).strip()
-    # No fences: the LLM may have indented the whole block (e.g. as a sub-bullet
-    # of the DECISION line). Dedent before stripping so common leading
-    # whitespace is removed *per line* rather than only off the first line.
-    return textwrap.dedent(body.strip("\n")).strip()
+    lines = body.splitlines()
+    fence_idxs = [i for i, ln in enumerate(lines) if _CODE_FENCE_RE.match(ln)]
+    if len(fence_idxs) >= 2:
+        lines = lines[:fence_idxs[-1]]
+    kept = [ln for ln in lines if not _CODE_FENCE_RE.match(ln)]
+    return textwrap.dedent("\n".join(kept).strip("\n")).strip()
 
 
 def _snake_to_camel(snake: str) -> str:
