@@ -36,7 +36,7 @@ class Model(nn.Module):
 
     def forward(self, input_tensor, q_proj, k_proj, v_proj,
                 cos, sin, k_cache, v_cache,
-                expert_indices, expert_weights,
+                expert_onehot, expert_weights,
                 w_gate_list, w_up_list, w_down_list,
                 num_token_list, o_proj_weight):
         # Derive per-call shape constants from the tensor args. Matches the
@@ -107,17 +107,20 @@ class Model(nn.Module):
         # [9] Post-attention RMS Norm
         normed_2 = _rms_norm(res_add_0)
 
-        # [10] MoE: y[i] = sum_j w[i,j] * down_j(silu(gate_j(x)) * up_j(x))
+        # [10] MoE: y[t] = sum_j w[t,j] * down_j(silu(gate_j(x)) * up_j(x))
+        # expert_onehot[s, k, e] == 1 iff token s assigns its slot k to expert e,
+        # so torch.where on the per-expert slice gives the (token, slot) pairs
+        # that step_impl routes to expert ``e``.
         moe_output = torch.zeros(batch, dim)
         for e in range(n_routed_experts):
-            idx, top_pos = torch.where(expert_indices == e)
-            if len(idx) == 0:
+            tok, top_pos = torch.where(expert_onehot[:, :, e] == 1)
+            if len(tok) == 0:
                 continue
-            gate_out = normed_2[idx] @ w_gate_list[e]
-            up_out = normed_2[idx] @ w_up_list[e]
+            gate_out = normed_2[tok] @ w_gate_list[e]
+            up_out = normed_2[tok] @ w_up_list[e]
             hidden = F.silu(gate_out) * up_out
             down_out = hidden @ w_down_list[e]
-            moe_output[idx] += down_out * expert_weights[idx, top_pos, None]
+            moe_output[tok] += down_out * expert_weights[tok, top_pos, None]
 
         # [11] Final residual add
         return moe_output + res_add_0
@@ -140,7 +143,7 @@ def get_inputs(dims):
     return [
         t["input_tensor"], t["q_proj"], t["k_proj"], t["v_proj"],
         t["cos"], t["sin"], t["k_cache"], t["v_cache"],
-        t["expert_indices"], t["expert_weights"],
+        t["expert_onehot"], t["expert_weights"],
         t["w_gate_list"], t["w_up_list"], t["w_down_list"],
         t["num_token_list"], t["o_proj_weight"],
     ]

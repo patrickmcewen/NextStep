@@ -513,6 +513,17 @@ def _precompute_end_to_end(dims):
     assert routing_path.exists(), f"Expert routing file not found: {routing_path}"
     expert_indices = torch.from_numpy(np.load(str(routing_path))["data"])
 
+    # SelectGen needs these as `underlying` tensors. Pure function of
+    # expert_indices (loaded from .npz, no RNG draw), so RNG sequence is
+    # preserved. Mirrors the moe_routed precompute so LLM-side build_graph
+    # can index tensors["expert_multihot"] / tensors["expert_onehot"]
+    # without depending on step_tl's utils.moe helpers.
+    _one_hot = torch.nn.functional.one_hot(
+        expert_indices.to(torch.int64), num_classes=mc.n_routed_experts
+    ).to(torch.int64)
+    expert_multihot = _one_hot.sum(dim=-2)
+    expert_onehot = _one_hot
+
     expert_weights = torch.softmax(
         torch.randn(batch, mc.n_activated_experts), dim=-1
     )
@@ -562,6 +573,8 @@ def _precompute_end_to_end(dims):
         "k_cache": k_cache,
         "v_cache": v_cache,
         "expert_indices": expert_indices,
+        "expert_multihot": expert_multihot,
+        "expert_onehot": expert_onehot,
         "expert_weights": expert_weights,
         "w_gate_list": w_gate_list,
         "w_up_list": w_up_list,
