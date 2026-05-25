@@ -153,6 +153,17 @@ def test_classify_arg_rejects_scalar_tensor():
         classify_arg("n_head_tensor", torch.tensor(12, dtype=torch.int64))
 
 
+def test_classify_arg_rejects_1d_singleton_tensor():
+    """1-D singleton tensors are scalar-wraps in disguise — the planner LLM
+    reaches for ``torch.tensor([n_head])`` when the 0-D guard fires, and
+    pass-1 then crashes in ``_wrap_on_chip_call_args`` with ``tiled shape (1,)
+    must be rank >= 2`` (kernelbench_opt_1p3b outer_0). ``classify_arg`` must
+    reject the same evasion the planner guard rejects, keeping the two
+    layers in sync."""
+    with pytest.raises(AssertionError, match="Python int"):
+        classify_arg("n_head_tensor", torch.tensor([12], dtype=torch.int64))
+
+
 def test_classify_arg_rejects_dict():
     with pytest.raises(AssertionError, match="unsupported type"):
         classify_arg("d", {"a": 1})

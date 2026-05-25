@@ -166,23 +166,59 @@ def make_stub(*, ref_module: nn.Module,
             for raw_out, out_shape in zip(raw_outputs, out_shapes)
         ]
 
+        cur_tiled = tuple(
+            _tiled_shape_of(v, spec)
+            for v, spec in zip(unwrapped_args, arg_specs))
+        cur_out = tuple(tuple(s) for s in out_shapes)
         if recorder.contract is None:
             recorder.contract = Contract(
                 arg_names=arg_names,
                 vanilla_shapes=tuple(
                     spec.shape if isinstance(spec, TensorArg) else ()
                     for spec in arg_specs),
-                tiled_shapes=tuple(
-                    _tiled_shape_of(v, spec)
-                    for v, spec in zip(unwrapped_args, arg_specs)),
+                tiled_shapes=cur_tiled,
                 tiled_values=tuple(
                     _clone_value(v, spec)
                     for v, spec in zip(unwrapped_args, arg_specs)),
-                out_shapes=tuple(tuple(s) for s in out_shapes),
+                out_shapes=cur_out,
                 tiled_outputs=tuple(r.detach().clone() for r in results),
                 out_is_tuple=isinstance(raw, tuple),
                 arg_specs=arg_specs,
                 max_tile=max_tile,
+            )
+        else:
+            # Re-invocation: the contract was already captured for this
+            # blackbox's first call site. The child's pass-1 only validates
+            # its DSL against that one input/output tile layout, so a
+            # subsequent call with a different tile-stream shape would let
+            # a shape bug slip past pass-1 and only surface at pass-2.
+            # The kernelbench_opt_1p3b regression was exactly this: a loop
+            # ``for layer in range(L): x = attention_block(x, ...)`` where
+            # iter-0 fed x with tile shape ``(1, B, T, 1, D)`` and
+            # ``out_shapes=((B, T, D),)``, so iter-1 handed back x with
+            # tile shape ``(B, T, D)`` — the child pre_norm crashed on the
+            # mismatched stream rank only at pass-2.
+            prev_tiled = recorder.contract.tiled_shapes
+            for i, (prev, cur) in enumerate(zip(prev_tiled, cur_tiled)):
+                assert prev == cur, (
+                    f"blackbox stub re-invocation: arg {arg_names[i]!r} has "
+                    f"tiled shape {cur}, but the first invocation recorded "
+                    f"{prev}. The parent is calling this blackbox at multiple "
+                    f"sites (or in a loop) with inconsistent tile-stream "
+                    f"shapes — typically the blackbox's output tile shape "
+                    f"does not match the input tile shape, so a loop body "
+                    f"``x = blackbox(x, ...)`` mutates the type between "
+                    f"iterations. Either (a) make the blackbox's output "
+                    f"tile shape equal the input tile shape so the loop can "
+                    f"iterate, or (b) reshape the value with DSL ops before "
+                    f"re-feeding it."
+                )
+            assert recorder.contract.out_shapes == cur_out, (
+                f"blackbox stub re-invocation: out_shapes {cur_out} differ "
+                f"from the first-invocation contract "
+                f"{recorder.contract.out_shapes}. Every call site must "
+                f"request the same output shape — the child emits one "
+                f"kernel, not one per shape."
             )
 
         # Wrap each output as a StepTensor so the parent's DSL ops can

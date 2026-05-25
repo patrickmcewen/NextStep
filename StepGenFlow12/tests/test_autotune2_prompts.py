@@ -211,7 +211,7 @@ def test_general_system_prompt_merges_tile_shrink_and_parallel_guidance():
     flat = " ".join(out.lower().split())
     assert "optimization recipes" in flat
     assert "Shrinking tile sizes" in out
-    assert "Applying parallelism" in out
+    assert "Sources of parallelism" in out
     assert "binary_map_accum" in out
     assert "static_reassemble" in out
     assert "reducing tile sizes" in flat
@@ -238,7 +238,7 @@ def test_general_fewshot_file_imports_specialized_fewshots():
     assert "{tile_shrink_fewshot}" not in rendered
     assert "{parallel_fewshot}" not in rendered
     assert "rms_norm" in rendered
-    assert "GEMM with M-axis parallelism" in rendered
+    assert "Worked example: GEMM, independent M-axis parallelism" in rendered
 
 
 # --- build_autotune2_user_prompt ---------------------------------------------

@@ -754,17 +754,27 @@ def check_children_called_with_tensors_only(refactored_parent_code: str,
             continue  # check_no_dead_children already covers unreached children
         for i, arg in enumerate(captured[child.name]):
             if isinstance(arg, torch.Tensor):
-                # Reject 0-D scalar tensors — they have no tile-stream
-                # representation. Direct the LLM to pass a Python int instead
-                # (which classifies as IntArg and forwards unchanged).
-                if arg.dim() == 0:
+                # Reject any single-element tensor: 0-D (``torch.tensor(x)``)
+                # AND singleton higher-rank wraps like ``torch.tensor([x])``
+                # / ``x.unsqueeze(0)``. 0-D was the original ban — the planner
+                # LLM then evaded it by reaching for ``torch.tensor([n_head])``
+                # (rank 1, numel 1), which classify_arg accepted as
+                # ``TensorArg(shape=(1,))`` and pass-1 crashed deep inside
+                # ``_wrap_on_chip_call_args`` with ``tiled shape (1,) must be
+                # rank >= 2`` (kernelbench_opt_1p3b outer_0). All numel==1
+                # tensors are morally scalars; route them through IntArg.
+                if arg.numel() == 1:
                     raise GuardFailure(
-                        f"child {child.name!r} is called with a 0-D "
-                        f"torch.Tensor at position {i}; the DSL has no "
-                        f"scalar-tensor stream type. Pass the value as a "
-                        f"Python int instead (e.g. `dims[\"H\"]`, not "
-                        f"`torch.tensor(dims[\"H\"])`) so it classifies as "
-                        f"IntArg and the child receives it as a host-side "
+                        f"child {child.name!r} is called with a 1-element "
+                        f"torch.Tensor at position {i} (shape={tuple(arg.shape)}); "
+                        f"the DSL has no scalar-tensor stream type, and "
+                        f"singleton tensors like ``torch.tensor([x])`` or "
+                        f"``x.unsqueeze(0)`` have no tile-stream form either "
+                        f"(the on-chip wrap requires the last two dims to be "
+                        f"the tile). Pass the value as a Python int instead "
+                        f"(e.g. `dims[\"H\"]`, not `torch.tensor(dims[\"H\"])` "
+                        f"or `torch.tensor([dims[\"H\"]])`) so it classifies "
+                        f"as IntArg and the child receives it as a host-side "
                         f"scalar."
                     )
                 continue
