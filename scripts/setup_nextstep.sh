@@ -59,7 +59,7 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 step_tl_dir="$repo_root/step_tl"
 step_perf_dir="$step_tl_dir/step-perf"
-env_file="$step_tl_dir/environment.yml"
+env_file="$repo_root/environment.yml"
 proto_dir="$step_tl_dir/step_perf_ir/proto"
 python_proto_out="$step_tl_dir/src/proto"
 
@@ -200,7 +200,7 @@ install_native_build_deps() {
     return
   fi
 
-  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl >/dev/null 2>&1; then
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl >/dev/null 2>&1 && pkg-config --exists libgvc >/dev/null 2>&1; then
     if command -v m4 >/dev/null 2>&1; then
       return
     fi
@@ -208,14 +208,14 @@ install_native_build_deps() {
 
   if command -v apt-get >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then
     run apt-get update
-    run apt-get install -y build-essential pkg-config libssl-dev m4
+    run apt-get install -y build-essential pkg-config libssl-dev libgraphviz-dev graphviz m4
   elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && command -v apt-get >/dev/null 2>&1; then
     run sudo apt-get update
-    run sudo apt-get install -y build-essential pkg-config libssl-dev m4
+    run sudo apt-get install -y build-essential pkg-config libssl-dev libgraphviz-dev graphviz m4
   elif command -v brew >/dev/null 2>&1; then
-    run brew install pkgconf openssl m4
+    run brew install pkgconf openssl graphviz m4
   else
-    echo "error: pkg-config and OpenSSL development headers are required for step-perf" >&2
+    echo "error: pkg-config, OpenSSL headers, and Graphviz headers are required" >&2
     exit 1
   fi
 }
@@ -262,6 +262,8 @@ fi
 unset VIRTUAL_ENV
 
 run python -m pip install maturin grpcio-tools
+
+run python -c "import torch, torch._refs; from pathlib import Path; root = Path(torch.__file__).resolve().parent; assert (root / 'lib' / 'libtorch_global_deps.so').exists(), root; print('torch:', torch.__version__, torch.__file__)"
 
 run mkdir -p "$python_proto_out"
 run_shell "cd $proto_dir && python -m grpc_tools.protoc -I$proto_dir --python_out=$python_proto_out datatype.proto func.proto ops.proto graph.proto"

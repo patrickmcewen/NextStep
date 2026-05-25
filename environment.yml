@@ -85,7 +85,9 @@ dependencies:
       - starlette==1.0.0
       - sympy==1.14.0
       - tabulate==0.10.0
+      - tiktoken==0.13.0
       - torch==2.11.0
+      - transformers==4.57.6
       - tqdm==4.67.3
       - types-requests==2.33.0.20260408
       - typing-extensions==4.15.0
