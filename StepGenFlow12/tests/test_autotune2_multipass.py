@@ -534,3 +534,28 @@ def test_resolve_pass_specs_uses_time_limit_instead_of_turn_limit():
     assert specs[1]["time_limit_seconds"] == 90.0
     assert "max_turns_per_attempt" not in specs[0]
     assert "max_turns_per_attempt" not in specs[1]
+
+
+def test_stamp_pass_spec_payload_excludes_resume_runtime_knobs():
+    """Changing the time limit or ACE cadence should not invalidate completed
+    node libraries; those knobs affect how much more search can happen after
+    resume, not whether an existing snapshot is semantically valid."""
+    mod = _load_run_autotune2_module()
+    old = {
+        "name": "general",
+        "fewshot": "general",
+        "max_baselines_per_node": 4,
+        "baseline_selection": "pareto_diverse",
+        "time_limit_seconds": 3600.0,
+        "ace_context_enabled": True,
+        "ace_refresh_interval_turns": 10,
+        "attempt_budgets_bytes": [5000000],
+    }
+    new = {
+        **old,
+        "time_limit_seconds": 600.0,
+        "ace_context_enabled": False,
+        "ace_refresh_interval_turns": 4,
+    }
+
+    assert mod._stamp_pass_spec_payload(old) == mod._stamp_pass_spec_payload(new)

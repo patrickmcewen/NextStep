@@ -156,6 +156,28 @@ _PASS_SPEC_DEFAULTS = {
     "ace_refresh_interval_turns": 4,
 }
 
+_STAMP_EXCLUDED_PASS_SPEC_KEYS = frozenset({
+    "time_limit_seconds",
+    "ace_context_enabled",
+    "ace_refresh_interval_turns",
+})
+
+
+def _stamp_pass_spec_payload(spec: dict) -> dict:
+    """Return the pass-spec subset that should invalidate completed nodes.
+
+    Operational resume knobs such as wall-clock time limit and ACE refresh
+    cadence affect how much additional search can happen after resume, but
+    they do not change whether an already-written library snapshot is
+    semantically valid. Keeping them out of the stamp prevents a completed
+    node from rerunning just because the user resumes with a shorter time
+    budget.
+    """
+    return {
+        k: v for k, v in spec.items()
+        if k not in _STAMP_EXCLUDED_PASS_SPEC_KEYS
+    }
+
 
 def _resolve_pass_specs(
     autotune_config: dict, *, cli_args: argparse.Namespace, source: str,
@@ -915,7 +937,10 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             **base_stamp_extra,
             "attempt_budgets_bytes": spec["attempt_budgets_bytes"],
             "pass_specs": [
-                {k: v for k, v in s.items() if k != "attempt_budgets_bytes"}
+                _stamp_pass_spec_payload({
+                    k: v for k, v in s.items()
+                    if k != "attempt_budgets_bytes"
+                })
                 for s in pass_specs[: pass_idx + 1]
             ],
         }
