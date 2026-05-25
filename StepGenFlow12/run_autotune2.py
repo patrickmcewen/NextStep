@@ -154,7 +154,7 @@ _PASS_SPEC_DEFAULTS = {
     "baseline_selection": "pareto_diverse",
     "time_limit_seconds": 1800.0,
     "ace_context_enabled": False,
-    "ace_refresh_interval_turns": 4,
+    "ace_refresh_interval_turns": 10,
     "rust_sim_timeout_seconds": 1800,
     "rust_timeout_cycles": 10**15,
 }
@@ -206,7 +206,7 @@ def _resolve_pass_specs(
         "time_limit_seconds": cli_args.time_limit_seconds,
         "ace_context_enabled": getattr(cli_args, "ace_context", False),
         "ace_refresh_interval_turns": getattr(
-            cli_args, "ace_refresh_interval_turns", 4,
+            cli_args, "ace_refresh_interval_turns", 10,
         ),
     }
     config_defaults: dict = {}
@@ -1178,7 +1178,7 @@ def main() -> int:
         "--ace-refresh-interval-turns", type=int, default=10,
         help="Completed turns per lane before the shared ACE context "
              "manager refreshes the playbook and starts a new session "
-             "(default: 4).",
+             "(default: 10).",
     )
     parser.add_argument(
         "--check-order", default="correctness-first",

@@ -54,13 +54,11 @@ configs:
   autotune_config_moe:
     base: autotune2_base
     max_on_chip_memory: 25276420
+    attempt_budgets: [1.0, 1.0, 1.0, 1.0]
     passes:
-      - name: tiling
-        fewshot: tile_shrink
-        time_limit_seconds: 1800
-      - name: parallel
-        fewshot: parallel
-        time_limit_seconds: 1800
+      - name: general
+        fewshot: general
+        time_limit_seconds: 7200
 
   autotune_config_general:
     base: common_hw
