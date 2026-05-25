@@ -38,7 +38,13 @@ class Model(nn.Module):
                 cos, sin, k_cache, v_cache,
                 expert_onehot, expert_weights,
                 w_gate_list, w_up_list, w_down_list,
-                num_token_list, o_proj_weight):
+                num_token_list, seq_len, idx, o_proj_weight):
+        # ``seq_len`` (= num_token_list + 1) and ``idx`` (= arange(batch))
+        # are derived ragged metadata exposed to the STeP DSL agent so it
+        # can feed them straight into metadata_gen / cache_read_addr_gen.
+        # The PyTorch reference body doesn't consume them — it still
+        # iterates per batch row with Python `for i in range(batch)`.
+        del seq_len, idx  # silence "unused" linters; intentionally unused here
         # Derive per-call shape constants from the tensor args. Matches the
         # ``mc.*`` attrs used by precompute.py / step_impl.py: head_dim is
         # the trailing dim of cos/sin; num_heads / num_kv_heads come from
@@ -73,10 +79,13 @@ class Model(nn.Module):
         Q = Q * cos + _rotate_half(Q) * sin
         K = K * cos + _rotate_half(K) * sin
 
-        # [5] Append new K, V to KV cache at the per-batch sequence end
+        # [5] Append new K, V to KV cache at the per-batch sequence end.
+        # ``int(num_token_list[i])`` works for both list[int] and 1-D tensor
+        # forms — precompute now emits the tensor form for the DSL agent.
         for i in range(batch):
-            k_cache[i, num_token_list[i]] = K[i]
-            v_cache[i, num_token_list[i]] = V[i]
+            pos = int(num_token_list[i])
+            k_cache[i, pos] = K[i]
+            v_cache[i, pos] = V[i]
 
         # [6] GQA attention (numerically-stable softmax, no 1/sqrt(d) scaling).
         # Vectorize across kv-heads: view Q as [Hkv, qpkv, D] and permute the
@@ -85,10 +94,13 @@ class Model(nn.Module):
         attn_output = torch.zeros(batch, num_heads, head_dim)
         Q_grouped = Q.view(batch, num_kv_heads, query_per_kvhead, head_dim)
         for i in range(batch):
-            seq_len = num_token_list[i] + 1
+            # `seq_len_i` is the per-row total length after append, computed
+            # from `num_token_list[i]`. Different from the positional arg
+            # `seq_len` (a 1-D tensor view of the same quantity for the LLM).
+            seq_len_i = int(num_token_list[i]) + 1
             q_i = Q_grouped[i]                                # [Hkv, qpkv, D]
-            k_i = k_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
-            v_i = v_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
+            k_i = k_cache[i, :seq_len_i].permute(1, 0, 2)     # [Hkv, S, D]
+            v_i = v_cache[i, :seq_len_i].permute(1, 0, 2)     # [Hkv, S, D]
 
             scores = q_i @ k_i.transpose(-1, -2)              # [Hkv, qpkv, S]
             row_max = scores.amax(dim=-1, keepdim=True)
@@ -145,7 +157,7 @@ def get_inputs(dims):
         t["cos"], t["sin"], t["k_cache"], t["v_cache"],
         t["expert_onehot"], t["expert_weights"],
         t["w_gate_list"], t["w_up_list"], t["w_down_list"],
-        t["num_token_list"], t["o_proj_weight"],
+        t["num_token_list"], t["seq_len"], t["idx"], t["o_proj_weight"],
     ]
 
 

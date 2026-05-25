@@ -362,10 +362,11 @@ class StepTensor:
     cannot silently read a symbolic stream size.
     """
 
-    __slots__ = ("underlying_tensor", "stream_dtype", "dyn_mask", "dyn_origins", "offsets")
+    __slots__ = ("underlying_tensor", "stream_dtype", "dyn_mask", "dyn_origins",
+                 "offsets", "ragged_lengths")
 
     def __init__(self, underlying_tensor, stream_dtype, dyn_mask=None, dyn_origins=None,
-                 offsets=None):
+                 offsets=None, ragged_lengths=None):
         assert isinstance(underlying_tensor, torch.Tensor), \
             f"StepTensor.underlying_tensor must be torch.Tensor, got {type(underlying_tensor).__name__}"
         sr = _stream_rank(underlying_tensor, stream_dtype)
@@ -387,6 +388,13 @@ class StepTensor:
         self.dyn_mask = tuple(dyn_mask)
         self.dyn_origins = tuple(dyn_origins)
         self.offsets = offsets
+        # `ragged_lengths` (when set) mirrors the functional sim's RaggedTensor:
+        # a dict mapping a STREAM dim index (0 = outermost stream dim) to a
+        # 1-D `lengths` tensor whose shape matches the leading stream dims
+        # before that ragged dim. Set by `cache_read_addr_gen` /
+        # `filter_last_tile`; consumed by `random_offchip_load` to mask padded
+        # tiles to zero. Propagated through ops that preserve the ragged dim.
+        self.ragged_lengths = dict(ragged_lengths) if ragged_lengths else None
 
     @property
     def shape(self):

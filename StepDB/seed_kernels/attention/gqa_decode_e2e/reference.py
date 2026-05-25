@@ -19,7 +19,7 @@ def compute_gold(dims, tensors):
     Q = tensors["Q"]                          # [batch, num_heads, head_dim]
     k_cache = tensors["k_cache"]              # [batch, max_seq_len, num_kv_heads, head_dim]
     v_cache = tensors["v_cache"]              # [batch, max_seq_len, num_kv_heads, head_dim]
-    seq_lens = tensors["seq_lens"]            # list[int] of length batch
+    seq_lens = tensors["seq_lens"]            # 1-D int64 tensor of length batch
     o_proj_weight = tensors["o_proj_weight"]  # [num_heads * head_dim, hidden_dim]
 
     batch, num_heads, head_dim = Q.shape
@@ -35,7 +35,7 @@ def compute_gold(dims, tensors):
     attn_output = torch.zeros(batch, num_heads, head_dim)
     Q_grouped = Q.view(batch, num_kv_heads, query_per_kvhead, head_dim)
     for i in range(batch):
-        seq_len = seq_lens[i]
+        seq_len = int(seq_lens[i])
         q_i = Q_grouped[i]                                # [Hkv, qpkv, D]
         k_i = k_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
         v_i = v_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]

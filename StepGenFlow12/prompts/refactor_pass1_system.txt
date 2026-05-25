@@ -7,7 +7,7 @@ After this pass, {dsl_only_phrase} No raw tensor arithmetic (`*`, `+`, `/`), no 
 
 You cannot use python indexing to access parts of data tensors.
 
-You also may not create any new pytorch tensors besides the ones provided to you in the function, except for specifically torch.zeros(). The one explicit exception is converting a ``list[int]`` input (declared as such in the contract block) to a 1D int tensor via ``torch.tensor(<list_of_ints>)`` so it can be fed into a DSL producer like ``metadata_gen`` — that's a deterministic conversion of an existing positional input, not free-form tensor creation, and is required for ragged-dataflow patterns.
+You also may not create any new pytorch tensors besides the ones provided to you in the function, except for specifically torch.zeros(). All ragged-dataflow metadata (per-batch sequence lengths, slot indices, intra-tile offsets) is pre-emitted as 1-D ``torch.Tensor`` by precompute and arrives wrapped as ``StepRawTensor`` — feed those straight into ``metadata_gen`` / ``cache_read_addr_gen`` without further conversion.
 
 If the code is already fully in DSL form, output it unchanged.
 
@@ -57,10 +57,7 @@ Fix it by loading the value into a stream first, e.g. ``W = offchip_load(o_proj_
 
 Args tagged **on-chip** in the contract block are already streams (the parent emitted them from a sibling DSL op{onchip_source_tail}); pass them directly to consumers without an extra load.
 
-Some positional args may arrive as Python lists rather than tensors. The contract block tags these with ``list[Tensor(...)] x N`` or ``list[int] x N``:
-
-- ``list[Tensor]`` (e.g. per-expert weight stacks): iterate at host time and emit one DSL op per element. The natural pattern is ``loads = [offchip_load(w_list[i], ...) for i in range(len(w_list))]`` — the list is preserved at the lowering target as N parallel structural graph nodes (one off-chip load per expert), so the static for-loop here is the right shape, not a placeholder. Do **not** pass the list itself to a DSL consumer.
-- ``list[int]`` (e.g. per-batch sequence lengths): convert to a 1D tensor exactly once via ``torch.tensor(<list_arg>)`` and feed into ``metadata_gen`` (or ``cache_*_addr_gen`` etc.) so ragged downstream ops can read the per-row metadata. Do not iterate the list element-by-element to scalar-index DSL ops.
+Some positional args may arrive as Python lists rather than tensors. The contract block tags these with ``list[Tensor(...)] x N`` (e.g. per-expert weight stacks): iterate at host time and emit one DSL op per element. The natural pattern is ``loads = [offchip_load(w_list[i], ...) for i in range(len(w_list))]`` — the list is preserved at the lowering target as N parallel structural graph nodes (one off-chip load per expert), so the static for-loop here is the right shape, not a placeholder. Do **not** pass the list itself to a DSL consumer.
 
 ## Stride Convention
 
@@ -99,5 +96,88 @@ def tiled_reference(dims, tensors):
 Non-root functions **must not** call `offchip_store`. They hand a stream tensor up to their parent (via `return`); the parent (and ultimately the root) is responsible for the off-chip write. The regex compliance check rejects a root that omits `offchip_store`.
 
 The judge will reject any function whose name or signature deviates from the one rendered in the user prompt.
+
+## Reference: dynamic-sequence-length KV-cache idiom
+
+When a kernel reads per-request K/V tiles whose count varies per batch row, then splices a new token's row into the last existing tile, the canonical STeP composition is:
+
+  ragged read → filter last tile → splice → reassemble → matmul + accum
+
+The accum at the end **absorbs the ragged sequence dim**, so the visible output is per-request — no `max_seq` padding leaks past `offchip_store`. Equivalently: never call `offchip_store` on a stream whose innermost stream dim is the ragged one; reduce it away first (typically with `binary_matmul + accum_add(rank=<ragged_dim>)`).
+
+Key conventions in this idiom:
+
+- `idx`, `seq_len`, `offset` arrive as `[B]`-shaped `(tile 1,1)` metadata via `metadata_gen` (or are pre-emitted as such by the parent). `seq_len` is the tile count **after** the append. The IR rewriter auto-broadcasts a metadata source to multiple consumers — write each consumer call as if you were passing the original tensor, do not hand-roll `broadcast`.
+- `cache_read_addr_gen(idx, seq_len, row_offset)` reads `seq_len` tiles per row and attaches per-row lengths to the output stream; `random_offchip_load` then zeros padded slots automatically. Padded zero K means padded slots contribute zero through any downstream matmul, so `accum_add` over the ragged dim is identical to summing only the real tiles.
+- `filter_last_tile(seq_len)` picks the tile at index `seq_len-1` of each row; pair it with `flat_partition(..., n=2, partition_rank=0)` to split out the last tile from the prefix. Padded rows have all-zero multihot, so they drop out of both branches naturally.
+- `binary_set_offset` followed by `binary_row_wise_append` splices the new token row into the last tile at row `offset`. Flatten the metadata stream into the data stream's shape first (`flatten(..., min_rank=0, max_rank=1)`) so the binary maps line up. The V variant has the same shape: rename `_k` → `_v` and reuse the same `seq_len` / `offset` (one shared `idx` per request).
+- `flat_reassemble([last_updated, prefix], control=last_sel, reassemble_rank=0)` rejoins the spliced last tile with the prefix; the trailing singleton stream dim it produces is folded back via `flatten(..., min_rank=0, max_rank=1)`.
+
+```python
+def tiled_reference(dims, tensors):
+    B          = dims["B"]
+    D          = dims["D"]
+    tile_N     = dims["tile_N"]
+    ROW_OFFSET = dims["maxN"] // tile_N
+
+    # Metadata: idx (cache slot), seq_len (tile count after append),
+    # offset (intra-tile row for the new token).
+    idx     = metadata_gen(tensors["idx"])
+    seq_len = metadata_gen(tensors["seq_len"])
+    offset  = metadata_gen(tensors["offset"])
+
+    # Ragged-K cache read: padded tile slots are zeroed by random_offchip_load
+    # because cache_read_addr_gen tagged the output with per-row lengths.
+    raddr   = cache_read_addr_gen(idx, seq_len, row_offset=ROW_OFFSET)
+    k_tiles = random_offchip_load(
+        tensors["cache"], raddr=raddr, tile_row=tile_N, tile_col=D,
+    )
+
+    # New token row (one row per request) to splice into the last tile.
+    new_k = offchip_load(
+        tensors["new_k"], stride=(1,), out_shape_tiled=(B,),
+        tile_row=1, tile_col=D,
+    )
+
+    # Split out the last tile, splice new_k into row `offset`, then rejoin.
+    last_sel = filter_last_tile(seq_len)
+    last_tile, prefix_tiles = flat_partition(
+        k_tiles, last_sel, n=2, partition_rank=0,
+    )
+    offset_flat   = flatten(offset, min_rank=0, max_rank=1)
+    new_k_flat    = flatten(new_k,  min_rank=0, max_rank=1)
+    last_with_off = binary_set_offset(last_tile, offset_flat)
+    last_updated  = binary_row_wise_append(last_with_off, new_k_flat)
+    appended_k    = flatten(
+        flat_reassemble(
+            [last_updated, prefix_tiles],
+            control=last_sel, reassemble_rank=0,
+        ),
+        min_rank=0, max_rank=1,
+    )
+
+    # Optional: write the updated last tile back to the cache. The cache
+    # is an off-chip side effect; the kernel's *output* still flows through
+    # offchip_store at the bottom of the function.
+    waddr      = binary_cache_write_addr_gen(idx, seq_len, row_offset=ROW_OFFSET)
+    waddr_flat = flatten(waddr, min_rank=0, max_rank=1)
+    random_offchip_store(
+        tensors["cache"], wdata=last_updated, waddr=waddr_flat,
+        tile_row=tile_N, tile_col=D,
+    )
+
+    # Per-request Q . K^T over the ragged seq dim, then absorb the ragged
+    # dim with accum_add(rank=1). Output stream rank is 2; no max_seq leak.
+    q = offchip_load(
+        tensors["Q"], stride=(1,), out_shape_tiled=(B,),
+        tile_row=1, tile_col=D,
+    )
+    q_expanded = repeat_ref(q, appended_k)
+    qkt        = binary_matmul(q_expanded, appended_k, weight_transposed=True)
+    pooled     = accum_add(qkt, rank=1)
+    return offchip_store(pooled)
+```
+
+This is a single-head sketch; for multi-head, lift `tensors["cache"]` / `tensors["new_k"]` / `tensors["Q"]` to carry the head dim and tile/repeat accordingly — the ragged-read / splice / reassemble / matmul-accum core is unchanged. The dims here (`B`, `D`, `tile_N`, `maxN`) are illustrative; adapt to whatever the parent contract gives you.
 
 {few_shot_examples}

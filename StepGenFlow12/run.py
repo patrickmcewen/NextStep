@@ -119,7 +119,7 @@ def main():
         help="Disable Phase 0 (decomposition planner). Falls back to single-node refactor.",
     )
     parser.add_argument(
-        "--max-replans", type=int, default=1,
+        "--max-replans", type=int, default=0,
         help="Global re-plan budget on Phase 1 failure. Default 3.",
     )
     parser.add_argument(
