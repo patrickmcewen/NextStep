@@ -138,7 +138,8 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
                     timing_only: bool = False,
                     step_impl_source: str | None = None,
                     max_total_compute_bw: int | None = None,
-                    tensors_override: dict | None = None) -> EvalResult:
+                    tensors_override: dict | None = None,
+                    sim_timeout_seconds: float | None = None) -> EvalResult:
     """Run the full evaluation pipeline for a single kernel pair + preset.
 
     Stages: exec -> simulate -> correctness -> success.
@@ -154,6 +155,9 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     same routine as ``validate_timing.normalize_compute_bw``. Autotuners pass
     this so the rust sim runs against the same compute budget the analytical
     scorer used to rank candidates.
+    ``sim_timeout_seconds`` overrides the default simulator subprocess
+    timeout for this call. On timeout the simulator subprocess is killed by
+    ``subprocess.run`` and this function returns a simulate-stage failure.
     """
     dims = get_dims(kernel_name, preset)
     ref_mod = None if timing_only else load_problem(kernel_name)
@@ -250,16 +254,31 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     env = os.environ.copy()
     env["PYTHONPATH"] = pythonpath
 
-    proc = subprocess.run(
-        [sys.executable, "-c", sim_runner_script,
-         work_dir, pb_path,
-         json.dumps(asdict(hbm_config)),
-         json.dumps({"channel_depth": sim_config.channel_depth,
-                      "functional_sim": sim_config.functional_sim,
-                      "mock_bf16": sim_config.mock_bf16})],
-        capture_output=True, text=True, timeout=SIM_TIMEOUT_SECONDS,
-        env=env,
+    timeout = (
+        SIM_TIMEOUT_SECONDS
+        if sim_timeout_seconds is None else float(sim_timeout_seconds)
     )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", sim_runner_script,
+             work_dir, pb_path,
+             json.dumps(asdict(hbm_config)),
+             json.dumps({"channel_depth": sim_config.channel_depth,
+                          "functional_sim": sim_config.functional_sim,
+                          "mock_bf16": sim_config.mock_bf16})],
+            capture_output=True, text=True, timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _write_result(work_dir, EvalResult(
+            kernel=kernel_name, preset=preset, stage="simulate",
+            success=False, dims=dims,
+            error_message=(
+                f"Simulator timed out after {timeout:g} seconds. "
+                f"stdout tail:\n{(exc.stdout or '')[-2000:]}\n"
+                f"stderr tail:\n{(exc.stderr or '')[-2000:]}"
+            ),
+        ))
 
     if proc.returncode != 0:
         return _write_result(work_dir, EvalResult(

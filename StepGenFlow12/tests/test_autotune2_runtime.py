@@ -237,6 +237,81 @@ def test_build_rust_evaluate_fn_uses_node_path_and_trace_label(
     assert (expected / "step_impl.py").exists()
 
 
+def test_build_rust_evaluate_fn_forwards_sim_timeout(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeEvalResult:
+        success = True
+        stage = "success"
+        cycle_time = 123.0
+        max_diff = 0.0
+        error_message = None
+
+    fake_evaluate_mod = types.ModuleType("evaluate")
+
+    def fake_evaluate_kernel(**kwargs):
+        captured.update(kwargs)
+        return FakeEvalResult()
+
+    fake_evaluate_mod.evaluate_kernel = fake_evaluate_kernel
+    monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate_mod)
+
+    import src.dsl_to_step as dsl_to_step
+
+    monkeypatch.setattr(
+        dsl_to_step,
+        "translate",
+        lambda _source: "def build_graph(dims, tensors):\n    pass\n",
+    )
+
+    rust_eval = build_rust_evaluate_fn(
+        work_dir=tmp_path,
+        kernel_name="prefill_transformer_simple",
+        preset="small",
+        timing_only=True,
+        rust_sim_timeout_seconds=17.5,
+    )
+
+    cycles, _dur_ms = rust_eval("# dsl")
+
+    assert cycles == 123
+    assert captured["sim_timeout_seconds"] == 17.5
+
+
+def test_build_rust_evaluate_fn_timeout_returns_high_cycles(tmp_path, monkeypatch):
+    class FakeEvalResult:
+        success = False
+        stage = "simulate"
+        cycle_time = None
+        max_diff = None
+        error_message = "Simulator timed out after 17.5 seconds"
+
+    fake_evaluate_mod = types.ModuleType("evaluate")
+    fake_evaluate_mod.evaluate_kernel = lambda **_kwargs: FakeEvalResult()
+    monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate_mod)
+
+    import src.dsl_to_step as dsl_to_step
+
+    monkeypatch.setattr(
+        dsl_to_step,
+        "translate",
+        lambda _source: "def build_graph(dims, tensors):\n    pass\n",
+    )
+
+    rust_eval = build_rust_evaluate_fn(
+        work_dir=tmp_path,
+        kernel_name="prefill_transformer_simple",
+        preset="small",
+        timing_only=True,
+        rust_sim_timeout_seconds=17.5,
+        rust_timeout_cycles=987654321,
+    )
+
+    cycles, _dur_ms = rust_eval("# dsl")
+
+    assert cycles == 987654321
+
+
 def test_build_rust_evaluate_fn_does_not_reuse_existing_trace_label(
     tmp_path, monkeypatch,
 ):

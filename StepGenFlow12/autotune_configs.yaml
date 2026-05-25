@@ -67,6 +67,8 @@ configs:
     max_on_chip_memory: 5000000
     attempt_budgets: [1.0, 1.0, 1.0]
     max_baselines_per_node: 4
+    rust_sim_timeout_seconds: 600
+    rust_timeout_cycles: 1000000000
     baseline_selection: pareto_diverse
     passes:
       - name: general

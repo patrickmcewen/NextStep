@@ -536,6 +536,25 @@ def test_resolve_pass_specs_uses_time_limit_instead_of_turn_limit():
     assert "max_turns_per_attempt" not in specs[1]
 
 
+def test_resolve_pass_specs_threads_rust_timeout_knobs():
+    mod = _load_run_autotune2_module()
+    cfg = {
+        "hw_config": {},
+        "max_on_chip_memory": 1000,
+        "attempt_budgets": [None],
+        "rust_sim_timeout_seconds": 45.0,
+        "rust_timeout_cycles": 123456789,
+        "passes": [{"name": "general"}],
+    }
+
+    specs, _ = mod._resolve_pass_specs(
+        cfg, cli_args=_cli_args(), source="test",
+    )
+
+    assert specs[0]["rust_sim_timeout_seconds"] == 45.0
+    assert specs[0]["rust_timeout_cycles"] == 123456789
+
+
 def test_stamp_pass_spec_payload_excludes_resume_runtime_knobs():
     """Changing the time limit or ACE cadence should not invalidate completed
     node libraries; those knobs affect how much more search can happen after
@@ -556,6 +575,8 @@ def test_stamp_pass_spec_payload_excludes_resume_runtime_knobs():
         "time_limit_seconds": 600.0,
         "ace_context_enabled": False,
         "ace_refresh_interval_turns": 4,
+        "rust_sim_timeout_seconds": 30.0,
+        "rust_timeout_cycles": 999999,
     }
 
     assert mod._stamp_pass_spec_payload(old) == mod._stamp_pass_spec_payload(new)

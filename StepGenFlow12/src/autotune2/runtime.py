@@ -781,6 +781,8 @@ def build_rust_evaluate_fn(
     tensors: dict | None = None,
     timing_only: bool = False,
     max_total_compute_bw: int | None = None,
+    rust_sim_timeout_seconds: float | None = None,
+    rust_timeout_cycles: int = 10**15,
 ) -> RustEvaluateFn:
     """Build a rust evaluator that writes a temp DSL file and invokes
     ``StepDB/evaluate.py``'s rust simulator subprocess.
@@ -808,6 +810,12 @@ def build_rust_evaluate_fn(
     that ``make_analytical_scorer`` got, or the analytical-vs-rust
     cycle comparison in the summary uses two different cost models.
 
+    ``rust_sim_timeout_seconds`` is forwarded to StepDB's simulator
+    subprocess timeout. If that timeout fires, the rust evaluator returns
+    ``rust_timeout_cycles`` instead of raising, so the variant is recorded
+    as a deliberately bad high-cycle measurement and the autotune run can
+    keep moving.
+
     Each call writes its artifacts under a unique labeled subdirectory.
     In-loop callers pass ``node_path`` and a trace ``run_label`` so the
     hierarchy mirrors the autotune checkpoint that produced the variant,
@@ -823,6 +831,8 @@ def build_rust_evaluate_fn(
     instead of StepDB's root-kernel precompute dict.
     """
     import threading
+    build_timeout_seconds = rust_sim_timeout_seconds
+    build_timeout_cycles = int(rust_timeout_cycles)
     _counter = {"i": 0}
     _counter_lock = threading.Lock()
 
@@ -832,6 +842,8 @@ def build_rust_evaluate_fn(
         tensors_override: dict | None = None,
         node_path: str | None = None,
         run_label: str | None = None,
+        rust_sim_timeout_seconds: float | None = None,
+        rust_timeout_cycles: int | None = None,
     ) -> tuple[int, float]:
         import sys
         import time
@@ -880,11 +892,28 @@ def build_rust_evaluate_fn(
             timing_only=timing_only,
             step_impl_source=step_source,
             max_total_compute_bw=max_total_compute_bw,
+            sim_timeout_seconds=(
+                rust_sim_timeout_seconds
+                if rust_sim_timeout_seconds is not None
+                else build_timeout_seconds
+            ),
             tensors_override=(
                 tensors if tensors_override is None else tensors_override
             ),
         )
         dur_ms = (time.perf_counter() - t0) * 1000.0
+
+        if (
+            not result.success
+            and result.stage == "simulate"
+            and result.error_message is not None
+            and "timed out" in result.error_message.lower()
+        ):
+            return int(
+                rust_timeout_cycles
+                if rust_timeout_cycles is not None
+                else build_timeout_cycles
+            ), dur_ms
 
         # Stage "correctness" is the only failure mode that means "the sim
         # ran and produced a number, but the produced output is wrong" —

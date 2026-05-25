@@ -145,7 +145,8 @@ def _resolve_attempt_budgets(
 _PASS_KNOBS = (
     "fewshot", "max_baselines_per_node", "baseline_selection",
     "attempt_budgets", "time_limit_seconds", "ace_context_enabled",
-    "ace_refresh_interval_turns",
+    "ace_refresh_interval_turns", "rust_sim_timeout_seconds",
+    "rust_timeout_cycles",
 )
 _PASS_SPEC_DEFAULTS = {
     "fewshot": "tile_shrink",
@@ -154,12 +155,16 @@ _PASS_SPEC_DEFAULTS = {
     "time_limit_seconds": 1800.0,
     "ace_context_enabled": False,
     "ace_refresh_interval_turns": 4,
+    "rust_sim_timeout_seconds": 1800,
+    "rust_timeout_cycles": 10**15,
 }
 
 _STAMP_EXCLUDED_PASS_SPEC_KEYS = frozenset({
     "time_limit_seconds",
     "ace_context_enabled",
     "ace_refresh_interval_turns",
+    "rust_sim_timeout_seconds",
+    "rust_timeout_cycles",
 })
 
 
@@ -260,6 +265,25 @@ def _resolve_pass_specs(
         ), (
             f"{source} passes[{i}].ace_refresh_interval_turns must be an "
             f"integer >= 1, got {spec['ace_refresh_interval_turns']!r}"
+        )
+        assert spec["rust_sim_timeout_seconds"] is None or (
+            isinstance(spec["rust_sim_timeout_seconds"], (int, float))
+            and spec["rust_sim_timeout_seconds"] > 0
+        ), (
+            f"{source} passes[{i}].rust_sim_timeout_seconds must be null "
+            f"or a positive number, got "
+            f"{spec['rust_sim_timeout_seconds']!r}"
+        )
+        if spec["rust_sim_timeout_seconds"] is not None:
+            spec["rust_sim_timeout_seconds"] = float(
+                spec["rust_sim_timeout_seconds"]
+            )
+        assert (
+            isinstance(spec["rust_timeout_cycles"], int)
+            and spec["rust_timeout_cycles"] > 0
+        ), (
+            f"{source} passes[{i}].rust_timeout_cycles must be a positive "
+            f"int, got {spec['rust_timeout_cycles']!r}"
         )
         budgets = p.get("attempt_budgets", top_level_budgets)
         spec["attempt_budgets_bytes"] = _resolve_attempt_budgets(
@@ -675,6 +699,21 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         timing_only=not args.rust_functional_check,
         max_total_compute_bw=args.compute_bw,
     )
+    current_rust_timeout = {
+        "seconds": None,
+        "cycles": 10**15,
+    }
+
+    def root_rust_evaluate(
+        composed_source: str,
+        **kwargs,
+    ):
+        return rust_evaluate(
+            composed_source,
+            rust_sim_timeout_seconds=current_rust_timeout["seconds"],
+            rust_timeout_cycles=current_rust_timeout["cycles"],
+            **kwargs,
+        )
 
     # Several modes need a per-target candidate-fetcher and one or more
     # of {curation, decision, final-pick} agents. Build them up-front so
@@ -797,6 +836,8 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
                 tensors_override=node_tensors,
                 node_path=node_path,
                 run_label=run_label,
+                rust_sim_timeout_seconds=current_rust_timeout["seconds"],
+                rust_timeout_cycles=current_rust_timeout["cycles"],
             )
 
         if args.sim_mode == "analytical":
@@ -927,6 +968,8 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         )
 
     for pass_idx, spec in enumerate(pass_specs):
+        current_rust_timeout["seconds"] = spec["rust_sim_timeout_seconds"]
+        current_rust_timeout["cycles"] = spec["rust_timeout_cycles"]
         pass_subdir = (
             f"pass_{pass_idx}_{spec['name']}" if is_multi_pass else None
         )
@@ -1009,7 +1052,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     if args.root_pick == "final_pick":
         promotions = final_pick(
             root_library=result.root_library(),
-            rust_evaluate_fn=rust_evaluate,
+            rust_evaluate_fn=root_rust_evaluate,
             strategy="min_cycles",
         )
         root_pick_strategy = "final_pick:min_cycles"
@@ -1022,7 +1065,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         )
         promotions = await final_pick_agent(
             root_library=result.root_library(),
-            rust_evaluate_fn=rust_evaluate,
+            rust_evaluate_fn=root_rust_evaluate,
             curation_agent_fn=curation_agent_fn,
             final_pick_agent_fn=final_pick_agent_fn,
             fetch_candidates_fn=fetch_candidates_fn,
@@ -1040,7 +1083,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         promotions = promote_top_k(
             root_library=result.root_library(),
             k=args.top_k,
-            rust_evaluate_fn=rust_evaluate,
+            rust_evaluate_fn=root_rust_evaluate,
         )
         root_pick_strategy = f"top_k:{args.top_k}"
 
