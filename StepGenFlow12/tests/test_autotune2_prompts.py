@@ -167,8 +167,9 @@ def test_system_prompt_embeds_step_dsl_code():
 def test_system_prompt_distinguishes_leaf_and_parent():
     leaf = build_autotune2_system_prompt(is_leaf=True, dsl_code="X")
     parent = build_autotune2_system_prompt(is_leaf=False, dsl_code="X")
-    # Parent protocol mentions child_picks; leaf protocol does not.
-    assert "child_picks" in parent
+    # Child selection is deterministic/system-side; neither prompt should ask
+    # the LLM to pick child variants.
+    assert "child_picks" not in parent
     assert "child_picks" not in leaf
 
 
@@ -343,7 +344,19 @@ def test_user_prompt_parent_embeds_variant_tables():
     )
     assert "<<ATTN-TABLE>>" in out
     assert "<<MOE-TABLE>>" in out
-    assert "child_picks" in out
+    assert "child_picks" not in out
+    assert "Pick exactly one" not in out
+
+
+def test_user_prompt_parent_accepts_child_design_examples_without_variant_tables():
+    out = build_autotune2_user_prompt(
+        is_leaf=False,
+        child_design_examples="### Child attention_block best design\n```python\n# child code\n```",
+        **_PROMPT_KWARGS,
+    )
+    assert "Child design examples" in out
+    assert "# child code" in out
+    assert "Pick exactly one" not in out
 
 
 # --- render_accepted_summary -------------------------------------------------
@@ -401,9 +414,6 @@ _PARENT_RESPONSE_OK = """\
 Some preamble from the agent...
 
 ```yaml
-child_picks:
-  attention_block: 3
-  moe_block: 1
 parent_input_contracts:
   Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
 ```
@@ -418,18 +428,35 @@ Trailing chatter.
 
 def test_parse_parent_response_happy_path():
     r = parse_autotune2_response(_PARENT_RESPONSE_OK, is_leaf=False)
-    assert r.child_picks == {"attention_block": 3, "moe_block": 1}
     assert r.input_contracts["Q"].reshape == (8, 8, 64)
     assert r.input_contracts["Q"].permutation == (1, 0, 2)
     assert "def my_parent" in r.dsl
 
 
-def test_parse_parent_response_validates_expected_children():
-    with pytest.raises(AssertionError, match="must equal expected_child_names"):
-        parse_autotune2_response(
-            _PARENT_RESPONSE_OK, is_leaf=False,
-            expected_child_names=("attention_block", "moe_block", "extra_one"),
-        )
+def test_parse_parent_response_rejects_child_picks():
+    body = """\
+```yaml
+child_picks:
+  attention_block: 3
+parent_input_contracts:
+  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
+```
+
+```python
+def my_parent(Q, *, out_shapes):
+    return None
+```
+"""
+    with pytest.raises(AssertionError, match="unexpected yaml keys"):
+        parse_autotune2_response(body, is_leaf=False)
+
+
+def test_parse_parent_response_ignores_expected_children_when_no_child_picks():
+    r = parse_autotune2_response(
+        _PARENT_RESPONSE_OK, is_leaf=False,
+        expected_child_names=("attention_block", "moe_block", "extra_one"),
+    )
+    assert r.input_contracts["Q"].reshape == (8, 8, 64)
 
 
 _LEAF_RESPONSE_OK = """\
@@ -447,7 +474,6 @@ def gqa_attention(Q, K, V, *, out_shapes):
 
 def test_parse_leaf_response_happy_path():
     r = parse_autotune2_response(_LEAF_RESPONSE_OK, is_leaf=True)
-    assert r.child_picks == {}
     assert r.input_contracts["Q"] == TensorContract(
         reshape=(8, 8, 64), permutation=(1, 0, 2))
     assert "def gqa_attention" in r.dsl

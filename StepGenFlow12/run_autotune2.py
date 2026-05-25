@@ -643,13 +643,6 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
     else:
         agent_decision_store = None
 
-    # ``RustAll`` instances across nodes share one ``TimeBudget`` via this
-    # closure so the per-pass wall-clock cap is enforced collectively
-    # (not per-node). ``start_pass`` on any node manager resets it; the
-    # driver calls start_pass from every node task with the same seconds
-    # so the resets are idempotent.
-    shared_time_budget = TimeBudget(total_seconds=None)
-
     # Built up-front (not after the autotune loop) so the RustAll factory
     # below can capture it. ``promote_top_k`` reuses the same closure.
     rust_evaluate = build_rust_evaluate_fn(
@@ -761,15 +754,27 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             final_pick_agent_fn = _make_agent_call(final_pick_agent_inst)
 
     def make_sim_manager(node_tensors: dict):
+        # Each autotune node gets its own simulator time budget. Sibling
+        # nodes still run in parallel, but a long-running leaf can no
+        # longer consume the rust/agent budget that a parent should get
+        # after its children finish.
+        node_time_budget = TimeBudget(total_seconds=None)
         score_fn = make_analytical_scorer(
             dims=state["dims"], tensors=node_tensors,
             hw_config=state["hw_config"],
             max_total_compute_bw=args.compute_bw,
         )
-        def node_rust_evaluate(composed_source: str):
+        def node_rust_evaluate(
+            composed_source: str,
+            *,
+            node_path: str | None = None,
+            run_label: str | None = None,
+        ):
             return rust_evaluate(
                 composed_source,
                 tensors_override=node_tensors,
+                node_path=node_path,
+                run_label=run_label,
             )
 
         if args.sim_mode == "analytical":
@@ -778,7 +783,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             return RustAll(
                 score_fn=score_fn,
                 rust_evaluate_fn=node_rust_evaluate,
-                time_budget=shared_time_budget,
+                time_budget=node_time_budget,
                 calibration_store=calibration_store,
                 sources_dir=calibration_sources_dir,
                 kernel=args.kernel,
@@ -791,7 +796,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             return DeterministicSplit(
                 score_fn=score_fn,
                 rust_evaluate_fn=node_rust_evaluate,
-                time_budget=shared_time_budget,
+                time_budget=node_time_budget,
                 calibration_store=calibration_store,
                 sources_dir=calibration_sources_dir,
                 kernel=args.kernel,
@@ -804,7 +809,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
         return AgentManager(
             score_fn=score_fn,
             rust_evaluate_fn=node_rust_evaluate,
-            time_budget=shared_time_budget,
+            time_budget=node_time_budget,
             calibration_store=calibration_store,
             sources_dir=calibration_sources_dir,
             kernel=args.kernel,

@@ -133,6 +133,168 @@ def test_build_rust_evaluate_fn_forwards_node_tensors_override(tmp_path, monkeyp
     assert captured["tensors_override"] is node_tensors
 
 
+def test_build_rust_evaluate_fn_does_not_reuse_existing_default_dirs(
+    tmp_path, monkeypatch,
+):
+    captured = {}
+
+    class FakeEvalResult:
+        success = True
+        stage = "success"
+        cycle_time = 123.0
+        max_diff = 0.0
+        error_message = None
+
+    fake_evaluate_mod = types.ModuleType("evaluate")
+
+    def fake_evaluate_kernel(**kwargs):
+        captured.update(kwargs)
+        return FakeEvalResult()
+
+    fake_evaluate_mod.evaluate_kernel = fake_evaluate_kernel
+    monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate_mod)
+
+    import src.dsl_to_step as dsl_to_step
+
+    monkeypatch.setattr(
+        dsl_to_step,
+        "translate",
+        lambda _source: "def build_graph(dims, tensors):\n    pass\n",
+    )
+
+    (tmp_path / "rust_eval_0").mkdir()
+    (tmp_path / "rust_eval_0" / "step_impl.py").write_text("old sentinel\n")
+
+    rust_eval = build_rust_evaluate_fn(
+        work_dir=tmp_path,
+        kernel_name="prefill_transformer_simple",
+        preset="small",
+        timing_only=True,
+    )
+
+    cycles, _dur_ms = rust_eval("# dsl")
+
+    assert cycles == 123
+    assert Path(captured["work_dir"]).name == "rust_eval_0__1"
+    assert (tmp_path / "rust_eval_0__1" / "step_impl.py").exists()
+    assert (
+        (tmp_path / "rust_eval_0" / "step_impl.py").read_text()
+        == "old sentinel\n"
+    )
+
+
+def test_build_rust_evaluate_fn_uses_node_path_and_trace_label(
+    tmp_path, monkeypatch,
+):
+    captured = {}
+
+    class FakeEvalResult:
+        success = True
+        stage = "success"
+        cycle_time = 123.0
+        max_diff = 0.0
+        error_message = None
+
+    fake_evaluate_mod = types.ModuleType("evaluate")
+
+    def fake_evaluate_kernel(**kwargs):
+        captured.update(kwargs)
+        return FakeEvalResult()
+
+    fake_evaluate_mod.evaluate_kernel = fake_evaluate_kernel
+    monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate_mod)
+
+    import src.dsl_to_step as dsl_to_step
+
+    monkeypatch.setattr(
+        dsl_to_step,
+        "translate",
+        lambda _source: "def build_graph(dims, tensors):\n    pass\n",
+    )
+
+    rust_eval = build_rust_evaluate_fn(
+        work_dir=tmp_path,
+        kernel_name="prefill_transformer_simple",
+        preset="small",
+        timing_only=True,
+    )
+
+    cycles, _dur_ms = rust_eval(
+        "# dsl",
+        node_path="root/moe",
+        run_label=(
+            "pass_0_general/baseline_0_attempt_1_b5000000/"
+            "session_0/turn_1"
+        ),
+    )
+
+    expected = (
+        tmp_path / "root" / "moe" / "pass_0_general"
+        / "baseline_0_attempt_1_b5000000" / "session_0" / "turn_1"
+    )
+    assert cycles == 123
+    assert Path(captured["work_dir"]) == expected
+    assert (expected / "step_impl.py").exists()
+
+
+def test_build_rust_evaluate_fn_does_not_reuse_existing_trace_label(
+    tmp_path, monkeypatch,
+):
+    captured = {}
+
+    class FakeEvalResult:
+        success = True
+        stage = "success"
+        cycle_time = 123.0
+        max_diff = 0.0
+        error_message = None
+
+    fake_evaluate_mod = types.ModuleType("evaluate")
+
+    def fake_evaluate_kernel(**kwargs):
+        captured.update(kwargs)
+        return FakeEvalResult()
+
+    fake_evaluate_mod.evaluate_kernel = fake_evaluate_kernel
+    monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate_mod)
+
+    import src.dsl_to_step as dsl_to_step
+
+    monkeypatch.setattr(
+        dsl_to_step,
+        "translate",
+        lambda _source: "def build_graph(dims, tensors):\n    pass\n",
+    )
+
+    existing = (
+        tmp_path / "root" / "moe" / "pass_0_general"
+        / "baseline_0_attempt_1_b5000000" / "session_0" / "turn_1"
+    )
+    existing.mkdir(parents=True)
+    (existing / "step_impl.py").write_text("old sentinel\n")
+
+    rust_eval = build_rust_evaluate_fn(
+        work_dir=tmp_path,
+        kernel_name="prefill_transformer_simple",
+        preset="small",
+        timing_only=True,
+    )
+
+    rust_eval(
+        "# dsl",
+        node_path="root/moe",
+        run_label=(
+            "pass_0_general/baseline_0_attempt_1_b5000000/"
+            "session_0/turn_1"
+        ),
+    )
+
+    expected = existing.parent / "turn_1__1"
+    assert Path(captured["work_dir"]) == expected
+    assert (expected / "step_impl.py").exists()
+    assert (existing / "step_impl.py").read_text() == "old sentinel\n"
+
+
 def test_promote_top_k_runs_rust_per_pick_and_sorts_by_rust_cycles():
     lib = _root_lib_with_entries([
         (50, 100, "A"),
@@ -320,6 +482,9 @@ def test_write_summary_includes_pareto_and_winner(tmp_path):
     payload = json.loads(out.read_text())
     assert payload["root_path"] == "root"
     assert payload["library_sizes"]["root"] == 1
+    assert payload["library_cell_counts"]["root"] == 1
+    assert payload["library_entry_counts"]["root"] == 2
+    assert payload["library_llm_entry_counts"]["root"] == 1
     # root_pareto sorted by cycles
     assert payload["root_pareto"][0]["cycles"] == 40
     assert payload["root_pareto"][1]["cycles"] == 50

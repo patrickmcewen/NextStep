@@ -4,9 +4,9 @@ timing model.
 
 The Rust simulator is ground truth but slow (seconds to hours). The
 analytical model is instant but can be off by 2x or more on some op
-patterns. You have a per-pass wall-clock budget shared across every node in
-the search; once it runs out the loop is forced to analytical regardless of
-what you say.
+patterns. You have a node-local wall-clock budget for the current autotune
+pass; once it runs out the loop is forced to analytical regardless of what
+you say.
 
 You will receive per call:
   - the variant's composed DSL source,

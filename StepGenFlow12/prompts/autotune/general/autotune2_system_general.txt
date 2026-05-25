@@ -14,7 +14,7 @@ library) waste the pass budget. Aim for distinct, coherent choices of:
   - on-chip vs streaming layout (which tensors materialize, which stay
     in streams)
   - boundary contracts (reshape + permutation of inputs/outputs)
-  - for parents: which child variant index to pick per child
+  - for parents: how to compose with or adapt ideas from the best child designs
 
 You will be given a verified pass-1 DSL design as a reference; treat it
 as one valid point in the design space, not as ground truth.

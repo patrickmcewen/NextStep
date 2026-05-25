@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from src.autotune2.compose import compose_source
 from src.autotune2.contracts import (
     DesignEntry,
     NodeLibrary,
@@ -28,6 +29,8 @@ from src.autotune2.search import (
     NodePromptInputs,
     SearchConfig,
     VerifyResult,
+    _child_helper_options,
+    _rename_top_level_function,
     autotune,
     build_node_tensors_dict,
     build_synthetic_wrapper_for_node,
@@ -36,6 +39,7 @@ from src.autotune2.search import (
     find_pass1_baseline_entry,
     gather_descendants_postorder,
     library_to_variant_registry,
+    render_child_design_examples,
     render_library_as_variant_summaries,
     search_leaf,
     search_parent,
@@ -391,6 +395,29 @@ def test_gather_descendants_post_order_two_levels():
     out = gather_descendants_postorder(parent)
     # grandchild before childA; childA before childB; parent NOT included.
     assert out == ["# grandchild\n", "# childA\n", "# childB\n"]
+
+
+def test_gather_descendants_renames_child_aliases_and_prunes_uncalled_children():
+    child = DesignEntry(dsl="def child_under(x, *, out_shapes):\n    return x\n")
+    parent = DesignEntry(
+        dsl="def parent(x, *, out_shapes):\n    return child_under_1(x, out_shapes=out_shapes)\n",
+        children_picks={"root/child_under": child},
+        child_call_aliases={"root/child_under": "child_under_1"},
+    )
+
+    out = gather_descendants_postorder(parent)
+
+    assert out == [
+        "def child_under_1(x, *, out_shapes):\n    return x\n"
+    ]
+
+
+def test_rename_top_level_function_preserves_body():
+    src = "def child_under(x, *, out_shapes):\n    return x\n"
+
+    assert _rename_top_level_function(src, "child_under_2") == (
+        "def child_under_2(x, *, out_shapes):\n    return x\n"
+    )
 
 
 # --- find_pass1_baseline_entry -----------------------------------------------
@@ -1130,9 +1157,10 @@ def _make_parent_response(child_name: str, variant_idx: int):
     )
 
 
-def test_search_parent_picks_one_child_entry_and_admits(tmp_path):
-    """search_parent resolves child_picks to one concrete DesignEntry per
-    child (no Cartesian sweep) and admits the resulting composition."""
+def test_search_parent_rejects_child_picks_before_verify(tmp_path):
+    """Parent responses no longer get to select child variants. Child picks
+    are deterministic/system-side so the prompt cannot reintroduce the old
+    opaque index mechanism."""
     child_node = _leaf("child_under")
     child_lib: NodeLibrary = {}
     c_id = vanilla_contract_for((4, 8))
@@ -1154,10 +1182,11 @@ def test_search_parent_picks_one_child_entry_and_admits(tmp_path):
     parent_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
 
     async def agent(_conversation):
-        # variant_idx=1 → cell1's single entry (the second per-entry index).
         return _make_parent_response("child_under", variant_idx=1)
 
+    verify_calls = [0]
     async def verifier(_src, *_a, **_kw):
+        verify_calls[0] += 1
         return VerifyResult(passed=True)
 
     score_calls = []
@@ -1179,11 +1208,21 @@ def test_search_parent_picks_one_child_entry_and_admits(tmp_path):
         config=_search_config(1, [None]*1),
     ))
 
-    # Two scoring calls expected: baseline + exactly one LLM composition
-    # (no Cartesian sweep — one DesignEntry per child).
-    assert len(score_calls) == 2
+    # Only the baseline should score; the LLM turn is a parse failure before
+    # composition/verification.
+    assert len(score_calls) == 1
+    assert verify_calls[0] == 0
+    statuses = [
+        p.read_text()
+        for p in (tmp_path / "parent").glob(
+            "baseline_0_attempt_0_b*/turn_0/status.txt"
+        )
+    ]
+    assert len(statuses) == 1
+    assert statuses[0].startswith("PARSE_FAIL:")
+    assert "child_picks" in statuses[0]
     reg = library_to_variant_registry(lib)
-    assert len(reg) >= 1
+    assert len(reg) == 1
 
 
 def test_search_parent_admits_only_baseline_when_llm_verify_fails(tmp_path):
@@ -1235,6 +1274,61 @@ def test_search_parent_admits_only_baseline_when_llm_verify_fails(tmp_path):
         for cell in by_out.values():
             assert cell, "search_parent left an empty cell after failed turn"
     render_library_as_variant_summaries(lib)
+
+
+def test_search_parent_rejects_wrong_function_name_before_verify(tmp_path):
+    child_node = _leaf("child_under")
+    child_lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell0 = library_cell(child_lib, {"x": c_id}, {"out_0": c_id})
+    cell0.append(DesignEntry(
+        dsl="def child_under(x, *, out_shapes):\n    return None\n",
+        input_contracts={"x": c_id}, output_contracts={"out_0": c_id},
+        cycles=100, on_chip=200, provenance="pass1_baseline",
+    ))
+
+    parent_node = _parent("my_parent", children=(child_node,))
+    parent_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
+
+    async def agent(_conversation):
+        return (
+            "```yaml\n"
+            "parent_input_contracts: {}\n"
+            "```\n\n"
+            "```python\n"
+            "def child_under(x, *, out_shapes):\n"
+            "    return x\n"
+            "```\n"
+        )
+
+    verify_calls = [0]
+    async def verifier(_src, *_a, **_kw):
+        verify_calls[0] += 1
+        raise AssertionError("LLM variant verifier should not run")
+
+    lib = run(search_parent(
+        node=parent_node,
+        parent_contract=parent_contract,
+        pass1_dsl="def my_parent(x, *, out_shapes):\n    return None\n",
+        children_libraries={child_node.path: child_lib},
+        children_picks_baseline={child_node.path: cell0[0]},
+        ckpt_dir=tmp_path / "parent",
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_parent"),
+        config=_search_config(1, [None]*1),
+    ))
+
+    assert verify_calls[0] == 0
+    statuses = [
+        p.read_text()
+        for p in (tmp_path / "parent").glob(
+            "baseline_0_attempt_0_b*/turn_0/status.txt"
+        )
+    ]
+    assert statuses == ["FUNCTION_DEF_FAIL"]
+    assert len(library_to_variant_registry(lib)) == 1
 
 
 # --- autotune driver ---------------------------------------------------------
@@ -1299,10 +1393,11 @@ def test_autotune_post_order_walk_populates_all_libraries(tmp_path):
     ))
     assert set(result.libraries.keys()) == {leaf.path, root.path}
     assert result.root_path == root.path
-    # Leaf invoked before root (post-order). Under a shared pass deadline,
-    # leaf feedback turns may exhaust the pass before the parent gets an
-    # LLM turn; the parent library still receives its baseline.
+    # Leaf invoked before root (post-order), but each node gets its own
+    # deadline, so the root still receives an LLM turn after the leaf
+    # exhausts its node-local window.
     assert "inner" in visited[0]
+    assert any("outer" in v for v in visited)
     # variants.py written for each
     assert (tmp_path / "tune" / "autotune2" / leaf.path / "variants.py").exists()
     assert (tmp_path / "tune" / "autotune2" / root.path / "variants.py").exists()
@@ -1417,9 +1512,175 @@ def test_autotune_runs_sibling_leaves_in_parallel(tmp_path):
         f"sibling leaves did not interleave: {order!r}"
     )
 
-    # Parent library exists even when the shared deadline is exhausted by
-    # leaves before the parent gets an LLM turn.
+    # Parent receives its own fresh node-local deadline after both leaves
+    # finish, so it can still start an LLM turn.
     assert root.path in result.libraries
+    assert "outer:start" in order
+
+
+def test_search_parent_uses_best_child_when_child_picks_omitted(tmp_path):
+    """Parent responses may omit child_picks; search_parent then composes
+    against the best child entry already surfaced as an in-context example."""
+    child_node = _leaf("child_under")
+    child_lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    cell0 = library_cell(child_lib, {"x": c_id}, {"out_0": c_id})
+    cell0.append(DesignEntry(
+        dsl="def child_under(x, *, out_shapes):\n    return None\n",
+        input_contracts={"x": c_id}, output_contracts={"out_0": c_id},
+        cycles=100, on_chip=200, provenance="pass1_baseline",
+    ))
+    c_alt = TensorContract(reshape=(4, 8), permutation=(1, 0))
+    cell1 = library_cell(child_lib, {"x": c_alt}, {"out_0": c_id})
+    cell1.append(DesignEntry(
+        dsl="def child_under(x, *, out_shapes):\n    return None  # faster\n",
+        input_contracts={"x": c_alt}, output_contracts={"out_0": c_id},
+        cycles=50, on_chip=300, provenance="llm_turn_fast",
+    ))
+
+    parent_node = _parent("my_parent", children=(child_node,))
+    parent_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
+    captured_prompts: list[str] = []
+
+    async def agent(conversation):
+        captured_prompts.append(conversation[0]["content"])
+        return (
+            "```yaml\n"
+            "parent_input_contracts: {}\n"
+            "```\n\n"
+            "```python\n"
+            "def my_parent(x, *, out_shapes):\n"
+            "    return child_under(x, out_shapes=out_shapes)\n"
+            "```\n"
+        )
+
+    async def verifier(src, *_a, **_kw):
+        assert "faster" in src
+        return VerifyResult(passed=True)
+
+    lib = run(search_parent(
+        node=parent_node,
+        parent_contract=parent_contract,
+        pass1_dsl="def my_parent(x, *, out_shapes):\n    return child_under(x, out_shapes=out_shapes)\n",
+        children_libraries={child_node.path: child_lib},
+        children_picks_baseline={child_node.path: cell0[0]},
+        ckpt_dir=tmp_path / "parent",
+        sim_manager=AnalyticalOnly(lambda _src: (10, 10)),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_parent"),
+        config=_search_config(1, [None]),
+    ))
+
+    entries = library_to_variant_registry(lib)
+    assert len(entries) == 2
+    assert "Child design examples" in captured_prompts[0]
+    assert "faster" in captured_prompts[0]
+
+
+def test_child_helper_examples_are_labeled_and_capped():
+    child_lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    for idx in range(7):
+        cell = library_cell(
+            child_lib,
+            {"x": TensorContract(reshape=(4, 8), permutation=(0, 1))},
+            {"out_0": c_id},
+        )
+        cell.append(DesignEntry(
+            dsl=f"def child_under(x, *, out_shapes):\n    return x  # variant {idx}\n",
+            input_contracts={"x": c_id}, output_contracts={"out_0": c_id},
+            cycles=100 - idx, on_chip=200 + idx,
+            provenance=f"variant_{idx}",
+        ))
+
+    options = _child_helper_options(
+        child_name="child_under", child_lib=child_lib, max_options=5,
+    )
+    prompt = render_child_design_examples({
+        "root/child_under": child_lib,
+    }, child_names_by_path={"root/child_under": "child_under"})
+
+    assert [o.label for o in options] == [
+        "child_under_0",
+        "child_under_1",
+        "child_under_2",
+        "child_under_3",
+        "child_under_4",
+    ]
+    assert "def child_under_0" in prompt
+    assert "def child_under_4" in prompt
+    assert "def child_under_5" not in prompt
+    assert "call `child_under_0(...)`" in prompt
+
+
+def test_search_parent_can_call_labeled_child_and_prunes_unused_variants(tmp_path):
+    child_node = _leaf("child_under")
+    child_lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    slow = DesignEntry(
+        dsl="def child_under(x, *, out_shapes):\n    return x  # slow\n",
+        input_contracts={"x": c_id}, output_contracts={"out_0": c_id},
+        cycles=100, on_chip=100, provenance="pass1_baseline",
+    )
+    fast = DesignEntry(
+        dsl="def child_under(x, *, out_shapes):\n    return x  # fast\n",
+        input_contracts={"x": c_id}, output_contracts={"out_0": c_id},
+        cycles=10, on_chip=100, provenance="llm_fast",
+    )
+    cell = library_cell(child_lib, {"x": c_id}, {"out_0": c_id})
+    cell.extend([slow, fast])
+
+    parent_node = _parent("my_parent", children=(child_node,))
+    parent_contract = _raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),))
+    scored_sources: list[str] = []
+
+    async def agent(_conversation):
+        return (
+            "```yaml\n"
+            "parent_input_contracts: {}\n"
+            "```\n\n"
+            "```python\n"
+            "def my_parent(x, *, out_shapes):\n"
+            "    return child_under_0(x, out_shapes=out_shapes)\n"
+            "```\n"
+        )
+
+    async def verifier(src, *_a, **_kw):
+        assert "def child_under_0" in src
+        assert "fast" in src
+        assert "slow" not in src
+        return VerifyResult(passed=True)
+
+    def score(src):
+        scored_sources.append(src)
+        return (10, 10)
+
+    lib = run(search_parent(
+        node=parent_node,
+        parent_contract=parent_contract,
+        pass1_dsl="def my_parent(x, *, out_shapes):\n    return child_under(x, out_shapes=out_shapes)\n",
+        children_libraries={child_node.path: child_lib},
+        children_picks_baseline={child_node.path: slow},
+        ckpt_dir=tmp_path / "parent",
+        sim_manager=AnalyticalOnly(score),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_parent"),
+        config=_search_config(1, [None]),
+    ))
+
+    entry = next(
+        e for by_out in lib.values() for cell in by_out.values() for e in cell
+        if e.provenance != "pass1_baseline"
+    )
+    composed = compose_source(
+        parent_dsl=entry.dsl,
+        descendant_dsls_postorder=gather_descendants_postorder(entry),
+    )
+    assert "def child_under_0" in composed
+    assert "fast" in composed
+    assert "slow" not in composed
 
 
 def test_autotune_root_as_leaf_single_node_tree(tmp_path):

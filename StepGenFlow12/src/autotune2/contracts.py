@@ -156,8 +156,16 @@ class DesignEntry:
     the full descendant DSL chain when composing this entry's parent.
     Leaf entries have an empty dict. Always populated via object reference
     (not index), so Pareto culling at the child level doesn't orphan the
-    parent's reproducibility chain — Python's GC keeps referenced entries
+    parent's reproducibility chain - Python's GC keeps referenced entries
     alive even after they're culled from their own cell."""
+
+    child_call_aliases: dict[str, str] = field(default_factory=dict)
+    """For parent entries: child_path -> function name used by this parent
+    to call the selected child entry. Empty/missing means the child is
+    composed under its natural function name. Parent prompts may expose
+    capped child variants as helper names such as ``rms_norm_0``; this
+    map preserves that alias for later recomposition without copying the
+    child entry out of its library."""
 
 
 # A hashable freeze of a per-arg contract dict, used to key library cells.

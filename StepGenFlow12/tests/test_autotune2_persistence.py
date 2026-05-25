@@ -53,6 +53,7 @@ def _entry(
     input_contracts: dict[str, TensorContract] | None = None,
     output_contracts: dict[str, TensorContract] | None = None,
     children_picks: dict[str, DesignEntry] | None = None,
+    child_call_aliases: dict[str, str] | None = None,
 ) -> DesignEntry:
     return DesignEntry(
         dsl=dsl,
@@ -62,6 +63,7 @@ def _entry(
         input_contracts=input_contracts or {},
         output_contracts=output_contracts or {},
         children_picks=children_picks or {},
+        child_call_aliases=child_call_aliases or {},
     )
 
 
@@ -260,6 +262,42 @@ def test_children_picks_serialized_as_coords_and_resolved_on_load(tmp_path: Path
     [out_key] = list(loaded[in_key].keys())
     [restored_parent] = loaded[in_key][out_key]
     assert restored_parent.children_picks["child"] is child_llm
+
+
+def test_child_call_aliases_round_trip_with_children_picks(tmp_path: Path):
+    child_lib: NodeLibrary = {}
+    child_cell = library_cell(child_lib, {}, {})
+    child_entry = _entry(provenance="llm_child", dsl="def child(): pass")
+    child_cell.append(child_entry)
+
+    parent_lib: NodeLibrary = {}
+    parent_cell = library_cell(parent_lib, {}, {})
+    parent_cell.append(_entry(
+        provenance="llm_parent",
+        children_picks={"child": child_entry},
+        child_call_aliases={"child": "child_0"},
+    ))
+
+    children_libraries = {"child": child_lib}
+    path = tmp_path / SNAPSHOT_FILENAME
+    save_library_snapshot(
+        parent_lib, path=path, stamp="s",
+        children_libraries=children_libraries,
+    )
+
+    raw = json.loads(path.read_text())
+    [cell_data] = raw["cells"]
+    [entry_data] = cell_data["entries"]
+    assert entry_data["child_call_aliases"] == {"child": "child_0"}
+
+    loaded = try_load_library_snapshot(
+        path, expected_stamp="s", children_libraries=children_libraries,
+    )
+    [in_key] = list(loaded.keys())
+    [out_key] = list(loaded[in_key].keys())
+    [restored_parent] = loaded[in_key][out_key]
+    assert restored_parent.children_picks["child"] is child_entry
+    assert restored_parent.child_call_aliases == {"child": "child_0"}
 
 
 def test_serialize_raises_when_child_entry_not_in_child_library():
@@ -541,6 +579,79 @@ def test_autotune_reruns_node_when_stamp_changes(tmp_path: Path):
     assert leaf_b.path not in invoked_nodes, (
         "leaf_b's stamp is unchanged — it should have been skipped"
     )
+
+
+def test_autotune_resume_wipes_incomplete_multipass_node_dir(tmp_path: Path):
+    """If a multipass node is missing a valid library snapshot, resume should
+    delete the whole partial node/pass artifact dir before repopulating it.
+    This catches stale partial attempt/session state that is not covered by
+    the narrow baseline_* cleanup prefixes."""
+    import asyncio
+    from src.autotune2.search import SearchConfig, VerifyResult, autotune
+
+    root = _leaf("outer", path="root")
+    tree = Tree(root=root)
+    pass1_dsls = {
+        root.path: "def tiled_reference(dims, tensors):\n    return None\n",
+    }
+    prompts = {root.path: _stub_for_path(root.path)}
+    sys_prompts = {root.path: "sys-root"}
+    stamps = compute_plan_stamps(
+        plan_tree=tree, pass1_dsls=pass1_dsls, pass1_contracts={},
+        extra={},
+    )
+
+    async def agent(_conversation):
+        return "garbage"
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    def _run():
+        return asyncio.run(autotune(
+            plan_tree=tree,
+            pass1_dsls=pass1_dsls,
+            pass1_contracts={},
+            ckpt_dir=tmp_path / "tune",
+            make_sim_manager=lambda _t: AnalyticalOnly(lambda _s: (10, 10)),
+            root_tensors={},
+            agent_factory=lambda _sp: agent,
+            make_verifier=lambda _node, _pc, _t: verifier,
+            prompt_inputs=prompts,
+            system_prompts=sys_prompts,
+            config=SearchConfig(
+                time_limit_seconds=1.0,
+                attempt_budgets_bytes=[None],
+                clock=_TickingClock(),
+            ),
+            node_stamps=stamps,
+            pass_subdir="pass_0_general",
+        ))
+
+    _run()
+    node_pass_dir = (
+        tmp_path / "tune" / "autotune2" / "root" / "pass_0_general"
+    )
+    assert (node_pass_dir / SNAPSHOT_FILENAME).exists()
+
+    # Simulate an interrupted/incomplete node: no snapshot, plus stale
+    # unexpected state that the old baseline_* selective cleanup left behind.
+    (node_pass_dir / SNAPSHOT_FILENAME).unlink()
+    stale_dir = node_pass_dir / "stale_partial_state"
+    stale_dir.mkdir()
+    (stale_dir / "sentinel.txt").write_text("old\n")
+    rust_stale_dir = (
+        tmp_path / "tune" / "autotune2" / "_rust_work"
+        / "root" / "pass_0_general" / "stale_rust"
+    )
+    rust_stale_dir.mkdir(parents=True)
+    (rust_stale_dir / "step_impl.py").write_text("old rust\n")
+
+    _run()
+
+    assert (node_pass_dir / SNAPSHOT_FILENAME).exists()
+    assert not stale_dir.exists()
+    assert not rust_stale_dir.exists()
 
 
 def _stub_for_path(path: str):

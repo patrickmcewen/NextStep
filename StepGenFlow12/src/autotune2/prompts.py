@@ -24,8 +24,6 @@ The LLM is asked to emit a fenced YAML block immediately above the
 Python DSL block:
 
     ```yaml
-    child_picks:                  # parent prompts only
-      attention_block: 3
     parent_input_contracts:       # empty when no input is on-chip
       Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
     ```
@@ -41,8 +39,8 @@ nodes carry the actual produced stream+tile shapes). See
 ``runtime._derive_output_contracts_from_graph``.
 
 ``parse_autotune2_response`` splits the response back into a structured
-``AutotuneResponse`` (child_picks dict, parent_input_contracts dict of
-``TensorContract``, and the raw DSL source string). All schema
+``AutotuneResponse`` (parent_input_contracts dict of ``TensorContract``,
+and the raw DSL source string). All schema
 violations raise ``AssertionError`` with the offending fragment in the
 message; the search driver routes the assertion text back into the
 agent loop as a feedback message.
@@ -406,17 +404,36 @@ _VARIANT_SECTION_TEMPLATE = """
 
 ### Child variant libraries
 
-Pick exactly one ``variant_index`` per child via ``child_picks``. Each
-table shows the per-arg classification, per-variant boundary contracts,
-and Pareto coordinates the autotuner measured for that variant.
+Reference summary of verified child designs. The autotuner selects the
+child implementation deterministically system-side; do not emit child
+variant indices or child selection fields. These tables are included only
+to show boundary contracts and Pareto coordinates measured for each child
+design.
 
 {variant_tables}
 """
 
 
+_CHILD_DESIGN_EXAMPLES_TEMPLATE = """
+
+### Child design examples
+
+The child designs below are already verified and scored. Use them as
+in-context implementation examples when rewriting this parent. Child
+selection is deterministic/system-side; do not emit child variant indices
+or child selection fields.
+
+{child_design_examples}
+"""
+
+
 _ACCEPTED_HINT = " shown above"
 _PARENT_HINT_TEXT = (
-    "\n  - Picks a child variant index for every child listed below."
+    "\n  - Calls child functions by natural name. The autotuner composes "
+    "against deterministic best child designs selected system-side; do "
+    "not emit child selection fields. You may call a labeled child helper "
+    "shown in the examples or inline equivalent child logic directly "
+    "inside this parent function."
 )
 
 
@@ -431,6 +448,7 @@ def build_autotune2_user_prompt(
     tensors_block: str,
     fewshot: str = "tile_shrink",
     child_variant_blocks: dict[str, str] | None = None,
+    child_design_examples: str = "",
     accepted_summary: str = "",
     budget_block: str = "",
     ace_context: str = "",
@@ -451,8 +469,10 @@ def build_autotune2_user_prompt(
     ``accepted_summary`` is the empty string on the first attempt; on
     subsequent fresh attempts it is the rendered Pareto-front summary
     of already-accepted variants (see ``render_accepted_summary``) so
-    the LLM can target gaps. ``child_variant_blocks`` is required for
-    parents and forbidden for leaves. ``budget_block`` is the empty
+    the LLM can target gaps. Parent prompts must provide either
+    ``child_variant_blocks`` (read-only child library summaries) or
+    ``child_design_examples`` (source examples for system-selected best
+    child designs); leaves may provide neither. ``budget_block`` is the empty
     string for an unlimited attempt or a pre-formatted markdown stanza
     describing this attempt's on-chip memory budget (the per-attempt
     parallel-fan-out signal in ``search_leaf`` / ``search_parent``).
@@ -472,15 +492,26 @@ def build_autotune2_user_prompt(
             "child_variant_blocks; got "
             f"{list((child_variant_blocks or {}).keys())!r}"
         )
+        assert not child_design_examples, (
+            "build_autotune2_user_prompt: leaf prompts must not include "
+            "child_design_examples"
+        )
         variant_section = ""
     else:
-        assert child_variant_blocks, (
+        assert child_variant_blocks or child_design_examples.strip(), (
             "build_autotune2_user_prompt: parent prompts must include at "
-            "least one child variant block"
+            "least one child variant block or child design example"
         )
-        variant_section = _VARIANT_SECTION_TEMPLATE.format(
-            variant_tables="\n\n".join(child_variant_blocks.values())
-        )
+        sections: list[str] = []
+        if child_design_examples.strip():
+            sections.append(_CHILD_DESIGN_EXAMPLES_TEMPLATE.format(
+                child_design_examples=child_design_examples.strip()
+            ))
+        if child_variant_blocks:
+            sections.append(_VARIANT_SECTION_TEMPLATE.format(
+                variant_tables="\n\n".join(child_variant_blocks.values())
+            ))
+        variant_section = "".join(sections)
     accepted_section = (
         f"\n\n### Already-accepted variants for this node\n\n{accepted_summary}\n"
         if accepted_summary else ""
@@ -573,15 +604,14 @@ def render_accepted_summary(
 class AutotuneResponse:
     """Parsed LLM response.
 
-    ``child_picks`` is empty for leaf prompts. ``input_contracts`` uses
-    TensorContract values (validated against any provided vanilla shape
-    — see ``parse_*``). ``dsl`` is the raw DSL function source extracted
-    from the response's python code block. Output contracts are NOT
-    parsed from the LLM response — the verifier derives them from the
-    built graph; see ``VerifyResult.derived_output_contracts``.
+    ``input_contracts`` uses TensorContract values (validated against any
+    provided vanilla shape — see ``parse_*``). ``dsl`` is the raw DSL
+    function source extracted from the response's python code block.
+    Output contracts are NOT parsed from the LLM response — the verifier
+    derives them from the built graph; see
+    ``VerifyResult.derived_output_contracts``.
     """
 
-    child_picks: dict[str, int] = field(default_factory=dict)
     input_contracts: dict[str, TensorContract] = field(default_factory=dict)
     dsl: str = ""
 
@@ -640,7 +670,7 @@ def parse_autotune2_response(
     yaml_body = _extract_fenced(response_text, "yaml")
     assert yaml_body is not None, (
         "parse_autotune2_response: response must contain a fenced ```yaml block "
-        "with the autotuner output spec (child_picks, parent_input_contracts); "
+        "with the autotuner output spec (parent_input_contracts); "
         "none found"
     )
     py_body = _extract_fenced(response_text, "python")
@@ -655,42 +685,25 @@ def parse_autotune2_response(
         f"got {type(parsed).__name__}"
     )
 
-    expected_keys_parent = {"child_picks", "parent_input_contracts"}
+    allowed_keys_parent = {"parent_input_contracts"}
+    required_keys_parent = {"parent_input_contracts"}
     expected_keys_leaf = {"parent_input_contracts"}
-    expected = expected_keys_leaf if is_leaf else expected_keys_parent
-    unexpected = set(parsed.keys()) - expected
-    missing = expected - set(parsed.keys())
+    allowed = expected_keys_leaf if is_leaf else allowed_keys_parent
+    required = expected_keys_leaf if is_leaf else required_keys_parent
+    unexpected = set(parsed.keys()) - allowed
+    missing = required - set(parsed.keys())
     assert not unexpected, (
         f"parse_autotune2_response: unexpected yaml keys "
-        f"{sorted(unexpected)!r}; allowed={sorted(expected)!r}. Note: "
+        f"{sorted(unexpected)!r}; allowed={sorted(allowed)!r}. Note: "
         f"`parent_output_contracts` is no longer accepted — output contracts "
         f"are derived from the built graph."
     )
     assert not missing, (
         f"parse_autotune2_response: missing yaml keys {sorted(missing)!r}; "
-        f"required={sorted(expected)!r}"
+        f"required={sorted(required)!r}"
     )
 
     response = AutotuneResponse(dsl=py_body)
-
-    if not is_leaf:
-        cp = parsed["child_picks"]
-        assert isinstance(cp, dict) and cp, (
-            f"parse_autotune2_response: child_picks must be a non-empty mapping "
-            f"of child_name -> variant_index, got {cp!r}"
-        )
-        if expected_child_names:
-            expected_names = set(expected_child_names)
-            assert set(cp.keys()) == expected_names, (
-                f"parse_autotune2_response: child_picks keys {sorted(cp.keys())!r} "
-                f"must equal expected_child_names {sorted(expected_names)!r}"
-            )
-        for name, idx in cp.items():
-            assert isinstance(idx, int) and idx >= 0, (
-                f"parse_autotune2_response: child_picks[{name!r}] must be a "
-                f"non-negative int variant index, got {idx!r}"
-            )
-        response.child_picks = dict(cp)
 
     in_c = parsed["parent_input_contracts"] or {}
     assert isinstance(in_c, dict), (

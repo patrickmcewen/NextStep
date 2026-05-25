@@ -128,6 +128,7 @@ def _entry_to_json(
         "cycle_source": entry.cycle_source,
         "provenance": entry.provenance,
         "children_picks": child_picks_json,
+        "child_call_aliases": dict(entry.child_call_aliases),
     }
 
 
@@ -157,6 +158,7 @@ def _entry_from_json(
         cycle_source=data.get("cycle_source", "analytical"),
         provenance=data["provenance"],
         children_picks=children_picks,
+        child_call_aliases=dict(data.get("child_call_aliases", {})),
     )
 
 

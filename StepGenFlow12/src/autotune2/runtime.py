@@ -40,7 +40,9 @@ deterministic fakes that ignore the translation step.
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -54,14 +56,87 @@ from src.autotune2.search import (
 )
 
 
-# (composed_source) -> (cycles, dur_ms)
-RustEvaluateFn = Callable[[str], tuple[int, float]]
+# (composed_source, optional metadata kwargs) -> (cycles, dur_ms)
+RustEvaluateFn = Callable[..., tuple[int, float]]
 
 # Raised by the ``build_rust_evaluate_fn`` closure when the rust functional
 # sim produces a tensor that doesn't match the PyTorch gold reference;
 # defined in ``sim_manager`` (where it's caught) to avoid an import cycle
 # back through ``search`` -> ``sim_manager``.
 from src.autotune2.sim_manager import RustOutputMismatch
+
+
+def _safe_path_component(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.=-]+", "_", str(value)).strip("._")
+    return safe or "unnamed"
+
+
+def _safe_path_parts(value: str | None) -> list[str]:
+    if value is None or not str(value).strip():
+        return ["rust_eval"]
+    raw = Path(str(value))
+    assert not raw.is_absolute(), (
+        f"rust work label must be relative, got {value!r}"
+    )
+    out: list[str] = []
+    for part in raw.parts:
+        assert part not in ("", ".", ".."), (
+            f"rust work label contains invalid path component {part!r}: "
+            f"{value!r}"
+        )
+        out.append(_safe_path_component(part))
+    return out or ["rust_eval"]
+
+
+def _allocate_labeled_work_dir(
+    *,
+    root: Path,
+    node_path: str | None,
+    run_label: str | None,
+) -> Path:
+    base = root.joinpath(*_safe_path_parts(node_path)) if node_path else root
+    label_parts = _safe_path_parts(run_label)
+    parent = base.joinpath(*label_parts[:-1])
+    leaf = label_parts[-1]
+    suffix = 0
+    while True:
+        name = leaf if suffix == 0 else f"{leaf}__{suffix}"
+        candidate = parent / name
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            suffix += 1
+
+
+def _invoke_rust_evaluate(
+    rust_evaluate_fn: RustEvaluateFn,
+    composed_source: str,
+    *,
+    node_path: str | None = None,
+    run_label: str | None = None,
+) -> tuple[int, float]:
+    """Call a rust evaluator with metadata when it accepts metadata.
+
+    Unit tests and older integrations often use ``lambda src: ...`` fakes.
+    Preserve that API while allowing the real evaluator to receive enough
+    context to lay artifacts out under traceable directories.
+    """
+    try:
+        sig = inspect.signature(rust_evaluate_fn)
+    except (TypeError, ValueError):
+        return rust_evaluate_fn(composed_source)
+    params = sig.parameters
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if accepts_kwargs or "node_path" in params or "run_label" in params:
+        return rust_evaluate_fn(
+            composed_source,
+            node_path=node_path,
+            run_label=run_label,
+        )
+    return rust_evaluate_fn(composed_source)
 
 
 @dataclass
@@ -180,6 +255,13 @@ def promote_top_k(
     needs_rust_sources = [composed_sources[i] for i in needs_rust_idx]
     fresh_results: dict[int, tuple[int, float]] = {}
     if needs_rust_sources:
+        labeled_sources = [
+            (
+                composed_sources[i],
+                f"top_k/{i}_{_safe_path_component(picks[i].provenance)}",
+            )
+            for i in needs_rust_idx
+        ]
         # max_workers caps parallelism so a large top_k doesn't fork an
         # arbitrarily large number of rust subprocesses. K is typically
         # <=8 in practice; cap at the number of pending calls so we
@@ -187,7 +269,15 @@ def promote_top_k(
         with ThreadPoolExecutor(max_workers=len(needs_rust_sources)) as ex:
             for i, result in zip(
                 needs_rust_idx,
-                ex.map(rust_evaluate_fn, needs_rust_sources),
+                ex.map(
+                    lambda item: _invoke_rust_evaluate(
+                        rust_evaluate_fn,
+                        item[0],
+                        node_path="root",
+                        run_label=item[1],
+                    ),
+                    labeled_sources,
+                ),
             ):
                 fresh_results[i] = result
 
@@ -241,6 +331,7 @@ def _build_promotion_for_pick(
     *,
     picked: DesignEntry,
     rust_evaluate_fn: RustEvaluateFn,
+    run_label: str = "final_pick",
 ) -> RustPromotionResult:
     """Compose the source for ``picked`` and either reuse its rust-measured
     cycles (when ``cycle_source == "rust"``) or invoke ``rust_evaluate_fn``
@@ -251,7 +342,12 @@ def _build_promotion_for_pick(
         cycles = picked.cycles
         dur_ms = 0.0
     else:
-        cycles, dur_ms = rust_evaluate_fn(composed)
+        cycles, dur_ms = _invoke_rust_evaluate(
+            rust_evaluate_fn,
+            composed,
+            node_path="root",
+            run_label=run_label,
+        )
     return RustPromotionResult(
         entry=picked,
         rust_cycles=cycles,
@@ -310,6 +406,7 @@ def final_pick(
     picked = candidates[0]
     return [_build_promotion_for_pick(
         picked=picked, rust_evaluate_fn=rust_evaluate_fn,
+        run_label=f"final_pick/{_safe_path_component(picked.provenance)}",
     )]
 
 
@@ -390,6 +487,10 @@ async def final_pick_agent(
         )
         return [_build_promotion_for_pick(
             picked=nondom[0], rust_evaluate_fn=rust_evaluate_fn,
+            run_label=(
+                "final_pick_agent/pareto_short_circuit/"
+                f"{_safe_path_component(nondom[0].provenance)}"
+            ),
         )]
 
     composed_sources = [_build_composed_source_for_entry(e) for e in nondom]
@@ -509,6 +610,10 @@ async def final_pick_agent(
 
     return [_build_promotion_for_pick(
         picked=picked, rust_evaluate_fn=rust_evaluate_fn,
+        run_label=(
+            f"final_pick_agent/pick_{picked_variant_index}_"
+            f"{_safe_path_component(picked.provenance)}"
+        ),
     )]
 
 
@@ -584,7 +689,11 @@ def write_autotune2_summary(
 
     Fields:
       - ``root_path``: the root node's path
-      - ``library_sizes``: ``{node_path: <num cells>}``
+      - ``library_sizes``: backwards-compatible alias for
+        ``library_cell_counts``
+      - ``library_cell_counts``: ``{node_path: <num contract cells>}``
+      - ``library_entry_counts``: ``{node_path: <num DesignEntry rows>}``
+      - ``library_llm_entry_counts``: ``{node_path: <num non-baseline rows>}``
       - ``root_pareto``: the root's analytical Pareto entries as
         ``[{cycles, on_chip, provenance}, ...]``, sorted by cycles
       - ``rust_winners``: the rust-promoted entries with their
@@ -600,8 +709,22 @@ def write_autotune2_summary(
         the source string of the rust-best entry (can be megabytes for
         large kernels)
     """
-    library_sizes = {
+    library_cell_counts = {
         path: sum(len(by_out) for by_out in lib.values())
+        for path, lib in autotune_result.libraries.items()
+    }
+    library_entry_counts = {
+        path: sum(len(cell) for by_out in lib.values() for cell in by_out.values())
+        for path, lib in autotune_result.libraries.items()
+    }
+    library_llm_entry_counts = {
+        path: sum(
+            1
+            for by_out in lib.values()
+            for cell in by_out.values()
+            for entry in cell
+            if entry.provenance != "pass1_baseline"
+        )
         for path, lib in autotune_result.libraries.items()
     }
 
@@ -629,7 +752,10 @@ def write_autotune2_summary(
 
     payload: dict = {
         "root_path": autotune_result.root_path,
-        "library_sizes": library_sizes,
+        "library_sizes": library_cell_counts,
+        "library_cell_counts": library_cell_counts,
+        "library_entry_counts": library_entry_counts,
+        "library_llm_entry_counts": library_llm_entry_counts,
         "root_pareto": root_pareto,
         "rust_winners": rust_winners,
         "best_rust_entry": rust_winners[0] if rust_winners else None,
@@ -682,9 +808,12 @@ def build_rust_evaluate_fn(
     that ``make_analytical_scorer`` got, or the analytical-vs-rust
     cycle comparison in the summary uses two different cost models.
 
-    Each call writes its artifacts under a unique ``work_dir/top_<i>/``
-    subdirectory so concurrent evaluations (``promote_top_k`` runs them
-    in parallel) don't overwrite each other's ``step_impl.py`` /
+    Each call writes its artifacts under a unique labeled subdirectory.
+    In-loop callers pass ``node_path`` and a trace ``run_label`` so the
+    hierarchy mirrors the autotune checkpoint that produced the variant,
+    e.g. ``_rust_work/root/moe/pass_0/.../session_0/turn_1``. If the
+    same label is reused, the final directory gets ``__<n>`` appended so
+    concurrent evaluations never overwrite each other's ``step_impl.py`` /
     ``graph.pb`` / sim outputs.
 
     ``tensors`` is the default tensor dictionary passed into
@@ -701,6 +830,8 @@ def build_rust_evaluate_fn(
         composed_source: str,
         *,
         tensors_override: dict | None = None,
+        node_path: str | None = None,
+        run_label: str | None = None,
     ) -> tuple[int, float]:
         import sys
         import time
@@ -731,10 +862,15 @@ def build_rust_evaluate_fn(
         step_source = _dsl_to_step_translate(composed_source)
 
         with _counter_lock:
-            idx = _counter["i"]
-            _counter["i"] += 1
-        sub_work_dir = work_dir / f"top_{idx}"
-        sub_work_dir.mkdir(parents=True, exist_ok=True)
+            if run_label is None:
+                idx = _counter["i"]
+                _counter["i"] += 1
+                run_label = f"rust_eval_{idx}"
+            sub_work_dir = _allocate_labeled_work_dir(
+                root=work_dir,
+                node_path=node_path,
+                run_label=run_label,
+            )
         (sub_work_dir / "step_impl.py").write_text(step_source)
         t0 = time.perf_counter()
         result = evaluate_kernel(

@@ -216,6 +216,38 @@ def test_rust_all_success_records_rust_cycles_and_analytical_on_chip(tmp_path):
     assert p.read_text() == "def src(): return 1"
 
 
+def test_rust_all_passes_node_path_and_turn_label_to_rust(tmp_path):
+    captured = {}
+
+    def rust(_src, **kwargs):
+        captured.update(kwargs)
+        return (500, 12.34)
+
+    mgr, _budget, _store, _sources_dir = _make_rust_all(
+        tmp_path, rust_evaluate_fn=rust, total_seconds=60.0,
+    )
+    turn_dir = (
+        tmp_path / "autotune2" / "root" / "moe" / "pass_0_general"
+        / "baseline_0_attempt_1_b5000000" / "session_0" / "turn_1"
+    )
+    ctx = SimContext(
+        node_path="root/moe",
+        variant_kind="variant",
+        is_root=False,
+        attempt_index=1,
+        turn_index=1,
+        turn_artifact_dir=turn_dir,
+    )
+
+    result = _run(mgr.score(ctx, "def src(): return 1"))
+
+    assert result.cycle_source == "rust"
+    assert captured["node_path"] == "root/moe"
+    assert captured["run_label"] == (
+        "pass_0_general/baseline_0_attempt_1_b5000000/session_0/turn_1"
+    )
+
+
 def test_rust_all_falls_back_to_analytical_when_budget_exhausted(tmp_path):
     # total_seconds=0 ⇒ remaining_seconds == 0 from the first call;
     # the manager should skip rust and return the analytical result.

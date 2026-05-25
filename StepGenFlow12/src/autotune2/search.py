@@ -4,8 +4,8 @@ Phase 5 of the autotuner. Three entry points:
 
   - ``search_leaf(node, ...)``   — populate one leaf node's library.
   - ``search_parent(node, ...)`` — populate one parent node's library by
-    composing its DSL with each immediate child's already-populated
-    library and scoring the Cartesian product.
+    composing its DSL with child entries selected from each immediate
+    child's already-populated library.
   - ``autotune(plan_tree, ...)`` — bottom-up driver that walks the plan
     tree post-order and calls the appropriate search routine per node.
     Returns the full ``{node_path: NodeLibrary}`` map.
@@ -46,24 +46,25 @@ Locked Phase-5 design decisions
    args. The timing model only inspects shapes, so zero-filled tensors
    are sufficient.
 
-4. **Variant binding**: ``build_variant_callables`` reads a child's
-   ``variants.py`` registry, calls ``make_variant_stub`` per entry,
-   and returns ``{f"{child_name}_{variant_index}": callable}`` — the
-   shape the search driver injects into the parent's exec namespace
-   alongside the existing blackbox stubs.
+4. **Child helper binding**: parent prompts show a capped Pareto slice of
+   verified child DSLs under labels such as ``rms_norm_0``. A parent may
+   call one of those labels, call the natural child name to use the
+   deterministic best child, or inline equivalent logic directly. Only
+   called child helpers are composed into the stored parent entry.
 
-5. **Variant indices** are assigned sequentially per node, one per
-   ``DesignEntry``, when the library is serialized to ``variants.py``.
-   Each entry — even two entries that share a Pareto cell's boundary
-   contracts — gets its own index, so the parent LLM picks one concrete
-   child implementation per child. No Cartesian sweep; ``search_parent``
-   composes exactly one descendant chain per turn.
+5. **Variant indices** are still assigned sequentially per node when the
+   library is serialized to ``variants.py`` for executable stubs, but
+   parent LLM responses no longer emit opaque child index selections.
+   ``search_parent`` resolves child calls from the DSL source itself and
+   composes at most one descendant chain per called child per turn.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -174,10 +175,11 @@ class SearchConfig:
     time_limit_seconds: float = 1800.0
     """Wall-clock limit for one autotuner pass.
 
-    The same deadline is shared by every node and every attempt in the
-    pass. A search loop starts a new LLM turn only while the deadline has
-    remaining time; work already in-flight is allowed to finish so turn
-    artifacts and feedback stay coherent.
+    Each node gets its own fresh deadline when that node begins searching.
+    Attempts for the same node share that node-local deadline. A search
+    loop starts a new LLM turn only while the deadline has remaining time;
+    work already in-flight is allowed to finish so turn artifacts and
+    feedback stay coherent.
     """
 
     clock: Callable[[], float] = time.monotonic
@@ -221,7 +223,7 @@ class SearchConfig:
 
 
 class PassDeadline:
-    """Shared pass-level wall-clock deadline.
+    """Wall-clock deadline shared by the attempts for one search scope.
 
     The start time is captured lazily on first use so tests can build a
     config before the coroutine starts without losing virtual time.
@@ -608,9 +610,13 @@ def gather_descendants_postorder(entry: DesignEntry) -> list[str]:
     NOT ``entry.dsl`` itself.
     """
     out: list[str] = []
-    for child_entry in entry.children_picks.values():
+    for child_path, child_entry in entry.children_picks.items():
         out.extend(gather_descendants_postorder(child_entry))
-        out.append(child_entry.dsl)
+        alias = entry.child_call_aliases.get(child_path)
+        out.append(
+            _rename_top_level_function(child_entry.dsl, alias)
+            if alias else child_entry.dsl
+        )
     return out
 
 
@@ -730,6 +736,129 @@ def render_library_as_variant_summaries(
                     ))
                 idx += 1
     return summaries
+
+
+def _library_entries(lib: NodeLibrary) -> list[DesignEntry]:
+    return [
+        entry
+        for by_out in lib.values()
+        for cell in by_out.values()
+        for entry in cell
+    ]
+
+
+def _top_level_function_name(dsl: str) -> str | None:
+    tree = ast.parse(dsl)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            return node.name
+    return None
+
+
+def _rename_top_level_function(dsl: str, new_name: str) -> str:
+    old_name = _top_level_function_name(dsl)
+    if old_name is None or old_name == new_name:
+        return dsl
+    renamed, count = re.subn(
+        rf"(^[ \t]*def[ \t]+){re.escape(old_name)}([ \t]*\()",
+        rf"\g<1>{new_name}\2",
+        dsl,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    assert count == 1, (
+        f"_rename_top_level_function: could not rename {old_name!r} "
+        f"to {new_name!r}"
+    )
+    return renamed
+
+
+def _best_child_entry(lib: NodeLibrary) -> DesignEntry:
+    entries = _library_entries(lib)
+    assert entries, "_best_child_entry: child library has no entries"
+    front_ids = {id(e) for e in pareto_front_of(entries)}
+    front = [e for e in entries if id(e) in front_ids]
+    return min(front, key=lambda e: (e.cycles, e.on_chip))
+
+
+def _composed_source_for_entry(entry: DesignEntry) -> str:
+    return compose_source(
+        parent_dsl=entry.dsl,
+        descendant_dsls_postorder=gather_descendants_postorder(entry),
+    )
+
+
+@dataclass(frozen=True)
+class ChildHelperOption:
+    label: str
+    entry: DesignEntry
+
+
+def _child_helper_options(
+    *,
+    child_name: str,
+    child_lib: NodeLibrary,
+    max_options: int = 5,
+) -> list[ChildHelperOption]:
+    assert max_options >= 1, (
+        f"_child_helper_options: max_options must be >= 1, got {max_options}"
+    )
+    entries = _library_entries(child_lib)
+    assert entries, "_child_helper_options: child library has no entries"
+    front_ids = {id(e) for e in pareto_front_of(entries)}
+    front = [e for e in entries if id(e) in front_ids]
+    front.sort(key=lambda e: (e.cycles, e.on_chip, e.provenance))
+    return [
+        ChildHelperOption(label=f"{child_name}_{idx}", entry=entry)
+        for idx, entry in enumerate(front[:max_options])
+    ]
+
+
+def render_child_design_examples(
+    children_libraries: dict[str, NodeLibrary],
+    *,
+    child_names_by_path: dict[str, str],
+    max_examples_per_child: int = 5,
+) -> str:
+    """Render best child sources for parent prompts.
+
+    Unlike the legacy variant table, this exposes actual DSL source for
+    the strongest child entries so the parent model can adapt ideas from
+    child designs without being forced to select an opaque variant index.
+    """
+    assert max_examples_per_child >= 1, (
+        "render_child_design_examples: max_examples_per_child must be >= 1"
+    )
+    blocks: list[str] = []
+    for child_path, child_lib in children_libraries.items():
+        child_name = child_names_by_path[child_path]
+        options = _child_helper_options(
+            child_name=child_name,
+            child_lib=child_lib,
+            max_options=max_examples_per_child,
+        )
+        blocks.append(f"#### Child {child_name} (`{child_path}`)")
+        blocks.append(
+            "You may call one helper by label (for example "
+            f"`{options[0].label}(...)`) or inline equivalent DSL directly "
+            "inside the parent instead of calling a child helper."
+        )
+        for example_index, option in enumerate(options):
+            entry = option.entry
+            source = compose_source(
+                parent_dsl=_rename_top_level_function(entry.dsl, option.label),
+                descendant_dsls_postorder=gather_descendants_postorder(entry),
+            )
+            blocks.append(
+                f"Example {example_index}: call `{option.label}(...)`; "
+                f"cycles={entry.cycles} "
+                f"({entry.cycle_source}), on_chip={entry.on_chip}, "
+                f"provenance={entry.provenance}\n"
+                "```python\n"
+                f"{source}\n"
+                "```"
+            )
+    return "\n\n".join(blocks)
 
 
 def find_pass1_baseline_entry(lib: NodeLibrary) -> DesignEntry:
@@ -1130,6 +1259,123 @@ def _compliance_preflight_feedback(dsl: str, *, is_root: bool) -> str | None:
     )
 
 
+def _required_node_function_feedback(
+    dsl: str,
+    *,
+    node_name: str,
+    is_root: bool,
+) -> str | None:
+    """Ensure a non-root response defines the node-local function.
+
+    Parent prompts may include composed baseline source plus child examples,
+    but the LLM's python block must still be the standalone function for
+    this node. Catching this before wrapper/verifier execution turns a
+    common protocol mistake into feedback instead of an assertion deep in
+    ``_extract_node_def_block``.
+    """
+    if is_root:
+        return None
+
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(dsl)
+    except SyntaxError as e:
+        return (
+            "## Function definition check FAILED\n\n"
+            "Your python block is not valid Python, so autotune2 cannot "
+            f"find the required node function `def {node_name}(...):`.\n\n"
+            f"Parser error: {e}"
+        )
+
+    top_level_defs = [
+        fn.name for fn in tree.body if isinstance(fn, _ast.FunctionDef)
+    ]
+    if node_name in top_level_defs:
+        return None
+    return (
+        "## Function definition check FAILED\n\n"
+        f"Your python block must define the standalone function for this "
+        f"node: `def {node_name}(...):`.\n\n"
+        f"Top-level functions found: {top_level_defs!r}.\n\n"
+        "Do not emit composed code, child function implementations, or a "
+        "`tiled_reference` wrapper. Use the composed baseline and child "
+        "examples only as context, then emit this node's function body."
+    )
+
+
+def _called_function_names(dsl: str) -> set[str]:
+    tree = ast.parse(dsl)
+    return {
+        call.func.id
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+
+
+def _select_called_child_helpers(
+    *,
+    node: PlanNode,
+    parsed_dsl: str,
+    default_children_picks: dict[str, DesignEntry],
+    child_helper_options: dict[str, list[ChildHelperOption]],
+) -> tuple[dict[str, DesignEntry], dict[str, str], str | None]:
+    """Resolve parent child calls to concrete entries and call aliases.
+
+    Parents may call a natural child name to use the deterministic default
+    best child, call a labeled helper such as ``rms_norm_0``, or inline
+    equivalent logic and call no child helper at all.
+    """
+    try:
+        called = _called_function_names(parsed_dsl)
+    except SyntaxError as e:
+        return {}, {}, f"Could not parse function calls from your DSL: {e}"
+
+    children_picks: dict[str, DesignEntry] = {}
+    child_aliases: dict[str, str] = {}
+    for child in node.children:
+        options = child_helper_options[child.path]
+        by_label = {option.label: option for option in options}
+        matching_labels = sorted(called & set(by_label))
+        natural_called = child.name in called
+        if natural_called and matching_labels:
+            return {}, {}, (
+                f"Your parent calls both natural child name {child.name!r} "
+                f"and labeled helper(s) {matching_labels!r}. Pick one "
+                "implementation for this child or inline the logic directly."
+            )
+        if len(matching_labels) > 1:
+            return {}, {}, (
+                f"Your parent calls multiple helper variants for child "
+                f"{child.name!r}: {matching_labels!r}. Pick one helper "
+                "variant for this child or inline the logic directly."
+            )
+        if matching_labels:
+            label = matching_labels[0]
+            children_picks[child.path] = by_label[label].entry
+            child_aliases[child.path] = label
+        elif natural_called:
+            children_picks[child.path] = default_children_picks[child.path]
+
+    unknown_helpers: list[str] = []
+    for child in node.children:
+        prefix = f"{child.name}_"
+        valid = {option.label for option in child_helper_options[child.path]}
+        unknown_helpers.extend(
+            name for name in called
+            if name.startswith(prefix) and name not in valid
+        )
+    if unknown_helpers:
+        return {}, {}, (
+            f"Your parent calls unknown child helper label(s) "
+            f"{sorted(set(unknown_helpers))!r}. Use only helper labels "
+            "shown in the child design examples, call the natural child "
+            "name for the default best child, or inline the logic directly."
+        )
+
+    return children_picks, child_aliases, None
+
+
 async def _run_leaf_attempt(
     *,
     node: PlanNode,
@@ -1312,6 +1558,21 @@ async def _run_leaf_attempt(
             )
             _append_turn_feedback(conversation, compliance_feedback)
             await _record_ace("COMPLIANCE_FAIL", turn)
+            continue
+
+        function_feedback = _required_node_function_feedback(
+            parsed.dsl, node_name=node.name, is_root=is_root,
+        )
+        if function_feedback is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="FUNCTION_DEF_FAIL",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, function_feedback)
+            await _record_ace("FUNCTION_DEF_FAIL", turn)
             continue
 
         try:
@@ -1573,7 +1834,10 @@ async def _run_parent_attempt(
     baseline_dsl: str,
     baseline_index: int,
     children_libraries: dict[str, NodeLibrary],
+    default_children_picks: dict[str, DesignEntry],
+    child_helper_options: dict[str, list[ChildHelperOption]],
     child_blocks: dict[str, str],
+    child_design_examples: str,
     expected_child_names: tuple[str, ...],
     attempt_index: int,
     budget: int | None,
@@ -1592,11 +1856,10 @@ async def _run_parent_attempt(
     Returns admitted DesignEntries (merged into the shared lib by the
     caller).
 
-    Children's full Pareto fronts are exposed to the LLM via
-    ``child_blocks``; the agent autonomously picks one variant_index
-    per child (a single ``DesignEntry``), and the parent DSL is
-    expected to add intermediate STeP ops if the picked children's
-    contracts don't compose cleanly. No Cartesian sweep.
+    Capped child Pareto entries are exposed to the LLM as labeled helper
+    functions via ``child_design_examples``. The parent may call one
+    helper per child, call the natural child name for the default best
+    child, or inline equivalent logic directly.
 
     ``baseline_dsl`` is the parent DSL shown to the LLM as its starting
     design. Single-pass autotune2 always passes the pass-1 baseline;
@@ -1611,6 +1874,14 @@ async def _run_parent_attempt(
     )
     output_vanilla_shapes = (
         {} if is_root else _output_vanilla_shapes(parent_contract)
+    )
+    baseline_descendants: list[str] = []
+    for child_entry in default_children_picks.values():
+        baseline_descendants.extend(gather_descendants_postorder(child_entry))
+        baseline_descendants.append(child_entry.dsl)
+    composed_baseline_dsl = compose_source(
+        parent_dsl=baseline_dsl,
+        descendant_dsls_postorder=baseline_descendants,
     )
     blabel = _budget_label(budget)
     admitted: list[DesignEntry] = []
@@ -1642,11 +1913,12 @@ async def _run_parent_attempt(
             node_name=node.name,
             function_signature=prompt_inputs.function_signature,
             pytorch_reference=prompt_inputs.pytorch_reference,
-            baseline_dsl=baseline_dsl,
+            baseline_dsl=composed_baseline_dsl,
             dims_block=prompt_inputs.dims_block,
             tensors_block=prompt_inputs.tensors_block,
             fewshot=config.fewshot,
-            child_variant_blocks=child_blocks,
+            child_variant_blocks={},
+            child_design_examples=child_design_examples,
             accepted_summary=accepted_summary,
             budget_block=_budget_block(budget, baseline_breakdown),
             ace_context=ace_context_text,
@@ -1743,30 +2015,6 @@ async def _run_parent_attempt(
             await _record_ace("PARSE_FAIL", turn)
             continue
 
-        try:
-            children_picks: dict[str, DesignEntry] = {
-                child.path: entry_for_variant(
-                    children_libraries[child.path],
-                    parsed.child_picks[child.name],
-                )
-                for child in node.children
-            }
-        except AssertionError as e:
-            _write_turn_artifacts(
-                turn_dir,
-                user_prompt=turn_user_prompt,
-                agent_response=agent_response,
-                status=f"BAD_CHILD_PICK: {e}",
-                extracted_code=parsed.dsl,
-            )
-            _append_turn_feedback(conversation, (
-                f"One of your child_picks indices is invalid: {e}\n\n"
-                "Refer to the child variant tables in the user prompt "
-                "and pick a valid variant_index per child."
-            ))
-            await _record_ace("BAD_CHILD_PICK", turn)
-            continue
-
         compliance_feedback = _compliance_preflight_feedback(
             parsed.dsl, is_root=is_root,
         )
@@ -1780,6 +2028,41 @@ async def _run_parent_attempt(
             )
             _append_turn_feedback(conversation, compliance_feedback)
             await _record_ace("COMPLIANCE_FAIL", turn)
+            continue
+
+        function_feedback = _required_node_function_feedback(
+            parsed.dsl, node_name=node.name, is_root=is_root,
+        )
+        if function_feedback is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="FUNCTION_DEF_FAIL",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, function_feedback)
+            await _record_ace("FUNCTION_DEF_FAIL", turn)
+            continue
+
+        children_picks, child_aliases, child_feedback = (
+            _select_called_child_helpers(
+                node=node,
+                parsed_dsl=parsed.dsl,
+                default_children_picks=default_children_picks,
+                child_helper_options=child_helper_options,
+            )
+        )
+        if child_feedback is not None:
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="CHILD_HELPER_FAIL",
+                extracted_code=parsed.dsl,
+            )
+            _append_turn_feedback(conversation, child_feedback)
+            await _record_ace("CHILD_HELPER_FAIL", turn)
             continue
 
         try:
@@ -1808,9 +2091,15 @@ async def _run_parent_attempt(
 
         descendants: list[str] = []
         for child in node.children:
-            child_entry = children_picks[child.path]
+            child_entry = children_picks.get(child.path)
+            if child_entry is None:
+                continue
             descendants.extend(gather_descendants_postorder(child_entry))
-            descendants.append(child_entry.dsl)
+            alias = child_aliases.get(child.path)
+            descendants.append(
+                _rename_top_level_function(child_entry.dsl, alias)
+                if alias else child_entry.dsl
+            )
         composed = compose_source(
             parent_dsl=wrapper + ("\n" if wrapper else "") + parsed.dsl,
             descendant_dsls_postorder=descendants,
@@ -1896,6 +2185,7 @@ async def _run_parent_attempt(
             ),
             breakdown=result.breakdown,
             children_picks=children_picks,
+            child_call_aliases=child_aliases,
         )
         admitted.append(entry)
         _write_turn_artifacts(
@@ -2005,6 +2295,7 @@ async def search_parent(
     # Build per-child variant tables for the prompt (stable across attempts —
     # children's libraries don't change while this parent is searching).
     child_blocks: dict[str, str] = {}
+    child_names_by_path = {child.path: child.name for child in node.children}
     for child in node.children:
         child_lib = children_libraries[child.path]
         summaries = render_library_as_variant_summaries(child_lib)
@@ -2028,9 +2319,25 @@ async def search_parent(
             output_vanilla_shapes=out_van_shapes,
             variants=summaries,
         )
+    child_design_examples = render_child_design_examples(
+        children_libraries,
+        child_names_by_path=child_names_by_path,
+    )
 
     expected_child_names = tuple(c.name for c in node.children)
     baselines: list[DesignEntry] = [baseline, *(initial_baselines or [])]
+    default_children_picks: dict[str, DesignEntry] = {
+        child.path: _best_child_entry(children_libraries[child.path])
+        for child in node.children
+    }
+    child_helper_options: dict[str, list[ChildHelperOption]] = {
+        child.path: _child_helper_options(
+            child_name=child.name,
+            child_lib=children_libraries[child.path],
+            max_options=5,
+        )
+        for child in node.children
+    }
 
     attempt_coros = [
         _run_parent_attempt(
@@ -2039,7 +2346,10 @@ async def search_parent(
             baseline_dsl=b.dsl,
             baseline_index=b_idx,
             children_libraries=children_libraries,
+            default_children_picks=default_children_picks,
+            child_helper_options=child_helper_options,
             child_blocks=child_blocks,
+            child_design_examples=child_design_examples,
             expected_child_names=expected_child_names,
             attempt_index=a_idx,
             budget=budget,
@@ -2236,6 +2546,35 @@ def _wipe_node_run_artifacts(node_ckpt: Path) -> None:
             shutil.rmtree(item)
 
 
+def _wipe_incomplete_node_resume_state(
+    *,
+    node_ckpt: Path,
+    ckpt_dir: Path,
+    node_path: str,
+    pass_subdir: str | None,
+) -> None:
+    """Clean stale state before rerunning a node with no valid snapshot.
+
+    In the legacy single-pass layout, children live below a parent's
+    checkpoint path (``autotune2/root/child`` is under ``autotune2/root``),
+    so cleanup must preserve unknown child directories and only delete
+    known node-owned artifacts. In multipass layout, ``node_ckpt`` points
+    at the leaf pass directory (``autotune2/root/pass_0``); children are
+    sibling subtrees such as ``autotune2/root/child/pass_0``. There it is
+    safe, and cleaner, to remove the whole incomplete node/pass dir.
+    """
+    if pass_subdir is None:
+        _wipe_node_run_artifacts(node_ckpt)
+        return
+
+    if node_ckpt.exists():
+        shutil.rmtree(node_ckpt)
+
+    rust_pass_dir = ckpt_dir / "autotune2" / "_rust_work" / node_path / pass_subdir
+    if rust_pass_dir.exists():
+        shutil.rmtree(rust_pass_dir)
+
+
 async def autotune(
     *,
     plan_tree: Tree,
@@ -2338,10 +2677,6 @@ async def autotune(
     """
     root_path = plan_tree.root.path
     tasks: dict[str, asyncio.Task] = {}
-    pass_deadline = PassDeadline(
-        seconds=config.time_limit_seconds,
-        clock=config.clock,
-    )
 
     async def _search_node(node: PlanNode) -> NodeLibrary:
         # Wait for every child's task before doing any work on this node.
@@ -2377,7 +2712,12 @@ async def autotune(
             )
             if loaded is not None:
                 return loaded
-            _wipe_node_run_artifacts(node_ckpt)
+            _wipe_incomplete_node_resume_state(
+                node_ckpt=node_ckpt,
+                ckpt_dir=ckpt_dir,
+                node_path=node.path,
+                pass_subdir=pass_subdir,
+            )
 
         node_system_prompt = system_prompts[node.path]
         node_agent = agent_factory(node_system_prompt)
@@ -2403,6 +2743,10 @@ async def autotune(
         # write the same value.
         await node_sim_manager.start_pass(config.time_limit_seconds)
         node_verifier = make_verifier(node, parent_contract, node_tensors)
+        node_deadline = PassDeadline(
+            seconds=config.time_limit_seconds,
+            clock=config.clock,
+        )
 
         # Multi-pass branching: pull additional starting designs from the
         # prior pass's library for this node. Exclude the prior library's
@@ -2441,7 +2785,7 @@ async def autotune(
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
                 prior_pass1_baseline=prior_pass1,
-                pass_deadline=pass_deadline,
+                pass_deadline=node_deadline,
             )
         else:
             # Parent: gather each child's pass-1 baseline entry. We must use
@@ -2470,7 +2814,7 @@ async def autotune(
                 system_prompt=node_system_prompt,
                 initial_baselines=node_initial_baselines,
                 prior_pass1_baseline=prior_pass1,
-                pass_deadline=pass_deadline,
+                pass_deadline=node_deadline,
             )
 
         # Multi-pass accumulator: merge the prior pass's entries for this

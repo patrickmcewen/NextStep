@@ -1,6 +1,6 @@
 ## Node: {node_name}
 
-You are tuning node ``{node_name}``. The pass-1 design below is verified
+You are tuning node ``{node_name}``. The baseline source below is verified
 correct against the PyTorch reference; your goal is to **minimize cycle
 latency while staying within the on-chip memory budget**.
 
@@ -24,7 +24,7 @@ latency while staying within the on-chip memory budget**.
 
 {tensors_block}
 
-### Pass-1 verified design
+### Verified baseline source
 
 ```python
 {baseline_dsl}
@@ -47,5 +47,8 @@ Propose a DSL implementation that:
   - Differs structurally from the pass-1 design and from any
     already-accepted variants{accepted_hint}.
   - Declares the boundary contracts your design exposes to the parent.{parent_hint}
+  - Emits only the standalone function for this node using the required
+    signature above. Do not emit composed code, child implementations, or a
+    ``tiled_reference`` wrapper; use those only as context.
 
 Emit your YAML + python blocks per the output protocol.

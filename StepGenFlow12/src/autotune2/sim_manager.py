@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 import json
 import hashlib
 import time
@@ -49,11 +50,11 @@ from typing import Awaitable, Callable, Protocol
 # need to import ``compose``.
 ScoreFn = Callable[[str], tuple[int, int]]
 
-# (composed_source) -> (rust_cycles, rust_dur_ms). Same shape as
-# ``runtime.RustEvaluateFn``; re-declared here so the rust manager
-# implementation doesn't have to import ``runtime`` (which would pull in
-# the StepDB / step_tl path setup at import time).
-RustEvaluateFn = Callable[[str], tuple[int, float]]
+# (composed_source, optional metadata kwargs) -> (rust_cycles, rust_dur_ms).
+# Same shape as ``runtime.RustEvaluateFn``; re-declared here so the rust
+# manager implementation doesn't have to import ``runtime`` (which would
+# pull in the StepDB / step_tl path setup at import time).
+RustEvaluateFn = Callable[..., tuple[int, float]]
 
 
 class RustOutputMismatch(Exception):
@@ -129,22 +130,63 @@ class SimulationManager(Protocol):
     ) -> SimulationResult: ...
 
 
+def _turn_relative_label(ctx: SimContext) -> str:
+    if ctx.turn_artifact_dir is None:
+        if ctx.variant_kind == "baseline":
+            return "pass1_baseline"
+        return (
+            f"{ctx.variant_kind}/attempt_{ctx.attempt_index}/"
+            f"turn_{ctx.turn_index}"
+        )
+    parts = tuple(Path(ctx.turn_artifact_dir).parts)
+    node_parts = tuple(p for p in ctx.node_path.split("/") if p)
+    for i in range(len(parts) - len(node_parts), -1, -1):
+        if parts[i:i + len(node_parts)] == node_parts:
+            tail = parts[i + len(node_parts):]
+            if tail:
+                return "/".join(tail)
+            break
+    return "/".join(parts[-3:])
+
+
+def _invoke_rust_evaluate(
+    rust_evaluate_fn: RustEvaluateFn,
+    composed_source: str,
+    *,
+    ctx: SimContext,
+) -> tuple[int, float]:
+    try:
+        sig = inspect.signature(rust_evaluate_fn)
+    except (TypeError, ValueError):
+        return rust_evaluate_fn(composed_source)
+    params = sig.parameters
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if accepts_kwargs or "node_path" in params or "run_label" in params:
+        return rust_evaluate_fn(
+            composed_source,
+            node_path=ctx.node_path,
+            run_label=_turn_relative_label(ctx),
+        )
+    return rust_evaluate_fn(composed_source)
+
+
 # ---------------------------------------------------------------------------
-# TimeBudget — shared per-pass wall-clock accounting
+# TimeBudget — wall-clock accounting for one manager scope
 # ---------------------------------------------------------------------------
 
 
 class TimeBudget:
-    """Per-pass wall-clock budget shared across every node's manager.
+    """Wall-clock budget for one simulation-manager scope.
 
-    Rust simulator runs take seconds to hours and are dispatched
-    concurrently from the autotune2 search fan-out, so a single
-    asyncio-aware budget object lets every node consult one
-    ``remaining_seconds`` and consume against one accounting record.
-    Per-pass semantics are implemented via ``reset(seconds)``: the
-    driver calls it (indirectly, through ``SimulationManager.start_pass``)
-    at the start of every pass; the budget consumed during one pass
-    does NOT carry over into the next.
+    Rust simulator runs take seconds to hours and may be dispatched
+    concurrently from an autotune node's attempt fan-out, so an
+    asyncio-aware budget object lets every attempt for that manager
+    consult one ``remaining_seconds`` and consume against one accounting
+    record. Node-local per-pass semantics are implemented via
+    ``reset(seconds)``: the driver calls it indirectly through
+    ``SimulationManager.start_pass`` when a node begins searching.
 
     ``total_seconds=None`` means "unlimited"; ``remaining_seconds``
     returns ``inf`` in that case so callers using the canonical
@@ -154,12 +196,8 @@ class TimeBudget:
     -----------------
     ``consume`` is awaited under an ``asyncio.Lock`` so the
     ``_consumed`` accumulator can't lose a write under the search
-    fan-out. ``reset`` is synchronous — the driver pattern is "every
-    node task calls ``start_pass`` with the SAME seconds before any
-    task calls ``consume``", so racing resets with identical
-    parameters is benign (both writes set the same value). Calling
-    ``reset`` with different seconds across concurrent tasks would be
-    a bug, but the autotune2 driver never does that.
+    fan-out. ``reset`` is synchronous and should happen before attempts
+    for this manager call ``consume``.
     """
 
     # Number of recent rust durations averaged into
@@ -417,15 +455,7 @@ class RustAll:
     async def start_pass(
         self, time_budget_seconds: float | None,
     ) -> None:
-        """Re-arm the shared per-pass time budget.
-
-        Every node's manager wraps the same ``TimeBudget`` instance via
-        factory closure, so this call is naturally idempotent across
-        the autotune2 driver's per-node fan-out (each node calls
-        ``start_pass`` with the same seconds; all writes set identical
-        values). See the ``TimeBudget`` docstring for the concurrency
-        model.
-        """
+        """Re-arm this manager's node-local time budget."""
         self._time_budget.reset(time_budget_seconds)
 
     async def score(
@@ -473,7 +503,10 @@ class RustAll:
         t0 = time.perf_counter()
         try:
             rust_cycles, rust_dur_ms = await asyncio.to_thread(
-                self._rust_evaluate_fn, composed_source,
+                _invoke_rust_evaluate,
+                self._rust_evaluate_fn,
+                composed_source,
+                ctx=ctx,
             )
         except RustOutputMismatch as exc:
             await self._time_budget.consume(time.perf_counter() - t0)
@@ -526,7 +559,7 @@ class DeterministicSplit:
       - Every other variant takes the analytical-only path.
 
     Identical wiring to ``RustAll`` otherwise: same constructor args, same
-    per-pass ``TimeBudget``, same calibration-store write-through on rust
+    node-local ``TimeBudget``, same calibration-store write-through on rust
     calls, same budget-exhausted fallback to analytical. Adding new rules
     is a switch in ``_should_use_rust``; the rule string is checked at
     construction so unknown rules fail loud.
@@ -568,7 +601,7 @@ class DeterministicSplit:
     async def start_pass(
         self, time_budget_seconds: float | None,
     ) -> None:
-        """Re-arm the shared per-pass time budget (idempotent)."""
+        """Re-arm this manager's node-local time budget."""
         self._time_budget.reset(time_budget_seconds)
 
     def _should_use_rust(self, ctx: SimContext) -> bool:
@@ -611,7 +644,10 @@ class DeterministicSplit:
         t0 = time.perf_counter()
         try:
             rust_cycles, rust_dur_ms = await asyncio.to_thread(
-                self._rust_evaluate_fn, composed_source,
+                _invoke_rust_evaluate,
+                self._rust_evaluate_fn,
+                composed_source,
+                ctx=ctx,
             )
         except RustOutputMismatch as exc:
             await self._time_budget.consume(time.perf_counter() - t0)
@@ -890,7 +926,10 @@ class AgentManager:
         t0 = time.perf_counter()
         try:
             rust_cycles, rust_dur_ms = await asyncio.to_thread(
-                self._rust_evaluate_fn, composed_source,
+                _invoke_rust_evaluate,
+                self._rust_evaluate_fn,
+                composed_source,
+                ctx=ctx,
             )
         except RustOutputMismatch as exc:
             await self._time_budget.consume(time.perf_counter() - t0)
