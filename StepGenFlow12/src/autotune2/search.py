@@ -221,6 +221,20 @@ class SearchConfig:
     ``"parallel"``.
     """
 
+    max_library_designs: int | None = None
+    """Optional cumulative per-node cap for successful library designs.
+
+    ``None`` disables the cap. When set, a node with at least this many
+    already-admitted non-``pass1_baseline`` entries skips new LLM search
+    attempts for the pass and only carries its existing library forward.
+    """
+
+    ace_min_output_tokens: int = 8_192
+    """Minimum proposal-agent output room to preserve when injecting ACE
+    context. Oversized ACE playbooks are trimmed per prompt before starting
+    a session so large root prompts do not starve the model's YAML/Python
+    response budget."""
+
 
 class PassDeadline:
     """Wall-clock deadline shared by the attempts for one search scope.
@@ -747,6 +761,32 @@ def _library_entries(lib: NodeLibrary) -> list[DesignEntry]:
     ]
 
 
+def _library_design_count_excluding_pass1(lib: NodeLibrary) -> int:
+    """Count successful library designs, excluding the required baseline."""
+    return sum(
+        1 for entry in _library_entries(lib)
+        if entry.provenance != "pass1_baseline"
+    )
+
+
+class _LibraryDesignCap:
+    """Shared per-node admission counter for live attempt fanout."""
+
+    def __init__(self, max_designs: int | None, *, initial_count: int = 0):
+        self.max_designs = max_designs
+        self.count = initial_count
+
+    @property
+    def reached(self) -> bool:
+        return self.max_designs is not None and self.count >= self.max_designs
+
+    def try_admit(self) -> bool:
+        if self.reached:
+            return False
+        self.count += 1
+        return True
+
+
 def _top_level_function_name(dsl: str) -> str | None:
     tree = ast.parse(dsl)
     for node in tree.body:
@@ -794,6 +834,14 @@ class ChildHelperOption:
     entry: DesignEntry
 
 
+_CHILD_EXAMPLE_SOURCE_PREVIEW_LINES = 24
+_CHILD_EXAMPLE_SOURCE_PREVIEW_CHARS = 2_400
+_CHILD_EXAMPLE_TRUNCATION_MARKER = (
+    "    # ... body truncated; call the helper label rather than copying "
+    "this full implementation."
+)
+
+
 def _child_helper_options(
     *,
     child_name: str,
@@ -814,17 +862,53 @@ def _child_helper_options(
     ]
 
 
+def _format_contracts_for_child_example(
+    contracts: dict[str, TensorContract],
+) -> str:
+    if not contracts:
+        return "{}"
+    return "\n".join(
+        f"- {name}: reshape={contract.reshape}, "
+        f"permutation={contract.permutation}"
+        for name, contract in sorted(contracts.items())
+    )
+
+
+def _preview_child_source(source: str) -> str:
+    lines = source.rstrip().splitlines()
+    truncated = len(lines) > _CHILD_EXAMPLE_SOURCE_PREVIEW_LINES
+    preview_lines = lines[:_CHILD_EXAMPLE_SOURCE_PREVIEW_LINES]
+    preview = "\n".join(preview_lines).rstrip()
+
+    if len(preview) > _CHILD_EXAMPLE_SOURCE_PREVIEW_CHARS:
+        truncated = True
+        shortened_lines: list[str] = []
+        current_len = 0
+        for line in preview_lines:
+            next_len = current_len + len(line) + (1 if shortened_lines else 0)
+            if next_len > _CHILD_EXAMPLE_SOURCE_PREVIEW_CHARS:
+                break
+            shortened_lines.append(line)
+            current_len = next_len
+        preview = "\n".join(shortened_lines).rstrip()
+
+    if truncated:
+        preview = f"{preview}\n{_CHILD_EXAMPLE_TRUNCATION_MARKER}"
+    return preview
+
+
 def render_child_design_examples(
     children_libraries: dict[str, NodeLibrary],
     *,
     child_names_by_path: dict[str, str],
     max_examples_per_child: int = 5,
 ) -> str:
-    """Render best child sources for parent prompts.
+    """Render compact child helper candidates for parent prompts.
 
-    Unlike the legacy variant table, this exposes actual DSL source for
-    the strongest child entries so the parent model can adapt ideas from
-    child designs without being forced to select an opaque variant index.
+    The prompt needs the callable helper labels, boundary contracts, and
+    enough source shape to recognize each option. Full child/descendant
+    bodies are intentionally omitted because they duplicate executable
+    helper bindings and can dominate the parent prompt token budget.
     """
     assert max_examples_per_child >= 1, (
         "render_child_design_examples: max_examples_per_child must be >= 1"
@@ -840,20 +924,25 @@ def render_child_design_examples(
         blocks.append(f"#### Child {child_name} (`{child_path}`)")
         blocks.append(
             "You may call one helper by label (for example "
-            f"`{options[0].label}(...)`) or inline equivalent DSL directly "
-            "inside the parent instead of calling a child helper."
+            f"`{options[0].label}(...)`). These helpers are available at "
+            "runtime; source previews are intentionally truncated, so prefer "
+            "calling helper labels instead of copying child bodies."
         )
         for example_index, option in enumerate(options):
             entry = option.entry
-            source = compose_source(
-                parent_dsl=_rename_top_level_function(entry.dsl, option.label),
-                descendant_dsls_postorder=gather_descendants_postorder(entry),
+            source = _preview_child_source(
+                _rename_top_level_function(entry.dsl, option.label)
             )
             blocks.append(
                 f"Example {example_index}: call `{option.label}(...)`; "
                 f"cycles={entry.cycles} "
                 f"({entry.cycle_source}), on_chip={entry.on_chip}, "
                 f"provenance={entry.provenance}\n"
+                "input_contracts:\n"
+                f"{_format_contracts_for_child_example(entry.input_contracts)}\n"
+                "output_contracts:\n"
+                f"{_format_contracts_for_child_example(entry.output_contracts)}\n"
+                "source_preview:\n"
                 "```python\n"
                 f"{source}\n"
                 "```"
@@ -1142,6 +1231,93 @@ def _ace_enabled(config: SearchConfig) -> bool:
     return bool(ace is not None and getattr(ace, "enabled", False))
 
 
+def _agent_context_token_budget(agent: AgentFn, conversation: list[dict]):
+    budget_fn = getattr(agent, "context_token_budget", None)
+    if budget_fn is None:
+        return None
+    budget = budget_fn(conversation)
+    assert hasattr(budget, "has_output_room"), (
+        "agent.context_token_budget must return an object with "
+        "has_output_room"
+    )
+    return budget
+
+
+def _agent_context_exhausted(agent: AgentFn, conversation: list[dict]) -> bool:
+    budget = _agent_context_token_budget(agent, conversation)
+    return bool(budget is not None and not budget.has_output_room)
+
+
+def _assert_agent_context_room(
+    agent: AgentFn,
+    conversation: list[dict],
+    *,
+    min_output_tokens: int = 1,
+) -> None:
+    budget = _agent_context_token_budget(agent, conversation)
+    if budget is None or budget.max_tokens >= max(1, int(min_output_tokens)):
+        return
+    raise AssertionError(
+        "prompt leaves no room for output tokens after ACE refresh: "
+        f"context_window_tokens={budget.context_window_tokens}, "
+        f"prompt_tokens={budget.prompt_tokens}, "
+        f"output_token_margin={budget.output_token_margin}, "
+        f"available_output_tokens={budget.max_tokens}, "
+        f"required_output_tokens={max(1, int(min_output_tokens))}"
+    )
+
+
+_ACE_CONTEXT_TRUNCATION_MARKER = (
+    "[ACE context truncated to preserve proposal output budget; "
+    "retaining most recent guidance.]\n"
+)
+
+
+def _fit_ace_context_to_agent_budget(
+    agent: AgentFn,
+    build_prompt: Callable[[str], str],
+    ace_context: str,
+    *,
+    min_output_tokens: int,
+) -> tuple[str, str]:
+    """Return ``(ace_context, prompt)`` that leaves proposal output room."""
+    min_output_tokens = max(1, int(min_output_tokens))
+
+    def prompt_and_budget(context: str):
+        prompt = build_prompt(context)
+        budget = _agent_context_token_budget(
+            agent, [{"role": "user", "content": prompt}]
+        )
+        return prompt, budget
+
+    prompt, budget = prompt_and_budget(ace_context)
+    if budget is None or budget.max_tokens >= min_output_tokens:
+        return ace_context, prompt
+    if not ace_context.strip():
+        return ace_context, prompt
+
+    empty_prompt, empty_budget = prompt_and_budget("")
+    if empty_budget is not None and empty_budget.max_tokens < min_output_tokens:
+        return "", empty_prompt
+
+    low = 0
+    high = len(ace_context)
+    best_context = ""
+    best_prompt = empty_prompt
+    while low <= high:
+        keep = (low + high) // 2
+        suffix = ace_context[-keep:] if keep else ""
+        candidate = _ACE_CONTEXT_TRUNCATION_MARKER + suffix
+        candidate_prompt, candidate_budget = prompt_and_budget(candidate)
+        if candidate_budget is None or candidate_budget.max_tokens >= min_output_tokens:
+            best_context = candidate
+            best_prompt = candidate_prompt
+            low = keep + 1
+        else:
+            high = keep - 1
+    return best_context, best_prompt
+
+
 def _turn_artifact_dir(
     attempt_dir: Path,
     *,
@@ -1392,6 +1568,7 @@ async def _run_leaf_attempt(
     config: SearchConfig,
     baseline_accepted: list[DesignEntry],
     pass_deadline: PassDeadline,
+    design_cap: _LibraryDesignCap,
     baseline_breakdown: str = "",
 ) -> list[DesignEntry]:
     """Run one leaf attempt under the pass-level wall-clock deadline.
@@ -1437,11 +1614,16 @@ async def _run_leaf_attempt(
         "fewshot": config.fewshot,
     }
 
-    def _build_user_prompt() -> str:
+    def _build_user_prompt(ace_context_override: str | None = None) -> str:
         accepted_summary = render_accepted_summary(
             baseline_accepted + admitted,
             arg_vanilla_shapes=arg_vanilla_shapes,
             output_vanilla_shapes=output_vanilla_shapes,
+        )
+        ace_context_for_prompt = (
+            ace_context_text
+            if ace_context_override is None
+            else ace_context_override
         )
         return build_autotune2_user_prompt(
             is_leaf=True,
@@ -1454,21 +1636,33 @@ async def _run_leaf_attempt(
             fewshot=config.fewshot,
             accepted_summary=accepted_summary,
             budget_block=_budget_block(budget, baseline_breakdown),
-            ace_context=ace_context_text,
+            ace_context=ace_context_for_prompt,
         )
 
-    conversation: list[dict] = [{"role": "user", "content": _build_user_prompt()}]
+    def _rebuild_conversation() -> list[dict]:
+        nonlocal ace_context_text
+        ace_context_text, prompt = _fit_ace_context_to_agent_budget(
+            agent,
+            _build_user_prompt,
+            ace_context_text,
+            min_output_tokens=config.ace_min_output_tokens,
+        )
+        return [{"role": "user", "content": prompt}]
+
+    conversation: list[dict] = _rebuild_conversation()
     if ace is not None:
         ace.write_session_start(
             attempt_dir, session_index=session_index, metadata=ace_metadata,
         )
 
-    async def _refresh_ace_session_if_needed() -> None:
+    async def _refresh_ace_session_if_needed(*, force: bool = False) -> bool:
         nonlocal ace_context_text, session_index, session_turn, ace_events, conversation
         if ace is None:
-            return
-        if session_turn < ace.refresh_interval_turns:
-            return
+            return False
+        if not force and session_turn < ace.refresh_interval_turns:
+            return False
+        if not ace_events:
+            return False
         ace_context_text = await ace.refresh(
             attempt_dir,
             completed_session_index=session_index,
@@ -1482,7 +1676,8 @@ async def _run_leaf_attempt(
         ace.write_session_start(
             attempt_dir, session_index=session_index, metadata=ace_metadata,
         )
-        conversation = [{"role": "user", "content": _build_user_prompt()}]
+        conversation = _rebuild_conversation()
+        return True
 
     async def _record_ace(
         status: str,
@@ -1510,7 +1705,16 @@ async def _run_leaf_attempt(
         session_turn += 1
 
     for turn in _turn_indices_until_deadline(pass_deadline):
+        if design_cap.reached:
+            break
         await _refresh_ace_session_if_needed()
+        if _agent_context_exhausted(agent, conversation):
+            await _refresh_ace_session_if_needed(force=True)
+        _assert_agent_context_room(
+            agent,
+            conversation,
+            min_output_tokens=config.ace_min_output_tokens,
+        )
         assert conversation[-1]["role"] == "user", (
             "search_leaf: expected last conversation message to be a user "
             "turn before invoking the agent"
@@ -1672,6 +1876,19 @@ async def _run_leaf_attempt(
             await _record_ace("OVER_BUDGET", turn)
             continue
 
+        if not design_cap.try_admit():
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="LIBRARY_CAP_REACHED",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=verify,
+            )
+            await _record_ace("LIBRARY_CAP_REACHED", turn)
+            break
+
         entry = DesignEntry(
             dsl=parsed.dsl,
             input_contracts=parsed.input_contracts,
@@ -1723,6 +1940,7 @@ async def search_leaf(
     initial_baselines: list[DesignEntry] | None = None,
     prior_pass1_baseline: DesignEntry | None = None,
     pass_deadline: PassDeadline | None = None,
+    initial_library_design_count: int = 0,
 ) -> NodeLibrary:
     """Populate one leaf node's library.
 
@@ -1786,6 +2004,10 @@ async def search_leaf(
     _write_pass1_baseline_score(ckpt_dir, baseline)
 
     baselines: list[DesignEntry] = [baseline, *(initial_baselines or [])]
+    design_cap = _LibraryDesignCap(
+        config.max_library_designs,
+        initial_count=initial_library_design_count,
+    )
     attempt_coros = [
         _run_leaf_attempt(
             node=node,
@@ -1805,6 +2027,7 @@ async def search_leaf(
             config=config,
             baseline_accepted=[b],
             pass_deadline=pass_deadline,
+            design_cap=design_cap,
             baseline_breakdown=b.breakdown,
         )
         for b_idx, b in enumerate(baselines)
@@ -1849,6 +2072,7 @@ async def _run_parent_attempt(
     config: SearchConfig,
     baseline_accepted: list[DesignEntry],
     pass_deadline: PassDeadline,
+    design_cap: _LibraryDesignCap,
     baseline_breakdown: str = "",
 ) -> list[DesignEntry]:
     """One parent attempt scoped to the pass-level wall-clock deadline.
@@ -1902,11 +2126,16 @@ async def _run_parent_attempt(
         "child_paths": [child.path for child in node.children],
     }
 
-    def _build_user_prompt() -> str:
+    def _build_user_prompt(ace_context_override: str | None = None) -> str:
         accepted_summary = render_accepted_summary(
             baseline_accepted + admitted,
             arg_vanilla_shapes=arg_vanilla_shapes,
             output_vanilla_shapes=output_vanilla_shapes,
+        )
+        ace_context_for_prompt = (
+            ace_context_text
+            if ace_context_override is None
+            else ace_context_override
         )
         return build_autotune2_user_prompt(
             is_leaf=False,
@@ -1921,21 +2150,33 @@ async def _run_parent_attempt(
             child_design_examples=child_design_examples,
             accepted_summary=accepted_summary,
             budget_block=_budget_block(budget, baseline_breakdown),
-            ace_context=ace_context_text,
+            ace_context=ace_context_for_prompt,
         )
 
-    conversation: list[dict] = [{"role": "user", "content": _build_user_prompt()}]
+    def _rebuild_conversation() -> list[dict]:
+        nonlocal ace_context_text
+        ace_context_text, prompt = _fit_ace_context_to_agent_budget(
+            agent,
+            _build_user_prompt,
+            ace_context_text,
+            min_output_tokens=config.ace_min_output_tokens,
+        )
+        return [{"role": "user", "content": prompt}]
+
+    conversation: list[dict] = _rebuild_conversation()
     if ace is not None:
         ace.write_session_start(
             attempt_dir, session_index=session_index, metadata=ace_metadata,
         )
 
-    async def _refresh_ace_session_if_needed() -> None:
+    async def _refresh_ace_session_if_needed(*, force: bool = False) -> bool:
         nonlocal ace_context_text, session_index, session_turn, ace_events, conversation
         if ace is None:
-            return
-        if session_turn < ace.refresh_interval_turns:
-            return
+            return False
+        if not force and session_turn < ace.refresh_interval_turns:
+            return False
+        if not ace_events:
+            return False
         ace_context_text = await ace.refresh(
             attempt_dir,
             completed_session_index=session_index,
@@ -1949,7 +2190,8 @@ async def _run_parent_attempt(
         ace.write_session_start(
             attempt_dir, session_index=session_index, metadata=ace_metadata,
         )
-        conversation = [{"role": "user", "content": _build_user_prompt()}]
+        conversation = _rebuild_conversation()
+        return True
 
     async def _record_ace(
         status: str,
@@ -1977,7 +2219,16 @@ async def _run_parent_attempt(
         session_turn += 1
 
     for turn in _turn_indices_until_deadline(pass_deadline):
+        if design_cap.reached:
+            break
         await _refresh_ace_session_if_needed()
+        if _agent_context_exhausted(agent, conversation):
+            await _refresh_ace_session_if_needed(force=True)
+        _assert_agent_context_room(
+            agent,
+            conversation,
+            min_output_tokens=config.ace_min_output_tokens,
+        )
         assert conversation[-1]["role"] == "user", (
             "search_parent: expected last conversation message to be a "
             "user turn before invoking the agent"
@@ -2172,6 +2423,19 @@ async def _run_parent_attempt(
             await _record_ace("OVER_BUDGET", turn)
             continue
 
+        if not design_cap.try_admit():
+            _write_turn_artifacts(
+                turn_dir,
+                user_prompt=turn_user_prompt,
+                agent_response=agent_response,
+                status="LIBRARY_CAP_REACHED",
+                extracted_code=parsed.dsl,
+                composed_source=composed,
+                verify_result=verify,
+            )
+            await _record_ace("LIBRARY_CAP_REACHED", turn)
+            break
+
         entry = DesignEntry(
             dsl=parsed.dsl,
             input_contracts=parsed.input_contracts,
@@ -2227,6 +2491,7 @@ async def search_parent(
     initial_baselines: list[DesignEntry] | None = None,
     prior_pass1_baseline: DesignEntry | None = None,
     pass_deadline: PassDeadline | None = None,
+    initial_library_design_count: int = 0,
 ) -> NodeLibrary:
     """Populate one parent node's library.
 
@@ -2326,6 +2591,10 @@ async def search_parent(
 
     expected_child_names = tuple(c.name for c in node.children)
     baselines: list[DesignEntry] = [baseline, *(initial_baselines or [])]
+    design_cap = _LibraryDesignCap(
+        config.max_library_designs,
+        initial_count=initial_library_design_count,
+    )
     default_children_picks: dict[str, DesignEntry] = {
         child.path: _best_child_entry(children_libraries[child.path])
         for child in node.children
@@ -2364,6 +2633,7 @@ async def search_parent(
             config=config,
             baseline_accepted=[b],
             pass_deadline=pass_deadline,
+            design_cap=design_cap,
             baseline_breakdown=b.breakdown,
         )
         for b_idx, b in enumerate(baselines)
@@ -2761,8 +3031,13 @@ async def autotune(
         # curation's no-duplicate-record_id invariant).
         node_initial_baselines: list[DesignEntry] | None = None
         prior_pass1: DesignEntry | None = None
+        prior_lib: NodeLibrary | None = None
+        prior_library_design_count = 0
         if initial_libraries is not None and node.path in initial_libraries:
             prior_lib = initial_libraries[node.path]
+            prior_library_design_count = _library_design_count_excluding_pass1(
+                prior_lib
+            )
             prior_pass1 = find_pass1_baseline_entry(prior_lib)
             node_initial_baselines = select_baselines(
                 prior_lib,
@@ -2771,7 +3046,90 @@ async def autotune(
                 exclude=[prior_pass1],
             )
 
-        if node.is_leaf:
+        library_cap_reached = (
+            config.max_library_designs is not None
+            and prior_lib is not None
+            and prior_library_design_count >= config.max_library_designs
+        )
+
+        if library_cap_reached:
+            lib = {}
+            if node_system_prompt:
+                node_ckpt.mkdir(parents=True, exist_ok=True)
+                (node_ckpt / "system_prompt.txt").write_text(node_system_prompt)
+
+            if node.is_leaf:
+                if is_root_node:
+                    baseline, _baseline_breakdown = await _seed_root_baseline(
+                        lib=lib,
+                        node_path=node.path,
+                        node_name=node.name,
+                        pass1_dsl=pass1_dsls[node.path],
+                        sim_manager=node_sim_manager,
+                        descendant_dsls=[],
+                        children_picks={},
+                        prior_baseline=prior_pass1,
+                    )
+                else:
+                    assert parent_contract is not None, (
+                        "non-root capped leaf must have a parent contract"
+                    )
+                    baseline, _baseline_breakdown = await _seed_baseline(
+                        lib=lib,
+                        node_path=node.path,
+                        node_name=node.name,
+                        parent_contract=parent_contract,
+                        pass1_dsl=pass1_dsls[node.path],
+                        sim_manager=node_sim_manager,
+                        descendant_dsls=[],
+                        children_picks={},
+                        prior_baseline=prior_pass1,
+                    )
+            else:
+                baseline_picks: dict[str, DesignEntry] = {
+                    child.path: find_pass1_baseline_entry(child_libs[child.path])
+                    for child in node.children
+                }
+                baseline_descendants: list[str] = []
+                for child_entry in baseline_picks.values():
+                    baseline_descendants.extend(
+                        gather_descendants_postorder(child_entry)
+                    )
+                    baseline_descendants.append(child_entry.dsl)
+                if is_root_node:
+                    baseline, _baseline_breakdown = await _seed_root_baseline(
+                        lib=lib,
+                        node_path=node.path,
+                        node_name=node.name,
+                        pass1_dsl=pass1_dsls[node.path],
+                        sim_manager=node_sim_manager,
+                        descendant_dsls=baseline_descendants,
+                        children_picks=baseline_picks,
+                        prior_baseline=prior_pass1,
+                    )
+                else:
+                    assert parent_contract is not None, (
+                        "non-root capped parent must have a parent contract"
+                    )
+                    baseline, _baseline_breakdown = await _seed_baseline(
+                        lib=lib,
+                        node_path=node.path,
+                        node_name=node.name,
+                        parent_contract=parent_contract,
+                        pass1_dsl=pass1_dsls[node.path],
+                        sim_manager=node_sim_manager,
+                        descendant_dsls=baseline_descendants,
+                        children_picks=baseline_picks,
+                        prior_baseline=prior_pass1,
+                    )
+            _write_pass1_baseline_score(node_ckpt, baseline)
+            node_ckpt.mkdir(parents=True, exist_ok=True)
+            emit_variants_module(
+                out_path=node_ckpt / "variants.py",
+                child_name=node.name,
+                variants=library_to_variant_registry(lib),
+            )
+        elif node.is_leaf:
             lib = await search_leaf(
                 node=node,
                 parent_contract=parent_contract,
@@ -2786,6 +3144,7 @@ async def autotune(
                 initial_baselines=node_initial_baselines,
                 prior_pass1_baseline=prior_pass1,
                 pass_deadline=node_deadline,
+                initial_library_design_count=prior_library_design_count,
             )
         else:
             # Parent: gather each child's pass-1 baseline entry. We must use
@@ -2815,6 +3174,7 @@ async def autotune(
                 initial_baselines=node_initial_baselines,
                 prior_pass1_baseline=prior_pass1,
                 pass_deadline=node_deadline,
+                initial_library_design_count=prior_library_design_count,
             )
 
         # Multi-pass accumulator: merge the prior pass's entries for this

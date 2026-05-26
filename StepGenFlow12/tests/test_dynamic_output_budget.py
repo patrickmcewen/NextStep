@@ -3,7 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 from src.agents import (
+    AgentPromptTokenBudget,
     compute_dynamic_max_tokens,
+    compute_prompt_token_budget,
     estimate_agent_prompt_tokens,
 )
 
@@ -35,3 +37,20 @@ def test_dynamic_max_tokens_asserts_when_prompt_leaves_no_output_room():
         )
 
     assert "prompt leaves no room" in str(exc_info.value)
+
+
+def test_prompt_token_budget_reports_available_output_room():
+    agent = SimpleNamespace(instructions="")
+    conversation = [{"role": "user", "content": "x " * 200}]
+
+    budget = compute_prompt_token_budget(
+        agent,
+        conversation,
+        context_window_tokens=64,
+        output_token_margin=32,
+    )
+
+    assert isinstance(budget, AgentPromptTokenBudget)
+    assert budget.prompt_tokens > 64
+    assert budget.max_tokens < 0
+    assert not budget.has_output_room

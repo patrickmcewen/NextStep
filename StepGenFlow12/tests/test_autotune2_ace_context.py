@@ -101,6 +101,77 @@ def test_ace_context_refresh_fn_repairs_curator_schema_error_once(tmp_path):
             / "response.txt").exists()
 
 
+def test_ace_context_refresh_fn_falls_back_to_prior_playbook_after_bad_repair(tmp_path):
+    from src.autotune2.ace_curator import build_ace_context_refresh_fn
+
+    attempt_dir = tmp_path / "attempt"
+    turn_dir = attempt_dir / "session_0" / "turn_0"
+    turn_dir.mkdir(parents=True)
+    (turn_dir / "status.txt").write_text("PARSE_FAIL")
+
+    calls = []
+
+    async def agent(conversation):
+        calls.append([dict(m) for m in conversation])
+        return '{"playbook": "bad \\` escape"}'
+
+    refresh_fn = build_ace_context_refresh_fn(agent)
+    playbook = run(refresh_fn(
+        playbook="previous stable playbook",
+        events=[{
+            "node_path": "root/leaf",
+            "status": "PARSE_FAIL",
+            "session_index": 0,
+            "session_turn": 0,
+            "global_turn": 0,
+        }],
+        metadata={"node_path": "root/leaf"},
+        attempt_dir=attempt_dir,
+        completed_session_index=0,
+        next_session_index=1,
+    ))
+
+    assert playbook == "previous stable playbook"
+    assert len(calls) == 2
+    call_dir = attempt_dir / "ace_curator" / "session_0_to_1"
+    repair_dir = attempt_dir / "ace_curator" / "session_0_to_1_repair_1"
+    assert (call_dir / "updated_playbook.txt").read_text() == "previous stable playbook"
+    assert "fallback" in (call_dir / "fallback.txt").read_text().lower()
+    assert (repair_dir / "response.txt").exists()
+
+
+def test_ace_context_refresh_fn_caps_oversized_prior_playbook_on_fallback(tmp_path):
+    from src.autotune2 import ace_curator
+    from src.autotune2.ace_curator import build_ace_context_refresh_fn
+
+    attempt_dir = tmp_path / "attempt"
+    turn_dir = attempt_dir / "session_0" / "turn_0"
+    turn_dir.mkdir(parents=True)
+    (turn_dir / "status.txt").write_text("PARSE_FAIL")
+
+    async def agent(_conversation):
+        return '{"playbook": "bad \\` escape"}'
+
+    refresh_fn = build_ace_context_refresh_fn(agent)
+    playbook = run(refresh_fn(
+        playbook="x" * (ace_curator.MAX_PLAYBOOK_CHARS + 100),
+        events=[{
+            "node_path": "root/leaf",
+            "status": "PARSE_FAIL",
+            "session_index": 0,
+            "session_turn": 0,
+            "global_turn": 0,
+        }],
+        metadata={"node_path": "root/leaf"},
+        attempt_dir=attempt_dir,
+        completed_session_index=0,
+        next_session_index=1,
+    ))
+
+    assert len(playbook) <= ace_curator.MAX_PLAYBOOK_CHARS
+    assert "truncated" in playbook
+
+
 def test_ace_context_manager_passes_attempt_dir_to_refresh_fn(tmp_path):
     from src.autotune2.ace_context import AceContextConfig, AceContextManager
 

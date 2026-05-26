@@ -962,7 +962,11 @@ def build_real_agent_fn(*, llm_config: dict):
     """
     from agents import ReasoningItem, Runner
 
-    from src.agents import build_dynamic_run_config, make_autotune2_agent
+    from src.agents import (
+        build_dynamic_run_config,
+        compute_prompt_token_budget,
+        make_autotune2_agent,
+    )
     from src.autotune2.search import AgentResponse
 
     def factory(system_prompt: str):
@@ -983,6 +987,9 @@ def build_real_agent_fn(*, llm_config: dict):
                 usage=result.context_wrapper.usage,
             )
 
+        call.context_token_budget = (
+            lambda conversation: compute_prompt_token_budget(agent, conversation)
+        )
         return call
 
     return factory

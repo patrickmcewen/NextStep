@@ -44,9 +44,11 @@ from src.autotune2.search import (
     search_leaf,
     search_parent,
     write_library_snapshot,
+    _fit_ace_context_to_agent_budget,
 )
 from src.autotune2.ace_context import AceContextConfig, AceContextManager
 from src.autotune2.sim_manager import AnalyticalOnly
+from src.agents import AgentPromptTokenBudget
 
 
 def _stub_prompt_inputs(node_name: str = "node") -> NodePromptInputs:
@@ -792,6 +794,44 @@ def test_search_leaf_stops_attempt_when_pass_time_limit_expires(tmp_path):
     assert len(captured_convos) == 2
 
 
+def test_search_leaf_stops_after_max_library_designs(tmp_path):
+    """The live library cap should stop new turns after enough LLM variants
+    have been accepted in the current node search."""
+    call_idx = [0]
+
+    async def agent(_conversation):
+        call_idx[0] += 1
+        return _make_leaf_response(
+            reshape=(call_idx[0], 1, 4, 8),
+            perm=(0, 1, 2, 3),
+        )
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    lib = run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=replace(_search_config(5, [None]), max_library_designs=1),
+    ))
+
+    admitted = [
+        entry
+        for by_out in lib.values()
+        for cell in by_out.values()
+        for entry in cell
+        if entry.provenance != "pass1_baseline"
+    ]
+    assert len(admitted) == 1
+    assert call_idx[0] == 1
+
+
 def test_search_leaf_ace_refresh_starts_new_logged_session(tmp_path):
     """ACE refresh windows restart the lane conversation under unique
     session directories and inject refreshed context into the next prompt."""
@@ -864,6 +904,124 @@ def test_search_leaf_ace_refresh_starts_new_logged_session(tmp_path):
     assert '"global_turn": 0' in event_log
     assert '"global_turn": 1' in event_log
     assert '"playbook_version": 1' in event_log
+
+
+def test_search_leaf_ace_refreshes_when_conversation_runs_out_of_context(tmp_path):
+    """ACE should compact a completed session before an overfull conversation
+    reaches the proposal agent."""
+    captured_conversations: list[list[dict]] = []
+
+    async def refresh_fn(
+        *,
+        playbook: str,
+        events: list[dict],
+        metadata: dict,
+        attempt_dir: Path,
+        completed_session_index: int,
+        next_session_index: int,
+    ) -> str:
+        assert playbook == "initial guidance"
+        assert len(events) == 1
+        assert events[0]["status"] == "PARSE_FAIL"
+        assert completed_session_index == 0
+        assert next_session_index == 1
+        return "refreshed after context exhaustion"
+
+    ace_context = AceContextManager(
+        AceContextConfig(
+            enabled=True,
+            refresh_interval_turns=100,
+            initial_playbook="initial guidance",
+        ),
+        refresh_fn=refresh_fn,
+    )
+
+    async def agent(conversation: list[dict]):
+        captured_conversations.append([dict(m) for m in conversation])
+        if len(captured_conversations) == 1:
+            return "garbage - no fenced blocks"
+        return _make_leaf_response(reshape=(4, 1, 8), perm=(1, 0, 2))
+
+    def context_token_budget(conversation: list[dict]) -> AgentPromptTokenBudget:
+        if len(conversation) > 1:
+            return AgentPromptTokenBudget(
+                context_window_tokens=128,
+                prompt_tokens=140,
+                output_token_margin=16,
+                max_tokens=-28,
+            )
+        return AgentPromptTokenBudget(
+            context_window_tokens=128,
+            prompt_tokens=64,
+            output_token_margin=16,
+            max_tokens=48,
+        )
+
+    agent.context_token_budget = context_token_budget
+
+    async def verifier(_src, *_a, **_kw):
+        return VerifyResult(passed=True)
+
+    run(search_leaf(
+        node=_leaf("my_leaf"),
+        parent_contract=_raw_contract({"x": (4, 8)}, out_shapes=((1, 4, 8),)),
+        pass1_dsl="def my_leaf(x, *, out_shapes):\n    return None\n",
+        ckpt_dir=tmp_path / "leaf",
+        sim_manager=AnalyticalOnly(lambda _src: (50, 100)),
+        agent=agent,
+        verifier=verifier,
+        prompt_inputs=_stub_prompt_inputs("my_leaf"),
+        config=SearchConfig(
+            time_limit_seconds=3.0,
+            attempt_budgets_bytes=[None],
+            clock=_TickingClock(),
+            ace_context=ace_context,
+            max_library_designs=1,
+            ace_min_output_tokens=32,
+        ),
+    ))
+
+    assert len(captured_conversations) == 2
+    assert len(captured_conversations[0]) == 1
+    assert len(captured_conversations[1]) == 1
+    assert "refreshed after context exhaustion" in captured_conversations[1][0]["content"]
+    assert (
+        tmp_path / "leaf" / "baseline_0_attempt_0_binf"
+        / "session_1" / "turn_0" / "status.txt"
+    ).exists()
+
+
+def test_ace_context_is_trimmed_to_preserve_agent_output_budget():
+    ace_context = "old guidance\n" + ("x" * 500) + "\nnew guidance"
+
+    class Agent:
+        @staticmethod
+        def context_token_budget(conversation: list[dict]) -> AgentPromptTokenBudget:
+            prompt = conversation[0]["content"]
+            return AgentPromptTokenBudget(
+                context_window_tokens=1_000,
+                prompt_tokens=len(prompt),
+                output_token_margin=0,
+                max_tokens=220 - len(prompt),
+            )
+
+    def build_prompt(context: str) -> str:
+        return "large fixed root prompt\n" + context
+
+    fitted_context, fitted_prompt = _fit_ace_context_to_agent_budget(
+        Agent(),
+        build_prompt,
+        ace_context,
+        min_output_tokens=80,
+    )
+
+    assert len(fitted_context) < len(ace_context)
+    assert "ACE context truncated" in fitted_context
+    assert "old guidance" not in fitted_context
+    assert "new guidance" in fitted_context
+    assert Agent.context_token_budget(
+        [{"role": "user", "content": fitted_prompt}]
+    ).max_tokens >= 80
 
 
 def test_search_leaf_fresh_attempt_includes_accepted_summary(tmp_path):
@@ -1612,6 +1770,53 @@ def test_child_helper_examples_are_labeled_and_capped():
     assert "def child_under_4" in prompt
     assert "def child_under_5" not in prompt
     assert "call `child_under_0(...)`" in prompt
+
+
+def test_child_helper_examples_truncate_bodies_and_skip_descendants():
+    child_lib: NodeLibrary = {}
+    c_id = vanilla_contract_for((4, 8))
+    body_lines = "\n".join(
+        f"    tmp_{idx} = x  # body line {idx}" for idx in range(80)
+    )
+    descendant = DesignEntry(
+        dsl=(
+            "def grandchild(x, *, out_shapes):\n"
+            "    return x  # descendant body should not be rendered\n"
+        ),
+        input_contracts={"x": c_id},
+        output_contracts={"out_0": c_id},
+    )
+    entry = DesignEntry(
+        dsl=(
+            "def child_under(x, *, out_shapes):\n"
+            f"{body_lines}\n"
+            "    return tmp_79\n"
+        ),
+        input_contracts={"x": c_id},
+        output_contracts={"out_0": c_id},
+        cycles=12,
+        on_chip=34,
+        provenance="long_child",
+        children_picks={"root/child_under/grandchild": descendant},
+    )
+    library_cell(child_lib, {"x": c_id}, {"out_0": c_id}).append(entry)
+
+    prompt = render_child_design_examples(
+        {"root/child_under": child_lib},
+        child_names_by_path={"root/child_under": "child_under"},
+    )
+
+    assert "call `child_under_0(...)`" in prompt
+    assert "def child_under_0(x, *, out_shapes):" in prompt
+    assert "cycles=12" in prompt
+    assert "on_chip=34" in prompt
+    assert "provenance=long_child" in prompt
+    assert "input_contracts:" in prompt
+    assert "output_contracts:" in prompt
+    assert "body line 0" in prompt
+    assert "body line 79" not in prompt
+    assert "descendant body should not be rendered" not in prompt
+    assert "truncated" in prompt
 
 
 def test_search_parent_can_call_labeled_child_and_prunes_unused_variants(tmp_path):

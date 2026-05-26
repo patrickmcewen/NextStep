@@ -71,15 +71,19 @@ configs:
     passes:
       - name: general
         fewshot: general
-        time_limit_seconds: 600
+        time_limit_seconds: 3600
+        max_library_designs: 20
 
   autotune_config_general_more_mem:
     base: common_hw
-    max_on_chip_memory: 50000000
-    attempt_budgets: [1.0, 0.5, 0.25, 0.1]
+    max_on_chip_memory: 10000000
+    attempt_budgets: [1.0, 1.0, 0.75, 0.5]
     max_baselines_per_node: 4
+    rust_sim_timeout_seconds: 600
+    rust_timeout_cycles: 1000000000
     baseline_selection: pareto_diverse
     passes:
       - name: general
         fewshot: general
         time_limit_seconds: 3600
+        max_library_designs: 20

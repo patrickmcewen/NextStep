@@ -144,15 +144,16 @@ def _resolve_attempt_budgets(
 
 _PASS_KNOBS = (
     "fewshot", "max_baselines_per_node", "baseline_selection",
-    "attempt_budgets", "time_limit_seconds", "ace_context_enabled",
-    "ace_refresh_interval_turns", "rust_sim_timeout_seconds",
-    "rust_timeout_cycles",
+    "attempt_budgets", "time_limit_seconds", "max_library_designs",
+    "ace_context_enabled", "ace_refresh_interval_turns",
+    "rust_sim_timeout_seconds", "rust_timeout_cycles",
 )
 _PASS_SPEC_DEFAULTS = {
     "fewshot": "tile_shrink",
     "max_baselines_per_node": 4,
     "baseline_selection": "pareto_diverse",
     "time_limit_seconds": 1800.0,
+    "max_library_designs": None,
     "ace_context_enabled": False,
     "ace_refresh_interval_turns": 10,
     "rust_sim_timeout_seconds": 1800,
@@ -161,6 +162,7 @@ _PASS_SPEC_DEFAULTS = {
 
 _STAMP_EXCLUDED_PASS_SPEC_KEYS = frozenset({
     "time_limit_seconds",
+    "max_library_designs",
     "ace_context_enabled",
     "ace_refresh_interval_turns",
     "rust_sim_timeout_seconds",
@@ -256,6 +258,14 @@ def _resolve_pass_specs(
             f"number, got {spec['time_limit_seconds']!r}"
         )
         spec["time_limit_seconds"] = float(spec["time_limit_seconds"])
+        assert spec["max_library_designs"] is None or (
+            isinstance(spec["max_library_designs"], int)
+            and not isinstance(spec["max_library_designs"], bool)
+            and spec["max_library_designs"] >= 1
+        ), (
+            f"{source} passes[{i}].max_library_designs must be null or "
+            f"a positive integer, got {spec['max_library_designs']!r}"
+        )
         assert isinstance(spec["ace_context_enabled"], bool), (
             f"{source} passes[{i}].ace_context_enabled must be a bool, "
             f"got {spec['ace_context_enabled']!r}"
@@ -1018,6 +1028,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             f"baseline_selection={spec['baseline_selection']}, "
             f"sim_mode={args.sim_mode}, "
             f"time_limit_seconds={spec['time_limit_seconds']}, "
+            f"max_library_designs={spec['max_library_designs']}, "
             f"ace_context_enabled={spec['ace_context_enabled']}, "
             f"ace_refresh_interval_turns="
             f"{spec['ace_refresh_interval_turns']}"
@@ -1035,6 +1046,7 @@ async def _run_autotune2(args: argparse.Namespace) -> int:
             system_prompts=system_prompts,
             config=SearchConfig(
                 time_limit_seconds=spec["time_limit_seconds"],
+                max_library_designs=spec["max_library_designs"],
                 attempt_budgets_bytes=spec["attempt_budgets_bytes"],
                 check_order=args.check_order,
                 fewshot=spec["fewshot"],

@@ -19,6 +19,7 @@ from src.autotune2.prompts import (
 
 
 AceCuratorAgentFn = Callable[[list[dict]], Awaitable[object]]
+MAX_PLAYBOOK_CHARS = 24_000
 
 
 def _turn_dir(attempt_dir: Path, event: dict) -> Path:
@@ -68,9 +69,10 @@ def build_ace_context_refresh_fn(agent_fn: AceCuratorAgentFn):
         completed_session_index: int,
         next_session_index: int,
     ) -> str:
+        prior_playbook = _cap_playbook(playbook)
         turn_summaries = summarize_ace_turn_artifacts(attempt_dir, events)
         user_prompt = build_ace_context_curator_user_prompt(
-            current_playbook=playbook,
+            current_playbook=prior_playbook,
             events=events,
             metadata=metadata,
             turn_summaries=turn_summaries,
@@ -90,6 +92,7 @@ def build_ace_context_refresh_fn(agent_fn: AceCuratorAgentFn):
         try:
             updated_playbook = parse_ace_context_curator_response(response_text)
         except (AssertionError, json.JSONDecodeError) as e:
+            first_error = e
             repair_prompt = (
                 "Your previous response failed schema validation.\n\n"
                 f"Error:\n{type(e).__name__}: {e}\n\n"
@@ -117,13 +120,62 @@ def build_ace_context_refresh_fn(agent_fn: AceCuratorAgentFn):
                 user_prompt=repair_prompt,
                 agent_response=response,
             )
-            updated_playbook = parse_ace_context_curator_response(
-                _response_text(response)
-            )
+            try:
+                updated_playbook = parse_ace_context_curator_response(
+                    _response_text(response)
+                )
+            except (AssertionError, json.JSONDecodeError) as repair_error:
+                updated_playbook = prior_playbook
+                _write_fallback_artifact(
+                    call_dir,
+                    first_error=first_error,
+                    repair_error=repair_error,
+                    fallback_playbook=updated_playbook,
+                )
+        updated_playbook = _cap_playbook(updated_playbook)
         (call_dir / "updated_playbook.txt").write_text(updated_playbook)
         return updated_playbook
 
     return refresh
+
+
+def _cap_playbook(playbook: str) -> str:
+    playbook = playbook.strip()
+    if len(playbook) <= MAX_PLAYBOOK_CHARS:
+        return playbook
+    marker = (
+        "[ACE playbook truncated to fit curator/proposal context; "
+        "retaining most recent guidance.]\n"
+    )
+    keep = max(0, MAX_PLAYBOOK_CHARS - len(marker))
+    return marker + playbook[-keep:]
+
+
+def _write_fallback_artifact(
+    call_dir: Path,
+    *,
+    first_error: Exception,
+    repair_error: Exception,
+    fallback_playbook: str,
+) -> None:
+    payload = {
+        "event": "ace_curator_fallback",
+        "fallback": "previous_playbook",
+        "first_error_type": type(first_error).__name__,
+        "first_error": str(first_error),
+        "repair_error_type": type(repair_error).__name__,
+        "repair_error": str(repair_error),
+        "fallback_playbook_chars": len(fallback_playbook),
+    }
+    (call_dir / "fallback.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True)
+    )
+    (call_dir / "fallback.txt").write_text(
+        "ACE curator fallback: failed initial parse and repair parse; "
+        "falling back to the previous playbook.\n"
+        f"Initial error: {type(first_error).__name__}: {first_error}\n"
+        f"Repair error: {type(repair_error).__name__}: {repair_error}\n"
+    )
 
 
 def _response_text(response: object) -> str:

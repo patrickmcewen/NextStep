@@ -297,6 +297,29 @@ def test_rust_all_propagates_analytical_failure_as_feedback(tmp_path):
     assert list(store.iter_records()) == []
 
 
+def test_rust_all_converts_rust_simulator_failure_to_score_feedback(tmp_path):
+    def bad_rust(_src):
+        raise AssertionError(
+            "build_rust_evaluate_fn: evaluate_kernel failed at stage "
+            "'simulate': min_rank must be less than max_rank"
+        )
+
+    mgr, budget, store, _ = _make_rust_all(
+        tmp_path, rust_evaluate_fn=bad_rust, total_seconds=60.0,
+    )
+
+    result = _run(mgr.score(_ctx(), "def s(): return 3"))
+
+    assert result.cycles is None
+    assert result.on_chip is None
+    assert result.cycle_source is None
+    assert result.error_feedback is not None
+    assert "Rust simulator failed" in result.error_feedback
+    assert "min_rank must be less than max_rank" in result.error_feedback
+    assert budget.consumed_seconds >= 0.0
+    assert list(store.iter_records()) == []
+
+
 def test_rust_all_source_persistence_is_idempotent_for_duplicate_sources(tmp_path):
     mgr, _budget, store, sources_dir = _make_rust_all(
         tmp_path, total_seconds=60.0,
@@ -476,6 +499,26 @@ def test_deterministic_split_propagates_analytical_failure_as_feedback(tmp_path)
     assert result.cycle_source is None
     assert result.error_feedback is not None
     assert "Analytical scorer failed" in result.error_feedback
+
+
+def test_deterministic_split_converts_rust_simulator_failure_to_score_feedback(
+    tmp_path,
+):
+    def bad_rust(_src):
+        raise RuntimeError("simulate crashed")
+
+    mgr, _b, store, _ = _make_deterministic_split(
+        tmp_path, rust_evaluate_fn=bad_rust, total_seconds=60.0,
+    )
+
+    result = _run(mgr.score(_baseline_ctx(), "def s(): pass"))
+
+    assert result.cycles is None
+    assert result.cycle_source is None
+    assert result.error_feedback is not None
+    assert "Rust simulator failed" in result.error_feedback
+    assert "simulate crashed" in result.error_feedback
+    assert list(store.iter_records()) == []
 
 
 def test_deterministic_split_start_pass_resets_shared_budget(tmp_path):
@@ -754,6 +797,27 @@ def test_agent_manager_propagates_analytical_failure_as_feedback(tmp_path):
     assert result.error_feedback is not None
     assert "Analytical scorer failed" in result.error_feedback
     assert decision_calls == [], "decision agent must not run after analytical crashed"
+
+
+def test_agent_manager_converts_rust_simulator_failure_to_score_feedback(
+    tmp_path,
+):
+    def bad_rust(_src):
+        raise AssertionError("evaluate_kernel failed at stage 'simulate'")
+
+    mgr, _b, store, _, warnings = _make_agent_manager(
+        tmp_path, rust_evaluate_fn=bad_rust, total_seconds=60.0,
+    )
+
+    result = _run(mgr.score(_ctx(), "def t(): pass"))
+
+    assert result.cycles is None
+    assert result.cycle_source is None
+    assert result.error_feedback is not None
+    assert "Rust simulator failed" in result.error_feedback
+    assert "evaluate_kernel failed" in result.error_feedback
+    assert list(store.iter_records()) == []
+    assert warnings == []
 
 
 def test_agent_manager_start_pass_resets_shared_budget(tmp_path):

@@ -15,6 +15,8 @@ surface chain-of-thought as structured ``ReasoningItem``s rather than
 contaminating the response content.
 """
 
+from dataclasses import dataclass
+
 import tiktoken
 
 from agents import (Agent, AsyncOpenAI, ModelSettings,
@@ -35,10 +37,22 @@ _PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
 _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
 
 _DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
-_DEFAULT_OUTPUT_TOKEN_MARGIN = 4096
+_DEFAULT_OUTPUT_TOKEN_MARGIN = 20000
 _TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
 _CHAT_MESSAGE_OVERHEAD = 4
 _CHAT_REPLY_PRIMER = 2
+
+
+@dataclass(frozen=True)
+class AgentPromptTokenBudget:
+    context_window_tokens: int
+    prompt_tokens: int
+    output_token_margin: int
+    max_tokens: int
+
+    @property
+    def has_output_room(self) -> bool:
+        return self.max_tokens > 0
 
 
 def _content_text(content) -> str:
@@ -112,6 +126,28 @@ def compute_dynamic_max_tokens(
     context_window_tokens: int | None = None,
     output_token_margin: int | None = None,
 ) -> int:
+    budget = compute_prompt_token_budget(
+        agent,
+        input_items,
+        context_window_tokens=context_window_tokens,
+        output_token_margin=output_token_margin,
+    )
+    assert budget.max_tokens > 0, (
+        "prompt leaves no room for output tokens after reserved margin: "
+        f"context_window_tokens={budget.context_window_tokens}, "
+        f"prompt_tokens={budget.prompt_tokens}, "
+        f"output_token_margin={budget.output_token_margin}"
+    )
+    return budget.max_tokens
+
+
+def compute_prompt_token_budget(
+    agent,
+    input_items,
+    *,
+    context_window_tokens: int | None = None,
+    output_token_margin: int | None = None,
+) -> AgentPromptTokenBudget:
     config = _agent_llm_config(agent)
     if context_window_tokens is None:
         context_window_tokens = int(config.get(
@@ -124,13 +160,12 @@ def compute_dynamic_max_tokens(
 
     prompt_tokens = estimate_agent_prompt_tokens(agent, input_items)
     max_tokens = context_window_tokens - prompt_tokens - output_token_margin
-    assert max_tokens > 0, (
-        "prompt leaves no room for output tokens after reserved margin: "
-        f"context_window_tokens={context_window_tokens}, "
-        f"prompt_tokens={prompt_tokens}, "
-        f"output_token_margin={output_token_margin}"
+    return AgentPromptTokenBudget(
+        context_window_tokens=context_window_tokens,
+        prompt_tokens=prompt_tokens,
+        output_token_margin=output_token_margin,
+        max_tokens=max_tokens,
     )
-    return max_tokens
 
 
 def build_dynamic_run_config(agent, input_items) -> RunConfig:
@@ -517,7 +552,7 @@ def _build_model_settings(llm_config: dict) -> ModelSettings:
     effort = llm_config.get("reasoning_effort")
     if effort is None:
         return ModelSettings(
-            max_tokens=100000,
+            max_tokens=32000,
             include_usage=True,
             retry=_RETRY_SETTINGS,
         )
@@ -526,7 +561,7 @@ def _build_model_settings(llm_config: dict) -> ModelSettings:
         f"got {effort!r}"
     )
     return ModelSettings(
-        max_tokens=100000,
+        max_tokens=32000,
         include_usage=True,
         retry=_RETRY_SETTINGS,
         reasoning=Reasoning(effort=effort),

@@ -367,6 +367,31 @@ def _rust_correctness_failure_feedback(*, cycles: float, max_diff: float, messag
     )
 
 
+def _should_reraise_rust_failure(exc: BaseException) -> bool:
+    return isinstance(
+        exc, (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit)
+    )
+
+
+def _rust_simulator_failure_feedback(err: str) -> str:
+    """LLM-actionable message when rust evaluation crashes before producing
+    a usable measurement.
+
+    This is distinct from correctness mismatch: there is no cycle count to
+    trust, so the search loop should invalidate the design and continue.
+    """
+    return (
+        "## Rust simulator failed on this variant\n\n"
+        "The DSL translated and passed verification, but rust evaluation "
+        "failed before producing a usable cycle measurement. Treat this "
+        "variant as invalid for the current autotune pass; the run should "
+        "continue with other candidates. Error follows:\n\n"
+        "```\n" + err + "```\n\n"
+        "Re-examine rank/shape assumptions in the STeP graph, especially "
+        "flatten/reassemble bounds, stream ranks, and reshape dimensions."
+    )
+
+
 def _analytical_failure_feedback(err: str) -> str:
     """LLM-actionable message produced when the analytical scorer raises.
 
@@ -516,6 +541,14 @@ class RustAll:
                     cycles=exc.cycles, max_diff=exc.max_diff, message=exc.message,
                 ),
             )
+        except BaseException as exc:
+            if _should_reraise_rust_failure(exc):
+                raise
+            await self._time_budget.consume(time.perf_counter() - t0)
+            return SimulationResult(
+                cycles=None, on_chip=None, cycle_source=None,
+                error_feedback=_rust_simulator_failure_feedback(_tb.format_exc()),
+            )
         elapsed = time.perf_counter() - t0
         await self._time_budget.consume(elapsed)
 
@@ -656,6 +689,14 @@ class DeterministicSplit:
                 error_feedback=_rust_correctness_failure_feedback(
                     cycles=exc.cycles, max_diff=exc.max_diff, message=exc.message,
                 ),
+            )
+        except BaseException as exc:
+            if _should_reraise_rust_failure(exc):
+                raise
+            await self._time_budget.consume(time.perf_counter() - t0)
+            return SimulationResult(
+                cycles=None, on_chip=None, cycle_source=None,
+                error_feedback=_rust_simulator_failure_feedback(_tb.format_exc()),
             )
         elapsed = time.perf_counter() - t0
         await self._time_budget.consume(elapsed)
@@ -938,6 +979,14 @@ class AgentManager:
                 error_feedback=_rust_correctness_failure_feedback(
                     cycles=exc.cycles, max_diff=exc.max_diff, message=exc.message,
                 ),
+            )
+        except BaseException as exc:
+            if _should_reraise_rust_failure(exc):
+                raise
+            await self._time_budget.consume(time.perf_counter() - t0)
+            return SimulationResult(
+                cycles=None, on_chip=None, cycle_source=None,
+                error_feedback=_rust_simulator_failure_feedback(_tb.format_exc()),
             )
         elapsed = time.perf_counter() - t0
         await self._time_budget.consume(elapsed)

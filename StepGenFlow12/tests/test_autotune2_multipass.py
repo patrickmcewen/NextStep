@@ -368,6 +368,103 @@ def test_autotune_no_initial_libraries_threads_none(tmp_path, monkeypatch):
     assert captured["initial_baselines"] is None
 
 
+def test_autotune_max_library_designs_skips_saturated_node(tmp_path, monkeypatch):
+    """A node whose prior cumulative library already meets the cap should
+    seed/merge artifacts for the current pass without launching LLM search."""
+    tree, node = _single_leaf_tree()
+
+    prior_pass1 = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n# pass1\n",
+        input_contracts={}, output_contracts={},
+        cycles=100, on_chip=100, provenance="pass1_baseline",
+    )
+    llm_a = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n# A\n",
+        input_contracts={}, output_contracts={},
+        cycles=80, on_chip=120,
+        provenance="llm_baseline_0_attempt_0_binf_turn_0",
+    )
+    llm_b = DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n# B\n",
+        input_contracts={}, output_contracts={},
+        cycles=120, on_chip=60,
+        provenance="llm_baseline_0_attempt_0_binf_turn_1",
+    )
+    prior_lib: NodeLibrary = {}
+    library_cell(prior_lib, {}, {}).extend([prior_pass1, llm_a, llm_b])
+
+    from src.autotune2 import search as search_mod
+
+    async def fail_search_leaf(**_kwargs):
+        raise AssertionError("saturated node should not launch search_leaf")
+
+    monkeypatch.setattr(search_mod, "search_leaf", fail_search_leaf)
+
+    kwargs = _baseline_invariant_inputs(node, tree)
+    kwargs["config"] = replace(kwargs["config"], max_library_designs=2)
+    result = asyncio.run(autotune(
+        ckpt_dir=tmp_path / "tune",
+        initial_libraries={node.path: prior_lib},
+        max_baselines_per_node=2,
+        baseline_selection="pareto_diverse",
+        pass_subdir="pass_1_capped",
+        **kwargs,
+    ))
+
+    merged = result.libraries[node.path]
+    provenances = {
+        e.provenance
+        for by_out in merged.values()
+        for cell in by_out.values()
+        for e in cell
+    }
+    assert "pass1_baseline" in provenances
+    assert llm_a.provenance in provenances
+    assert llm_b.provenance in provenances
+    assert (
+        tmp_path / "tune" / "autotune2" / node.path
+        / "pass_1_capped" / "variants.py"
+    ).exists()
+
+
+def test_autotune_max_library_designs_excludes_pass1_baseline(
+    tmp_path, monkeypatch,
+):
+    """The cap counts admitted LLM/library designs, not the required
+    pass-1 baseline entry."""
+    tree, node = _single_leaf_tree()
+
+    prior_lib: NodeLibrary = {}
+    library_cell(prior_lib, {}, {}).append(DesignEntry(
+        dsl="def tiled_reference(dims, tensors):\n    return None\n",
+        input_contracts={}, output_contracts={},
+        cycles=100, on_chip=100, provenance="pass1_baseline",
+    ))
+
+    captured = {"called": False}
+    from src.autotune2 import search as search_mod
+    real_search_leaf = search_mod.search_leaf
+
+    async def spy_search_leaf(**kwargs):
+        captured["called"] = True
+        return await real_search_leaf(**kwargs)
+
+    monkeypatch.setattr(search_mod, "search_leaf", spy_search_leaf)
+
+    kwargs = _baseline_invariant_inputs(node, tree)
+    kwargs["config"] = replace(kwargs["config"], max_library_designs=1)
+    asyncio.run(autotune(
+        ckpt_dir=tmp_path / "tune",
+        initial_libraries={node.path: prior_lib},
+        max_baselines_per_node=2,
+        baseline_selection="pareto_diverse",
+        pass_subdir="pass_1_not_capped",
+        **kwargs,
+    ))
+
+    assert captured["called"] is True
+
+
 # --- run_autotune2._resolve_pass_specs --------------------------------------
 
 
@@ -536,6 +633,41 @@ def test_resolve_pass_specs_uses_time_limit_instead_of_turn_limit():
     assert "max_turns_per_attempt" not in specs[1]
 
 
+def test_resolve_pass_specs_max_library_designs_inherits_and_overrides():
+    mod = _load_run_autotune2_module()
+    cfg = {
+        "hw_config": {},
+        "max_on_chip_memory": 1000,
+        "attempt_budgets": [None],
+        "max_library_designs": 12,
+        "passes": [
+            {"name": "tiling"},
+            {"name": "parallel", "max_library_designs": 4},
+        ],
+    }
+
+    specs, _ = mod._resolve_pass_specs(
+        cfg, cli_args=_cli_args(), source="test",
+    )
+
+    assert specs[0]["max_library_designs"] == 12
+    assert specs[1]["max_library_designs"] == 4
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 1.5, "4", True])
+def test_resolve_pass_specs_rejects_invalid_max_library_designs(bad_value):
+    mod = _load_run_autotune2_module()
+    cfg = {
+        "hw_config": {},
+        "max_on_chip_memory": 1000,
+        "attempt_budgets": [None],
+        "passes": [{"name": "tiling", "max_library_designs": bad_value}],
+    }
+
+    with pytest.raises(AssertionError, match="max_library_designs"):
+        mod._resolve_pass_specs(cfg, cli_args=_cli_args(), source="test")
+
+
 def test_resolve_pass_specs_threads_rust_timeout_knobs():
     mod = _load_run_autotune2_module()
     cfg = {
@@ -568,6 +700,7 @@ def test_stamp_pass_spec_payload_excludes_resume_runtime_knobs():
         "time_limit_seconds": 3600.0,
         "ace_context_enabled": True,
         "ace_refresh_interval_turns": 10,
+        "max_library_designs": 24,
         "attempt_budgets_bytes": [5000000],
     }
     new = {
@@ -575,6 +708,7 @@ def test_stamp_pass_spec_payload_excludes_resume_runtime_knobs():
         "time_limit_seconds": 600.0,
         "ace_context_enabled": False,
         "ace_refresh_interval_turns": 4,
+        "max_library_designs": 8,
         "rust_sim_timeout_seconds": 30.0,
         "rust_timeout_cycles": 999999,
     }

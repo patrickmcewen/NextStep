@@ -17,8 +17,13 @@ memory contributors, child-pick mistakes, tiling choices, stream ranks, or
 parallelization constraints.
 
 Do not overwrite the playbook with only the latest session. Do not include
-raw code unless a short snippet is essential. Keep the playbook concise enough
-to fit into later optimization prompts.
+raw code unless a short snippet is essential; prefer prose descriptions of
+DSL calls and shapes. Keep the playbook under 24,000 characters so it fits
+into later optimization prompts.
+
+The playbook is returned as a JSON string. Escape every newline as `\n`, every
+double quote as `\"`, and every literal backslash as `\\`. Avoid markdown code
+fences inside the playbook string because they are easy to escape incorrectly.
 
 Respond with one fenced JSON block and no other text:
 
