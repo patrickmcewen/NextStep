@@ -26,11 +26,14 @@ Definitions are kept local — not imported from step_py.datatype — because:
     avoids confusion about which kind of "dynamic" a piece of code means
 
 Stream dynamism: each StepTensor carries `dyn_mask` (bool per stream dim)
-and `dyn_origins` (op name that birthed each dyn slot). Dynamic dims arise
-from flat_partition, flat_reassemble, eager_merge (when any input has a
-dyn outer), flatmap_filter_row_streamify, flatmap_counter, and flatten
-across a dynamic group. User-facing `x.shape[i]` raises on a dynamic slot;
-DSL-internal code uses `x.underlying_tensor.shape` as the escape hatch.
+and `dyn_origins` (producer provenance for each dyn slot). Newly synthesized
+dynamic dims use fresh provenance tokens so eager DSL stream matching can
+distinguish two equal-length runtime dims that would lower to different IR
+DynDim symbols. Dynamic dims arise from flat_partition, flat_reassemble,
+eager_merge (when any input has a dyn outer), flatmap_filter_row_streamify,
+flatmap_counter, and flatten across a dynamic group. User-facing `x.shape[i]`
+raises on a dynamic slot; DSL-internal code uses `x.underlying_tensor.shape`
+as the escape hatch.
 """
 
 import torch

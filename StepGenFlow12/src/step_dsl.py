@@ -111,6 +111,26 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
     )
 
 
+def _assert_stop_rank_available(mask, required_rank, op_name):
+    stream_rank = len(mask) - 1
+    assert required_rank <= stream_rank, (
+        f"{op_name}: rank {required_rank} requires input stream rank >= "
+        f"{required_rank}, got input stream rank {stream_rank} "
+        f"(dyn_mask length {len(mask)}). The Rust simulator waits for a "
+        f"ValStop at level >= {required_rank}; rank-0 streams cannot "
+        f"satisfy this op."
+    )
+
+
+_DYN_ORIGIN_COUNTER = 0
+
+
+def _fresh_dyn_origin(op_name):
+    global _DYN_ORIGIN_COUNTER
+    _DYN_ORIGIN_COUNTER += 1
+    return f"{op_name}_{_DYN_ORIGIN_COUNTER}"
+
+
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     underlying = _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
@@ -307,7 +327,7 @@ def cache_read_addr_gen(idx, seq_len, row_offset):
         result,
         stream_dtype=Tile(Uint64(), (1, 1)),
         dyn_mask=mask_i + (True,),
-        dyn_origins=orig_i + ("cache_read_addr_gen",),
+        dyn_origins=orig_i + (_fresh_dyn_origin("cache_read_addr_gen"),),
         ragged_lengths={ragged_dim: lengths},
     )
 
@@ -375,7 +395,7 @@ def filter_last_tile(seq_len):
         result,
         stream_dtype=MultiHot(2),
         dyn_mask=mask + (True,),
-        dyn_origins=orig + ("filter_last_tile",),
+        dyn_origins=orig + (_fresh_dyn_origin("filter_last_tile"),),
     )
 
 
@@ -466,6 +486,14 @@ def _assert_stream_match(a, b, op_name):
         f"b has {mask_b} (origins {orig_b}). Strict matching is required so "
         f"a symbolic dim isn't silently aligned to a static one."
     )
+    for i, (is_dyn, a_origin, b_origin) in enumerate(zip(mask_a, orig_a, orig_b)):
+        if is_dyn:
+            assert a_origin == b_origin, (
+                f"{op_name}: dynamic stream origin mismatch at dim {i} — "
+                f"a has {a_origin!r}, b has {b_origin!r}. Dynamic stream "
+                f"dims must come from the same DSL producer; equal concrete "
+                f"runtime lengths are not enough for translated STeP IR."
+            )
 
 
 def _assert_float(x, op_name):
@@ -855,9 +883,7 @@ def accum_retile_row(x, rank=1, *, compute_bw=1):
     sd, mask, orig = _step_meta(x, "accum_retile_row")
     _assert_tile_kind(sd, "accum_retile_row")
     assert rank > 0, f"accum_retile_row: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"accum_retile_row: rank {rank} exceeds input stream rank {len(mask)}"
-    )
+    _assert_stop_rank_available(mask, rank, "accum_retile_row")
     for i in range(rank):
         slot = len(mask) - 1 - i
         assert not mask[slot], (
@@ -887,9 +913,7 @@ def accum_retile_col(x, rank=1, *, compute_bw=1):
     sd, mask, orig = _step_meta(x, "accum_retile_col")
     _assert_tile_kind(sd, "accum_retile_col")
     assert rank > 0, f"accum_retile_col: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"accum_retile_col: rank {rank} exceeds input stream rank {len(mask)}"
-    )
+    _assert_stop_rank_available(mask, rank, "accum_retile_col")
     for i in range(rank):
         slot = len(mask) - 1 - i
         assert not mask[slot], (
@@ -923,9 +947,7 @@ def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
     sd, mask, orig = _step_meta(x, "accum_signal_req_all_read")
     _assert_elem_in(sd, "accum_signal_req_all_read", (Float16, Float32))
     assert rank > 0, f"accum_signal_req_all_read: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"accum_signal_req_all_read: rank {rank} exceeds input stream rank {len(mask)}"
-    )
+    _assert_stop_rank_available(mask, rank, "accum_signal_req_all_read")
     stream_shape = x.underlying_tensor.shape[: x.underlying_tensor.ndim - 2 - rank]
     result = torch.ones(*stream_shape, 1, 1)
     return StepTensor(
@@ -1153,7 +1175,7 @@ def flatmap_filter_row_streamify(x, mask):
         result,
         stream_dtype=Tile(sd_x.tile_dtype, (1, tile_c)),
         dyn_mask=mask_x[:-1] + (True,),
-        dyn_origins=orig_x[:-1] + ("flatmap_filter_row_streamify",),
+        dyn_origins=orig_x[:-1] + (_fresh_dyn_origin("flatmap_filter_row_streamify"),),
     )
 
 
@@ -1174,7 +1196,7 @@ def flatmap_counter(x):
         result,
         stream_dtype=Tile(sd.tile_dtype, (1, 1)),
         dyn_mask=mask + (True,),
-        dyn_origins=orig + ("flatmap_counter",),
+        dyn_origins=orig + (_fresh_dyn_origin("flatmap_counter"),),
     )
 
 
@@ -1192,6 +1214,8 @@ def promote(x, rank=1):
         f"promote(rank={rank}): tensor has {x.underlying_tensor.ndim} dims "
         f"({tuple(x.underlying_tensor.shape)}), max valid rank is {max_rank}."
     )
+    if rank > 0:
+        _assert_stop_rank_available(mask, rank, "promote")
     result = x.underlying_tensor.unsqueeze(-(3 + rank))
     # Insert a static False slot at stream position (len(mask) - rank).
     n = len(mask)
@@ -1675,9 +1699,7 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
     _assert_stream_match(a, b, "binary_map_accum")
     assert rank > 0, f"binary_map_accum: rank must be > 0, got {rank}"
     sd_a, mask_a, orig_a = a.stream_dtype, a.dyn_mask, a.dyn_origins
-    assert rank <= len(mask_a), (
-        f"binary_map_accum: rank {rank} exceeds stream rank {len(mask_a)}"
-    )
+    _assert_stop_rank_available(mask_a, rank, "binary_map_accum")
     if weight_transposed:
         mapped = torch.matmul(a.underlying_tensor, b.underlying_tensor.transpose(-2, -1))
         tile_shape = (sd_a.shape[0], b.stream_dtype.shape[0])

@@ -141,6 +141,15 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
     )
 
 
+_DYN_ORIGIN_COUNTER = 0
+
+
+def _fresh_dyn_origin(op_name):
+    global _DYN_ORIGIN_COUNTER
+    _DYN_ORIGIN_COUNTER += 1
+    return f"{op_name}_{_DYN_ORIGIN_COUNTER}"
+
+
 def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1, start_tile_idx=0):
     underlying = _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
@@ -405,7 +414,7 @@ def filter_last_tile(seq_len):
         result,
         stream_dtype=MultiHot(2),
         dyn_mask=mask + (True,),
-        dyn_origins=orig + ("filter_last_tile",),
+        dyn_origins=orig + (_fresh_dyn_origin("filter_last_tile"),),
     )
 
 
@@ -474,6 +483,14 @@ def _assert_stream_match(a, b, op_name):
         f"b has {mask_b} (origins {orig_b}). Strict matching is required so "
         f"a symbolic dim isn't silently aligned to a static one."
     )
+    for i, (is_dyn, a_origin, b_origin) in enumerate(zip(mask_a, orig_a, orig_b)):
+        if is_dyn:
+            assert a_origin == b_origin, (
+                f"{op_name}: dynamic stream origin mismatch at dim {i} — "
+                f"a has {a_origin!r}, b has {b_origin!r}. Dynamic stream "
+                f"dims must come from the same DSL producer; equal concrete "
+                f"runtime lengths are not enough for translated STeP IR."
+            )
 
 
 def _assert_float(x, op_name):
@@ -1191,7 +1208,7 @@ def flatmap_filter_row_streamify(x, mask):
         result,
         stream_dtype=Tile(sd_x.tile_dtype, (1, tile_c)),
         dyn_mask=mask_x[:-1] + (True,),
-        dyn_origins=orig_x[:-1] + ("flatmap_filter_row_streamify",),
+        dyn_origins=orig_x[:-1] + (_fresh_dyn_origin("flatmap_filter_row_streamify"),),
     )
 
 
@@ -1212,7 +1229,7 @@ def flatmap_counter(x):
         result,
         stream_dtype=Tile(sd.tile_dtype, (1, 1)),
         dyn_mask=mask + (True,),
-        dyn_origins=orig + ("flatmap_counter",),
+        dyn_origins=orig + (_fresh_dyn_origin("flatmap_counter"),),
     )
 
 
