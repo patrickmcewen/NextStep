@@ -21,6 +21,8 @@ grep -F "cd $repo_root/step_tl/step_perf_ir/proto && python -m grpc_tools.protoc
 grep -F "cd $repo_root/step_tl && maturin develop --release" <<<"$output" >/dev/null
 grep -F "create grpc_tools protoc wrapper at " <<<"$output" >/dev/null
 grep -F "install native build dependencies if missing" <<<"$output" >/dev/null
+grep -F "install MongoDB 7.0 and start local mongod if needed" <<<"$output" >/dev/null
+grep -F "MongoClient('mongodb://127.0.0.1:27017'" <<<"$output" >/dev/null
 grep -F "libgraphviz-dev" "$repo_root/scripts/setup_nextstep.sh" >/dev/null
 grep -F "cd $repo_root/step_tl/step-perf && PROTOC=" <<<"$output" >/dev/null
 grep -F "maturin develop --release" <<<"$output" >/dev/null

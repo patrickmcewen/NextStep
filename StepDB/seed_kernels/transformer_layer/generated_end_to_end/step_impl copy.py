@@ -71,13 +71,6 @@ def _seal_unused_branches(graph):
 
 def build_graph(dims, tensors):
     graph = Graph()
-
-    def promote_outer_static_1(x):
-        y = PromoteOuter(graph, x)
-        s = _dsl2step_stream(x)
-        y._stream = Stream(stream_dtype=s.stream_dtype, shape=(1,) + s.shape)
-        return y
-
     B = 64
     D = 512
     HEAD_DIM = 32
@@ -213,22 +206,18 @@ def build_graph(dims, tensors):
         kv_results = []
         for kv_h in range(NUM_KV):
             Q_kv_h = Q_b_by_kv[kv_h]
-            v_kv = promote_outer_static_1(v_b_by_head[kv_h])
+            v_kv = v_b_by_head[kv_h]
             Q_kv_h_exp = RepeatRef(graph, Q_kv_h, ref=k_full_b)
             scores_4x4 = BinaryMap(graph, Q_kv_h_exp, k_full_b, fn=map_fn.Matmul(weight_transposed=True), write_back_mu=False, compute_bw=4096)
             scores_cols = RetileStreamify(graph, scores_4x4, split_row=False, chunk=1)
             scores_flat = Flatten(graph, scores_cols, min_rank=0, max_rank=1)
             _parallelize24 = Parallelize(graph, scores_flat, parallelize_rank=scores_flat.stream.rank, num_consumers=NUM_KV)
             scores_by_kv = [_BranchRef(_parallelize24, _i) for _i in range(NUM_KV)]
-            scores_kv_h = promote_outer_static_1(scores_by_kv[kv_h])
-            scores_b = Broadcast(graph, scores_kv_h, 2)
-            row_max = Accum(graph, _BranchRef(scores_b, 0), output_stream_dtype=_dsl2step_out_tile(scores_kv_h, 'elem', 1), fn=accum_fn.Max(), init_fn=_dsl2step_init(scores_kv_h, 'elem'), accum_rank=1, write_back_mu=False, compute_bw=4096)
-            scores_buf = Bufferize(graph, _BranchRef(scores_b, 1), rank=1)
-            scores_replay = DynStreamify(graph, scores_buf, ref=row_max, repeat_rank=0)
-            _tmp11 = UnaryMap(graph, row_max, fn=map_fn.MulImmediate(-1.0), write_back_mu=False, compute_bw=4096)
-            row_max_promoted = Promote(graph, _tmp11, promote_rank=0)
-            row_max_exp = ExpandRef(graph, row_max_promoted, ref=scores_replay, expand_rank=1)
-            scores_shifted = BinaryMap(graph, scores_replay, row_max_exp, fn=map_fn.Add(), write_back_mu=False, compute_bw=4096)
+            scores_kv_h = scores_by_kv[kv_h]
+            row_max = Accum(graph, scores_kv_h, output_stream_dtype=_dsl2step_out_tile(scores_kv_h, 'elem', 1), fn=accum_fn.Max(), init_fn=_dsl2step_init(scores_kv_h, 'elem'), accum_rank=1, write_back_mu=False, compute_bw=4096)
+            row_max_exp = RepeatRef(graph, row_max, ref=scores_kv_h)
+            _tmp11 = UnaryMap(graph, row_max_exp, fn=map_fn.MulImmediate(-1.0), write_back_mu=False, compute_bw=4096)
+            scores_shifted = BinaryMap(graph, scores_kv_h, _tmp11, fn=map_fn.Add(), write_back_mu=False, compute_bw=4096)
             exp_s = UnaryMap(graph, scores_shifted, fn=map_fn.Exp(), write_back_mu=False, compute_bw=4096)
             context_num = BinaryMap(graph, exp_s, v_kv, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4096)
             context_sum = Accum(graph, context_num, output_stream_dtype=_dsl2step_out_tile(context_num, 'elem', 1), fn=accum_fn.Add(), init_fn=_dsl2step_init(context_num, 'elem'), accum_rank=1, write_back_mu=False, compute_bw=4096)
@@ -246,7 +235,6 @@ def build_graph(dims, tensors):
     _eager_merge26 = EagerMerge(graph, attn_outputs_per_batch, input_rank=1)
     attn_all = _BranchRef(_eager_merge26, 0)
     _ = _BranchRef(_eager_merge26, 1)
-    attn_all = Flatten(graph, attn_all, min_rank=0, max_rank=1)
     attn_2d = Reshape(graph, attn_all, chunk_size=NUM_HEADS, reshape_rank=0, write_back_mu=False)
     attn_merged = Accum(graph, attn_2d, output_stream_dtype=_dsl2step_out_tile(attn_2d, 'col', 1), fn=accum_fn.RetileCol(), init_fn=_dsl2step_init(attn_2d, 'col'), accum_rank=1, write_back_mu=False, compute_bw=4096)
     _tmp12 = LinearOffChipLoad(tensors['o_proj_weight'], stride=tuple((0, 1)), out_shape_tiled=tuple((B, W_CHUNKS)), tile_row=D, tile_col=TILE_N, par_dispatch=8, start_tile_idx=0)

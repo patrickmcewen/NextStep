@@ -3,14 +3,15 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/setup_nextstep.sh [--dry-run] [--env-name NAME] [--conda-prefix DIR]
+Usage: scripts/setup_nextstep.sh [--dry-run] [--skip-mongodb] [--env-name NAME] [--conda-prefix DIR]
 
 Set up the NextStep step_tl toolchain on a fresh machine:
   1. create or update the conda environment
   2. install Python build/proto helpers
   3. regenerate Python protobuf bindings
   4. build step_tl and step_perf with maturin
-  5. verify Python imports
+  5. install/start local MongoDB for simulator event logging
+  6. verify Python imports
 
 Defaults:
   --env-name testenv
@@ -19,6 +20,7 @@ USAGE
 }
 
 dry_run=0
+setup_mongodb=1
 env_name="testenv"
 conda_prefix="${HOME:-/root}/miniforge3"
 
@@ -26,6 +28,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)
       dry_run=1
+      shift
+      ;;
+    --skip-mongodb)
+      setup_mongodb=0
       shift
       ;;
     --env-name)
@@ -62,6 +68,10 @@ step_perf_dir="$step_tl_dir/step-perf"
 env_file="$repo_root/environment.yml"
 proto_dir="$step_tl_dir/step_perf_ir/proto"
 python_proto_out="$step_tl_dir/src/proto"
+mongodb_uri="mongodb://127.0.0.1:27017"
+mongodb_data_dir="$repo_root/.local/mongodb/db"
+mongodb_log_dir="$repo_root/.local/mongodb/log"
+mongodb_log_path="$mongodb_log_dir/mongod.log"
 
 run() {
   printf '+ %s\n' "$*"
@@ -220,6 +230,62 @@ install_native_build_deps() {
   fi
 }
 
+install_mongodb() {
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '+ install MongoDB 7.0 and start local mongod if needed\n'
+    printf '+ python -c from pymongo import MongoClient; assert MongoClient('\''%s'\'').admin.command('\''ping'\'')['\''ok'\''] == 1.0\n' "$mongodb_uri"
+    return
+  fi
+
+  if python -c "from pymongo import MongoClient; assert MongoClient('$mongodb_uri', serverSelectionTimeoutMS=1000).admin.command('ping')['ok'] == 1.0" >/dev/null 2>&1; then
+    return
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "error: automatic MongoDB setup currently requires apt-get" >&2
+    exit 1
+  fi
+  if [[ ! -r /etc/os-release ]]; then
+    echo "error: automatic MongoDB setup requires /etc/os-release" >&2
+    exit 1
+  fi
+
+  local distro_id distro_codename
+  distro_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  distro_codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+  if [[ "$distro_id" != "ubuntu" || -z "$distro_codename" ]]; then
+    echo "error: automatic MongoDB setup currently supports Ubuntu apt hosts; use --skip-mongodb on this platform" >&2
+    exit 1
+  fi
+
+  local apt_prefix
+  if [[ "$(id -u)" -eq 0 ]]; then
+    apt_prefix=""
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    apt_prefix="sudo"
+  else
+    echo "error: MongoDB setup requires root or passwordless sudo for apt-get" >&2
+    exit 1
+  fi
+
+  run_shell "$apt_prefix apt-get update"
+  run_shell "$apt_prefix DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg"
+  run_shell "curl -fsSL https://pgp.mongodb.com/server-7.0.asc | $apt_prefix gpg --batch --yes -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor"
+  run_shell "echo 'deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu $distro_codename/mongodb-org/7.0 multiverse' | $apt_prefix tee /etc/apt/sources.list.d/mongodb-org-7.0.list >/dev/null"
+  run_shell "$apt_prefix apt-get update"
+  run_shell "$apt_prefix DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org"
+
+  run mkdir -p "$mongodb_data_dir" "$mongodb_log_dir"
+  if ! command -v mongod >/dev/null 2>&1; then
+    echo "error: mongod was not found after MongoDB installation" >&2
+    exit 1
+  fi
+  if ! ss -ltn 2>/dev/null | grep -q ':27017'; then
+    run mongod --dbpath "$mongodb_data_dir" --bind_ip 127.0.0.1 --port 27017 --logpath "$mongodb_log_path" --fork
+  fi
+  run python -c "from pymongo import MongoClient; assert MongoClient('$mongodb_uri', serverSelectionTimeoutMS=3000).admin.command('ping')['ok'] == 1.0"
+}
+
 install_miniforge
 conda_bin="$(find_conda || true)"
 
@@ -272,6 +338,9 @@ run_shell "cd $step_tl_dir && maturin develop --release"
 
 create_protoc_wrapper
 install_native_build_deps
+if [[ "$setup_mongodb" -eq 1 ]]; then
+  install_mongodb
+fi
 
 if [[ "$dry_run" -eq 0 ]]; then
   protoc_path="${CONDA_PREFIX:?}/bin/protoc-grpc-tools"

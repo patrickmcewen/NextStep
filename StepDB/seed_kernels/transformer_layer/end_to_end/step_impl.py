@@ -274,9 +274,13 @@ def build_graph(dims):
     )
 
     # [Output store]
+    # moe_output is residual_add with stream shape (4,) tile (16, HID) — rank 0.
+    # OffChipStore needs stream rank >= 1 (Rust panics on empty tensor_shape_tiled),
+    # so lift to (1, 4) with PromoteOuter (metadata-only, tile unchanged).
+    moe_output_outer = PromoteOuter(graph=step_graph, input=moe_output)
     output = OffChipStore(
         graph=step_graph,
-        input=moe_output,
+        input=moe_output_outer,
         par_dispatch=sim_config["par_dispatch"],
         store_file_name="output",
     )
