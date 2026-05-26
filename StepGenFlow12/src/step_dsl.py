@@ -934,54 +934,6 @@ def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
         dyn_origins=orig[:len(orig) - rank],
     )
 
-def eager_merge(inputs):
-    """Concatenate `inputs` along their outermost stream dim and emit a
-    MultiHot(num_inputs) selector that recovers each source.
-
-    Outer-dim dynamism: if any input has a dynamic outer slot, the merged
-    output (and the selector) inherit dynamism with origin "eager_merge".
-    Inner stream dims must match exactly (incl dyn_mask) across inputs."""
-    n = len(inputs)
-    assert n > 0, "eager_merge: must have at least one input"
-    sd0, mask0, _ = _step_meta(inputs[0], "eager_merge (inputs[0])")
-    _assert_tile_kind(sd0, "eager_merge (inputs[0])")
-    assert len(mask0) >= 1, (
-        f"eager_merge: inputs must have at least one stream dim, got "
-        f"shape {tuple(inputs[0].underlying_tensor.shape)}"
-    )
-    tile_shape = sd0.shape
-    any_dyn_outer = bool(mask0[0])
-    for i, p in enumerate(inputs):
-        sd_i, mask_i, _ = _step_meta(p, f"eager_merge (inputs[{i}])")
-        _assert_tile_kind(sd_i, f"eager_merge (inputs[{i}])")
-        assert sd_i.shape == tile_shape, (
-            f"eager_merge: input {i} tile shape {sd_i.shape} != {tile_shape}"
-        )
-        assert mask_i[1:] == mask0[1:], (
-            f"eager_merge: input {i} inner dyn_mask {mask_i[1:]} != {mask0[1:]}"
-        )
-        any_dyn_outer = any_dyn_outer or bool(mask_i[0])
-
-    data = torch.cat([p.underlying_tensor for p in inputs], dim=0)
-    counts = [p.underlying_tensor.shape[0] for p in inputs]
-    select = torch.zeros(sum(counts), n)
-    offset = 0
-    for i, c in enumerate(counts):
-        select[offset:offset + c, i] = 1.0
-        offset += c
-
-    outer_origin = "eager_merge" if any_dyn_outer else None
-    data_mask = (any_dyn_outer,) + mask0[1:]
-    # Inner origins come from inputs[0] (all inputs share matching inner masks).
-    data_origins = (outer_origin,) + inputs[0].dyn_origins[1:]
-    return [
-        StepTensor(data, stream_dtype=sd0,
-                   dyn_mask=data_mask, dyn_origins=data_origins),
-        StepTensor(select, stream_dtype=MultiHot(n),
-                   dyn_mask=(any_dyn_outer,),
-                   dyn_origins=(outer_origin,)),
-    ]
-
 
 def flat_partition(x, control, n, partition_rank=0):
     sd_x, mask_x, orig_x = _step_meta(x, "flat_partition")
@@ -1882,7 +1834,7 @@ DSL_FUNCTIONS = {
     # Multi-output
     "parallelize", "static_reassemble",
     # Routing
-    "eager_merge", "flat_partition", "flat_reassemble",
+    "flat_partition", "flat_reassemble",
     # Flatmap
     "flatmap_filter_row_streamify", "flatmap_counter",
     # Sink

@@ -35,7 +35,7 @@ _PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
 _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
 
 _DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
-_DEFAULT_OUTPUT_TOKEN_MARGIN = 4096
+_DEFAULT_OUTPUT_TOKEN_MARGIN = 20000
 _TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
 _CHAT_MESSAGE_OVERHEAD = 4
 _CHAT_REPLY_PRIMER = 2
