@@ -245,7 +245,7 @@ def run_simulator(
     os.makedirs(work_dir, exist_ok=True)
     pb_path = os.path.join(work_dir, "graph.pb")
 
-    sim_config = SimConfig(channel_depth=1024, functional_sim=False, mock_bf16=False)
+    sim_config = SimConfig(channel_depth=10000000, functional_sim=False, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,
@@ -435,25 +435,25 @@ def _run_serial(
     results = []
     skipped = []
     for kernel, preset in jobs:
-        try:
-            r = validate_kernel(
-                kernel,
-                preset,
-                config,
-                verbose,
-                max_compute_bw=max_compute_bw,
-                show_memory=show_memory,
-                sim_timeout_seconds=sim_timeout_seconds,
-                rust_sim_debug=rust_sim_debug,
-                rust_sim_log=_log_path(rust_sim_log_dir, kernel, preset),
-                rust_stall_windows=rust_stall_windows,
-            )
-            kernel, preset, predicted, actual, error_pct, detail = r
-            print_kernel_result(kernel, preset, config, predicted, actual, error_pct, detail, verbose)
-            results.append((kernel, preset, predicted, actual, error_pct))
-        except Exception as e:
-            print(f"  SKIPPED {kernel}/{preset}: {e}")
-            skipped.append((kernel, preset, str(e)))
+        #try:
+        r = validate_kernel(
+            kernel,
+            preset,
+            config,
+            verbose,
+            max_compute_bw=max_compute_bw,
+            show_memory=show_memory,
+            sim_timeout_seconds=sim_timeout_seconds,
+            rust_sim_debug=rust_sim_debug,
+            rust_sim_log=_log_path(rust_sim_log_dir, kernel, preset),
+            rust_stall_windows=rust_stall_windows,
+        )
+        kernel, preset, predicted, actual, error_pct, detail = r
+        print_kernel_result(kernel, preset, config, predicted, actual, error_pct, detail, verbose)
+        results.append((kernel, preset, predicted, actual, error_pct))
+        #except Exception as e:
+        #    print(f"  SKIPPED {kernel}/{preset}: {e}")
+        #    skipped.append((kernel, preset, str(e)))
     return results, skipped
 
 
@@ -591,7 +591,7 @@ def main():
     if skipped:
         print(f"  --- Skipped {len(skipped)} kernel(s) due to errors ---")
         for kernel, preset, reason in skipped:
-            print(f"    {kernel}/{preset}: {reason[:80]}")
+            print(f"    {kernel}/{preset}: {reason}")
     print(f"{'='*80}")
 
     avg_err = sum(abs(e) for _, _, _, _, e in results) / len(results) if results else 0

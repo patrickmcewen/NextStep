@@ -225,7 +225,7 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     # cycles without spending hours hung on candidates that would deadlock at
     # depth=2 but run fine here. See validate_deadlock.py for the static check
     # we used to apply (kept as a diagnostic; no longer wired in).
-    sim_config = SimConfig(channel_depth=1024, functional_sim=not timing_only, mock_bf16=False)
+    sim_config = SimConfig(channel_depth=10000000, functional_sim=not timing_only, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,

@@ -1627,6 +1627,68 @@ generated_end_to_end:
       end: 64
   origin: seed
 
+
+generated_end_to_end_2:
+  problem: seed_kernels/transformer_layer/end_to_end/reference.py
+  step_impl: seed_kernels/transformer_layer/generated_end_to_end_2/step_impl.py
+  params:
+  - model_name
+  - tile_N
+  - tile_F
+  - batch
+  - scale_seq
+  - is_small
+  - par_factor
+  - stdev
+  - start
+  - end
+  presets:
+    mixtral_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    mixtral_small_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 16
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_small_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+  origin: seed
+
 end_to_end:
   problem: seed_kernels/transformer_layer/end_to_end/reference.py
   step_impl: seed_kernels/transformer_layer/end_to_end/step_impl.py

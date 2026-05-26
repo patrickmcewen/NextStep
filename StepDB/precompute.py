@@ -443,6 +443,7 @@ def _precompute_moe_routed(dims):
 
 @register("end_to_end")
 @register("generated_end_to_end")
+@register("generated_end_to_end_2")
 def _precompute_end_to_end(dims):
     """Precompute tensors for the end-to-end transformer layer kernel.
 
