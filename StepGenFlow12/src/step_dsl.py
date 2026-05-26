@@ -813,8 +813,10 @@ def _accum_reduce(x, rank, op_name, reduce_fn):
     sd, mask, orig = _step_meta(x, op_name)
     _assert_elem_in(sd, op_name, (Float16, Float32))
     assert rank > 0, f"{op_name}: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"{op_name}: rank {rank} exceeds input stream rank {len(mask)}"
+    assert rank < len(mask), (
+        f"{op_name}: rank {rank} would reduce all stream dims from shape "
+        f"{tuple(x.underlying_tensor.shape[:-2])}. Preserve an outer stream "
+        f"dim before Accum or reduce a smaller rank."
     )
     t = x.underlying_tensor
     for _ in range(rank):
@@ -1661,16 +1663,6 @@ def dyn_streamify(x, ref):
         dyn_origins=orig_r + (None,) * bufferized_rank,
     )
 
-def broadcast(x, n):
-    """n duplicate StepTensors. Each output's metadata mirrors `x`."""
-    _step_meta(x, "broadcast")
-    return [
-        StepTensor(x.underlying_tensor.clone(), stream_dtype=x.stream_dtype,
-                   dyn_mask=x.dyn_mask, dyn_origins=x.dyn_origins,
-                   offsets=x.offsets)
-        for _ in range(n)
-    ]
-
 
 def parallelize(x, n):
     """Cycle-level round-robin: consumer i gets tokens i, n+i, 2n+i, ...
@@ -1888,7 +1880,7 @@ DSL_FUNCTIONS = {
     "expand_ref", "repeat_ref", "repeat_static", "streamify", "dyn_streamify",
     "bufferize", "restream", "retile_streamify",
     # Multi-output
-    "broadcast", "parallelize", "static_reassemble",
+    "parallelize", "static_reassemble",
     # Routing
     "eager_merge", "flat_partition", "flat_reassemble",
     # Flatmap
