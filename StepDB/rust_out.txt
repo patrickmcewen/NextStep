@@ -1,0 +1,418 @@
+
+(testenv) root@d9b478aadb45:/workspace/NextStep/StepDB# python validate_timing.py generated_end_to_end mixtral_small_b64 --rust-sim-debug
+Running 1 benchmark(s) with 1 worker(s)
+
+Predicted: 88208688
+Saved MetadataGen_85 data to /workspace/NextStep/StepDB/seed_kernels/generated_end_to_end/_work_timing_mixtral_small_b64/MetadataGen_85.npy
+Saved SelectGen_9081 data to /workspace/NextStep/StepDB/seed_kernels/generated_end_to_end/_work_timing_mixtral_small_b64/SelectGen_9081.npy
+Traceback (most recent call last):
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 602, in <module>
+    main()
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 574, in main
+    results, skipped = _run_serial(
+                       ^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 439, in _run_serial
+    r = validate_kernel(
+        ^^^^^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 362, in validate_kernel
+    actual = run_simulator(
+             ^^^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 260, in run_simulator
+    serialize(graph, pb_path, sim_config.functional_sim)
+  File "/workspace/NextStep/step_tl/src/sim/__init__.py", line 928, in serialize
+    broadcast_pb.dtype.CopyFrom(to_pb_datatype(op.stream_idx(0).stream_dtype))
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/NextStep/step_tl/src/sim/__init__.py", line 362, in to_pb_datatype
+    if isinstance(dtype.shape[1], DynDim):
+                  ~~~~~~~~~~~^^^
+IndexError: tuple index out of range
+(testenv) root@d9b478aadb45:/workspace/NextStep/StepDB# python validate_timing.py generated_end_to_end mixtral_small_b64 --rust-sim-debug
+Running 1 benchmark(s) with 1 worker(s)
+
+Predicted: 88208688
+Saved MetadataGen_85 data to /workspace/NextStep/StepDB/seed_kernels/generated_end_to_end/_work_timing_mixtral_small_b64/MetadataGen_85.npy
+Saved SelectGen_8697 data to /workspace/NextStep/StepDB/seed_kernels/generated_end_to_end/_work_timing_mixtral_small_b64/SelectGen_8697.npy
+Successfully wrote to /workspace/NextStep/StepDB/seed_kernels/generated_end_to_end/_work_timing_mixtral_small_b64/graph.pb
+Successfully read proto file
+[step-perf-progress] build_from_proto start
+processing Operation { name: "UnaryMap_23 (fn: Rsqrt)", id: 23, op_type: Some(Unarymap(UnaryMap { input_id: 22, stream_idx: None, func: Some(ElemtoElemFunc { elem_elem_fn: Some(Rsqrt(Rsqrt)) }), compute_bw: 4096, write_back_m
+u: false, dtype_a: Some(DataType { r#type: Some(F32(F32 { row_size: Some(RowStatic(1)), col_size: Some(ColStatic(1)) })) }), dtype_b: Some(DataType { r#type: Some(F32(F32 { row_size: Some(RowStatic(1)), col_size: Some(ColStat
+ic(1)) })) }) })) }
+
+processing Operation { name: "RepeatStatic_24", id: 24, op_type: Some(RepeatStatic(RepeatStatic { input_id: 23, stream_idx: None, repeat_factor: 32, dtype: Some(DataType { r#type: Some(F32(F32 { row_size: Some(RowStatic(1)),
+col_size: Some(ColStatic(1)) })) }) })) }
+
+processing Operation { name: "Accum_25 (1 D) (fn: RetileCol)", id: 25, op_type: Some(Accum(Accum { input_id: 24, stream_idx: None, func: Some(AccumFunc { accum_fn: Some(RetileCol(RetileCol)) }), init_func: Some(InitFunc { ini
+t_fn: Some(Empty(Empty)) }), tile_row: 1, tile_col: 0, rank: 1, compute_bw: 4096, write_back_mu: false, dtype_a: Some(DataType { r#type: Some(F32(F32 { row_size: Some(RowStatic(1)), col_size: Some(ColStatic(1)) })) }), dtype_
+b: Some(DataType { r#type: Some(F32(F32 { row_size: Some(RowStatic(1)), col_size: Some(ColStatic(32)) })) }) })) }
+
+[step-perf-progress] build_from_proto done after 167.776295ms
+[step-perf-progress] initialize start
+[step-perf-progress] initialize done after 83.787493ms
+[dam-progress] total=10393 spawned=10393 started=10393 completed=991 failed=0 sends=382542 (+382542) recvs=0 (+0) try_recv_hits=192971 (+192971) pending_sample=[HBMContext(32), LinearOffChipLoad(33), Flatten(34), UnaryMap(35)
+, UnaryMap(36), UnaryMap(37), UnaryMap(38), UnaryMap(39), RepeatStatic(40), Accum(41), BinaryMap(42), LinearOffChipLoadRef(43)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=991 failed=0 sends=556429 (+173887) recvs=0 (+0) try_recv_hits=358474 (+165503) pending_sample=[HBMContext(32), LinearOffChipLoad(33), Flatten(34), UnaryMap(35)
+, UnaryMap(36), UnaryMap(37), UnaryMap(38), UnaryMap(39), RepeatStatic(40), Accum(41), BinaryMap(42), LinearOffChipLoadRef(43)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1003 failed=0 sends=750852 (+194423) recvs=0 (+0) try_recv_hits=546966 (+188492) pending_sample=[HBMContext(32), LinearOffChipLoad(33), Flatten(34), UnaryMap(35
+), UnaryMap(36), UnaryMap(37), UnaryMap(38), UnaryMap(39), RepeatStatic(40), Accum(41), BinaryMap(42), LinearOffChipLoadRef(43)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1003 failed=0 sends=972713 (+221861) recvs=0 (+0) try_recv_hits=761888 (+214922) pending_sample=[HBMContext(32), LinearOffChipLoad(33), Flatten(34), UnaryMap(35
+), UnaryMap(36), UnaryMap(37), UnaryMap(38), UnaryMap(39), RepeatStatic(40), Accum(41), BinaryMap(42), LinearOffChipLoadRef(43)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1025 failed=0 sends=1148214 (+175501) recvs=0 (+0) try_recv_hits=932736 (+170848) pending_sample=[HBMContext(32), LinearOffChipLoad(33), Flatten(34), UnaryMap(3
+5), UnaryMap(36), UnaryMap(37), UnaryMap(38), UnaryMap(39), RepeatStatic(40), Accum(41), BinaryMap(42), LinearOffChipLoadRef(43)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1048 failed=0 sends=1393742 (+245528) recvs=0 (+0) try_recv_hits=1172000 (+239264) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1048 failed=0 sends=1599560 (+205818) recvs=0 (+0) try_recv_hits=1371417 (+199417) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1198 failed=0 sends=1806826 (+207266) recvs=0 (+0) try_recv_hits=1573362 (+201945) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1198 failed=0 sends=2055999 (+249173) recvs=0 (+0) try_recv_hits=1815178 (+241816) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1216 failed=0 sends=2282762 (+226763) recvs=0 (+0) try_recv_hits=2035769 (+220591) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1216 failed=0 sends=2499670 (+216908) recvs=0 (+0) try_recv_hits=2247052 (+211283) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1216 failed=0 sends=2726896 (+227226) recvs=0 (+0) try_recv_hits=2467619 (+220567) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1236 failed=0 sends=2965277 (+238381) recvs=0 (+0) try_recv_hits=2699796 (+232177) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1423 failed=0 sends=3261963 (+296686) recvs=0 (+0) try_recv_hits=2988310 (+288514) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1686 failed=0 sends=3609036 (+347073) recvs=0 (+0) try_recv_hits=3328960 (+340650) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1686 failed=0 sends=3883063 (+274027) recvs=0 (+0) try_recv_hits=3595227 (+266267) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1690 failed=0 sends=4153509 (+270446) recvs=0 (+0) try_recv_hits=3858634 (+263407) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1692 failed=0 sends=4445562 (+292053) recvs=0 (+0) try_recv_hits=4142620 (+283986) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=1725 failed=0 sends=4760261 (+314699) recvs=0 (+0) try_recv_hits=4449559 (+306939) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=2308 failed=0 sends=5197109 (+436848) recvs=0 (+0) try_recv_hits=4884745 (+435186) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=2358 failed=0 sends=5854945 (+657836) recvs=0 (+0) try_recv_hits=5526564 (+641819) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=2358 failed=0 sends=6495283 (+640338) recvs=0 (+0) try_recv_hits=6152493 (+625929) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), LinearOffChipLoadRef(46), RepeatRef(47), BinaryMap(48), LinearOffChipLoadRef(49), RepeatRef(50), BinaryMap(51), UnaryMap(52), UnaryMap(53)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=4453 failed=0 sends=7127492 (+632209) recvs=0 (+0) try_recv_hits=6768361 (+615868) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bina
+ryMap(45), UnaryMap(52), UnaryMap(53), UnaryMap(54), UnaryMap(55), UnaryMap(56), RepeatStatic(57), Accum(58), BinaryMap(59)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=4713 failed=0 sends=8178789 (+1051297) recvs=0 (+0) try_recv_hits=7788925 (+1020564) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bi
+naryMap(45), UnaryMap(52), UnaryMap(53), UnaryMap(54), UnaryMap(55), UnaryMap(56), RepeatStatic(57), Accum(58), BinaryMap(59)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=4977 failed=0 sends=9750448 (+1571659) recvs=0 (+0) try_recv_hits=9360764 (+1571839) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44), Bi
+naryMap(45), UnaryMap(52), UnaryMap(53), UnaryMap(54), UnaryMap(55), UnaryMap(56), RepeatStatic(57), Accum(58), BinaryMap(59)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=5150 failed=0 sends=11188197 (+1437749) recvs=0 (+0) try_recv_hits=10712077 (+1351313) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44),
+BinaryMap(45), UnaryMap(52), UnaryMap(53), UnaryMap(54), UnaryMap(55), UnaryMap(56), RepeatStatic(57), Accum(58), BinaryMap(59)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=5287 failed=0 sends=12488509 (+1300312) recvs=0 (+0) try_recv_hits=12005500 (+1293423) pending_sample=[HBMContext(32), LinearOffChipLoadRef(43), RepeatRef(44),
+BinaryMap(45), UnaryMap(52), UnaryMap(53), UnaryMap(54), UnaryMap(55), UnaryMap(56), RepeatStatic(57), Accum(58), BinaryMap(59)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9246 failed=0 sends=14014515 (+1526006) recvs=0 (+0) try_recv_hits=13647890 (+1642390) pending_sample=[HBMContext(32), RandomOffChipStore(390), RandomOffChipSto
+re(392), RandomOffChipStore(395), RandomOffChipStore(397), RandomOffChipStore(400), RandomOffChipStore(402), RandomOffChipStore(405), RandomOffChipStore(407), RandomOffChipStore(410), RandomOffChipStore(412), RandomOffChipSto
+re(415)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=14015043 (+528) recvs=0 (+0) try_recv_hits=13648418 (+528) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRe
+f(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=14015043 (+0) recvs=0 (+0) try_recv_hits=13648418 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=14015043 (+0) recvs=0 (+0) try_recv_hits=13648418 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=14015043 (+0) recvs=0 (+0) try_recv_hits=13648419 (+1) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=14119440 (+104397) recvs=0 (+0) try_recv_hits=13752060 (+103641) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), Ex
+pandRef(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195232 (+1075792) recvs=0 (+0) try_recv_hits=14828616 (+1076556) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259),
+ExpandRef(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+96) recvs=0 (+0) try_recv_hits=14828715 (+99) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(
+1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+0) recvs=0 (+0) try_recv_hits=14828715 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+0) recvs=0 (+0) try_recv_hits=14828715 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+0) recvs=0 (+0) try_recv_hits=14828715 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+0) recvs=0 (+0) try_recv_hits=14828715 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+0) recvs=0 (+0) try_recv_hits=14828715 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15195328 (+0) recvs=0 (+0) try_recv_hits=14828715 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=15675209 (+479881) recvs=0 (+0) try_recv_hits=15303608 (+474893) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), Ex
+pandRef(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=17066870 (+1391661) recvs=0 (+0) try_recv_hits=16691724 (+1388116) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259),
+ExpandRef(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=18548224 (+1481354) recvs=0 (+0) try_recv_hits=18172647 (+1480923) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259),
+ExpandRef(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19708806 (+1160582) recvs=0 (+0) try_recv_hits=19342347 (+1169700) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259),
+ExpandRef(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19708812 (+6) recvs=0 (+0) try_recv_hits=19342355 (+8) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709012 (+200) recvs=0 (+0) try_recv_hits=19342557 (+202) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRe
+f(1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+96) recvs=0 (+0) try_recv_hits=19342656 (+99) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(
+1260), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+[dam-progress] total=10393 spawned=10393 started=10393 completed=9268 failed=0 sends=19709108 (+0) recvs=0 (+0) try_recv_hits=19342656 (+0) pending_sample=[HBMContext(32), Accum(1254), Accum(1258), Reshape(1259), ExpandRef(12
+60), UnaryMap(1261), BinaryMap(1262), UnaryMap(1263), Accum(1264), BinaryMap(1265), Accum(1266), RepeatStatic(1267)]
+^CTraceback (most recent call last):
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 602, in <module>
+    main()
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 574, in main
+    results, skipped = _run_serial(
+                       ^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 439, in _run_serial
+    r = validate_kernel(
+        ^^^^^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 362, in validate_kernel
+    actual = run_simulator(
+             ^^^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/validate_timing.py", line 264, in run_simulator
+    result = run_serialized_graph(
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/NextStep/StepDB/rust_sim_runner.py", line 252, in run_serialized_graph
+    for key, _mask in selector.select(timeout=0.5):
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/envs/testenv/lib/python3.12/selectors.py", line 468, in select
+    fd_event_list = self._selector.poll(timeout, max_ev)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+
+(testenv) root@d9b478aadb45:/workspace/NextStep/StepDB#

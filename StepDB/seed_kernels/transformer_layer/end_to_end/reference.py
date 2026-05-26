@@ -36,9 +36,15 @@ class Model(nn.Module):
 
     def forward(self, input_tensor, q_proj, k_proj, v_proj,
                 cos, sin, k_cache, v_cache,
-                expert_indices, expert_weights,
+                expert_onehot, expert_weights,
                 w_gate_list, w_up_list, w_down_list,
-                num_token_list, o_proj_weight):
+                num_token_list, seq_len, idx, o_proj_weight):
+        # ``seq_len`` (= num_token_list + 1) and ``idx`` (= arange(batch))
+        # are derived ragged metadata exposed to the STeP DSL agent so it
+        # can feed them straight into metadata_gen / cache_read_addr_gen.
+        # The PyTorch reference body doesn't consume them — it still
+        # iterates per batch row with Python `for i in range(batch)`.
+        del seq_len, idx  # silence "unused" linters; intentionally unused here
         # Derive per-call shape constants from the tensor args. Matches the
         # ``mc.*`` attrs used by precompute.py / step_impl.py: head_dim is
         # the trailing dim of cos/sin; num_heads / num_kv_heads come from
@@ -73,10 +79,13 @@ class Model(nn.Module):
         Q = Q * cos + _rotate_half(Q) * sin
         K = K * cos + _rotate_half(K) * sin
 
-        # [5] Append new K, V to KV cache at the per-batch sequence end
+        # [5] Append new K, V to KV cache at the per-batch sequence end.
+        # ``int(num_token_list[i])`` works for both list[int] and 1-D tensor
+        # forms — precompute now emits the tensor form for the DSL agent.
         for i in range(batch):
-            k_cache[i, num_token_list[i]] = K[i]
-            v_cache[i, num_token_list[i]] = V[i]
+            pos = int(num_token_list[i])
+            k_cache[i, pos] = K[i]
+            v_cache[i, pos] = V[i]
 
         # [6] GQA attention (numerically-stable softmax, no 1/sqrt(d) scaling).
         # Vectorize across kv-heads: view Q as [Hkv, qpkv, D] and permute the
@@ -85,10 +94,13 @@ class Model(nn.Module):
         attn_output = torch.zeros(batch, num_heads, head_dim)
         Q_grouped = Q.view(batch, num_kv_heads, query_per_kvhead, head_dim)
         for i in range(batch):
-            seq_len = num_token_list[i] + 1
+            # `seq_len_i` is the per-row total length after append, computed
+            # from `num_token_list[i]`. Different from the positional arg
+            # `seq_len` (a 1-D tensor view of the same quantity for the LLM).
+            seq_len_i = int(num_token_list[i]) + 1
             q_i = Q_grouped[i]                                # [Hkv, qpkv, D]
-            k_i = k_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
-            v_i = v_cache[i, :seq_len].permute(1, 0, 2)       # [Hkv, S, D]
+            k_i = k_cache[i, :seq_len_i].permute(1, 0, 2)     # [Hkv, S, D]
+            v_i = v_cache[i, :seq_len_i].permute(1, 0, 2)     # [Hkv, S, D]
 
             scores = q_i @ k_i.transpose(-1, -2)              # [Hkv, qpkv, S]
             row_max = scores.amax(dim=-1, keepdim=True)
@@ -107,17 +119,20 @@ class Model(nn.Module):
         # [9] Post-attention RMS Norm
         normed_2 = _rms_norm(res_add_0)
 
-        # [10] MoE: y[i] = sum_j w[i,j] * down_j(silu(gate_j(x)) * up_j(x))
+        # [10] MoE: y[t] = sum_j w[t,j] * down_j(silu(gate_j(x)) * up_j(x))
+        # expert_onehot[s, k, e] == 1 iff token s assigns its slot k to expert e,
+        # so torch.where on the per-expert slice gives the (token, slot) pairs
+        # that step_impl routes to expert ``e``.
         moe_output = torch.zeros(batch, dim)
         for e in range(n_routed_experts):
-            idx, top_pos = torch.where(expert_indices == e)
-            if len(idx) == 0:
+            tok, top_pos = torch.where(expert_onehot[:, :, e] == 1)
+            if len(tok) == 0:
                 continue
-            gate_out = normed_2[idx] @ w_gate_list[e]
-            up_out = normed_2[idx] @ w_up_list[e]
+            gate_out = normed_2[tok] @ w_gate_list[e]
+            up_out = normed_2[tok] @ w_up_list[e]
             hidden = F.silu(gate_out) * up_out
             down_out = hidden @ w_down_list[e]
-            moe_output[idx] += down_out * expert_weights[idx, top_pos, None]
+            moe_output[tok] += down_out * expert_weights[tok, top_pos, None]
 
         # [11] Final residual add
         return moe_output + res_add_0
@@ -140,9 +155,9 @@ def get_inputs(dims):
     return [
         t["input_tensor"], t["q_proj"], t["k_proj"], t["v_proj"],
         t["cos"], t["sin"], t["k_cache"], t["v_cache"],
-        t["expert_indices"], t["expert_weights"],
+        t["expert_onehot"], t["expert_weights"],
         t["w_gate_list"], t["w_up_list"], t["w_down_list"],
-        t["num_token_list"], t["o_proj_weight"],
+        t["num_token_list"], t["seq_len"], t["idx"], t["o_proj_weight"],
     ]
 
 

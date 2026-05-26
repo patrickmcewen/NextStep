@@ -10,13 +10,10 @@ Usage:
 """
 import argparse
 import inspect
-import json
 import os
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
 from pathlib import Path
 
 import sympy
@@ -34,6 +31,7 @@ sys.path.insert(0, STEP_TL_PROTO)
 sys.path.insert(0, STEPDB_DIR)
 
 from precompute import precompute_tensors
+from rust_sim_runner import RustSimDebugConfig, run_serialized_graph
 from timing_and_emulator.timing import DEFAULT_HW_CONFIG
 
 # Standard imports prepended to step_impl code
@@ -230,7 +228,16 @@ def run_analytical_model(graph, hw_config=None, sym_subs=None):
     return total_val, result
 
 
-def run_simulator(graph, output_op, work_dir):
+def run_simulator(
+    graph,
+    output_op,
+    work_dir,
+    *,
+    sim_timeout_seconds=None,
+    rust_sim_debug=False,
+    rust_sim_log=None,
+    rust_stall_windows=3,
+):
     """Run the cycle-accurate simulator and return actual cycles."""
     from sim import serialize, SimConfig, HBMConfig
 
@@ -238,7 +245,7 @@ def run_simulator(graph, output_op, work_dir):
     os.makedirs(work_dir, exist_ok=True)
     pb_path = os.path.join(work_dir, "graph.pb")
 
-    sim_config = SimConfig(channel_depth=1024, functional_sim=False, mock_bf16=False)
+    sim_config = SimConfig(channel_depth=10000000, functional_sim=False, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,
@@ -253,65 +260,54 @@ def run_simulator(graph, output_op, work_dir):
         serialize(graph, pb_path, sim_config.functional_sim)
         os.chdir(orig_dir)
 
-    sim_runner_script = (
-        "import json, sys, os\n"
-        "os.chdir(sys.argv[1])\n"
-        "from sim import HBMConfig, SimConfig\n"
-        "import step_perf\n"
-        "pb_path = sys.argv[2]\n"
-        "hbm_cfg = json.loads(sys.argv[3])\n"
-        "sim_cfg = json.loads(sys.argv[4])\n"
-        "hbm = HBMConfig(**hbm_cfg)\n"
-        "sim = SimConfig(**sim_cfg)\n"
-        "ret = step_perf.run_graph(pb_path, False, hbm, sim, None)\n"
-        "if len(ret) == 4:\n"
-        "    passed, cycles, dur_ms, dur_s = ret\n"
-        "elif len(ret) == 2:\n"
-        "    passed, cycles = ret\n"
-        "    dur_ms, dur_s = 0.0, 0.0\n"
-        "else:\n"
-        "    raise RuntimeError(f'Unexpected return: {ret}')\n"
-        "print(json.dumps({'passed': bool(passed), 'cycles': cycles, 'dur_ms': dur_ms, 'dur_s': dur_s}))\n"
+    timeout = SIM_TIMEOUT_SECONDS if sim_timeout_seconds is None else float(sim_timeout_seconds)
+    result = run_serialized_graph(
+        work_dir=work_dir,
+        graph_pb=pb_path,
+        hbm_config=hbm_config,
+        sim_config=sim_config,
+        timeout_seconds=timeout,
+        debug=RustSimDebugConfig(
+            enabled=rust_sim_debug,
+            log_path=rust_sim_log,
+            stall_windows=rust_stall_windows,
+        ),
     )
 
-    pythonpath = STEP_TL_SRC + ":" + STEP_TL_PROTO + ":" + os.environ.get("PYTHONPATH", "")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = pythonpath
-
-    proc = subprocess.run(
-        [sys.executable, "-c", sim_runner_script,
-         work_dir, pb_path,
-         json.dumps(asdict(hbm_config)),
-         json.dumps({"channel_depth": sim_config.channel_depth,
-                      "functional_sim": sim_config.functional_sim,
-                      "mock_bf16": sim_config.mock_bf16})],
-        capture_output=True, text=True, timeout=SIM_TIMEOUT_SECONDS,
-        env=env,
+    assert not result.timed_out, (
+        f"Simulator timed out after {timeout:g} seconds.\n"
+        f"{result.summary()}\noutput tail:\n{result.output[-2000:]}"
     )
-
-    assert proc.returncode == 0, (
-        f"Simulator failed (rc={proc.returncode}):\n{proc.stderr[-2000:]}"
+    assert result.returncode == 0, (
+        f"Simulator failed (rc={result.returncode}):\n"
+        f"{result.summary()}\noutput tail:\n{result.output[-2000:]}"
     )
-
-    sim_result = json.loads(proc.stdout.strip().split("\n")[-1])
+    assert result.sim_json is not None, (
+        f"Simulator did not emit a JSON result.\n"
+        f"{result.summary()}\noutput tail:\n{result.output[-2000:]}"
+    )
 
     # The Rust simulator catches panics inside worker threads and still returns
     # (passed=False, cycles=<elapsed-at-time-of-panic>). If we ignore `passed`,
     # we end up comparing the analytical prediction against a crashed sim and
     # report a nonsense error. Surface the panic lines so the root cause is
     # visible instead of buried in megabytes of stderr.
-    assert sim_result["passed"], (
-        f"Simulator did not pass (cycles before crash: {sim_result['cycles']}).\n"
+    assert result.sim_json["passed"], (
+        f"Simulator did not pass (cycles before crash: {result.sim_json['cycles']}).\n"
+        f"{result.summary()}\n"
         f"Panic excerpts:\n"
-        + "\n".join(l for l in proc.stderr.split("\n") if "panicked" in l or "assertion" in l)[-2000:]
+        + "\n".join(
+            l for l in result.output.split("\n")
+            if "panicked" in l or "assertion" in l
+        )[-2000:]
     )
 
-    cycles = int(sim_result["cycles"])
+    cycles = int(result.sim_json["cycles"])
 
     # Parse TRACE_EVENT lines from stderr if STEP_TRACE is set
     trace_events = []
     if os.environ.get("STEP_TRACE"):
-        for line in proc.stderr.split("\n"):
+        for line in result.output.split("\n"):
             if line.startswith("TRACE_EVENT|"):
                 parts = line.split("|")
                 assert len(parts) == 6, f"Bad trace line: {line}"
@@ -325,10 +321,24 @@ def run_simulator(graph, output_op, work_dir):
 
     if trace_events:
         return cycles, trace_events
+    if rust_sim_debug:
+        print("\n=== rust-sim liveness summary ===")
+        print(result.summary())
     return cycles
 
 
-def validate_kernel(kernel_name, preset, config, verbose=False, max_compute_bw=None, show_memory=False):
+def validate_kernel(
+    kernel_name,
+    preset,
+    config,
+    verbose=False,
+    max_compute_bw=None,
+    show_memory=False,
+    sim_timeout_seconds=None,
+    rust_sim_debug=False,
+    rust_sim_log=None,
+    rust_stall_windows=3,
+):
     """Validate one kernel+preset. Returns (kernel, preset, predicted, actual, error_pct, detail)."""
     dims = dict(config[kernel_name]["presets"][preset])
     graph, output_op = build_graph_from_impl(kernel_name, dims, config)
@@ -349,7 +359,15 @@ def validate_kernel(kernel_name, preset, config, verbose=False, max_compute_bw=N
         print(f"  off-chip: {mem['off_chip_bytes']} B")
 
     work_dir = os.path.join(STEPDB_DIR, "seed_kernels", kernel_name, f"_work_timing_{preset}")
-    actual = run_simulator(graph, output_op, work_dir)
+    actual = run_simulator(
+        graph,
+        output_op,
+        work_dir,
+        sim_timeout_seconds=sim_timeout_seconds,
+        rust_sim_debug=rust_sim_debug,
+        rust_sim_log=rust_sim_log,
+        rust_stall_windows=rust_stall_windows,
+    )
 
     error_pct = (predicted - actual) / max(actual, 1) * 100
     return kernel_name, preset, predicted, actual, error_pct, detail
@@ -393,23 +411,64 @@ def _build_job_list(config, args):
         return [(k, list(config[k]["presets"].keys())[0]) for k in seed_kernels]
 
 
-def _run_serial(jobs, config, verbose, max_compute_bw=None, show_memory=False):
+def _log_path(log_dir, kernel, preset):
+    if log_dir is None:
+        return None
+    os.makedirs(log_dir, exist_ok=True)
+    safe_kernel = kernel.replace("/", "__")
+    safe_preset = preset.replace("/", "__")
+    return os.path.join(log_dir, f"{safe_kernel}_{safe_preset}.log")
+
+
+def _run_serial(
+    jobs,
+    config,
+    verbose,
+    max_compute_bw=None,
+    show_memory=False,
+    sim_timeout_seconds=None,
+    rust_sim_debug=False,
+    rust_sim_log_dir=None,
+    rust_stall_windows=3,
+):
     """Run jobs sequentially with full output."""
     results = []
     skipped = []
     for kernel, preset in jobs:
-        try:
-            r = validate_kernel(kernel, preset, config, verbose, max_compute_bw=max_compute_bw, show_memory=show_memory)
-            kernel, preset, predicted, actual, error_pct, detail = r
-            print_kernel_result(kernel, preset, config, predicted, actual, error_pct, detail, verbose)
-            results.append((kernel, preset, predicted, actual, error_pct))
-        except Exception as e:
-            print(f"  SKIPPED {kernel}/{preset}: {e}")
-            skipped.append((kernel, preset, str(e)))
+        #try:
+        r = validate_kernel(
+            kernel,
+            preset,
+            config,
+            verbose,
+            max_compute_bw=max_compute_bw,
+            show_memory=show_memory,
+            sim_timeout_seconds=sim_timeout_seconds,
+            rust_sim_debug=rust_sim_debug,
+            rust_sim_log=_log_path(rust_sim_log_dir, kernel, preset),
+            rust_stall_windows=rust_stall_windows,
+        )
+        kernel, preset, predicted, actual, error_pct, detail = r
+        print_kernel_result(kernel, preset, config, predicted, actual, error_pct, detail, verbose)
+        results.append((kernel, preset, predicted, actual, error_pct))
+        #except Exception as e:
+        #    print(f"  SKIPPED {kernel}/{preset}: {e}")
+        #    skipped.append((kernel, preset, str(e)))
     return results, skipped
 
 
-def _run_parallel(jobs, config, verbose, max_workers, max_compute_bw=None, show_memory=False):
+def _run_parallel(
+    jobs,
+    config,
+    verbose,
+    max_workers,
+    max_compute_bw=None,
+    show_memory=False,
+    sim_timeout_seconds=None,
+    rust_sim_debug=False,
+    rust_sim_log_dir=None,
+    rust_stall_windows=3,
+):
     """Run jobs in parallel, logging each as it completes."""
     results = []
     skipped = []
@@ -418,7 +477,18 @@ def _run_parallel(jobs, config, verbose, max_workers, max_compute_bw=None, show_
     done_count = [0]  # mutable counter for closure
 
     def _worker(kernel, preset):
-        return validate_kernel(kernel, preset, config, verbose, max_compute_bw=max_compute_bw, show_memory=show_memory)
+        return validate_kernel(
+            kernel,
+            preset,
+            config,
+            verbose,
+            max_compute_bw=max_compute_bw,
+            show_memory=show_memory,
+            sim_timeout_seconds=sim_timeout_seconds,
+            rust_sim_debug=rust_sim_debug,
+            rust_sim_log=_log_path(rust_sim_log_dir, kernel, preset),
+            rust_stall_windows=rust_stall_windows,
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_to_job = {
@@ -469,6 +539,22 @@ def main():
         help="Compute and report on-chip / off-chip memory totals (matches the "
              "autotuner's _compute_memory_totals).",
     )
+    parser.add_argument(
+        "--sim-timeout", type=float, default=None,
+        help="Override simulator subprocess timeout in seconds.",
+    )
+    parser.add_argument(
+        "--rust-sim-debug", action="store_true",
+        help="Stream Rust/DAM progress lines and include liveness classification on failures.",
+    )
+    parser.add_argument(
+        "--rust-sim-log-dir", default=None,
+        help="Write combined Rust simulator stdout/stderr logs under this directory.",
+    )
+    parser.add_argument(
+        "--rust-stall-windows", type=int, default=3,
+        help="Classify stall after this many zero-movement DAM progress windows.",
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -479,11 +565,19 @@ def main():
         results, skipped = _run_parallel(
             jobs, config, args.verbose, args.jobs,
             max_compute_bw=args.max_compute_bw, show_memory=args.show_memory,
+            sim_timeout_seconds=args.sim_timeout,
+            rust_sim_debug=args.rust_sim_debug,
+            rust_sim_log_dir=args.rust_sim_log_dir,
+            rust_stall_windows=args.rust_stall_windows,
         )
     else:
         results, skipped = _run_serial(
             jobs, config, args.verbose,
             max_compute_bw=args.max_compute_bw, show_memory=args.show_memory,
+            sim_timeout_seconds=args.sim_timeout,
+            rust_sim_debug=args.rust_sim_debug,
+            rust_sim_log_dir=args.rust_sim_log_dir,
+            rust_stall_windows=args.rust_stall_windows,
         )
 
     # Summary sorted by kernel name then preset
@@ -497,7 +591,7 @@ def main():
     if skipped:
         print(f"  --- Skipped {len(skipped)} kernel(s) due to errors ---")
         for kernel, preset, reason in skipped:
-            print(f"    {kernel}/{preset}: {reason[:80]}")
+            print(f"    {kernel}/{preset}: {reason}")
     print(f"{'='*80}")
 
     avg_err = sum(abs(e) for _, _, _, _, e in results) / len(results) if results else 0

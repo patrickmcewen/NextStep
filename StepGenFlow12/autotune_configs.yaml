@@ -55,6 +55,8 @@ configs:
     base: autotune2_base
     max_on_chip_memory: 25276420
     attempt_budgets: [1.0, 1.0, 1.0, 1.0]
+    rust_sim_timeout_seconds: 1800
+    rust_timeout_cycles: 1000000000
     passes:
       - name: general
         fewshot: general

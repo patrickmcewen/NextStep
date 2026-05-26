@@ -442,6 +442,8 @@ def _precompute_moe_routed(dims):
 # ---------------------------------------------------------------------------
 
 @register("end_to_end")
+@register("generated_end_to_end")
+@register("generated_end_to_end_2")
 def _precompute_end_to_end(dims):
     """Precompute tensors for the end-to-end transformer layer kernel.
 
@@ -513,6 +515,17 @@ def _precompute_end_to_end(dims):
     assert routing_path.exists(), f"Expert routing file not found: {routing_path}"
     expert_indices = torch.from_numpy(np.load(str(routing_path))["data"])
 
+    # SelectGen needs these as `underlying` tensors. Pure function of
+    # expert_indices (loaded from .npz, no RNG draw), so RNG sequence is
+    # preserved. Mirrors the moe_routed precompute so LLM-side build_graph
+    # can index tensors["expert_multihot"] / tensors["expert_onehot"]
+    # without depending on step_tl's utils.moe helpers.
+    _one_hot = torch.nn.functional.one_hot(
+        expert_indices.to(torch.int64), num_classes=mc.n_routed_experts
+    ).to(torch.int64)
+    expert_multihot = _one_hot.sum(dim=-2)
+    expert_onehot = _one_hot
+
     expert_weights = torch.softmax(
         torch.randn(batch, mc.n_activated_experts), dim=-1
     )
@@ -552,6 +565,17 @@ def _precompute_end_to_end(dims):
 
     o_proj_weight = torch.randn(mc.num_heads * mc.head_dim, mc.hidden_dim)
 
+    # Ragged metadata: emit as 1-D int64 tensors (not Python lists). The
+    # framework wraps every tensors[...] entry as StepRawTensor at root, so
+    # the LLM can pass these straight into metadata_gen / cache_read_addr_gen
+    # without the (broken) ``torch.tensor(<list>) -> metadata_gen`` bridge.
+    # Also pre-derive ``seq_len`` (tile/token count after append) and
+    # ``idx`` (per-batch cache slot) so the LLM doesn't need to recreate
+    # them with banned ops (raw tensor arithmetic / torch.arange).
+    num_token_list_t = torch.tensor(num_token_list, dtype=torch.int64)
+    seq_len_t = num_token_list_t + 1
+    idx_t = torch.arange(batch, dtype=torch.int64)
+
     return {
         "input_tensor": input_tensor,
         "q_proj": q_proj,
@@ -562,11 +586,15 @@ def _precompute_end_to_end(dims):
         "k_cache": k_cache,
         "v_cache": v_cache,
         "expert_indices": expert_indices,
+        "expert_multihot": expert_multihot,
+        "expert_onehot": expert_onehot,
         "expert_weights": expert_weights,
         "w_gate_list": w_gate_list,
         "w_up_list": w_up_list,
         "w_down_list": w_down_list,
-        "num_token_list": num_token_list,
+        "num_token_list": num_token_list_t,
+        "seq_len": seq_len_t,
+        "idx": idx_t,
         "o_proj_weight": o_proj_weight,
     }
 
@@ -651,7 +679,9 @@ def _precompute_gqa_decode_e2e(dims):
     seq_lens_tiles = torch.randint(
         low=n_min, high=n_max + 1, size=(batch,), dtype=torch.int64
     )
-    seq_lens = (seq_lens_tiles * tile_seq).tolist()
+    # Keep as 1-D int64 tensor (not list) so it auto-wraps as StepRawTensor
+    # at root and can flow directly into metadata_gen / cache_read_addr_gen.
+    seq_lens = seq_lens_tiles * tile_seq
 
     # tile_mask[b, t] = 1.0 if tile t is fully valid for batch b, else 0.0.
     # Used by step_impl to zero out invalid tiles after exp() so the uniform-S
@@ -1480,3 +1510,23 @@ def _precompute_kernelbench_reformer_enwik8(dims):
     }
     out["input_ids"] = torch.randint(0, dims["V"], (dims["B"], dims["T"]))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Examples (origin: example) — self-contained didactic kernels under examples/
+# ---------------------------------------------------------------------------
+
+@register("kv_append_load")
+def _precompute_kv_append_load(dims):
+    # Delegates to examples/kv/precompute.py so the example folder stays a
+    # single source of truth and remains runnable via the standalone smoke
+    # test in HANDOFF.md. Loaded by file path (examples/ is not a package).
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent / "examples" / "kv" / "precompute.py"
+    if not hasattr(_precompute_kv_append_load, "_mod"):
+        spec = importlib.util.spec_from_file_location("_examples_kv_precompute", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _precompute_kv_append_load._mod = mod
+    return _precompute_kv_append_load._mod.precompute(dims)

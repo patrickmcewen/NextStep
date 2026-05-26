@@ -13,7 +13,6 @@ import argparse
 import inspect
 import json
 import os
-import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -23,6 +22,7 @@ import torch
 
 from loader import load_config, get_dims, list_kernels, list_presets, load_problem, load_step_impl
 from precompute import precompute_tensors
+from rust_sim_runner import RustSimDebugConfig, run_serialized_graph
 
 
 STEP_TL_SRC = str(Path(__file__).resolve().parent.parent / "step_tl" / "src")
@@ -52,6 +52,8 @@ class EvalResult:
     error_message: str | None = None
     cycle_time: float | None = None
     max_diff: float | None = None
+    rust_sim_classification: str | None = None
+    rust_sim_log: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -139,7 +141,10 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
                     step_impl_source: str | None = None,
                     max_total_compute_bw: int | None = None,
                     tensors_override: dict | None = None,
-                    sim_timeout_seconds: float | None = None) -> EvalResult:
+                    sim_timeout_seconds: float | None = None,
+                    rust_sim_debug: bool = False,
+                    rust_sim_log: str | None = None,
+                    rust_stall_windows: int = 3) -> EvalResult:
     """Run the full evaluation pipeline for a single kernel pair + preset.
 
     Stages: exec -> simulate -> correctness -> success.
@@ -155,9 +160,9 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     same routine as ``validate_timing.normalize_compute_bw``. Autotuners pass
     this so the rust sim runs against the same compute budget the analytical
     scorer used to rank candidates.
-    ``sim_timeout_seconds`` overrides the default simulator subprocess
-    timeout for this call. On timeout the simulator subprocess is killed by
-    ``subprocess.run`` and this function returns a simulate-stage failure.
+    ``sim_timeout_seconds`` overrides the default simulator subprocess timeout.
+    Rust sim debug options stream/log instrumented DAM progress and attach a
+    liveness classification to simulate-stage failures.
     """
     dims = get_dims(kernel_name, preset)
     ref_mod = None if timing_only else load_problem(kernel_name)
@@ -220,7 +225,7 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
     # cycles without spending hours hung on candidates that would deadlock at
     # depth=2 but run fine here. See validate_deadlock.py for the static check
     # we used to apply (kept as a diagnostic; no longer wired in).
-    sim_config = SimConfig(channel_depth=1024, functional_sim=not timing_only, mock_bf16=False)
+    sim_config = SimConfig(channel_depth=10000000, functional_sim=not timing_only, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,
@@ -229,79 +234,87 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
 
     serialize(graph, pb_path, sim_config.functional_sim)
 
-    sim_runner_script = (
-        "import json, sys, os\n"
-        "os.chdir(sys.argv[1])\n"
-        "from sim import HBMConfig, SimConfig\n"
-        "import step_perf\n"
-        "pb_path = sys.argv[2]\n"
-        "hbm_cfg = json.loads(sys.argv[3])\n"
-        "sim_cfg = json.loads(sys.argv[4])\n"
-        "hbm = HBMConfig(**hbm_cfg)\n"
-        "sim = SimConfig(**sim_cfg)\n"
-        "ret = step_perf.run_graph(pb_path, False, hbm, sim, None)\n"
-        "if len(ret) == 4:\n"
-        "    _, cycles, dur_ms, dur_s = ret\n"
-        "elif len(ret) == 2:\n"
-        "    _, cycles = ret\n"
-        "    dur_ms, dur_s = 0.0, 0.0\n"
-        "else:\n"
-        "    raise RuntimeError(f'Unexpected return: {ret}')\n"
-        "print(json.dumps({'cycles': cycles, 'dur_ms': dur_ms, 'dur_s': dur_s}))\n"
-    )
-
-    pythonpath = STEP_TL_SRC + ":" + STEP_TL_PROTO + ":" + os.environ.get("PYTHONPATH", "")
-    env = os.environ.copy()
-    env["PYTHONPATH"] = pythonpath
-
     timeout = (
         SIM_TIMEOUT_SECONDS
         if sim_timeout_seconds is None else float(sim_timeout_seconds)
     )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", sim_runner_script,
-             work_dir, pb_path,
-             json.dumps(asdict(hbm_config)),
-             json.dumps({"channel_depth": sim_config.channel_depth,
-                          "functional_sim": sim_config.functional_sim,
-                          "mock_bf16": sim_config.mock_bf16})],
-            capture_output=True, text=True, timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
+    sim_result = run_serialized_graph(
+        work_dir=work_dir,
+        graph_pb=pb_path,
+        hbm_config=hbm_config,
+        sim_config=sim_config,
+        timeout_seconds=timeout,
+        debug=RustSimDebugConfig(
+            enabled=rust_sim_debug,
+            log_path=rust_sim_log,
+            stall_windows=rust_stall_windows,
+        ),
+    )
+
+    if sim_result.timed_out:
         return _write_result(work_dir, EvalResult(
             kernel=kernel_name, preset=preset, stage="simulate",
             success=False, dims=dims,
             error_message=(
                 f"Simulator timed out after {timeout:g} seconds. "
-                f"stdout tail:\n{(exc.stdout or '')[-2000:]}\n"
-                f"stderr tail:\n{(exc.stderr or '')[-2000:]}"
+                f"{sim_result.summary()}\n"
+                f"output tail:\n{sim_result.output[-2000:]}"
             ),
+            rust_sim_classification=sim_result.classification,
+            rust_sim_log=sim_result.log_path,
         ))
 
-    if proc.returncode != 0:
+    if sim_result.returncode != 0:
         return _write_result(work_dir, EvalResult(
             kernel=kernel_name, preset=preset, stage="simulate", success=False,
             dims=dims,
-            error_message=f"Simulator failed (rc={proc.returncode}):\n{proc.stderr[-2000:]}",
+            error_message=(
+                f"Simulator failed (rc={sim_result.returncode}). "
+                f"{sim_result.summary()}\n"
+                f"output tail:\n{sim_result.output[-2000:]}"
+            ),
+            rust_sim_classification=sim_result.classification,
+            rust_sim_log=sim_result.log_path,
         ))
 
-    sim_result = json.loads(proc.stdout.strip().split("\n")[-1])
-    cycles = sim_result["cycles"]
+    if sim_result.sim_json is None:
+        return _write_result(work_dir, EvalResult(
+            kernel=kernel_name, preset=preset, stage="simulate", success=False,
+            dims=dims,
+            error_message=(
+                f"Simulator did not emit a JSON result. {sim_result.summary()}\n"
+                f"output tail:\n{sim_result.output[-2000:]}"
+            ),
+            rust_sim_classification=sim_result.classification,
+            rust_sim_log=sim_result.log_path,
+        ))
+    if not sim_result.sim_json["passed"]:
+        return _write_result(work_dir, EvalResult(
+            kernel=kernel_name, preset=preset, stage="simulate", success=False,
+            dims=dims,
+            error_message=(
+                f"Simulator did not pass. {sim_result.summary()}\n"
+                f"output tail:\n{sim_result.output[-2000:]}"
+            ),
+            rust_sim_classification=sim_result.classification,
+            rust_sim_log=sim_result.log_path,
+        ))
+    cycles = sim_result.sim_json["cycles"]
 
     # --- Stage 3: correctness ---
     if timing_only:
         return _write_result(work_dir, EvalResult(
             kernel=kernel_name, preset=preset, stage="success", success=True,
             dims=dims, cycle_time=float(cycles),
+            rust_sim_classification=sim_result.classification,
+            rust_sim_log=sim_result.log_path,
         ))
 
     store_name = output_op.store_file_name
     store_path = os.path.join(work_dir, store_name)
 
     assert os.path.exists(f"{store_path}.npy"), (
-        f"Simulation did not produce {store_name}.npy\nstderr: {proc.stderr[-2000:]}"
+        f"Simulation did not produce {store_name}.npy\noutput: {sim_result.output[-2000:]}"
     )
 
     if os.path.exists(f"{store_path}.json"):
@@ -335,12 +348,16 @@ def evaluate_kernel(kernel_name: str, preset: str, work_dir: str | None = None,
             dims=dims,
             error_message=f"Output incorrect: max_diff={max_diff}, rel_err={rel_err:.2e} (threshold {REL_ERR_THRESHOLD:.0e})",
             cycle_time=float(cycles), max_diff=max_diff,
+            rust_sim_classification=sim_result.classification,
+            rust_sim_log=sim_result.log_path,
         ))
 
     # --- Stage 4: success ---
     return _write_result(work_dir, EvalResult(
         kernel=kernel_name, preset=preset, stage="success", success=True,
         dims=dims, cycle_time=float(cycles), max_diff=max_diff,
+        rust_sim_classification=sim_result.classification,
+        rust_sim_log=sim_result.log_path,
     ))
 
 
@@ -353,6 +370,14 @@ def main():
     parser.add_argument("--list", action="store_true", help="List available kernels and presets")
     parser.add_argument("--timing-only", action="store_true",
                         help="Skip correctness check, run cycle-accurate timing only")
+    parser.add_argument("--sim-timeout", type=float, default=None,
+                        help="Override simulator subprocess timeout in seconds")
+    parser.add_argument("--rust-sim-debug", action="store_true",
+                        help="Stream Rust/DAM progress lines and print liveness context")
+    parser.add_argument("--rust-sim-log", default=None,
+                        help="Write combined Rust simulator stdout/stderr to this path")
+    parser.add_argument("--rust-stall-windows", type=int, default=3,
+                        help="Classify stall after this many zero-movement DAM progress windows")
     args = parser.parse_args()
 
     if args.list:
@@ -380,11 +405,27 @@ def main():
         print(f"\n{'='*60}")
         print(f"Evaluating: {name} / {preset}")
         print(f"{'='*60}")
-        result = evaluate_kernel(name, preset, timing_only=args.timing_only)
+        log_path = args.rust_sim_log
+        if log_path and len(pairs) > 1:
+            base = Path(log_path)
+            log_path = str(base.with_name(f"{base.stem}_{name}_{preset}{base.suffix}"))
+        result = evaluate_kernel(
+            name,
+            preset,
+            timing_only=args.timing_only,
+            sim_timeout_seconds=args.sim_timeout,
+            rust_sim_debug=args.rust_sim_debug,
+            rust_sim_log=log_path,
+            rust_stall_windows=args.rust_stall_windows,
+        )
         results.append(result)
         status = "PASS" if result.success else f"FAIL @ {result.stage}"
         cycles_str = f" ({result.cycle_time} cycles)" if result.cycle_time else ""
         print(f"  -> {status}{cycles_str}")
+        if result.rust_sim_classification:
+            print(f"  -> rust sim: {result.rust_sim_classification}")
+        if result.rust_sim_log:
+            print(f"  -> rust sim log: {result.rust_sim_log}")
         if result.error_message:
             print(f"  -> {result.error_message[:200]}")
 

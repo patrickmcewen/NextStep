@@ -111,10 +111,30 @@ def _assert_elem_in(stream_dtype, op_name, allowed):
     )
 
 
-def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1, start_tile_idx=0):
+def _assert_stop_rank_available(mask, required_rank, op_name):
+    stream_rank = len(mask) - 1
+    assert required_rank <= stream_rank, (
+        f"{op_name}: rank {required_rank} requires input stream rank >= "
+        f"{required_rank}, got input stream rank {stream_rank} "
+        f"(dyn_mask length {len(mask)}). The Rust simulator waits for a "
+        f"ValStop at level >= {required_rank}; rank-0 streams cannot "
+        f"satisfy this op."
+    )
+
+
+_DYN_ORIGIN_COUNTER = 0
+
+
+def _fresh_dyn_origin(op_name):
+    global _DYN_ORIGIN_COUNTER
+    _DYN_ORIGIN_COUNTER += 1
+    return f"{op_name}_{_DYN_ORIGIN_COUNTER}"
+
+
+def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     underlying = _assert_raw(underlying, "offchip_load", "underlying")
     assert par_dispatch >= 1, f"offchip_load: par_dispatch must be >= 1, got {par_dispatch}"
-    assert start_tile_idx >= 0, f"offchip_load: start_tile_idx must be >= 0, got {start_tile_idx}"
+    #assert start_tile_idx >= 0, f"offchip_load: start_tile_idx must be >= 0, got {start_tile_idx}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load: underlying dtype must be float16 or float32, got {underlying.dtype}"
     # out_shape_tiled enumerates the stream positions to read; an empty tuple
     # produces a zero-rank stream which the rest of the DSL cannot represent
@@ -165,7 +185,7 @@ def offchip_load(underlying, stride, out_shape_tiled, tile_row, tile_col, transp
     # the DSL and timing-sim views of which tiles get read stay in lockstep.
     ranges = [torch.arange(s) for s in out_shape_tiled]
     grids = torch.meshgrid(*ranges, indexing="ij")
-    linear_idx = sum(g.long() * int(s) for g, s in zip(grids, stride)) + int(start_tile_idx)
+    linear_idx = sum(g.long() * int(s) for g, s in zip(grids, stride))# + int(start_tile_idx)
 
     result = flat[linear_idx.long()]  # (*out_shape_tiled, tile_row, tile_col)
     if transposed:
@@ -208,10 +228,10 @@ def dyn_offchip_load(underlying, tensor_shape_tiled, tile_row, tile_col, *, par_
     )
 
 
-def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1, start_tile_idx=0):
+def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_col, transposed=False, *, par_dispatch=1):
     underlying = _assert_raw(underlying, "offchip_load_ref", "underlying")
     assert par_dispatch >= 1, f"offchip_load_ref: par_dispatch must be >= 1, got {par_dispatch}"
-    assert start_tile_idx >= 0, f"offchip_load_ref: start_tile_idx must be >= 0, got {start_tile_idx}"
+    #assert start_tile_idx >= 0, f"offchip_load_ref: start_tile_idx must be >= 0, got {start_tile_idx}"
     assert underlying.dtype in [torch.float32, torch.float16], f"offchip_load_ref: underlying dtype must be float16 or float32, got {underlying.dtype}"
     sd_ref, mask_ref, orig_ref = _step_meta(ref, "offchip_load_ref (ref)")
     _assert_elem_in(sd_ref, "offchip_load_ref (ref)", (Float16, Float32))
@@ -219,7 +239,7 @@ def offchip_load_ref(ref, underlying, stride, out_shape_tiled, tile_row, tile_co
     # _assert_raw insists on the wrapper type even when invoked from inside
     # the DSL implementation. The wrap is a no-op semantically (same
     # underlying tensor) — it just satisfies the source-op type gate.
-    loaded = offchip_load(StepRawTensor(underlying), stride, out_shape_tiled, tile_row, tile_col, transposed, start_tile_idx=start_tile_idx).underlying_tensor
+    loaded = offchip_load(StepRawTensor(underlying), stride, out_shape_tiled, tile_row, tile_col, transposed).underlying_tensor
     # loaded: (1, *out_shape_tiled, tile_row, tile_col)
     # target: (*ref_stream, *out_shape_tiled, tile_row, tile_col)
     ref_stream = list(ref.underlying_tensor.shape[:-2])
@@ -267,7 +287,14 @@ def metadata_gen(tensor):
 
 
 def cache_read_addr_gen(idx, seq_len, row_offset):
-    sd_i, _, _ = _step_meta(idx, "cache_read_addr_gen (idx)")
+    # IR semantics (functional.py:_exec_cache_read_addr_gen): append one
+    # ragged stream dim to idx's stream — output stream = idx.stream +
+    # (DynN,) with tile (1,1). Eager-side: pad the new dim to max(seq_len)
+    # and record per-row lengths as a `ragged_lengths` sidecar at that dim
+    # (mirroring RaggedTensor). Downstream `random_offchip_load` masks the
+    # padded tiles to zero, so summing/accumulating over the ragged dim is
+    # correct even though the physical tensor is padded.
+    sd_i, mask_i, orig_i = _step_meta(idx, "cache_read_addr_gen (idx)")
     sd_s, _, _ = _step_meta(seq_len, "cache_read_addr_gen (seq_len)")
     _assert_tile_kind(sd_i, "cache_read_addr_gen (idx)")
     _assert_tile_kind(sd_s, "cache_read_addr_gen (seq_len)")
@@ -279,20 +306,30 @@ def cache_read_addr_gen(idx, seq_len, row_offset):
     assert seq_t.shape == idx_t.shape, (
         f"cache_read_addr_gen: idx {tuple(idx_t.shape)} and seq_len {tuple(seq_t.shape)} must match"
     )
+    stream_shape = idx_t.shape[:-2]
     idx_flat = idx_t.reshape(-1).long()
     seq_len_flat = seq_t.reshape(-1).long()
-    out = []
+    assert (seq_len_flat >= 0).all(), (
+        f"cache_read_addr_gen: seq_len entries must be >= 0, got min={int(seq_len_flat.min())}"
+    )
+    max_n = int(seq_len_flat.max().item())
+    out = torch.zeros(idx_flat.shape[0], max_n, dtype=torch.float32)
+    arange = torch.arange(max_n, dtype=torch.long)
     for b in range(idx_flat.shape[0]):
-        base = int(idx_flat[b]) * int(row_offset)
         n = int(seq_len_flat[b])
-        assert n >= 0, f"cache_read_addr_gen: seq_len[{b}]={n} must be >= 0"
-        # Per-batch output stream shape (1, n) with tile (1,1). Each n is
-        # concrete eager-time but represents a ragged dim; we list one
-        # StepTensor per batch so the raggedness lives in the Python list
-        # rather than in dyn_mask of a single tensor.
-        t = torch.arange(base, base + n, dtype=torch.float32).reshape(1, n, 1, 1)
-        out.append(StepTensor(t, stream_dtype=Tile(Uint64(), (1, 1))))
-    return out
+        base = int(idx_flat[b]) * int(row_offset)
+        out[b, :n] = (base + arange[:n]).to(torch.float32)
+    result = out.reshape(*stream_shape, max_n, 1, 1)
+    # Ragged dim is the newly appended one — stream index = len(idx.stream).
+    ragged_dim = len(stream_shape)
+    lengths = seq_len_flat.reshape(stream_shape)
+    return StepTensor(
+        result,
+        stream_dtype=Tile(Uint64(), (1, 1)),
+        dyn_mask=mask_i + (True,),
+        dyn_origins=orig_i + (_fresh_dyn_origin("cache_read_addr_gen"),),
+        ragged_lengths={ragged_dim: lengths},
+    )
 
 
 def expert_addr_gen(x, expert_addr_base, num_tile_per_expert):
@@ -358,7 +395,7 @@ def filter_last_tile(seq_len):
         result,
         stream_dtype=MultiHot(2),
         dyn_mask=mask + (True,),
-        dyn_origins=orig + ("filter_last_tile",),
+        dyn_origins=orig + (_fresh_dyn_origin("filter_last_tile"),),
     )
 
 
@@ -392,15 +429,42 @@ def random_offchip_load(underlying, raddr, tile_row, tile_col, transposed=False,
         f"got min={int(addrs.min())}, max={int(addrs.max())}"
     )
     result = flat[addrs].reshape(*stream_shape, tile_row, tile_col)
+
+    # Mirror functional.py:_exec_random_load — if raddr carries a ragged_lengths
+    # sidecar (typically from cache_read_addr_gen), zero out tiles whose
+    # ragged-dim position is >= length for that row. After this masking the
+    # padded slots hold zero data, so downstream accum-reductions can sum
+    # over the (still-padded) ragged dim without leaking padding values.
+    if raddr.ragged_lengths:
+        for ragged_dim, lengths in raddr.ragged_lengths.items():
+            assert 0 <= ragged_dim < len(stream_shape), (
+                f"random_offchip_load: ragged_dim {ragged_dim} out of range "
+                f"for stream shape {tuple(stream_shape)}"
+            )
+            dim_size = int(stream_shape[ragged_dim])
+            arange = torch.arange(dim_size, dtype=torch.long, device=result.device)
+            # lengths has shape stream_shape[:ragged_dim]; broadcast against
+            # arange (shape (dim_size,)) to produce a per-position keep mask.
+            keep = arange < lengths.reshape(*lengths.shape, 1).to(torch.long)
+            # Broadcast keep to the full underlying tensor shape (add trailing
+            # ones for the rest of the stream dims after `ragged_dim`, plus
+            # the two tile dims).
+            view_shape = (
+                tuple(lengths.shape) + (dim_size,)
+                + (1,) * (len(stream_shape) - ragged_dim - 1 + 2)
+            )
+            keep = keep.reshape(*view_shape)
+            result = result * keep.to(result.dtype)
+
     if transposed:
         result = result.transpose(-2, -1)
     tile_shape = (tile_col, tile_row) if transposed else (tile_row, tile_col)
-    # Output stream shape == raddr stream shape, dyn_mask matches raddr.
     return StepTensor(
         result,
         stream_dtype=Tile(_elem_from_torch(underlying.dtype), tile_shape),
         dyn_mask=mask_r,
         dyn_origins=orig_r,
+        ragged_lengths=raddr.ragged_lengths,
     )
 
 def _assert_stream_match(a, b, op_name):
@@ -422,6 +486,14 @@ def _assert_stream_match(a, b, op_name):
         f"b has {mask_b} (origins {orig_b}). Strict matching is required so "
         f"a symbolic dim isn't silently aligned to a static one."
     )
+    for i, (is_dyn, a_origin, b_origin) in enumerate(zip(mask_a, orig_a, orig_b)):
+        if is_dyn:
+            assert a_origin == b_origin, (
+                f"{op_name}: dynamic stream origin mismatch at dim {i} — "
+                f"a has {a_origin!r}, b has {b_origin!r}. Dynamic stream "
+                f"dims must come from the same DSL producer; equal concrete "
+                f"runtime lengths are not enough for translated STeP IR."
+            )
 
 
 def _assert_float(x, op_name):
@@ -514,16 +586,36 @@ def binary_is_equal(a, b, *, compute_bw=1):
 def binary_set_offset(a, b, *, compute_bw=1):
     assert compute_bw >= 1, f"binary_set_offset: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_set_offset")
-    _assert_float(b, "binary_set_offset")
-    _assert_stream_match(a, b, "binary_set_offset")
-    assert b.underlying_tensor.shape[-2:] == (1, 1), (
-        f"binary_set_offset: b tile shape must be (1,1), got {tuple(b.underlying_tensor.shape[-2:])}"
+    _assert_int(b, "binary_set_offset")
+    # IR semantics (map_fn.SetOffset) pair each data tile in `a` with one
+    # uint offset in `b`. The token cardinality must match, but `b` is often
+    # a static metadata stream while `a` came out of flat_partition with a
+    # dyn outer dim — so we accept any pairing whose stream shapes have the
+    # same total number of tiles. We reshape `offsets` to a's stream shape
+    # so binary_row_wise_append can scatter row-by-row.
+    a_t = a.underlying_tensor
+    b_t = b.underlying_tensor
+    assert b_t.shape[-2:] == (1, 1), (
+        f"binary_set_offset: b tile shape must be (1,1), got {tuple(b_t.shape[-2:])}"
     )
-    offsets = b.underlying_tensor[..., 0, 0].long()
+    a_stream = a_t.shape[: a_t.ndim - 2]
+    b_stream = b_t.shape[: b_t.ndim - 2]
+    a_total = 1
+    for d in a_stream:
+        a_total *= int(d)
+    b_total = 1
+    for d in b_stream:
+        b_total *= int(d)
+    assert a_total == b_total, (
+        f"binary_set_offset: token count mismatch — a stream {tuple(a_stream)} "
+        f"({a_total} tiles) vs b stream {tuple(b_stream)} ({b_total} tiles). "
+        f"The two operands must produce the same number of stream tokens."
+    )
+    offsets = b_t.reshape(*a_stream, 1, 1)[..., 0, 0].long()
     # Carry `a` forward unchanged but attach offsets on the wrapper for the
     # downstream binary_row_wise_append to consume.
     return StepTensor(
-        a.underlying_tensor, stream_dtype=a.stream_dtype,
+        a_t, stream_dtype=a.stream_dtype,
         dyn_mask=a.dyn_mask, dyn_origins=a.dyn_origins,
         offsets=offsets,
     )
@@ -533,26 +625,43 @@ def binary_row_wise_append(a, b, *, compute_bw=1):
     assert compute_bw >= 1, f"binary_row_wise_append: compute_bw must be >= 1, got {compute_bw}"
     _assert_float(a, "binary_row_wise_append")
     _assert_float(b, "binary_row_wise_append")
-    _assert_stream_match(a, b, "binary_row_wise_append")
+    # IR semantics (map_fn.RowWiseAppend) pair each data tile in `a` with one
+    # row tile in `b`. Token cardinality must match; dyn classification need
+    # not — `a` typically comes out of flat_partition (dyn) while `b` is a
+    # metadata-derived row stream (static).
     data = a.underlying_tensor
+    b_t = b.underlying_tensor
+    a_stream = data.shape[:-2]
+    b_stream = b_t.shape[:-2]
+    a_total = 1
+    for d in a_stream:
+        a_total *= int(d)
+    b_total = 1
+    for d in b_stream:
+        b_total *= int(d)
+    assert a_total == b_total, (
+        f"binary_row_wise_append: token count mismatch — a stream {tuple(a_stream)} "
+        f"({a_total} tiles) vs b stream {tuple(b_stream)} ({b_total} tiles)."
+    )
     if a.offsets is not None:
         offsets = a.offsets
     else:
-        offsets = torch.zeros(data.shape[:-2], dtype=torch.long)
+        offsets = torch.zeros(a_stream, dtype=torch.long)
     tile_r, tile_c = data.shape[-2], data.shape[-1]
-    M = b.underlying_tensor.shape[-2]
-    assert b.underlying_tensor.shape[-1] == tile_c, (
-        f"binary_row_wise_append: column dim mismatch ({b.underlying_tensor.shape[-1]} vs {tile_c})"
+    M = b_t.shape[-2]
+    assert b_t.shape[-1] == tile_c, (
+        f"binary_row_wise_append: column dim mismatch ({b_t.shape[-1]} vs {tile_c})"
     )
     assert (offsets + M <= tile_r).all(), (
         f"binary_row_wise_append: not enough space to append {M} rows "
         f"(tile_r={tile_r}, max offset={int(offsets.max())})"
     )
-    stream_shape = data.shape[:-2]
+    # Align b's stream shape to a's so the scatter indices broadcast cleanly.
+    b_aligned = b_t.reshape(*a_stream, M, tile_c)
     row_idx = offsets.unsqueeze(-1) + torch.arange(M, dtype=torch.long, device=data.device)
-    row_idx = row_idx.unsqueeze(-1).expand(*stream_shape, M, tile_c)
+    row_idx = row_idx.unsqueeze(-1).expand(*a_stream, M, tile_c)
     result = data.clone()
-    result.scatter_(dim=-2, index=row_idx, src=b.underlying_tensor.to(data.dtype))
+    result.scatter_(dim=-2, index=row_idx, src=b_aligned.to(data.dtype))
     return StepTensor(
         result, stream_dtype=a.stream_dtype,
         dyn_mask=a.dyn_mask, dyn_origins=a.dyn_origins,
@@ -732,8 +841,10 @@ def _accum_reduce(x, rank, op_name, reduce_fn):
     sd, mask, orig = _step_meta(x, op_name)
     _assert_elem_in(sd, op_name, (Float16, Float32))
     assert rank > 0, f"{op_name}: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"{op_name}: rank {rank} exceeds input stream rank {len(mask)}"
+    assert rank < len(mask), (
+        f"{op_name}: rank {rank} would reduce all stream dims from shape "
+        f"{tuple(x.underlying_tensor.shape[:-2])}. Preserve an outer stream "
+        f"dim before Accum or reduce a smaller rank."
     )
     t = x.underlying_tensor
     for _ in range(rank):
@@ -772,9 +883,7 @@ def accum_retile_row(x, rank=1, *, compute_bw=1):
     sd, mask, orig = _step_meta(x, "accum_retile_row")
     _assert_tile_kind(sd, "accum_retile_row")
     assert rank > 0, f"accum_retile_row: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"accum_retile_row: rank {rank} exceeds input stream rank {len(mask)}"
-    )
+    _assert_stop_rank_available(mask, rank, "accum_retile_row")
     for i in range(rank):
         slot = len(mask) - 1 - i
         assert not mask[slot], (
@@ -804,9 +913,7 @@ def accum_retile_col(x, rank=1, *, compute_bw=1):
     sd, mask, orig = _step_meta(x, "accum_retile_col")
     _assert_tile_kind(sd, "accum_retile_col")
     assert rank > 0, f"accum_retile_col: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"accum_retile_col: rank {rank} exceeds input stream rank {len(mask)}"
-    )
+    _assert_stop_rank_available(mask, rank, "accum_retile_col")
     for i in range(rank):
         slot = len(mask) - 1 - i
         assert not mask[slot], (
@@ -840,9 +947,7 @@ def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
     sd, mask, orig = _step_meta(x, "accum_signal_req_all_read")
     _assert_elem_in(sd, "accum_signal_req_all_read", (Float16, Float32))
     assert rank > 0, f"accum_signal_req_all_read: rank must be > 0, got {rank}"
-    assert rank <= len(mask), (
-        f"accum_signal_req_all_read: rank {rank} exceeds input stream rank {len(mask)}"
-    )
+    _assert_stop_rank_available(mask, rank, "accum_signal_req_all_read")
     stream_shape = x.underlying_tensor.shape[: x.underlying_tensor.ndim - 2 - rank]
     result = torch.ones(*stream_shape, 1, 1)
     return StepTensor(
@@ -850,54 +955,6 @@ def accum_signal_req_all_read(x, rank=1, *, compute_bw=1):
         dyn_mask=mask[:len(mask) - rank],
         dyn_origins=orig[:len(orig) - rank],
     )
-
-def eager_merge(inputs):
-    """Concatenate `inputs` along their outermost stream dim and emit a
-    MultiHot(num_inputs) selector that recovers each source.
-
-    Outer-dim dynamism: if any input has a dynamic outer slot, the merged
-    output (and the selector) inherit dynamism with origin "eager_merge".
-    Inner stream dims must match exactly (incl dyn_mask) across inputs."""
-    n = len(inputs)
-    assert n > 0, "eager_merge: must have at least one input"
-    sd0, mask0, _ = _step_meta(inputs[0], "eager_merge (inputs[0])")
-    _assert_tile_kind(sd0, "eager_merge (inputs[0])")
-    assert len(mask0) >= 1, (
-        f"eager_merge: inputs must have at least one stream dim, got "
-        f"shape {tuple(inputs[0].underlying_tensor.shape)}"
-    )
-    tile_shape = sd0.shape
-    any_dyn_outer = bool(mask0[0])
-    for i, p in enumerate(inputs):
-        sd_i, mask_i, _ = _step_meta(p, f"eager_merge (inputs[{i}])")
-        _assert_tile_kind(sd_i, f"eager_merge (inputs[{i}])")
-        assert sd_i.shape == tile_shape, (
-            f"eager_merge: input {i} tile shape {sd_i.shape} != {tile_shape}"
-        )
-        assert mask_i[1:] == mask0[1:], (
-            f"eager_merge: input {i} inner dyn_mask {mask_i[1:]} != {mask0[1:]}"
-        )
-        any_dyn_outer = any_dyn_outer or bool(mask_i[0])
-
-    data = torch.cat([p.underlying_tensor for p in inputs], dim=0)
-    counts = [p.underlying_tensor.shape[0] for p in inputs]
-    select = torch.zeros(sum(counts), n)
-    offset = 0
-    for i, c in enumerate(counts):
-        select[offset:offset + c, i] = 1.0
-        offset += c
-
-    outer_origin = "eager_merge" if any_dyn_outer else None
-    data_mask = (any_dyn_outer,) + mask0[1:]
-    # Inner origins come from inputs[0] (all inputs share matching inner masks).
-    data_origins = (outer_origin,) + inputs[0].dyn_origins[1:]
-    return [
-        StepTensor(data, stream_dtype=sd0,
-                   dyn_mask=data_mask, dyn_origins=data_origins),
-        StepTensor(select, stream_dtype=MultiHot(n),
-                   dyn_mask=(any_dyn_outer,),
-                   dyn_origins=(outer_origin,)),
-    ]
 
 
 def flat_partition(x, control, n, partition_rank=0):
@@ -1118,7 +1175,7 @@ def flatmap_filter_row_streamify(x, mask):
         result,
         stream_dtype=Tile(sd_x.tile_dtype, (1, tile_c)),
         dyn_mask=mask_x[:-1] + (True,),
-        dyn_origins=orig_x[:-1] + ("flatmap_filter_row_streamify",),
+        dyn_origins=orig_x[:-1] + (_fresh_dyn_origin("flatmap_filter_row_streamify"),),
     )
 
 
@@ -1139,7 +1196,7 @@ def flatmap_counter(x):
         result,
         stream_dtype=Tile(sd.tile_dtype, (1, 1)),
         dyn_mask=mask + (True,),
-        dyn_origins=orig + ("flatmap_counter",),
+        dyn_origins=orig + (_fresh_dyn_origin("flatmap_counter"),),
     )
 
 
@@ -1157,6 +1214,8 @@ def promote(x, rank=1):
         f"promote(rank={rank}): tensor has {x.underlying_tensor.ndim} dims "
         f"({tuple(x.underlying_tensor.shape)}), max valid rank is {max_rank}."
     )
+    if rank > 0:
+        _assert_stop_rank_available(mask, rank, "promote")
     result = x.underlying_tensor.unsqueeze(-(3 + rank))
     # Insert a static False slot at stream position (len(mask) - rank).
     n = len(mask)
@@ -1580,16 +1639,6 @@ def dyn_streamify(x, ref):
         dyn_origins=orig_r + (None,) * bufferized_rank,
     )
 
-def broadcast(x, n):
-    """n duplicate StepTensors. Each output's metadata mirrors `x`."""
-    _step_meta(x, "broadcast")
-    return [
-        StepTensor(x.underlying_tensor.clone(), stream_dtype=x.stream_dtype,
-                   dyn_mask=x.dyn_mask, dyn_origins=x.dyn_origins,
-                   offsets=x.offsets)
-        for _ in range(n)
-    ]
-
 
 def parallelize(x, n):
     """Cycle-level round-robin: consumer i gets tokens i, n+i, 2n+i, ...
@@ -1650,9 +1699,7 @@ def binary_map_accum(a, b, rank=1, weight_transposed=False, *, compute_bw=1):
     _assert_stream_match(a, b, "binary_map_accum")
     assert rank > 0, f"binary_map_accum: rank must be > 0, got {rank}"
     sd_a, mask_a, orig_a = a.stream_dtype, a.dyn_mask, a.dyn_origins
-    assert rank <= len(mask_a), (
-        f"binary_map_accum: rank {rank} exceeds stream rank {len(mask_a)}"
-    )
+    _assert_stop_rank_available(mask_a, rank, "binary_map_accum")
     if weight_transposed:
         mapped = torch.matmul(a.underlying_tensor, b.underlying_tensor.transpose(-2, -1))
         tile_shape = (sd_a.shape[0], b.stream_dtype.shape[0])
@@ -1687,37 +1734,47 @@ def random_offchip_store(underlying, wdata, waddr, tile_row, tile_col, base_addr
     assert wdata_t.shape[-2:] == (tile_row, tile_col), (
         f"random_offchip_store: wdata tile {tuple(wdata_t.shape[-2:])} != ({tile_row},{tile_col})"
     )
-    assert wdata_t.shape[:-2] == waddr_t.shape[:-2], (
-        f"random_offchip_store: wdata stream {tuple(wdata_t.shape[:-2])} != waddr stream {tuple(waddr_t.shape[:-2])}"
+    # IR semantics: wdata and waddr stream in lockstep at runtime; the token
+    # count must match, but dyn classification need not (a writeback driven by
+    # a dyn data stream and a static metadata-derived address stream is a
+    # legitimate pairing — see end_to_end/attention/flashattn.py).
+    w_stream = wdata_t.shape[:-2]
+    a_stream = waddr_t.shape[:-2]
+    w_total = 1
+    for d in w_stream:
+        w_total *= int(d)
+    a_total = 1
+    for d in a_stream:
+        a_total *= int(d)
+    assert w_total == a_total, (
+        f"random_offchip_store: token count mismatch — wdata stream "
+        f"{tuple(w_stream)} ({w_total} tiles) vs waddr stream "
+        f"{tuple(a_stream)} ({a_total} tiles)."
     )
-    assert mask_w == mask_a, (
-        f"random_offchip_store: wdata/waddr dyn_mask mismatch: {mask_w} vs {mask_a}"
-    )
+    # Reshape waddr to wdata's stream shape so the per-tile zip below works.
+    waddr_t = waddr_t.reshape(*w_stream, 1, 1)
     R, C = underlying.shape[-2], underlying.shape[-1]
     assert R % tile_row == 0 and C % tile_col == 0, (
         f"random_offchip_store: ({R},{C}) not divisible by tile ({tile_row},{tile_col})"
     )
-    # Mirror random_offchip_load's flat tile walk: batch dims (row-major) -> grid_r -> grid_c.
-    # The Rust impl asserts 2D underlying, but the Python op layer (ops.py) builds tensor_shape_tiled
-    # with leading batch dims (e.g. KV cache [batch, maxN, num_kv_heads, head_dim]), so we follow
-    # the load-side semantics and accept N-D underlying.
-    assert underlying.is_contiguous(), (
-        "random_offchip_store: underlying must be contiguous so writes propagate through the view"
-    )
+    # Bounds-check the addresses against the tile grid so an obviously wrong
+    # address generator surfaces early. The store is value-level a no-op
+    # (matching the IR functional sim, step_tl/.../functional.py: returns
+    # wdata directly without writing into `underlying`) — only the timing
+    # simulator models the actual off-chip write. Keeping eager DSL aligned
+    # with IR semantics is important so validate_functional_dsl.py can share
+    # the same input tensors across PyTorch / DSL / IR runs.
     batch_shape = underlying.shape[:-2]
-    B = 1
+    nb = 1
     for d in batch_shape:
-        B *= d
+        nb *= int(d)
     grid_r, grid_c = R // tile_row, C // tile_col
-    tiles_per_batch = grid_r * grid_c
-    flat_batch = underlying.view(B, R, C)
-    addrs = waddr_t.reshape(-1).long().tolist()
-    wflat = wdata_t.reshape(-1, tile_row, tile_col)
-    for i, a in enumerate(addrs):
-        b = a // tiles_per_batch
-        within = a % tiles_per_batch
-        gr, gc = within // grid_c, within % grid_c
-        flat_batch[b, gr * tile_row:(gr + 1) * tile_row, gc * tile_col:(gc + 1) * tile_col] = wflat[i]
+    tiles_total = nb * grid_r * grid_c
+    addrs = waddr_t.reshape(-1).long()
+    assert (addrs >= 0).all() and (addrs < tiles_total).all(), (
+        f"random_offchip_store: address out of range [0, {tiles_total}), "
+        f"got min={int(addrs.min())}, max={int(addrs.max())}"
+    )
     stream_shape = waddr_t.shape[:-2]
     ack = torch.ones(*stream_shape, 1, 1, dtype=torch.float32)
     # IR: stream_dtype = Bool() (bare, not wrapped in Tile). DSL stores as a
@@ -1797,9 +1854,9 @@ DSL_FUNCTIONS = {
     "expand_ref", "repeat_ref", "repeat_static", "streamify", "dyn_streamify",
     "bufferize", "restream", "retile_streamify",
     # Multi-output
-    "broadcast", "parallelize", "static_reassemble",
+    "parallelize", "static_reassemble",
     # Routing
-    "eager_merge", "flat_partition", "flat_reassemble",
+    "flat_partition", "flat_reassemble",
     # Flatmap
     "flatmap_filter_row_streamify", "flatmap_counter",
     # Sink
