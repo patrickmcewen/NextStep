@@ -72,6 +72,19 @@ def default_memory_output_path(calibration_path: Path, node_path: str) -> Path:
     return calibration_path.parent / f"calibration_cycles_vs_on_chip_{node_slug}.png"
 
 
+def default_baseline_score_path(calibration_path: Path, node_path: str) -> Path:
+    return calibration_path.parent.joinpath(
+        *node_path.split("/"), "pass_0_general", "pass1_baseline_score.json"
+    )
+
+
+def load_baseline_score(baseline_path: Path) -> tuple[int, int]:
+    score = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert "cycles" in score, f"{baseline_path}: missing cycles"
+    assert "on_chip" in score, f"{baseline_path}: missing on_chip"
+    return int(score["cycles"]), int(score["on_chip"])
+
+
 def build_figure(points: list[tuple[int, int]], node_path: str, kernel: str):
     plt = _setup_matplotlib()
 
@@ -101,7 +114,12 @@ def build_figure(points: list[tuple[int, int]], node_path: str, kernel: str):
     return fig
 
 
-def build_memory_figure(points: list[tuple[int, int, int]], node_path: str, kernel: str):
+def build_memory_figure(
+    points: list[tuple[int, int, int]],
+    node_path: str,
+    kernel: str,
+    baseline_score: tuple[int, int] | None = None,
+):
     plt = _setup_matplotlib()
 
     sorted_points = sorted(points)
@@ -115,8 +133,19 @@ def build_memory_figure(points: list[tuple[int, int, int]], node_path: str, kern
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.plot(on_chip, analytical_cycles, marker="o", label="Analytical cycles")
     ax.plot(on_chip, rust_cycles, marker="o", label="Rust cycles")
-    for memory, analytical, rust in sorted_points:
-        ax.plot([memory, memory], [analytical, rust], linestyle=":", color="black", linewidth=1)
+    if baseline_score is not None:
+        baseline_cycles, baseline_on_chip = baseline_score
+        ax.scatter(
+            [baseline_on_chip],
+            [baseline_cycles],
+            marker="*",
+            color="black",
+            s=160,
+            label="Baseline score",
+            zorder=5,
+        )
+    #for memory, analytical, rust in sorted_points:
+    #    ax.plot([memory, memory], [analytical, rust], linestyle=":", color="black", linewidth=1)
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_title(f"Cycles vs on-chip memory: {kernel} / {node_path}", fontsize=18)
@@ -140,9 +169,14 @@ def plot_points(
 
 
 def plot_memory_points(
-    points: list[tuple[int, int, int]], node_path: str, kernel: str, output_path: Path
+    points: list[tuple[int, int, int]],
+    node_path: str,
+    kernel: str,
+    output_path: Path,
+    *,
+    baseline_score: tuple[int, int] | None = None,
 ) -> None:
-    fig = build_memory_figure(points, node_path, kernel)
+    fig = build_memory_figure(points, node_path, kernel, baseline_score=baseline_score)
     fig.savefig(output_path, dpi=160)
     plt = _setup_matplotlib()
     plt.close(fig)
@@ -175,10 +209,18 @@ def main() -> None:
     )
     kernel, points = load_plot_data(args.calibration_jsonl, args.node_path)
     memory_points = load_memory_points(args.calibration_jsonl, args.node_path)
+    baseline_path = default_baseline_score_path(args.calibration_jsonl, args.node_path)
+    baseline_score = load_baseline_score(baseline_path) if baseline_path.exists() else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     memory_output_path.parent.mkdir(parents=True, exist_ok=True)
     plot_points(points, args.node_path, kernel, output_path)
-    plot_memory_points(memory_points, args.node_path, kernel, memory_output_path)
+    plot_memory_points(
+        memory_points,
+        args.node_path,
+        kernel,
+        memory_output_path,
+        baseline_score=baseline_score,
+    )
     print(f"wrote {output_path}")
     print(f"wrote {memory_output_path}")
 
