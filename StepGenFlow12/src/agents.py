@@ -15,6 +15,7 @@ surface chain-of-thought as structured ``ReasoningItem``s rather than
 contaminating the response content.
 """
 
+import re
 from dataclasses import dataclass
 
 import tiktoken
@@ -22,7 +23,7 @@ import tiktoken
 from agents import (Agent, AsyncOpenAI, ModelSettings,
                     OpenAIChatCompletionsModel, RunConfig)
 from agents.retry import ModelRetrySettings, RetryPolicyContext, retry_policies
-from openai import APIError, APIStatusError
+from openai import APIError, APIStatusError, BadRequestError
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice as _ChatCompletionChoice
 from openai.types.shared import Reasoning
@@ -38,9 +39,16 @@ _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.pare
 
 _DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
 _DEFAULT_OUTPUT_TOKEN_MARGIN = 4000
+_CONTEXT_OVERFLOW_RETRY_MARGIN_TOKENS = 1024
 _TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
 _CHAT_MESSAGE_OVERHEAD = 4
 _CHAT_REPLY_PRIMER = 2
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"maximum context length is (?P<maximum>\d+) tokens.*?"
+    r"requested about (?P<requested>\d+) tokens "
+    r"\((?P<input>\d+) of text input, (?P<output>\d+) in the output\)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -172,6 +180,62 @@ def build_dynamic_run_config(agent, input_items) -> RunConfig:
     return RunConfig(
         model_settings=ModelSettings(
             max_tokens=compute_dynamic_max_tokens(agent, input_items)))
+
+
+def retry_max_tokens_after_context_overflow(
+    error_message: str,
+    current_max_tokens: int | None,
+    *,
+    retry_margin_tokens: int = _CONTEXT_OVERFLOW_RETRY_MARGIN_TOKENS,
+) -> int | None:
+    """Return a lower output budget for provider context-overflow 400s."""
+    assert isinstance(error_message, str), (
+        f"error_message must be str, got {type(error_message).__name__}")
+    assert retry_margin_tokens > 0, (
+        f"retry_margin_tokens must be positive, got {retry_margin_tokens}")
+    match = _CONTEXT_OVERFLOW_RE.search(error_message)
+    if match is None or current_max_tokens is None:
+        return None
+    maximum = int(match.group("maximum"))
+    requested = int(match.group("requested"))
+    requested_output = int(match.group("output"))
+    overflow = requested - maximum
+    assert requested_output > 0, (
+        f"context overflow error reported non-positive output tokens: "
+        f"{requested_output}")
+    if overflow <= 0:
+        return None
+    next_max_tokens = (
+        min(current_max_tokens, requested_output) - overflow - retry_margin_tokens
+    )
+    if next_max_tokens <= 0 or next_max_tokens >= current_max_tokens:
+        return None
+    return next_max_tokens
+
+
+def _model_settings_from_fetch_args(args, kwargs) -> ModelSettings:
+    if "model_settings" in kwargs:
+        model_settings = kwargs["model_settings"]
+    else:
+        assert len(args) >= 3, "_fetch_response args must include model_settings"
+        model_settings = args[2]
+    assert isinstance(model_settings, ModelSettings), (
+        f"model_settings must be ModelSettings, got "
+        f"{type(model_settings).__name__}")
+    return model_settings
+
+
+def _replace_model_settings_in_fetch_args(
+    args, kwargs, model_settings: ModelSettings
+):
+    if "model_settings" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["model_settings"] = model_settings
+        return args, kwargs
+    args = list(args)
+    assert len(args) >= 3, "_fetch_response args must include model_settings"
+    args[2] = model_settings
+    return tuple(args), kwargs
 
 
 def _with_llm_config(agent: Agent, llm_config: dict) -> Agent:
@@ -598,7 +662,23 @@ class ReasoningAwareModel(OpenAIChatCompletionsModel):
 
         # Non-streaming path: upgrade to streaming internally and reassemble.
         kwargs["stream"] = True
-        _resp, stream = await super()._fetch_response(*args, **kwargs)
+        try:
+            _resp, stream = await super()._fetch_response(*args, **kwargs)
+        except BadRequestError as exc:
+            model_settings = _model_settings_from_fetch_args(args, kwargs)
+            retry_max_tokens = retry_max_tokens_after_context_overflow(
+                str(exc), model_settings.max_tokens)
+            if retry_max_tokens is None:
+                raise
+            retry_settings = model_settings.resolve(
+                ModelSettings(max_tokens=retry_max_tokens))
+            args, kwargs = _replace_model_settings_in_fetch_args(
+                args, kwargs, retry_settings)
+            print(
+                "[llm] context-overflow retry: "
+                f"max_tokens {model_settings.max_tokens} -> {retry_max_tokens}"
+            )
+            _resp, stream = await super()._fetch_response(*args, **kwargs)
         completion = await _collect_stream_into_completion(stream)
 
         for choice in completion.choices:

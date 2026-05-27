@@ -7,6 +7,7 @@ from src.agents import (
     compute_dynamic_max_tokens,
     compute_prompt_token_budget,
     estimate_agent_prompt_tokens,
+    retry_max_tokens_after_context_overflow,
 )
 
 
@@ -54,3 +55,26 @@ def test_prompt_token_budget_reports_available_output_room():
     assert budget.prompt_tokens > 64
     assert budget.max_tokens < 0
     assert not budget.has_output_room
+
+
+def test_context_overflow_retry_reduces_requested_output_budget():
+    message = (
+        "This endpoint's maximum context length is 131072 tokens. However, "
+        "you requested about 131382 tokens (78837 of text input, 52545 in "
+        "the output)."
+    )
+
+    retry_max_tokens = retry_max_tokens_after_context_overflow(
+        message, current_max_tokens=52_545, retry_margin_tokens=1_024)
+
+    assert retry_max_tokens == 52_545 - (131_382 - 131_072) - 1_024
+
+
+def test_context_overflow_retry_ignores_unrelated_bad_request():
+    retry_max_tokens = retry_max_tokens_after_context_overflow(
+        "model does not support this parameter",
+        current_max_tokens=10_000,
+        retry_margin_tokens=1_024,
+    )
+
+    assert retry_max_tokens is None
