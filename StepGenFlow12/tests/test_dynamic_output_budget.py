@@ -1,9 +1,11 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from src.agents import (
     AgentPromptTokenBudget,
+    _collect_stream_into_completion,
     compute_dynamic_max_tokens,
     compute_prompt_token_budget,
     estimate_agent_prompt_tokens,
@@ -78,3 +80,32 @@ def test_context_overflow_retry_ignores_unrelated_bad_request():
     )
 
     assert retry_max_tokens is None
+
+
+def test_stream_error_finish_reason_becomes_failed_turn_marker():
+    async def stream():
+        yield SimpleNamespace(
+            id="chatcmpl-test",
+            model="test-model",
+            created=1,
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content="```python\npartial_but_invalid()",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                    ),
+                    finish_reason="error",
+                )
+            ],
+        )
+
+    completion = asyncio.run(_collect_stream_into_completion(stream()))
+
+    choice = completion.choices[0]
+    assert choice.finish_reason == "stop"
+    assert "LLM_STREAM_ERROR" in choice.message.content
+    assert "partial_but_invalid" not in choice.message.content

@@ -49,6 +49,18 @@ _CONTEXT_OVERFLOW_RE = re.compile(
     r"\((?P<input>\d+) of text input, (?P<output>\d+) in the output\)",
     re.IGNORECASE | re.DOTALL,
 )
+_CHAT_COMPLETION_FINISH_REASONS = {
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "function_call",
+}
+_STREAM_ERROR_TURN_MARKER = (
+    "[LLM_STREAM_ERROR: provider terminated the streamed response with "
+    "finish_reason=error. Treat this as a failed turn and retry with a fresh "
+    "complete response.]"
+)
 
 
 @dataclass(frozen=True)
@@ -706,6 +718,7 @@ async def _collect_stream_into_completion(stream) -> ChatCompletion:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     finish_reason: str | None = None
+    stream_error = False
     usage = None
     n_chunks = 0
 
@@ -731,7 +744,14 @@ async def _collect_stream_into_completion(stream) -> ChatCompletion:
         if r:
             reasoning_parts.append(r)
         if choice.finish_reason:
-            finish_reason = choice.finish_reason
+            if choice.finish_reason == "error":
+                stream_error = True
+            else:
+                assert choice.finish_reason in _CHAT_COMPLETION_FINISH_REASONS, (
+                    f"unsupported chat completion finish_reason: "
+                    f"{choice.finish_reason!r}"
+                )
+                finish_reason = choice.finish_reason
 
     assert completion_id is not None, "stream produced no chunks"
 
@@ -742,13 +762,22 @@ async def _collect_stream_into_completion(stream) -> ChatCompletion:
     # will treat the turn as a failure and trigger a retry/abandon as usual.
     content_len = sum(len(p) for p in content_parts)
     reasoning_len = sum(len(p) for p in reasoning_parts)
-    if finish_reason is None:
+    if finish_reason is None and not stream_error:
         finish_reason = "stop"
         print(
             f"[llm] WARNING: stream had no finish_reason "
             f"(chunks={n_chunks}, content_chars={content_len}, "
             f"reasoning_chars={reasoning_len}, usage={'yes' if usage else 'no'}); "
             f"defaulting to 'stop'"
+        )
+    if stream_error:
+        finish_reason = "stop"
+        content_parts = [_STREAM_ERROR_TURN_MARKER]
+        print(
+            f"[llm] WARNING: stream ended with provider finish_reason=error "
+            f"(chunks={n_chunks}, discarded_content_chars={content_len}, "
+            f"reasoning_chars={reasoning_len}, usage={'yes' if usage else 'no'}); "
+            "emitting failed-turn marker"
         )
 
     message = ChatCompletionMessage(

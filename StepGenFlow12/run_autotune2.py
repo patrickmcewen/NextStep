@@ -45,6 +45,7 @@ import json
 import pickle
 import shutil
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -106,6 +107,36 @@ def _snapshot_checkpoint_for_autotune2(
         f"(excluding sibling outer_* dirs)"
     )
     return new_ts_dir / src_kernel_dir.name / src_outer_dir.name
+
+
+def _inlined_child_names(pass1_iteration_dir: Path, node_path: str) -> set[str]:
+    path = pass1_iteration_dir / node_path / "inlined_children.txt"
+    if not path.exists():
+        return set()
+    names = {line.strip() for line in path.read_text().splitlines() if line.strip()}
+    assert names, f"{path}: inlined_children.txt must contain at least one name"
+    return names
+
+
+def _prune_inlined_children_from_tree(tree, pass1_iteration_dir: Path):
+    """Return a tree with Pass-1 inlined child subtrees removed."""
+    from src.planner import Tree
+
+    def prune(node):
+        inlined = _inlined_child_names(pass1_iteration_dir, node.path)
+        child_names = {child.name for child in node.children}
+        unknown = inlined - child_names
+        assert not unknown, (
+            f"{pass1_iteration_dir / node.path / 'inlined_children.txt'} "
+            f"lists non-child node(s) {sorted(unknown)!r}; children are "
+            f"{sorted(child_names)!r}"
+        )
+        live_children = tuple(
+            prune(child) for child in node.children if child.name not in inlined
+        )
+        return replace(node, children=live_children, is_leaf=not live_children)
+
+    return Tree(root=prune(tree.root))
 
 
 def _function_signature_for(node, parent_contract) -> str:
@@ -483,6 +514,7 @@ def _load_pass1_state(
     )
     assert iter_dirs, f"no pass1 iterations found under {pass1_root}"
     latest_pass1 = iter_dirs[-1]
+    tree = _prune_inlined_children_from_tree(tree, latest_pass1)
 
     pass1_contracts: dict = {}
     for node in tree.iter_topological():
