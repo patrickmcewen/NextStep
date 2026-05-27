@@ -536,6 +536,22 @@ def x():
         parse_autotune2_response(bad, is_leaf=True)
 
 
+def test_parse_response_rejects_malformed_yaml_as_parse_failure():
+    bad = """\
+```yaml
+parent_input_contracts:
+  res_add_0:      {reshape: [64, 8],    permutation: [0, 1]}
+  expert_weights:{reshape: [64, 2, 1, 1],    permutation: [0, 1, 2, 3]}
+```
+```python
+def x():
+    pass
+```
+"""
+    with pytest.raises(AssertionError, match="invalid yaml block"):
+        parse_autotune2_response(bad, is_leaf=True)
+
+
 def test_parse_response_rejects_unknown_contract_keys():
     bad = """\
 ```yaml

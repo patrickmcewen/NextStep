@@ -2049,7 +2049,7 @@ kv_cache_tile_append:
   origin: seed
 generated_prefill_transformer:
   problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
-  step_impl: seed_kernels/transformer_layer/generated_prefill_transformer/step_impl.py
+  step_impl: seed_kernels/transformer_layer/generated_prefill_transformer/step_impl_new.py
   params:
   - model_name
   - seq_len

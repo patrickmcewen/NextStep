@@ -105,6 +105,72 @@ def test_build_node_index_child_signature():
     assert "root/child" in ref_modules
 
 
+def test_build_node_index_captures_child_keyword_args():
+    from src.orchestrator import _build_node_index
+
+    child_ref = '''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def forward(self, x, y):
+        return x + y
+
+
+def get_inputs(dims):
+    return [torch.randn(4, 8), torch.randn(4, 8)]
+
+
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+'''
+    root_ref = '''
+import torch
+import torch.nn as nn
+
+
+class ChildModel(nn.Module):
+    def forward(self, x, y):
+        return x + y
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.child = ChildModel()
+
+    def forward(self, x, y):
+        return self.child(x, y=y)
+
+
+def get_inputs(dims):
+    return [torch.randn(4, 8), torch.randn(4, 8)]
+
+
+def compute_gold(dims):
+    return Model()(*get_inputs(dims))
+'''
+    child = PlanNode(
+        name="child", path="root/child",
+        reference_code=child_ref, refactored_code=None,
+        is_leaf=True, children=(),
+    )
+    root = PlanNode(
+        name="root", path="root",
+        reference_code=root_ref, refactored_code=root_ref,
+        is_leaf=False, children=(child,),
+    )
+
+    signatures, _ = _build_node_index(
+        Tree(root=root),
+        {"x": torch.randn(4, 8), "y": torch.randn(4, 8)},
+    )
+
+    assert signatures["root/child"].arg_names == ("x", "y")
+    assert signatures["root/child"].arg_shapes == ((4, 8), (4, 8))
+
+
 # Function-based StepDB references define only `compute_gold(dims, tensors)` —
 # no `class Model`. The planner produces children with `forward(self, dims, tensors)`,
 # which the v1 contract design (one tensor per arg) cannot represent. `refactor_tree`

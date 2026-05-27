@@ -679,7 +679,14 @@ def parse_autotune2_response(
         "block with the DSL function body; none found"
     )
 
-    parsed = yaml.safe_load(yaml_body)
+    try:
+        parsed = yaml.safe_load(yaml_body)
+    except yaml.YAMLError as exc:
+        raise AssertionError(
+            "parse_autotune2_response: invalid yaml block; emit valid YAML "
+            "inside the fenced ```yaml block. PyYAML error:\n"
+            f"{exc}\n\nYAML block was:\n{yaml_body}"
+        ) from exc
     assert isinstance(parsed, dict), (
         f"parse_autotune2_response: yaml block must be a mapping at top level, "
         f"got {type(parsed).__name__}"

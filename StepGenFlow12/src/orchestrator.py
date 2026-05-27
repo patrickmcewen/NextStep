@@ -1695,9 +1695,25 @@ async def _run_pass_loop(agent, pass_name, kernel_name, dims, max_turns,
 
         from openai import BadRequestError as _BadRequestError
         try:
+            run_config = build_dynamic_run_config(agent, conversation)
             run_result = await Runner.run(
-                agent, conversation,
-                run_config=build_dynamic_run_config(agent, conversation))
+                agent, conversation, run_config=run_config)
+        except AssertionError as exc:
+            if "prompt leaves no room for output tokens" not in str(exc):
+                raise
+            log(
+                f"      Prompt exhausted context budget ({exc}); aborting "
+                f"this {pass_name} attempt."
+            )
+            _write(turn_dir / "status.txt", f"LLM_CONTEXT_EXHAUSTED: {exc}")
+            return {
+                "success": False,
+                "code": last_code,
+                "last_messages": [
+                    {"role": "user", "content": last_user_msg},
+                    {"role": "assistant", "content": f"<context exhausted: {exc}>"},
+                ],
+            }
         except _BadRequestError as exc:
             log(f"      LLM rejected request ({exc}); aborting this {pass_name} attempt.")
             _write(turn_dir / "status.txt", f"LLM_BAD_REQUEST: {exc}")
@@ -2217,19 +2233,39 @@ def _build_node_index(tree, tensors: dict, dims: dict | None = None):
         child_by_name = {c.name: c for c in node.children}
 
         # Register pre-hooks on each child sub-module found as a direct attribute
-        captured_inputs: dict = {}  # child.name -> tuple of args
+        captured_inputs: dict = {}  # child.path -> tuple of args in signature order
         hooks = []
         for attr_name, submodule in parent_model.named_children():
             if attr_name in child_by_name:
                 child_path = child_by_name[attr_name].path
 
                 def make_hook(cpath):
-                    def hook(module, args):
+                    def hook(module, args, kwargs):
                         if cpath not in captured_inputs:
-                            captured_inputs[cpath] = args
+                            child_forward_sig = _inspect.signature(module.forward)
+                            child_arg_names = tuple(
+                                p for p in child_forward_sig.parameters
+                                if p != "self"
+                            )
+                            ordered_args = []
+                            missing = []
+                            for idx, name in enumerate(child_arg_names):
+                                if idx < len(args):
+                                    ordered_args.append(args[idx])
+                                elif name in kwargs:
+                                    ordered_args.append(kwargs[name])
+                                else:
+                                    missing.append(name)
+                            assert not missing, (
+                                f"child {cpath!r}: forward call omitted "
+                                f"argument(s) {missing!r}"
+                            )
+                            captured_inputs[cpath] = tuple(ordered_args)
                     return hook
 
-                h = submodule.register_forward_pre_hook(make_hook(child_path))
+                h = submodule.register_forward_pre_hook(
+                    make_hook(child_path), with_kwargs=True,
+                )
                 hooks.append(h)
                 child_instances[child_path] = submodule
 
