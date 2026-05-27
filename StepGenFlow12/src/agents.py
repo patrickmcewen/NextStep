@@ -37,7 +37,7 @@ _PASS1_JUDGE_TEMPLATE = "refactor_pass1_judge_system.txt"
 _PROMPTS_DIR_AGENTS = __import__("pathlib").Path(__file__).resolve().parent.parent / "prompts"
 
 _DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
-_DEFAULT_OUTPUT_TOKEN_MARGIN = 20000
+_DEFAULT_OUTPUT_TOKEN_MARGIN = 4000
 _TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
 _CHAT_MESSAGE_OVERHEAD = 4
 _CHAT_REPLY_PRIMER = 2
@@ -552,7 +552,7 @@ def _build_model_settings(llm_config: dict) -> ModelSettings:
     effort = llm_config.get("reasoning_effort")
     if effort is None:
         return ModelSettings(
-            max_tokens=32000,
+            max_tokens=100000,
             include_usage=True,
             retry=_RETRY_SETTINGS,
         )
@@ -561,7 +561,7 @@ def _build_model_settings(llm_config: dict) -> ModelSettings:
         f"got {effort!r}"
     )
     return ModelSettings(
-        max_tokens=32000,
+        max_tokens=100000,
         include_usage=True,
         retry=_RETRY_SETTINGS,
         reasoning=Reasoning(effort=effort),
