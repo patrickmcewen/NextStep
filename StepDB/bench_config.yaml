@@ -941,6 +941,14 @@ moe_routed:
       n_active: 2
       tile_n: 32
       tile_f: 256
+    mixtral_small_b64:
+      B: 64
+      D: 512
+      F: 1792
+      n_experts: 8
+      n_active: 2
+      tile_n: 16
+      tile_f: 64
   origin: seed
 generated_moe:
   problem: seed_kernels/mlp/generated_moe/reference.py
@@ -962,6 +970,14 @@ generated_moe:
         n_active: 2
         tile_n: 1
         tile_f: 256
+    mixtral_small_b64:
+      B: 64
+      D: 512
+      F: 1792
+      n_experts: 8
+      n_active: 2
+      tile_n: 16
+      tile_f: 64
   origin: seed
 vector_reduce_sum:
   problem: seed_kernels/reductions/vector_reduce_sum/reference.py
@@ -2606,7 +2622,7 @@ kernelbench_mlp:
   origin: seed
 kernelbench_gpt2:
   problem: seed_kernels/kernelbench/level4/gpt2/reference.py
-  step_impl: null
+  step_impl: /workspace/NextStep/StepDB/seed_kernels/kernelbench/level4/gpt2/step_impl.py
   params:
   - B
   - T

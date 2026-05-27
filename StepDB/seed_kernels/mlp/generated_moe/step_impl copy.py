@@ -58,7 +58,7 @@ def build_graph(dims: dict, tensors: dict):
     F_dim = dims['F']
     n_experts = dims['n_experts']
     n_active = dims['n_active']
-    tile_f = 2
+    tile_f = dims['tile_f']
     num_f_tiles = F_dim // tile_f
     x_stream = LinearOffChipLoad(tensors['x'], stride=(1,), out_shape_tiled=(B,), tile_row=1, tile_col=D, par_dispatch=16)
     graph.add_node(x_stream)
@@ -80,17 +80,17 @@ def build_graph(dims: dict, tensors: dict):
         wi_rep = RepeatStatic(graph, wi, repeat_factor=num_f_tiles)
         gate_w = LinearOffChipLoadRef(graph, ref=xi, underlying=tensors['gate_weights'][i], stride=(1,), out_shape_tiled=(num_f_tiles,), tile_row=D, tile_col=tile_f, par_dispatch=16)
         up_w = LinearOffChipLoadRef(graph, ref=xi, underlying=tensors['up_weights'][i], stride=(1,), out_shape_tiled=(num_f_tiles,), tile_row=D, tile_col=tile_f, par_dispatch=16)
-        gate_out = BinaryMap(graph, xi_rep, gate_w, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4)
-        up_out = BinaryMap(graph, xi_rep, up_w, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4)
-        _tmp1 = UnaryMap(graph, gate_out, fn=map_fn.Silu(), write_back_mu=False, compute_bw=4)
-        proj = BinaryMap(graph, _tmp1, up_out, fn=map_fn.Mul(), write_back_mu=False, compute_bw=4)
+        gate_out = BinaryMap(graph, xi_rep, gate_w, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4096)
+        up_out = BinaryMap(graph, xi_rep, up_w, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4096)
+        _tmp1 = UnaryMap(graph, gate_out, fn=map_fn.Silu(), write_back_mu=False, compute_bw=4096)
+        proj = BinaryMap(graph, _tmp1, up_out, fn=map_fn.Mul(), write_back_mu=False, compute_bw=4096)
         down_w = LinearOffChipLoadRef(graph, ref=xi, underlying=tensors['down_weights'][i], stride=(1,), out_shape_tiled=(num_f_tiles,), tile_row=tile_f, tile_col=D, par_dispatch=16)
-        down_out = BinaryMap(graph, proj, down_w, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4)
-        weighted = BinaryMap(graph, down_out, wi_rep, fn=map_fn.Mul(), write_back_mu=False, compute_bw=4)
-        expert_sum = Accum(graph, weighted, output_stream_dtype=_dsl2step_out_tile(weighted, 'elem', 1), fn=accum_fn.Add(), init_fn=_dsl2step_init(weighted), accum_rank=1, write_back_mu=False, compute_bw=4)
+        down_out = BinaryMap(graph, proj, down_w, fn=map_fn.Matmul(), write_back_mu=False, compute_bw=4096)
+        weighted = BinaryMap(graph, down_out, wi_rep, fn=map_fn.Mul(), write_back_mu=False, compute_bw=4096)
+        expert_sum = Accum(graph, weighted, output_stream_dtype=_dsl2step_out_tile(weighted, 'elem', 1), fn=accum_fn.Add(), init_fn=_dsl2step_init(weighted), accum_rank=1, write_back_mu=False, compute_bw=4096)
         expert_contributions.append(expert_sum)
     y_flat = FlatReassemble(graph, inputs=expert_contributions, control=expert_multihot_ctrl, reassemble_rank=0, switch_cycles=[1] * len(expert_contributions), write_back_mu=False)
-    y_sum = Accum(graph, y_flat, output_stream_dtype=_dsl2step_out_tile(y_flat, 'elem', 1), fn=accum_fn.Add(), init_fn=_dsl2step_init(y_flat), accum_rank=1, write_back_mu=False, compute_bw=4)
+    y_sum = Accum(graph, y_flat, output_stream_dtype=_dsl2step_out_tile(y_flat, 'elem', 1), fn=accum_fn.Add(), init_fn=_dsl2step_init(y_flat), accum_rank=1, write_back_mu=False, compute_bw=4096)
     y_out = OffChipStore(graph, y_sum, par_dispatch=16)
     _seal_unused_branches(graph)
     graph = infer_broadcast(graph)
