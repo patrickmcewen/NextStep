@@ -27,6 +27,7 @@ from typing import Callable
 # ~100k so per-op BW distribution is vacuous; we just enforce the total
 # at the boundary.
 LEVEL_TOTAL_BW = 100_000
+PER_NODE_MEMORY_REPORT_LIMIT = 100
 
 
 # A scorer takes a composed-source string and returns (cycles, on_chip_bytes).
@@ -195,11 +196,8 @@ def _format_per_node_memory_report(
 ) -> str:
     """Render the per-node on-chip-memory contributors as a markdown stanza.
 
-    Sorted descending by bytes; every node with a non-zero footprint
-    appears on its own line. Earlier versions capped at top-K with a
-    ``... N more nodes`` rollup, which hid the long tail right when the
-    LLM most needs it (e.g. MoE graphs where the per-expert loads are
-    individually mid-sized but dominate the total in aggregate).
+    Sorted descending by bytes; the largest contributors appear on their
+    own lines and large graphs are capped with a compact tail summary.
     Returns the empty string when total is zero — no on-chip footprint
     means nothing useful to surface.
     """
@@ -207,12 +205,21 @@ def _format_per_node_memory_report(
         return ""
     nonzero = [t for t in per_node if t[2] > 0]
     nonzero.sort(key=lambda t: t[2], reverse=True)
+    shown = nonzero[:PER_NODE_MEMORY_REPORT_LIMIT]
+    omitted = nonzero[PER_NODE_MEMORY_REPORT_LIMIT:]
 
     lines = [
         f"Per-node on-chip memory breakdown (total {total} B across "
         f"{len(nonzero)} contributing nodes):",
     ]
-    for _nid, label, b in nonzero:
+    for _nid, label, b in shown:
         pct = 100.0 * b / total
         lines.append(f"  {label:<44s} {b:>12d} B  ({pct:5.1f}%)")
+    if omitted:
+        omitted_bytes = sum(b for _, _, b in omitted)
+        pct = 100.0 * omitted_bytes / total
+        lines.append(
+            f"  ... {len(omitted)} more contributing nodes omitted "
+            f"({omitted_bytes} B, {pct:5.1f}%)"
+        )
     return "\n".join(lines)

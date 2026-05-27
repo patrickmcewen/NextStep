@@ -1006,9 +1006,13 @@ def _h_reshape_stream(state, target, call):
     x          = _src(_arg(call, 0, "x"))
     chunk_size = _src(_arg(call, 1, "chunk_size"))
     rank       = _arg_or_default(call, 2, "rank", "0")
+    add_outer_dim = _arg_or_default(call, 3, "add_outer_dim", "False")
     return _block(
         f"{target} = Reshape(graph, {x}, chunk_size={chunk_size}, "
-        f"reshape_rank={rank}, write_back_mu=False)\n"
+        f"reshape_rank={rank}, write_back_mu=False, "
+        f"add_outer_dim={add_outer_dim}, "
+        f"pad_fn=Zero(shape=_dsl2step_in_tile({x}).shape, "
+        f"dtype=_dsl2step_in_tile({x}).tile_dtype))\n"
     )
 
 
@@ -1095,9 +1099,10 @@ def _h_retile_streamify(state, target, call):
     x         = _src(_arg(call, 0, "x"))
     chunk     = _src(_arg(call, 1, "chunk"))
     split_row = _arg_or_default(call, 2, "split_row", "True")
+    filter_mask = _arg_or_default(call, 3, "filter_mask", "False")
     return _block(
         f"{target} = RetileStreamify(graph, {x}, split_row={split_row}, "
-        f"chunk={chunk})\n"
+        f"filter_mask={filter_mask}, chunk={chunk})\n"
     )
 
 

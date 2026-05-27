@@ -63,6 +63,7 @@ _PROMPTS_DIR = _PROJECT_ROOT / "prompts"
 _AUTOTUNE_PROMPTS_DIR = _PROMPTS_DIR / "autotune"
 _TILE_SHRINK_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "tile_shrink"
 _PARALLEL_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "parallel"
+_BATCHING_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "batching"
 _GENERAL_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "general"
 _CURATION_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "curation"
 _ACE_CONTEXT_PROMPTS_DIR = _AUTOTUNE_PROMPTS_DIR / "ace_context"
@@ -78,6 +79,7 @@ _TILE_SHRINK_FEWSHOT_PATH = (
     _TILE_SHRINK_PROMPTS_DIR / "autotune_tile_shrink_fewshot.txt"
 )
 _PARALLEL_FEWSHOT_PATH = _PARALLEL_PROMPTS_DIR / "autotune_parallel_fewshot.txt"
+_BATCHING_FEWSHOT_PATH = _BATCHING_PROMPTS_DIR / "autotune_batching_fewshot.txt"
 # Per-example DSL files inlined into the parallel few-shot via placeholders
 # (see _PARALLEL_FEWSHOT_EXAMPLES below). Each file is a validated
 # tiled_reference checked by StepDB/validate_functional_dsl.py.
@@ -343,6 +345,7 @@ def build_autotune2_system_prompt(
         fewshot_path.read_text()
         .replace("{tile_shrink_fewshot}", _TILE_SHRINK_FEWSHOT_PATH.read_text().rstrip())
         .replace("{parallel_fewshot}", _PARALLEL_FEWSHOT_PATH.read_text().rstrip())
+        .replace("{batching_fewshot}", _BATCHING_FEWSHOT_PATH.read_text().rstrip())
         .rstrip()
     )
     # Inline each parallel-fewshot example .py file at its placeholder. Done

@@ -12,6 +12,8 @@ from src.step_dsl import (
     binary_map_accum,
     flatmap_counter,
     promote,
+    retile_streamify,
+    reshape_stream,
 )
 
 
@@ -95,3 +97,37 @@ def test_binary_map_accum_accepts_reused_dynamic_producer():
     out = binary_map_accum(a, b, rank=1)
 
     assert tuple(out.underlying_tensor.shape) == (1, 1, 1)
+
+
+def test_reshape_stream_add_outer_dim_batches_rank0_dynamic_stream():
+    x = StepTensor(
+        torch.ones(5, 1, 4),
+        stream_dtype=Tile(Float32(), (1, 4)),
+        dyn_mask=(True,),
+        dyn_origins=("partition",),
+    )
+
+    out = reshape_stream(x, chunk_size=2, rank=0, add_outer_dim=True)
+
+    assert tuple(out.underlying_tensor.shape) == (1, 3, 2, 1, 4)
+    assert out.dyn_mask == (False, True, False)
+
+
+def test_retile_streamify_filter_mask_drops_zero_padded_rows():
+    x = StepTensor(
+        torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [0.0, 0.0]],
+            ]
+        ),
+        stream_dtype=Tile(Float32(), (2, 2)),
+        dyn_mask=(True,),
+        dyn_origins=("partition",),
+    )
+
+    out = retile_streamify(x, chunk=1, split_row=True, filter_mask=True)
+
+    assert tuple(out.underlying_tensor.shape) == (3, 1, 2)
+    assert out.dyn_mask == (True,)
+    assert out.dyn_origins == ("partition",)

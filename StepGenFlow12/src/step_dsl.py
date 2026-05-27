@@ -1356,7 +1356,7 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False, _allow_dyn=False)
     prepends a static 1 to the stream shape.
 
     `_allow_dyn` is an internal escape hatch used by `reshape_pad_stream`,
-    which lowers to STeP's `ReshapePadStream` op (accepts DynDim).
+    which lowers to STeP's `ReshapePadStream` op.
     """
     sd, mask, orig = _step_meta(x, "reshape_stream")
     _assert_tile_kind(sd, "reshape_stream")
@@ -1366,9 +1366,12 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False, _allow_dyn=False)
     n = len(stream_shape)
     assert rank >= 0, f"reshape_stream(rank={rank}): rank must be >= 0"
     if add_outer_dim:
-        assert n == 0, (
+        assert n == 1, (
             f"reshape_stream(add_outer_dim=True): input stream rank must be 0 "
-            f"(a single tile, x.ndim==2), got shape {tuple(t.shape)}."
+            f"(one stream dim before the tile), got shape {tuple(t.shape)}."
+        )
+        assert rank == 0, (
+            f"reshape_stream(add_outer_dim=True): rank must be 0, got {rank}."
         )
     else:
         assert n >= 1, (
@@ -1385,20 +1388,14 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False, _allow_dyn=False)
         f"reshape_stream: shape[{rank_pos}]={D} not divisible by chunk_size={chunk_size}. "
         f"Automatic padding is only allowed when rank==0, got rank={rank}."
     )
-    # STeP's `Reshape` requires either a static-int divisor at the reshape
-    # rank, or (rank==0 AND chunk_size==1) — the DSL-to-STeP translator never
-    # emits a `pad_fn`, so a dynamic stream dim is rejected at IR-build time.
-    # Catch it here so the failure surfaces during DSL execution, with a
-    # pointer at the right escape hatch.
+    # STeP's `Reshape` can pad only the innermost split. The translator emits
+    # a zero pad_fn for reshape_stream, so dynamic rank-0 batching is valid.
     if not add_outer_dim:
-        assert _allow_dyn or not mask[rank_pos] or (rank == 0 and chunk_size == 1), (
+        assert _allow_dyn or not mask[rank_pos] or rank == 0, (
             f"reshape_stream(rank={rank}, chunk_size={chunk_size}): stream dim "
             f"at rank {rank} is dynamic (dyn_mask[{rank_pos}]=True — typically "
             f"from flat_partition/select_gen, or retile_streamify of a dyn "
-            f"dim). STeP's Reshape op rejects chunk_size>1 splits of a DynDim. "
-            f"Use reshape_pad_stream(x, chunk_size={chunk_size}, "
-            f"reshape_rank={rank}) instead — it lowers to ReshapePadStream "
-            f"which accepts a DynDim."
+            f"dim). STeP's Reshape op only pads dynamic innermost splits."
         )
     padded_D = ((D + chunk_size - 1) // chunk_size) * chunk_size
 
@@ -1414,9 +1411,15 @@ def reshape_stream(x, chunk_size, rank=0, add_outer_dim=False, _allow_dyn=False)
     new_count = padded_D // chunk_size
 
     if add_outer_dim:
+        was_dyn = mask[rank_pos]
+        was_origin = orig[rank_pos]
         new_shape = [1] + pre + [new_count, chunk_size] + post + [tile_r, tile_c]
-        new_mask = (False,) * (1 + len(pre)) + (False, False) + tuple(mask[rank_pos + 1:])
-        new_orig = (None,) * (1 + len(pre)) + (None, None) + tuple(orig[rank_pos + 1:])
+        new_mask = ((False,) + tuple(mask[:rank_pos])
+                    + (was_dyn, False)
+                    + tuple(mask[rank_pos + 1:]))
+        new_orig = ((None,) + tuple(orig[:rank_pos])
+                    + (was_origin, None)
+                    + tuple(orig[rank_pos + 1:]))
     else:
         new_shape = pre + [new_count, chunk_size] + post + [tile_r, tile_c]
         # Split semantics: the new_count slot inherits dynamism (the produced
@@ -1441,7 +1444,7 @@ def reshape_pad_stream(x, chunk_size, reshape_rank=0):
                           _allow_dyn=True)
 
 
-def retile_streamify(x, chunk, split_row=True):
+def retile_streamify(x, chunk, split_row=True, filter_mask=False):
     """Replace last stream dim D with D*num_chunks, shrinking the corresponding
     tile dim from (tile_r,tile_c) → (chunk, tile_c) [row] or (tile_r, chunk) [col].
     The last stream slot's dyn-ness is preserved (D * static_int stays dyn iff D was)."""
@@ -1462,6 +1465,10 @@ def retile_streamify(x, chunk, split_row=True):
         )
         reshaped = t.reshape(*pre, last, actual_num_chunks, chunk, tile_c)
         result = reshaped.reshape(*pre, last * actual_num_chunks, chunk, tile_c)
+        if filter_mask:
+            flat = result.reshape(-1, chunk, tile_c)
+            keep = ~((flat == 0).all(dim=(-2, -1)))
+            result = flat[keep]
         new_tile = (chunk, tile_c)
     else:
         actual_num_chunks = tile_c // chunk
@@ -1472,6 +1479,10 @@ def retile_streamify(x, chunk, split_row=True):
         perm = list(range(len(pre))) + [len(pre), len(pre) + 2, len(pre) + 1, len(pre) + 3]
         reshaped = reshaped.permute(perm)
         result = reshaped.reshape(*pre, last * actual_num_chunks, tile_r, chunk)
+        if filter_mask:
+            flat = result.reshape(-1, tile_r, chunk)
+            keep = ~((flat == 0).all(dim=(-2, -1)))
+            result = flat[keep]
         new_tile = (tile_r, chunk)
     new_sd_cls = DynTile if isinstance(sd, DynTile) else Tile
     return StepTensor(result, stream_dtype=new_sd_cls(sd.tile_dtype, new_tile),

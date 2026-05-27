@@ -102,4 +102,4 @@ configs:
       - name: general
         fewshot: general
         time_limit_seconds: 7200
-        max_library_designs: 20
+        max_library_designs: 40

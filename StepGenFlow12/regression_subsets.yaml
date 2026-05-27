@@ -62,4 +62,5 @@ full_bench_set:
   kernelbench_gpt2: deep
   kernelbench_bart_large: deep
   kernelbench_opt_1p3b: deep
+  end_to_end: mixtral_small_b64
 

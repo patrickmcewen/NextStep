@@ -9,6 +9,7 @@ callable and rejects invalid bandwidth budgets.
 import pytest
 
 from src.autotune2.compose import (
+    _format_per_node_memory_report,
     compose_source,
     make_analytical_scorer,
 )
@@ -34,6 +35,24 @@ def test_compose_source_post_order_concat():
 def test_compose_source_empty_descendants():
     parent = "def root():\n    pass\n"
     assert compose_source(parent_dsl=parent, descendant_dsls_postorder=[]) == parent
+
+
+# --- per-node memory report ---------------------------------------------------
+
+
+def test_per_node_memory_report_caps_large_graphs_at_top_100():
+    per_node = [
+        (i, f"[{i}] Op{i}", 200 - i)
+        for i in range(101)
+    ]
+
+    out = _format_per_node_memory_report(per_node, sum(b for _, _, b in per_node))
+
+    assert "across 101 contributing nodes" in out
+    assert out.count("Op") == 100
+    assert "[99] Op99" in out
+    assert "[100] Op100" not in out
+    assert "... 1 more contributing nodes omitted" in out
 
 
 # --- make_analytical_scorer (sanity: factory + lazy import) -------------------

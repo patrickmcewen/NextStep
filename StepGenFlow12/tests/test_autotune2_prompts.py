@@ -34,6 +34,7 @@ def test_active_autotune_prompt_files_are_grouped_by_agent():
         "autotune/parallel/autotune2_user_parallel.txt",
         "autotune/parallel/autotune_parallel_fewshot.txt",
         "autotune/parallel/autotune_parallel_system.txt",
+        "autotune/batching/autotune_batching_fewshot.txt",
         "autotune/general/autotune2_system_general.txt",
         "autotune/general/autotune2_user_general.txt",
         "autotune/general/autotune_general_fewshot.txt",
@@ -205,7 +206,7 @@ def test_system_prompt_embeds_tile_shrink_fewshot():
         )
 
 
-def test_general_system_prompt_merges_tile_shrink_and_parallel_guidance():
+def test_general_system_prompt_merges_tile_shrink_parallel_and_batching_guidance():
     out = build_autotune2_system_prompt(
         is_leaf=True, dsl_code="X", fewshot="general",
     )
@@ -213,8 +214,14 @@ def test_general_system_prompt_merges_tile_shrink_and_parallel_guidance():
     assert "optimization recipes" in flat
     assert "Shrinking tile sizes" in out
     assert "Sources of parallelism" in out
+    assert "Batched processing" in out
     assert "binary_map_accum" in out
     assert "static_reassemble" in out
+    assert "RetileRow" in out
+    assert "reshape_stream(" in out
+    assert "add_outer_dim=True" in out
+    assert "filter_mask=True" in out
+    assert "LinearOffChipLoadRef(graph, ref=packed" in out
     assert "reducing tile sizes" in flat
     assert "headroom" in flat
     assert "before applying parallelism" in flat
@@ -231,6 +238,7 @@ def test_general_fewshot_file_imports_specialized_fewshots():
     ).read_text()
     assert "{tile_shrink_fewshot}" in general_fewshot
     assert "{parallel_fewshot}" in general_fewshot
+    assert "{batching_fewshot}" in general_fewshot
     assert len(general_fewshot.splitlines()) < 60
 
     rendered = build_autotune2_system_prompt(
@@ -238,8 +246,10 @@ def test_general_fewshot_file_imports_specialized_fewshots():
     )
     assert "{tile_shrink_fewshot}" not in rendered
     assert "{parallel_fewshot}" not in rendered
+    assert "{batching_fewshot}" not in rendered
     assert "rms_norm" in rendered
     assert "Worked example: GEMM, independent M-axis parallelism" in rendered
+    assert "Worked example: routed MoE token batching" in rendered
 
 
 # --- build_autotune2_user_prompt ---------------------------------------------
