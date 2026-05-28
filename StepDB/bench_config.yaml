@@ -1584,7 +1584,7 @@ flash_attn_reuse:
 
 generated_end_to_end:
   problem: seed_kernels/transformer_layer/end_to_end/reference.py
-  step_impl: seed_kernels/transformer_layer/generated_end_to_end/step_impl.py
+  step_impl: /workspace/NextStep/StepDB/seed_kernels/transformer_layer/generated_end_to_end_2/step_impl.py
   params:
   - model_name
   - tile_N
