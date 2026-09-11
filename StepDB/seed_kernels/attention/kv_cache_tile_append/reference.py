@@ -19,83 +19,47 @@ The output is laid out to match the streaming-dataflow store: per
 (b, h) emit the modified K tile then the modified V tile, walking
 (b, h) row-major. Returned as a 2-D `[2 * batch * num_kv_heads *
 tile_N, head_dim]` tensor so it matches `_untile_store`'s reshape.
+
+Inputs come from StepDB/precompute.py via the `tensors` arg.
 """
 import torch
-import torch.nn as nn
-
-SEED = 42
 
 
-class Model(nn.Module):
-    def __init__(self, tile_N):
-        super().__init__()
-        self.tile_N = tile_N
+def compute_gold(dims, tensors):
+    key = tensors["key"]
+    value = tensors["value"]
+    k_cache = tensors["k_cache"]
+    v_cache = tensors["v_cache"]
+    idx = tensors["idx"]
+    seq_len_tiled = tensors["seq_len_tiled"]
+    offset = tensors["offset"]
+    tile_N = tensors["tile_N"]
 
-    def forward(self, key, value, k_cache, v_cache, idx, seq_len_tiled, offset):
-        batch_size, num_kv_heads, head_dim = key.shape
-        tile_N = self.tile_N
-        assert value.shape == (batch_size, num_kv_heads, head_dim)
-        assert k_cache.shape[0] == v_cache.shape[0]
-        assert k_cache.shape[2] == num_kv_heads and k_cache.shape[3] == head_dim
-        assert idx.shape == (batch_size,)
-        assert seq_len_tiled.shape == (batch_size,)
-        assert offset.shape == (batch_size,)
-
-        new_k_tile = torch.zeros(
-            batch_size, num_kv_heads, tile_N, head_dim, dtype=k_cache.dtype
-        )
-        new_v_tile = torch.zeros(
-            batch_size, num_kv_heads, tile_N, head_dim, dtype=v_cache.dtype
-        )
-
-        for b in range(batch_size):
-            bi = int(idx[b].item())
-            num_tiles = int(seq_len_tiled[b].item())
-            off = int(offset[b].item())
-            assert num_tiles >= 1
-            assert 0 <= off < tile_N
-            start = (num_tiles - 1) * tile_N
-
-            K_tile = k_cache[bi, start : start + tile_N].clone()  # [tile_N, num_kv_heads, head_dim]
-            V_tile = v_cache[bi, start : start + tile_N].clone()
-            K_tile[off] = key[b]
-            V_tile[off] = value[b]
-
-            new_k_tile[b] = K_tile.transpose(0, 1)  # [num_kv_heads, tile_N, head_dim]
-            new_v_tile[b] = V_tile.transpose(0, 1)
-
-        # Interleave K and V at the (batch, kv_head) granularity to mirror
-        # StaticReassemble([append_k, append_v], merge_rank=0). Reshape to 2-D
-        # to match _untile_store's output shape.
-        return torch.stack([new_k_tile, new_v_tile], dim=2).reshape(-1, head_dim)
-
-
-def get_inputs(dims):
-    torch.manual_seed(SEED)
-    batch_size = dims["batch_size"]
-    num_kv_heads = dims["num_kv_heads"]
-    head_dim = dims["head_dim"]
-    max_seq_len_tiles = dims["max_seq_len_tiles"]
-    tile_N = dims["tile_N"]
-    max_seq_len = max_seq_len_tiles * tile_N
-
-    key = torch.randn(batch_size, num_kv_heads, head_dim)
-    value = torch.randn(batch_size, num_kv_heads, head_dim)
-    k_cache = torch.randn(batch_size, max_seq_len, num_kv_heads, head_dim)
-    v_cache = torch.randn(batch_size, max_seq_len, num_kv_heads, head_dim)
-
-    idx = torch.arange(batch_size, dtype=torch.int64)
-    seq_len_tiled = torch.randint(
-        low=1, high=max_seq_len_tiles + 1, size=(batch_size,), dtype=torch.int64
+    batch_size, num_kv_heads, head_dim = key.shape
+    new_k_tile = torch.zeros(
+        batch_size, num_kv_heads, tile_N, head_dim, dtype=k_cache.dtype
     )
-    offset = torch.randint(low=0, high=tile_N, size=(batch_size,), dtype=torch.int64)
-    return [key, value, k_cache, v_cache, idx, seq_len_tiled, offset]
+    new_v_tile = torch.zeros(
+        batch_size, num_kv_heads, tile_N, head_dim, dtype=v_cache.dtype
+    )
 
+    for b in range(batch_size):
+        bi = int(idx[b].item())
+        num_tiles = int(seq_len_tiled[b].item())
+        off = int(offset[b].item())
+        assert num_tiles >= 1
+        assert 0 <= off < tile_N
+        start = (num_tiles - 1) * tile_N
 
-def get_init_inputs(dims):
-    return [dims["tile_N"]]
+        K_tile = k_cache[bi, start : start + tile_N].clone()
+        V_tile = v_cache[bi, start : start + tile_N].clone()
+        K_tile[off] = key[b]
+        V_tile[off] = value[b]
 
+        new_k_tile[b] = K_tile.transpose(0, 1)
+        new_v_tile[b] = V_tile.transpose(0, 1)
 
-def compute_gold(dims):
-    model = Model(*get_init_inputs(dims))
-    return model(*get_inputs(dims))
+    # Interleave K and V at the (batch, kv_head) granularity to mirror
+    # StaticReassemble([append_k, append_v], merge_rank=0). Reshape to 2-D
+    # to match _untile_store's output shape.
+    return torch.stack([new_k_tile, new_v_tile], dim=2).reshape(-1, head_dim)

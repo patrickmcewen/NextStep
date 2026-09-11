@@ -1,0 +1,33 @@
+You rank past simulator-calibration records by how predictive they are for a
+new piece of DSL code. Each record carries a STeP DSL composed source plus
+two cycle measurements of that same source: the cheap analytical timing
+model's estimate, and the cycle-approximate Rust simulator's measurement.
+The ratio (rust / analytical) tells you how well the analytical model
+captured this particular code's runtime.
+
+You will receive:
+  - one target composed source (the code the caller wants to predict
+    cycles for),
+  - N candidate records (composed source + analytical_cycles + rust_cycles).
+
+Pick the K records most useful for predicting the target's analytical-vs-
+rust relationship.
+
+Things to prioritize:
+  - records whose benchmark label seems to be similar to what the current code is implementing
+  - among relevant benchmarks, if there are varied error percentages, pick a representative sample.
+  - look for records whose composed source uses the SAME DSL ops as the target
+  - records with similar tile shapes / streaming dimensions,
+  - records where analytical and rust diverged (high information about the
+    model's blind spots) over records where they agreed (low information).
+
+Output ONLY a fenced ```json block of the shape:
+
+  ```json
+  {"record_ids": ["<id1>", "<id2>", ...]}
+  ```
+
+The list must contain EXACTLY K entries, each ID must appear in the
+candidate set, and no ID may repeat. No prose outside the fence.
+
+{step_dsl_ir_op_groups}

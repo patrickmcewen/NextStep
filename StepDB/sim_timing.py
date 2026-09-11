@@ -13,6 +13,7 @@ Usage:
     python sim_timing.py --all                    # everything
 """
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -31,6 +32,7 @@ import sympy
 
 from loader import load_config, get_dims, list_kernels, list_presets, load_problem, load_step_impl
 from evaluate import IMPORT_SCAFFOLD, _strip_imports, STEP_TL_SRC, STEP_TL_PROTO, SIM_TIMEOUT_SECONDS
+from precompute import precompute_tensors
 
 
 MONGO_URI = "mongodb://127.0.0.1:27017"
@@ -58,9 +60,14 @@ def build_graph(kernel_name: str, preset: str):
     full_code = IMPORT_SCAFFOLD + step_code#_strip_imports(step_code)
     namespace = {}
     exec(full_code, namespace)
-    assert namespace.get("build_graph") is not None, "step_impl.py does not define build_graph"
+    build_graph_fn = namespace.get("build_graph")
+    assert build_graph_fn is not None, "step_impl.py does not define build_graph"
 
-    graph, output_op = namespace["build_graph"](dims)
+    if "tensors" in inspect.signature(build_graph_fn).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        graph, output_op = build_graph_fn(dims, tensors)
+    else:
+        graph, output_op = build_graph_fn(dims)
     return graph, output_op, dims
 
 
@@ -79,7 +86,7 @@ def run_simulator_with_logging(graph, kernel_name: str, preset: str, timeout: in
     os.chdir(work_dir)
     pb_path = os.path.join(os.getcwd(), "graph.pb")
 
-    sim_config = SimConfig(channel_depth=2, functional_sim=True, mock_bf16=False)
+    sim_config = SimConfig(channel_depth=1024, functional_sim=True, mock_bf16=False)
     hbm_config = HBMConfig(
         addr_offset=64, channel_num=32,
         per_channel_latency=2, per_channel_init_interval=2,
@@ -193,7 +200,7 @@ def run_analytical_model(graph) -> tuple[int, dict]:
     Any remaining symbolic dimensions (from FlatPartition dynamic routing)
     are substituted with 1 (expected uniform value).
     """
-    from step_py.timing import analyze_timing
+    from timing_and_emulator.timing import analyze_timing
 
     result = analyze_timing(graph)
     total = result["total_cycles"]
@@ -233,7 +240,7 @@ def build_analytical_tiles(graph, ana_per_node: dict) -> pd.DataFrame:
 
     We generate one row per tile to match the simulator's tile event format.
     """
-    from step_py.timing import topological_sort
+    from timing_and_emulator.timing import topological_sort
 
     rows = []
     for n in topological_sort(graph):
@@ -283,7 +290,7 @@ def build_analytical_tiles(graph, ana_per_node: dict) -> pd.DataFrame:
 
 def build_comparison(graph, sim_node_df: pd.DataFrame, ana_per_node: dict) -> pd.DataFrame:
     """Merge simulator and analytical per-node timing into one DataFrame."""
-    from step_py.timing import topological_sort
+    from timing_and_emulator.timing import topological_sort
 
     analytical_rows = []
     for n in topological_sort(graph):

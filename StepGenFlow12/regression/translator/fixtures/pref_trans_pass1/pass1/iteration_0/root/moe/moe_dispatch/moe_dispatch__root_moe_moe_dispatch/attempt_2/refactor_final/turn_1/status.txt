@@ -1,0 +1,1 @@
+FAIL: RuntimeError: Expected size for first two dimensions of batch2 tensor to be: [128, 1] but got: [128, 512].

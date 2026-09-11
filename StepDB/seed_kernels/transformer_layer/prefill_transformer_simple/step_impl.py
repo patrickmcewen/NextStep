@@ -250,7 +250,7 @@ def _sdpa_streamed(graph, Q_stream, K_stream, V_stream, S, head_dim):
 
 def _moe_block(
     graph, x_stream, x_residual_stream,
-    w_gate_list, w_up_list, w_down_list,
+    w_gate, w_up, w_down,
     expert_weights_t, expert_multihot, expert_onehot,
     S, D, F_dim, n_experts, n_active, tile_n, tile_f,
 ):
@@ -298,7 +298,7 @@ def _moe_block(
     up_loads = [
         LinearOffChipLoadRef(
             graph=graph, ref=expert_feature_streams[i],
-            underlying=w_up_list[i],
+            underlying=w_up[i],
             stride=(1, 1),
             out_shape_tiled=(F_dim // tile_f, 1),
             tile_row=D, tile_col=tile_f, par_dispatch=4,
@@ -318,7 +318,7 @@ def _moe_block(
     gate_loads = [
         LinearOffChipLoadRef(
             graph=graph, ref=expert_feature_streams[i],
-            underlying=w_gate_list[i],
+            underlying=w_gate[i],
             stride=(1, 1),
             out_shape_tiled=(F_dim // tile_f, 1),
             tile_row=D, tile_col=tile_f, par_dispatch=4,
@@ -348,7 +348,7 @@ def _moe_block(
     down_loads = [
         LinearOffChipLoadRef(
             graph=graph, ref=expert_feature_streams[i],
-            underlying=w_down_list[i],
+            underlying=w_down[i],
             stride=(1, 1),
             out_shape_tiled=(F_dim // tile_f, 1),
             tile_row=tile_f, tile_col=D, par_dispatch=4,
@@ -442,9 +442,9 @@ def build_graph(dims):
     cos            = t["cos"]
     sin            = t["sin"]
     o_proj_weight  = t["o_proj_weight"]
-    w_gate_list    = t["w_gate_list"]
-    w_up_list      = t["w_up_list"]
-    w_down_list    = t["w_down_list"]
+    w_gate    = t["w_gate"]
+    w_up      = t["w_up"]
+    w_down    = t["w_down"]
     expert_weights = t["expert_weights"]
     expert_multihot = t["expert_multihot"]
     expert_onehot  = t["expert_onehot"]
@@ -564,9 +564,9 @@ def build_graph(dims):
         graph,
         x_stream=normed_2,
         x_residual_stream=res0_for_final_residual,
-        w_gate_list=w_gate_list,
-        w_up_list=w_up_list,
-        w_down_list=w_down_list,
+        w_gate=w_gate,
+        w_up=w_up,
+        w_down=w_down,
         expert_weights_t=expert_weights,
         expert_multihot=expert_multihot,
         expert_onehot=expert_onehot,

@@ -1,0 +1,161 @@
+test_name: kernelbench_gpt2__deep
+# Derived from StepDB seed_kernels/kernelbench/level4/gpt2 (preset: deep).
+# Preset values: B=2, T=32, V=128, P=64, D=64, L=6, H=4, I=128, D_head=16.
+# Mirrors the GPT-2 hand-roll in StepDB seed_kernels/kernelbench/level4/gpt2/
+# reference.py:Model.forward (pre-norm, Conv1D convention x @ W + b, gelu_new
+# activation, tied LM head).
+#
+# Deviations from the StepDB reference:
+#   * The (input_ids, wte, wpe) -> token-embedding lookup is precomputed as a
+#     single fp32 input ``x_in`` of shape (B, T, D); PCL-lite has no integer
+#     dtype and no gather op. The math otherwise reproduces the per-layer
+#     transformer block exactly.
+#   * The tied LM head weight is materialised as a separate ``lm_head_w``
+#     input of shape (V, D) because, with the embedding lookup precomputed
+#     away, there is no longer a single ``wte`` shared between input-side
+#     and output-side.
+#
+# Per-layer weight banks are stacked along axis 0 so ``input_data['*'][i]`` is
+# the contiguous slice for layer i; matrix slices stay >=2-D (matmul shape),
+# vector slices use a (1, D) layout so they remain >=2-D for StepDB's
+# offchip_load. LayerNorm and gelu_new are inlined inside data_transform so
+# the spec depends only on top-level torch ops.
+dims:
+  B: 2
+  T: 32
+  V: 128
+  D: 64
+  L: 6
+  H: 4
+  I: 128
+  D_head: 16
+
+inputs:
+  - name: x_in
+    dtype: fp32
+    dims: [D, T, B]
+    data_gen: torch.randn
+  - name: causal_mask
+    dtype: fp32
+    dims: [T, T]
+    data_gen: torch.randn
+  - name: ln1_w
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: ln1_b
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: w_q
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: w_k
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: w_v
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: b_q
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: b_k
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: b_v
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: w_proj
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: b_proj
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: ln2_w
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: ln2_b
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: w_fc
+    dtype: fp32
+    dims: [I, D, L]
+    data_gen: torch.randn
+  - name: b_fc
+    dtype: fp32
+    dims: [I, 1, L]
+    data_gen: torch.randn
+  - name: w_proj_mlp
+    dtype: fp32
+    dims: [D, I, L]
+    data_gen: torch.randn
+  - name: b_proj_mlp
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: ln_f_w
+    dtype: fp32
+    dims: [D, 1]
+    data_gen: torch.randn
+  - name: ln_f_b
+    dtype: fp32
+    dims: [D, 1]
+    data_gen: torch.randn
+  - name: lm_head_w
+    dtype: fp32
+    dims: [D, V]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [V, T, B]
+    data_transform:
+      - |
+        B_dim = B_value
+        T_dim = T_value
+        D_dim = D_value
+        L_dim = L_value
+        H_dim = H_value
+        Dh = D_head_value
+        inv_sqrt_dh = 1.0 / (Dh ** 0.5)
+        sqrt_2_over_pi = (2.0 / 3.141592653589793) ** 0.5
+        def _ln(t, w, b, eps=1e-5):
+            mean = t.mean(dim=-1, keepdim=True)
+            var = t.var(dim=-1, keepdim=True, unbiased=False)
+            return (t - mean) * torch.rsqrt(var + eps) * w.squeeze(0) + b.squeeze(0)
+        def _gelu_new(t):
+            return 0.5 * t * (1.0 + torch.tanh(sqrt_2_over_pi * (t + 0.044715 * t.pow(3))))
+        x = input_data['x_in']
+        mask = input_data['causal_mask']
+        for layer in range(L_dim):
+            h = _ln(x, input_data['ln1_w'][layer], input_data['ln1_b'][layer])
+            q = h @ input_data['w_q'][layer] + input_data['b_q'][layer]
+            k = h @ input_data['w_k'][layer] + input_data['b_k'][layer]
+            v = h @ input_data['w_v'][layer] + input_data['b_v'][layer]
+            q = q.view(B_dim, T_dim, H_dim, Dh).transpose(1, 2)
+            k = k.view(B_dim, T_dim, H_dim, Dh).transpose(1, 2)
+            v = v.view(B_dim, T_dim, H_dim, Dh).transpose(1, 2)
+            scores = (q @ k.transpose(-2, -1)) * inv_sqrt_dh
+            scores = scores + mask
+            attn = torch.softmax(scores, dim=-1)
+            ctx = (attn @ v).transpose(1, 2).contiguous().view(B_dim, T_dim, D_dim)
+            ctx = ctx @ input_data['w_proj'][layer] + input_data['b_proj'][layer]
+            x = x + ctx
+            h = _ln(x, input_data['ln2_w'][layer], input_data['ln2_b'][layer])
+            h = h @ input_data['w_fc'][layer] + input_data['b_fc'][layer]
+            h = _gelu_new(h)
+            h = h @ input_data['w_proj_mlp'][layer] + input_data['b_proj_mlp'][layer]
+            x = x + h
+        x = _ln(x, input_data['ln_f_w'], input_data['ln_f_b'])
+        x @ input_data['lm_head_w'].T

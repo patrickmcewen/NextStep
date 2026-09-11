@@ -85,10 +85,16 @@ dependencies:
       - starlette==1.0.0
       - sympy==1.14.0
       - tabulate==0.10.0
+      - tiktoken==0.13.0
       - torch==2.11.0
+      - transformers==4.57.6
       - tqdm==4.67.3
       - types-requests==2.33.0.20260408
       - typing-extensions==4.15.0
       - typing-inspection==0.4.2
       - urllib3==2.6.3
       - uvicorn==0.44.0
+      - matplotlib==3.10.9
+      - pandas==3.0.2
+      - pymongo==4.17.0
+      - pygraphviz==1.14

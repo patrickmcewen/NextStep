@@ -87,6 +87,107 @@ gemm:
       tile_k: 128
       tile_n: 256
   origin: seed
+gemm_parallel:
+  problem: seed_kernels/matmul/gemm/reference.py
+  step_impl: seed_kernels/matmul/gemm_parallel/step_impl.py
+  params:
+  - M
+  - K
+  - N
+  - tile_m
+  - tile_k
+  - tile_n
+  - par_factor
+  presets:
+    small:
+      M: 32
+      K: 48
+      N: 64
+      tile_m: 16
+      tile_k: 16
+      tile_n: 16
+      par_factor: 2
+    square:
+      M: 64
+      K: 64
+      N: 64
+      tile_m: 16
+      tile_k: 16
+      tile_n: 16
+      par_factor: 2
+    wide:
+      M: 32
+      K: 128
+      N: 256
+      tile_m: 16
+      tile_k: 16
+      tile_n: 32
+      par_factor: 2
+    large_tile:
+      M: 64
+      K: 64
+      N: 128
+      tile_m: 32
+      tile_k: 32
+      tile_n: 32
+      par_factor: 2
+    med_256:
+      M: 256
+      K: 256
+      N: 256
+      tile_m: 64
+      tile_k: 64
+      tile_n: 64
+      par_factor: 2
+    med_512:
+      M: 512
+      K: 512
+      N: 512
+      tile_m: 64
+      tile_k: 64
+      tile_n: 128
+      par_factor: 2
+    large_1k:
+      M: 1024
+      K: 1024
+      N: 1024
+      tile_m: 128
+      tile_k: 128
+      tile_n: 128
+      par_factor: 2
+    large_2k:
+      M: 2048
+      K: 2048
+      N: 2048
+      tile_m: 128
+      tile_k: 128
+      tile_n: 256
+      par_factor: 2
+    large_4k:
+      M: 4096
+      K: 4096
+      N: 4096
+      tile_m: 128
+      tile_k: 128
+      tile_n: 256
+      par_factor: 2
+    rect_tall:
+      M: 4096
+      K: 512
+      N: 1024
+      tile_m: 128
+      tile_k: 128
+      tile_n: 128
+      par_factor: 2
+    rect_wide:
+      M: 512
+      K: 1024
+      N: 4096
+      tile_m: 64
+      tile_k: 128
+      tile_n: 256
+      par_factor: 2
+  origin: seed
 matmul_binarymap:
   problem: seed_kernels/matmul/matmul_binarymap/reference.py
   step_impl: seed_kernels/matmul/matmul_binarymap/step_impl.py
@@ -840,6 +941,43 @@ moe_routed:
       n_active: 2
       tile_n: 32
       tile_f: 256
+    mixtral_small_b64:
+      B: 64
+      D: 512
+      F: 1792
+      n_experts: 8
+      n_active: 2
+      tile_n: 16
+      tile_f: 64
+  origin: seed
+generated_moe:
+  problem: seed_kernels/mlp/generated_moe/reference.py
+  step_impl: seed_kernels/mlp/generated_moe/step_impl.py
+  params:
+  - B
+  - D
+  - F
+  - n_experts
+  - n_active
+  - tile_n
+  - tile_f
+  presets:
+    large_d1k:
+        B: 64
+        D: 1024
+        F: 2048
+        n_experts: 8
+        n_active: 2
+        tile_n: 1
+        tile_f: 256
+    mixtral_small_b64:
+      B: 64
+      D: 512
+      F: 1792
+      n_experts: 8
+      n_active: 2
+      tile_n: 16
+      tile_f: 64
   origin: seed
 vector_reduce_sum:
   problem: seed_kernels/reductions/vector_reduce_sum/reference.py
@@ -1444,6 +1582,129 @@ flash_attn_reuse:
       tile_n: 64
   origin: seed
 
+generated_end_to_end:
+  problem: seed_kernels/transformer_layer/end_to_end/reference.py
+  step_impl: /workspace/NextStep/StepDB/seed_kernels/transformer_layer/generated_end_to_end_2/step_impl.py
+  params:
+  - model_name
+  - tile_N
+  - tile_F
+  - batch
+  - scale_seq
+  - is_small
+  - par_factor
+  - stdev
+  - start
+  - end
+  presets:
+    mixtral_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    mixtral_small_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 16
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_small_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+  origin: seed
+
+
+generated_end_to_end_2:
+  problem: seed_kernels/transformer_layer/end_to_end/reference.py
+  step_impl: seed_kernels/transformer_layer/generated_end_to_end_2/step_impl.py
+  params:
+  - model_name
+  - tile_N
+  - tile_F
+  - batch
+  - scale_seq
+  - is_small
+  - par_factor
+  - stdev
+  - start
+  - end
+  presets:
+    mixtral_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    mixtral_small_b64:
+      model_name: mixtral
+      tile_N: 32
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 16
+      is_small: false
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+    qwen_small_b64:
+      model_name: qwen
+      tile_N: 8
+      tile_F: 48
+      batch: 64
+      scale_seq: 1
+      is_small: true
+      par_factor: 4
+      stdev: 1034
+      start: 1
+      end: 64
+  origin: seed
+
 end_to_end:
   problem: seed_kernels/transformer_layer/end_to_end/reference.py
   step_impl: seed_kernels/transformer_layer/end_to_end/step_impl.py
@@ -1802,6 +2063,40 @@ kv_cache_tile_append:
       max_seq_len_tiles: 128
       tile_N: 32
   origin: seed
+generated_prefill_transformer:
+  problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
+  step_impl: seed_kernels/transformer_layer/generated_prefill_transformer/step_impl_new.py
+  params:
+  - model_name
+  - seq_len
+  - is_small
+  presets:
+    tiny:
+      model_name: mixtral
+      seq_len: 8
+      is_small: true
+    small:
+      model_name: mixtral
+      seq_len: 64
+      is_small: true
+  origin: seed
+generated_prefill_transformer_working:
+  problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
+  step_impl: seed_kernels/transformer_layer/generated_prefill_transformer_working/step_impl.py
+  params:
+  - model_name
+  - seq_len
+  - is_small
+  presets:
+    tiny:
+      model_name: mixtral
+      seq_len: 8
+      is_small: true
+    small:
+      model_name: mixtral
+      seq_len: 64
+      is_small: true
+  origin: seed
 prefill_transformer_simple:
   problem: seed_kernels/transformer_layer/prefill_transformer_simple/reference.py
   step_impl: seed_kernels/transformer_layer/prefill_transformer_simple/step_impl.py
@@ -1971,3 +2266,719 @@ sdpa_kv_read:
       head_dim: 16
       batch_size: 8
       batch_idx: 3
+streamify_identity_2d:
+  problem: seed_kernels/language_primitives/streamify_identity_2d/reference.py
+  step_impl: seed_kernels/language_primitives/streamify_identity_2d/step_impl.py
+  params:
+  - M
+  - K
+  - tile_m
+  - tile_k
+  presets:
+    small:
+      M: 32
+      K: 48
+      tile_m: 16
+      tile_k: 16
+    square:
+      M: 64
+      K: 64
+      tile_m: 16
+      tile_k: 16
+    large:
+      M: 128
+      K: 128
+      tile_m: 32
+      tile_k: 32
+  origin: seed
+streamify_repeat_outer:
+  problem: seed_kernels/language_primitives/streamify_repeat_outer/reference.py
+  step_impl: seed_kernels/language_primitives/streamify_repeat_outer/step_impl.py
+  params:
+  - M
+  - K
+  - R
+  - tile_m
+  - tile_k
+  presets:
+    small:
+      M: 32
+      K: 48
+      R: 3
+      tile_m: 16
+      tile_k: 16
+    square:
+      M: 64
+      K: 64
+      R: 4
+      tile_m: 16
+      tile_k: 16
+    large:
+      M: 128
+      K: 128
+      R: 5
+      tile_m: 32
+      tile_k: 32
+  origin: seed
+parallelize_observe:
+  problem: seed_kernels/language_primitives/parallelize_observe/reference.py
+  step_impl: seed_kernels/language_primitives/parallelize_observe/step_impl.py
+  params:
+  - B
+  - K
+  - tile_m
+  - tile_k
+  - par_factor
+  presets:
+    tiny:
+      B: 8
+      K: 2
+      tile_m: 4
+      tile_k: 4
+      par_factor: 2
+    small:
+      B: 16
+      K: 4
+      tile_m: 8
+      tile_k: 8
+      par_factor: 4
+    mixtral_like:
+      B: 64
+      K: 8
+      tile_m: 16
+      tile_k: 16
+      par_factor: 4
+  origin: seed
+
+qk_reshape_score:
+  problem: seed_kernels/qk_reshape_score/reference.py
+  step_impl: null
+  params:
+  - seq_len
+  - hidden_size
+  - num_heads
+  - num_kv_heads
+  - head_dim
+  presets:
+    tiny:
+      seq_len: 8
+      hidden_size: 16
+      num_heads: 4
+      num_kv_heads: 2
+      head_dim: 8
+    small:
+      seq_len: 128
+      hidden_size: 512
+      num_heads: 8
+      num_kv_heads: 4
+      head_dim: 64
+    medium:
+      seq_len: 512
+      hidden_size: 2048
+      num_heads: 16
+      num_kv_heads: 4
+      head_dim: 128
+    large:
+      seq_len: 1024
+      hidden_size: 4096
+      num_heads: 32
+      num_kv_heads: 8
+      head_dim: 128
+  origin: seed
+tile_grid_transpose_2d:
+  problem: seed_kernels/language_primitives/tile_grid_transpose_2d/reference.py
+  step_impl: seed_kernels/language_primitives/tile_grid_transpose_2d/step_impl.py
+  params:
+  - M
+  - K
+  - tile_m
+  - tile_k
+  presets:
+    small:
+      M: 32
+      K: 32
+      tile_m: 16
+      tile_k: 16
+    rect:
+      M: 64
+      K: 64
+      tile_m: 16
+      tile_k: 8
+    square:
+      M: 64
+      K: 64
+      tile_m: 16
+      tile_k: 16
+  origin: seed
+head_split_permute:
+  problem: seed_kernels/language_primitives/head_split_permute/reference.py
+  step_impl: seed_kernels/language_primitives/head_split_permute/step_impl.py
+  params:
+  - S
+  - H
+  - D
+  presets:
+    small:
+      S: 8
+      H: 4
+      D: 16
+    medium:
+      S: 16
+      H: 8
+      D: 32
+  origin: seed
+attn_layout_permute_4d:
+  problem: seed_kernels/language_primitives/attn_layout_permute_4d/reference.py
+  step_impl: seed_kernels/language_primitives/attn_layout_permute_4d/step_impl.py
+  params:
+  - B
+  - H
+  - S
+  - D
+  presets:
+    small:
+      B: 2
+      H: 4
+      S: 8
+      D: 16
+    medium:
+      B: 4
+      H: 8
+      S: 16
+      D: 32
+  origin: seed
+gqa_decode_e2e:
+  problem: seed_kernels/attention/gqa_decode_e2e/reference.py
+  step_impl: seed_kernels/attention/gqa_decode_e2e/step_impl.py
+  params:
+  - batch
+  - num_heads
+  - num_kv_heads
+  - head_dim
+  - hidden_dim
+  - seq_len_min
+  - seq_len_max
+  - tile_seq
+  - tile_hidden
+  presets:
+    tiny:
+      batch: 2
+      num_heads: 4
+      num_kv_heads: 2
+      head_dim: 16
+      hidden_dim: 32
+      seq_len_min: 8
+      seq_len_max: 16
+      tile_seq: 8
+      tile_hidden: 16
+    small:
+      batch: 4
+      num_heads: 8
+      num_kv_heads: 4
+      head_dim: 32
+      hidden_dim: 128
+      seq_len_min: 16
+      seq_len_max: 48
+      tile_seq: 16
+      tile_hidden: 64
+    mixtral_b32_ctx512:
+      batch: 32
+      num_heads: 32
+      num_kv_heads: 8
+      head_dim: 128
+      hidden_dim: 4096
+      seq_len_min: 128
+      seq_len_max: 512
+      tile_seq: 32
+      tile_hidden: 64
+  origin: seed
+hf__gpt2:
+  problem: seed_kernels/hf_imported/gpt2/reference.py
+  step_impl: null
+  params:
+  - model_name
+  - batch_size
+  - seq_len
+  presets:
+    tiny:
+      model_name: gpt2
+      batch_size: 1
+      seq_len: 8
+    small:
+      model_name: gpt2
+      batch_size: 1
+      seq_len: 32
+    medium:
+      model_name: gpt2
+      batch_size: 1
+      seq_len: 128
+  origin: hf_import
+gemm_rms_norm:
+  problem: seed_kernels/gemm_rms_norm/reference.py
+  step_impl: null
+  params:
+  - M
+  - K
+  - N
+  - eps
+  presets:
+    tiny:
+      M: 16
+      K: 32
+      N: 16
+      eps: 1.0e-06
+    small:
+      M: 32
+      K: 48
+      N: 64
+      eps: 1.0e-06
+    square:
+      M: 64
+      K: 64
+      N: 64
+      eps: 1.0e-06
+    wide:
+      M: 32
+      K: 128
+      N: 256
+      eps: 1.0e-06
+    qwen_scale:
+      M: 128
+      K: 64
+      N: 128
+      eps: 1.0e-05
+    hidden_512:
+      M: 256
+      K: 512
+      N: 512
+      eps: 1.0e-06
+    hidden_1k:
+      M: 512
+      K: 1024
+      N: 1024
+      eps: 1.0e-06
+    single_big_tile:
+      M: 256
+      K: 256
+      N: 256
+      eps: 1.0e-06
+    big_tile_2x2:
+      M: 256
+      K: 512
+      N: 512
+      eps: 1.0e-06
+    big_tile_4x4:
+      M: 512
+      K: 1024
+      N: 1024
+      eps: 1.0e-06
+  origin: seed
+kernelbench_mlp:
+  problem: seed_kernels/kernelbench/level3/mlp/reference.py
+  step_impl: null
+  params:
+  - B
+  - D_in
+  - D_h1
+  - D_h2
+  - D_out
+  presets:
+    tiny:
+      B: 4
+      D_in: 16
+      D_h1: 16
+      D_h2: 16
+      D_out: 8
+    small:
+      B: 8
+      D_in: 32
+      D_h1: 32
+      D_h2: 32
+      D_out: 16
+    medium:
+      B: 16
+      D_in: 64
+      D_h1: 64
+      D_h2: 64
+      D_out: 32
+    wide:
+      B: 32
+      D_in: 128
+      D_h1: 128
+      D_h2: 128
+      D_out: 64
+    hidden_512:
+      B: 32
+      D_in: 512
+      D_h1: 512
+      D_h2: 512
+      D_out: 256
+    hidden_1k:
+      B: 32
+      D_in: 1024
+      D_h1: 1024
+      D_h2: 1024
+      D_out: 512
+  origin: seed
+kernelbench_gpt2:
+  problem: seed_kernels/kernelbench/level4/gpt2/reference.py
+  step_impl: /workspace/NextStep/StepDB/seed_kernels/kernelbench/level4/gpt2/step_impl.py
+  params:
+  - B
+  - T
+  - V
+  - P
+  - D
+  - L
+  - H
+  - I
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 32
+      P: 16
+      D: 16
+      L: 2
+      H: 2
+      I: 32
+    small:
+      B: 2
+      T: 16
+      V: 64
+      P: 32
+      D: 32
+      L: 2
+      H: 2
+      I: 64
+    medium:
+      B: 4
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 2
+      H: 4
+      I: 128
+    wide:
+      B: 4
+      T: 64
+      V: 256
+      P: 128
+      D: 128
+      L: 2
+      H: 4
+      I: 512
+    deep:
+      B: 2
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 6
+      H: 4
+      I: 128
+    gpt2_bs32_seq256:
+      B: 32
+      T: 256
+      V: 50257
+      P: 1024
+      D: 768
+      L: 12
+      H: 12
+      I: 3072
+    gpt2_bs1024_seq32:
+      B: 1024
+      T: 32
+      V: 50257
+      P: 1024
+      D: 768
+      L: 12
+      H: 12
+      I: 3072
+    gpt2_bs1_seq1023:
+      B: 1
+      T: 1023
+      V: 50257
+      P: 1024
+      D: 768
+      L: 12
+      H: 12
+      I: 3072
+  origin: seed
+kernelbench_bart_large:
+  problem: seed_kernels/kernelbench/level4/bart_large/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - P
+  - D
+  - L
+  - H
+  - I
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 32
+      P: 16
+      D: 16
+      L: 2
+      H: 2
+      I: 32
+    small:
+      B: 2
+      T: 16
+      V: 64
+      P: 32
+      D: 32
+      L: 2
+      H: 2
+      I: 64
+    medium:
+      B: 4
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 2
+      H: 4
+      I: 128
+    deep:
+      B: 2
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 6
+      H: 4
+      I: 128
+    bart_large_bs32_seq256:
+      B: 32
+      T: 256
+      V: 50265
+      P: 1024
+      D: 1024
+      L: 12
+      H: 16
+      I: 4096
+    bart_large_bs1024_seq32:
+      B: 1024
+      T: 32
+      V: 50265
+      P: 1024
+      D: 1024
+      L: 12
+      H: 16
+      I: 4096
+    bart_large_bs1_seq1023:
+      B: 1
+      T: 1023
+      V: 50265
+      P: 1024
+      D: 1024
+      L: 12
+      H: 16
+      I: 4096
+  origin: seed
+kernelbench_opt_1p3b:
+  problem: seed_kernels/kernelbench/level4/opt_1p3b/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - P
+  - D
+  - L
+  - H
+  - I
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 32
+      P: 16
+      D: 16
+      L: 2
+      H: 2
+      I: 32
+    small:
+      B: 2
+      T: 16
+      V: 64
+      P: 32
+      D: 32
+      L: 2
+      H: 2
+      I: 64
+    medium:
+      B: 4
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 2
+      H: 4
+      I: 128
+    deep:
+      B: 2
+      T: 32
+      V: 128
+      P: 64
+      D: 64
+      L: 6
+      H: 4
+      I: 128
+    opt_1p3b_bs32_seq256:
+      B: 32
+      T: 256
+      V: 50272
+      P: 2048
+      D: 2048
+      L: 24
+      H: 32
+      I: 8192
+    opt_1p3b_bs1_seq2047:
+      B: 1
+      T: 2047
+      V: 50272
+      P: 2048
+      D: 2048
+      L: 24
+      H: 32
+      I: 8192
+    opt_1p3b_bs512_seq32:
+      B: 512
+      T: 32
+      V: 50272
+      P: 2048
+      D: 2048
+      L: 24
+      H: 32
+      I: 8192
+  origin: seed
+
+kernelbench_reformer_enwik8:
+  problem: seed_kernels/kernelbench/level4/reformer_enwik8/reference.py
+  step_impl: null
+  params:
+  - B
+  - T
+  - V
+  - D
+  - L
+  - H
+  - D_HEAD
+  - FF
+  - AX0
+  - AX1
+  - AE0
+  - AE1
+  - MAX_POS
+  - LSH_CL
+  - LOC_CL
+  - ATTN_LAYERS
+  - NUM_BUCKETS
+  presets:
+    tiny:
+      B: 2
+      T: 8
+      V: 16
+      D: 32
+      L: 4
+      H: 2
+      D_HEAD: 16
+      FF: 64
+      AX0: 2
+      AX1: 8
+      AE0: 8
+      AE1: 24
+      MAX_POS: 16
+      LSH_CL: 8
+      LOC_CL: 8
+      ATTN_LAYERS: lLlL
+      NUM_BUCKETS: 8
+    small:
+      B: 2
+      T: 16
+      V: 32
+      D: 64
+      L: 4
+      H: 4
+      D_HEAD: 16
+      FF: 128
+      AX0: 2
+      AX1: 16
+      AE0: 16
+      AE1: 48
+      MAX_POS: 32
+      LSH_CL: 16
+      LOC_CL: 16
+      ATTN_LAYERS: llLl
+      NUM_BUCKETS: 8
+    medium:
+      B: 4
+      T: 32
+      V: 64
+      D: 64
+      L: 6
+      H: 4
+      D_HEAD: 16
+      FF: 128
+      AX0: 4
+      AX1: 32
+      AE0: 16
+      AE1: 48
+      MAX_POS: 128
+      LSH_CL: 32
+      LOC_CL: 16
+      ATTN_LAYERS: lLllLl
+      NUM_BUCKETS: 8
+    reformer_enwik8_bs32_seq256:
+      B: 32
+      T: 256
+      V: 258
+      D: 1024
+      L: 12
+      H: 8
+      D_HEAD: 128
+      FF: 4096
+      AX0: 128
+      AX1: 512
+      AE0: 256
+      AE1: 768
+      MAX_POS: 65536
+      LSH_CL: 256
+      LOC_CL: 128
+      ATTN_LAYERS: llLlllLlllLl
+      NUM_BUCKETS: 512
+  origin: seed
+
+kv_append_load:
+  problem: examples/kv/reference.py
+  step_impl: null
+  params:
+  - B
+  - D
+  - tile_N
+  - maxN
+  presets:
+    tiny:
+      B: 3
+      D: 8
+      tile_N: 4
+      maxN: 32
+    small:
+      B: 4
+      D: 16
+      tile_N: 8
+      maxN: 64
+    medium:
+      B: 8
+      D: 64
+      tile_N: 16
+      maxN: 256
+  origin: example

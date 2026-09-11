@@ -1,0 +1,1 @@
+FAIL: AssertionError: offchip_load: underlying dtype must be float16 or float32, got torch.int64

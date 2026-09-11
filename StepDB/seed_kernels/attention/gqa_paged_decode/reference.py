@@ -4,10 +4,7 @@ Ported verbatim from the flashinfer_trace definition
 `gqa_paged_decode_h32_kv16_d128_ps1.json` (Gemma 3 27B, TP=1).
 
 The `run` function below is the definition's reference implementation unchanged.
-This module wraps it with the StepDB `get_inputs` / `compute_gold` API:
-each batch element owns a contiguous, non-overlapping range of `kv_len` pages,
-giving `num_pages = batch_size * kv_len` and deterministic `kv_indptr`/
-`kv_indices` arrays.
+Inputs come from StepDB/precompute.py via the `tensors` arg.
 
 Source JSON:
   flashinfer-bench/flashinfer_trace/definitions/gqa_paged/
@@ -16,14 +13,6 @@ Source JSON:
 import math
 
 import torch
-import torch.nn as nn
-
-SEED = 42
-
-NUM_QO_HEADS = 32
-NUM_KV_HEADS = 16
-HEAD_DIM = 128
-PAGE_SIZE = 1
 
 
 @torch.no_grad()
@@ -99,39 +88,9 @@ def run(q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
     return output, lse
 
 
-class Model(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
-        output, _lse = run(q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale)
-        return output
-
-
-def get_inputs(dims):
-    torch.manual_seed(SEED)
-    batch_size = dims["batch_size"]
-    kv_len = dims["kv_len"]
-
-    num_pages = batch_size * kv_len
-    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
-
-    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16)
-    k_cache = torch.randn(
-        num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16
+def compute_gold(dims, tensors):
+    output, _lse = run(
+        tensors["q"], tensors["k_cache"], tensors["v_cache"],
+        tensors["kv_indptr"], tensors["kv_indices"], tensors["sm_scale"],
     )
-    v_cache = torch.randn(
-        num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16
-    )
-    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
-    kv_indices = torch.arange(num_pages, dtype=torch.int32)
-    return q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale
-
-
-def get_init_inputs(dims):
-    return []
-
-
-def compute_gold(dims):
-    model = Model()
-    return model(*get_inputs(dims))
+    return output

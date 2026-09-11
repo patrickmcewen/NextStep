@@ -1,0 +1,41 @@
+test_name: gated_mlp__qwen_16x
+# Derived from StepDB seed_kernels/mlp/gated_mlp (preset: qwen_16x).
+# Preset values: B=16 tokens, D=128 hidden, F=48 intermediate.
+# SwiGLU variant: y = (silu(x @ gate_w) * (x @ up_w)) @ down_w.
+# silu is inlined as x * sigmoid(x) to avoid the F.silu dependency.
+# Gold from seed_kernels/mlp/gated_mlp/reference.py:compute_gold.
+dims:
+  B: 16
+  D: 128
+  F: 48
+  tile_b: 1
+  tile_f: 48
+
+inputs:
+  - name: x
+    dtype: fp32
+    dims: [D, B]
+    data_gen: torch.randn
+  - name: gate_w
+    dtype: fp32
+    dims: [F, D]
+    data_gen: torch.randn
+  - name: up_w
+    dtype: fp32
+    dims: [F, D]
+    data_gen: torch.randn
+  - name: down_w
+    dtype: fp32
+    dims: [D, F]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [D, B]
+    data_transform:
+      - |
+        gate_out = input_data['x'] @ input_data['gate_w']
+        up_out = input_data['x'] @ input_data['up_w']
+        hidden = (gate_out * torch.sigmoid(gate_out)) * up_out
+        hidden @ input_data['down_w']

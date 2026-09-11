@@ -1,0 +1,23 @@
+## Variant context
+
+node_path={node_path}, is_root={is_root}, variant_kind={variant_kind}, attempt_index={attempt_index}, turn_index={turn_index}
+
+## Composed source
+
+```
+{composed_source}
+```
+
+## Analytical estimate
+
+cycles={analytical_cycles}, on_chip={analytical_on_chip} bytes
+
+## Budget state
+
+remaining_seconds={remaining_seconds}, recent_rust_avg_sec={recent_rust_avg_sec}, consumed_seconds={consumed_seconds}
+
+## Curated calibration evidence (K={curated_count})
+
+{curated_block}
+
+## Decide.

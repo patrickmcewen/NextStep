@@ -1,0 +1,34 @@
+## Output protocol (parent node)
+
+Your response MUST contain two fenced blocks in order: a ``yaml`` block
+with ``parent_input_contracts``, followed by a ``python`` block with the
+DSL function. Surrounding prose is ignored.
+
+```yaml
+parent_input_contracts:        # on-chip inputs only; empty mapping if none
+  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
+```
+
+```python
+def <node_name>(<args>, *, out_shapes):
+    ...
+```
+
+A contract is ``{reshape: <shape>, permutation: [...]}`` applied to the
+vanilla PyTorch tensor. RAW args have no input contract. Identity
+contracts (``reshape == vanilla_shape`` with identity permutation) mean
+"no rearrangement". Inside the DSL body, call each child by its natural
+name (e.g. ``attention_block(...)``). The autotuner composes your parent
+DSL against deterministic best child designs selected system-side from
+the child libraries. Child source shown in the prompt is context only:
+do not emit child implementations, child variant indices, or child
+selection fields. You may call a shown helper label such as
+``attention_block_0(...)`` to use that exact child implementation, call
+the natural child name for the default best implementation, or inline
+equivalent child logic directly inside this parent function and skip the
+child helper call.
+
+Note: output contracts are NOT declared. The autotuner derives them
+mechanically from the built graph after your DSL passes the graph-build
+smoke test — the actual stream + tile shape of each output is read off
+the live IR and recorded automatically.

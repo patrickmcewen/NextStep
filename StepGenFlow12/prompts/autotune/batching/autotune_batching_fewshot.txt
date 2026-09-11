@@ -1,0 +1,301 @@
+# Batched processing for many small routed items
+
+Batching is the fix when a graph does the right math but fires too many small
+tiles. The common symptom is an expert/body loop that receives a dynamic stream
+of `[1, D]` items, then repeats each item across feature chunks:
+
+```python
+parts = flat_partition(x, control=expert_multihot, n=n_experts, partition_rank=0)
+for e in range(n_experts):
+    xi = parts[e]                         # dynamic stream, tile (1, D)
+    xi_rep = repeat_static(xi, factor=F // tile_f)
+    w = offchip_load_ref(ref=xi, underlying=W[e], ...)
+    out = binary_matmul(xi_rep, w)
+```
+
+This avoids full-matrix tiles, but it is still per-token. If expert `e`
+receives `tokens_e` tokens and `F // tile_f` chunks, the body fires roughly
+`tokens_e * (F // tile_f)` times. If `tokens_e=24` and `F // tile_f=28`, that
+is 672 firings for one expert.
+
+The batching recipe is:
+
+1. Partition first, so each expert has a dynamic token stream.
+2. Pack that dynamic stream into row batches with
+   `reshape_stream(..., add_outer_dim=True)`, `flatten`, and
+   `accum_retile_row`.
+3. Use the packed stream as the `offchip_load_ref` reference for gate/up/down
+   chunk loads.
+4. Run matmuls on tile `(tile_n, tile_f)` instead of `(1, tile_f)`.
+5. Use `binary_map_accum(..., rank=1)` for down projection over feature
+   chunks.
+6. Split the packed result back to per-token tiles with
+   `retile_streamify(..., filter_mask=True)` before multiplying routing
+   weights and reassembling.
+
+The firing count becomes `ceil(tokens_e / tile_n) * (F // tile_f)`. With
+`tokens_e=24`, `tile_n=16`, and `F // tile_f=28`, that is 56 firings instead
+of 672 for the expert body.
+
+---
+
+## Worked example: routed MoE token batching
+
+Reference shape:
+
+```python
+# x:              [B, D]
+# gate/up weight: [D, F]
+# down weight:    [F, D]
+# routing: top-k over n_experts, n_active experts per token
+```
+
+### Before: chunked but still per-token
+
+```python
+def tiled_reference(dims, tensors):
+    B, D, F = dims["B"], dims["D"], dims["F"]
+    n_experts = dims["n_experts"]
+    n_active = dims["n_active"]
+    tile_f = dims["tile_f"]
+    f_tiles = F // tile_f
+
+    x = offchip_load(
+        tensors["x"],
+        stride=(1,),
+        out_shape_tiled=(B,),
+        tile_row=1,
+        tile_col=D,
+    )
+    weights = offchip_load(
+        tensors["expert_weights"],
+        stride=(n_active, 1),
+        out_shape_tiled=(B, n_active),
+        tile_row=1,
+        tile_col=1,
+    )
+
+    # One control routes tokens to experts. The other routes per-slot weights.
+    token_parts = flat_partition(
+        x,
+        control=select_gen(tensors["expert_multihot"], n=n_experts),
+        n=n_experts,
+        partition_rank=0,
+    )
+    weight_parts = flat_partition(
+        weights,
+        control=select_gen(tensors["expert_onehot"], n=n_experts),
+        n=n_experts,
+        partition_rank=0,
+    )
+
+    expert_outputs = []
+    for e in range(n_experts):
+        xi = token_parts[e]                 # tile (1, D), dynamic token count
+        wi = weight_parts[e]                # tile (1, 1), same dynamic count
+        xi_rep = repeat_static(xi, factor=f_tiles)
+        wi_rep = repeat_static(wi, factor=f_tiles)
+
+        gate_w = offchip_load_ref(
+            ref=xi,
+            underlying=tensors["gate_weights"][e],
+            stride=(1,),
+            out_shape_tiled=(f_tiles,),
+            tile_row=D,
+            tile_col=tile_f,
+        )
+        up_w = offchip_load_ref(
+            ref=xi,
+            underlying=tensors["up_weights"][e],
+            stride=(1,),
+            out_shape_tiled=(f_tiles,),
+            tile_row=D,
+            tile_col=tile_f,
+        )
+
+        gate = binary_matmul(xi_rep, gate_w)
+        up = binary_matmul(xi_rep, up_w)
+        hidden = binary_mul(unary_silu(gate), up)
+
+        down_w = offchip_load_ref(
+            ref=xi,
+            underlying=tensors["down_weights"][e],
+            stride=(1,),
+            out_shape_tiled=(f_tiles,),
+            tile_row=tile_f,
+            tile_col=D,
+        )
+        down = binary_matmul(hidden, down_w)
+        weighted = binary_mul(down, wi_rep)
+        expert_outputs.append(accum_add(weighted, rank=1))
+
+    merged = flat_reassemble(
+        expert_outputs,
+        control=select_gen(tensors["expert_multihot"], n=n_experts),
+        reassemble_rank=0,
+    )
+    return offchip_store(accum_add(merged, rank=1))
+```
+
+Why it is slow:
+
+- `xi` is still tile `(1, D)`, so each token does its own gate/up/down body.
+- `offchip_load_ref(ref=xi, ...)` fires once per token per feature chunk.
+- `down` uses per-token `binary_matmul`, then a separate `accum_add`.
+
+### After: batch routed tokens before the expert body
+
+```python
+def tiled_reference(dims, tensors):
+    B, D, F = dims["B"], dims["D"], dims["F"]
+    n_experts = dims["n_experts"]
+    n_active = dims["n_active"]
+    tile_n = dims["tile_n"]
+    tile_f = dims["tile_f"]
+    f_tiles = F // tile_f
+    assert B % tile_n == 0 or tile_n >= B
+    assert F % tile_f == 0
+
+    x = offchip_load(
+        tensors["x"],
+        stride=(1,),
+        out_shape_tiled=(B,),
+        tile_row=1,
+        tile_col=D,
+    )
+    weights = offchip_load(
+        tensors["expert_weights"],
+        stride=(n_active, 1),
+        out_shape_tiled=(B, n_active),
+        tile_row=1,
+        tile_col=1,
+    )
+
+    token_control = select_gen(tensors["expert_multihot"], n=n_experts)
+    weight_control = select_gen(tensors["expert_onehot"], n=n_experts)
+    token_parts = flat_partition(x, control=token_control, n=n_experts, partition_rank=0)
+    weight_parts = flat_partition(weights, control=weight_control, n=n_experts, partition_rank=0)
+
+    packed_parts = []
+    for e in range(n_experts):
+        # STeP IR equivalent:
+        #   Reshape(..., chunk_size=tile_n, add_outer_dim=True, pad_fn=Zero)
+        #   Flatten(min_rank=1, max_rank=2)
+        #   Accum(..., Tile(Float32, (tile_n, D)), RetileRow, Empty)
+        #
+        # DSL equivalent: this lowers to Reshape(..., add_outer_dim=True,
+        # pad_fn=Zero(...)). Do not use reshape_pad_stream for this pattern;
+        # Rust needs a pad value when a dynamic expert count is not divisible
+        # by tile_n.
+        grouped = reshape_stream(
+            token_parts[e],
+            chunk_size=tile_n,
+            rank=0,
+            add_outer_dim=True,
+        )
+        flattened = flatten(grouped, min_rank=1, max_rank=2)
+        packed = accum_retile_row(flattened, rank=1)
+        packed_parts.append(packed)          # tile (tile_n, D)
+
+    expert_outputs = []
+    for e in range(n_experts):
+        packed = packed_parts[e]
+        packed_rep = repeat_static(packed, factor=f_tiles)
+
+        # The ref must be the packed stream, not the original per-token stream.
+        # Lowered IR should look like:
+        #   LinearOffChipLoadRef(graph, ref=packed, ...)
+        gate_w = offchip_load_ref(
+            ref=packed,
+            underlying=tensors["gate_weights"][e],
+            stride=(1,),
+            out_shape_tiled=(f_tiles,),
+            tile_row=D,
+            tile_col=tile_f,
+        )
+        up_w = offchip_load_ref(
+            ref=packed,
+            underlying=tensors["up_weights"][e],
+            stride=(1,),
+            out_shape_tiled=(f_tiles,),
+            tile_row=D,
+            tile_col=tile_f,
+        )
+
+        gate = binary_matmul(packed_rep, gate_w)       # tile (tile_n, tile_f)
+        up = binary_matmul(packed_rep, up_w)           # tile (tile_n, tile_f)
+        hidden = binary_mul(unary_silu(gate), up)
+
+        down_w = offchip_load_ref(
+            ref=packed,
+            underlying=tensors["down_weights"][e],
+            stride=(1,),
+            out_shape_tiled=(f_tiles,),
+            tile_row=tile_f,
+            tile_col=D,
+        )
+        down = binary_map_accum(hidden, down_w, rank=1)  # tile (tile_n, D)
+
+        per_token = retile_streamify(
+            down,
+            chunk=1,
+            split_row=True,
+            filter_mask=True,
+        )
+        weighted = binary_mul(per_token, weight_parts[e])
+        expert_outputs.append(weighted)
+
+    merged = flat_reassemble(
+        expert_outputs,
+        control=token_control,
+        reassemble_rank=0,
+    )
+    summed = accum_add(merged, rank=1)
+    return offchip_store(summed)
+```
+
+Transforms applied:
+
+1. The expert partition stays first. Batching after `flat_partition` keeps
+   each expert's tokens contiguous and avoids mixing experts inside a batch.
+2. `reshape_stream(add_outer_dim=True) -> flatten -> accum_retile_row`
+   converts a dynamic stream of tile `(1, D)` tokens into tile `(tile_n, D)`
+   token batches.
+3. `repeat_static(packed, factor=f_tiles)` repeats whole token batches, not
+   individual tokens.
+4. Gate/up/down `offchip_load_ref` use `ref=packed`, so one reference event
+   pulls the feature chunks for a whole token batch.
+5. Down projection is `binary_map_accum(..., rank=1)`, reducing feature
+   chunks inside the down matmul pipeline instead of producing per-chunk
+   outputs and summing them separately.
+6. `retile_streamify(..., split_row=True, filter_mask=True)` returns the
+   expert result to per-token tile `(1, D)` and drops zero-padded rows before
+   routing-weight multiply and reassembly.
+
+---
+
+## Pitfalls
+
+- **Batch after routing, not before.** Packing before `flat_partition` mixes
+  tokens that may route to different experts. Partition first, then pack each
+  expert stream independently.
+- **Use the packed stream as the weight-load ref.** If the code still says
+  `offchip_load_ref(ref=token_parts[e], ...)`, the graph still fires per
+  token. The lowered IR should say `LinearOffChipLoadRef(graph, ref=packed,
+  ...)` or the equivalent variable name.
+- **Do not repeat routing weights across feature chunks after down
+  accumulation.** The weight multiply belongs after `binary_map_accum` and
+  after retile back to per-token outputs.
+- **Filter the padded rows after retile.** Use
+  `retile_streamify(..., filter_mask=True)` after the down `binary_map_accum`.
+  Without the filter, padded zero rows remain in the per-token stream and will
+  not align with the routing-weight stream.
+- **Preserve dynamic dim provenance.** The per-token stream produced by
+  `retile_streamify` must have the same dynamic count as the original expert
+  partition. In hand-written IR this may require setting
+  `retiled.stream.shape = (partitioned.stream_idx(e).shape[0],)`.
+- **Use the right control tensor.** `expert_multihot` controls token
+  partition/reassembly; `expert_onehot` controls per-slot routing weights.
+- **Batching and parallelism are orthogonal.** First collapse per-token work
+  into batched work; then parallelize the remaining bottleneck if timing still
+  needs it.

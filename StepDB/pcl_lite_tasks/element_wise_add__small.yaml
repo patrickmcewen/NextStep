@@ -1,0 +1,27 @@
+test_name: element_wise_add__small
+# Derived from StepDB seed_kernels/elementwise/element_wise_add (preset: small).
+# Preset values come from StepDB/bench_config.yaml; gold from
+# seed_kernels/elementwise/element_wise_add/reference.py:compute_gold.
+dims:
+  M: 32
+  K: 48
+  tile_m: 16
+  tile_k: 16
+
+inputs:
+  - name: A
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  - name: B
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+      - |
+        input_data['A'] + input_data['B']

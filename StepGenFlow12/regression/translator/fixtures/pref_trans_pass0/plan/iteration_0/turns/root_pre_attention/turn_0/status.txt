@@ -1,0 +1,1 @@
+SPLIT_OK: children=['pre_attn_norm_and_proj', 'per_head_norm_and_rope']

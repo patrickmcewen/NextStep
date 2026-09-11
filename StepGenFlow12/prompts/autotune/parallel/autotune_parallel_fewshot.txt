@@ -1,0 +1,297 @@
+# Sources of parallelism in STeP
+
+A STeP graph can be made parallel in three places. They aren't substitutes
+for each other — each relieves a different bottleneck and costs a different
+resource. Read the timing report first, then pick by which resource the
+bottleneck node is competing for.
+
+  - **(1) HBM-side parallelism.** Replicate the off-chip load itself: emit
+    `par_factor` separate `LinearOffChipLoad` ops, each reading its own
+    sub-range of the tensor (different `start_tile_idx`, stride scaled by
+    `par_factor`). Multiple DRAM channels engage in parallel. Cost: HBM
+    traffic on any operand that's *broadcast* across the parallelized axis
+    is multiplied by `par_factor` (every consumer re-reads the full
+    broadcast tensor).
+
+  - **(2) On-chip Parallelize node.** Keep a single load; insert a DSL
+    `parallelize(x, n)` downstream. The lowered IR emits one `Parallelize`
+    op that round-robin dispatches incoming tiles to `n` consumer
+    pipelines. HBM traffic is unchanged. The cost is a single-threaded
+    dispatch point: if any consumer's input port back-pressures, the
+    Parallelize op stalls and the other consumers starve too.
+
+  - **(3) Parallelize + per-branch bufferize/streamify.** Same Parallelize
+    fan-out as (2), but each output stream passes through its own
+    `bufferize → streamify` before the consumer compute. The buffer
+    decouples the Parallelize dispatcher from the consumer's intake rate
+    — a slow tile on consumer 0 no longer freezes the dispatcher's
+    round-robin loop. Cost: SRAM per branch, sized to the buffer's depth.
+
+Recipe for **any** source:
+
+  1. **Identify the parallelized axis.** It must be an *outer* stream dim
+     (smallest-rank-index is innermost, so "outer" = largest stream-shape
+     index). The axis must be divisible by `par_factor`.
+  2. **Absorb offchip_load's leading singleton.** Every `offchip_load`
+     prepends a static 1 stream dim (via `unsqueeze(0)` in the DSL
+     semantics). Use `flatten(min_rank=k, max_rank=k+1)` to merge it
+     into the next dim *before* parallelizing — otherwise `parallelize`
+     slices the singleton (size 1) and emits empty consumers.
+  3. **Replicate the consumer body.** Each branch's pipeline is identical
+     except for its operand(s). After the per-consumer compute, collect
+     outputs into a Python list.
+  4. **Rejoin with `static_reassemble`.** Default `merge_rank` is the
+     outermost stream dim, which exactly inverts the round-robin slice
+     embedded in `parallelize` (source 2/3) or in `start_tile_idx`/stride
+     (source 1).
+  5. **Restore the leading singleton if needed.** If `static_reassemble`
+     produces a stream with fewer dims than `offchip_store`'s minimum
+     (rank >= 1, i.e. tensor ndim >= 4), wrap with `promote_outer` before
+     the store.
+
+---
+
+## Source (1) — HBM-side parallelism
+
+Replicate the off-chip load. Use when the timing report shows the
+LinearOffChipLoad as the bottleneck and the broadcast operand is small
+enough that the par_factor× re-read cost is acceptable. Each consumer
+owns its own LinearOffChipLoad differing only by `start_tile_idx` and a
+par_factor× stride along the parallelized axis.
+
+### Worked example: GEMM, independent M-axis parallelism
+
+Sequential baseline:
+```python
+{gemm_seq_code}
+```
+
+Parallelized (independent M-axis):
+```python
+{gemm_par_indep_code}
+```
+
+Transforms applied:
+
+  1. `m_tiles_per = m_tiles // par_factor` partitions the outermost stream
+     dim. `par_factor` must divide `m_tiles`.
+  2. The single `offchip_load` for A becomes a Python `for`-loop emitting
+     `par_factor` separate loads. The stride along the parallelized axis
+     grows by `par_factor` (`k_tiles` → `par_factor * k_tiles`), and each
+     load's `start_tile_idx` is shifted by `i * k_tiles` (one M-tile row
+     in the original A's tile grid). All consumers share the *same*
+     underlying tensor object (`tensors["A"]`); only the address gen
+     differs.
+  3. B is broadcast across the M axis (M-stride is 0 already), so every
+     consumer's `offchip_load` for B is byte-identical. Each is a
+     *separate* IR `LinearOffChipLoad`, so HBM B-traffic is replicated by
+     `par_factor`. If B is large and HBM-bound, prefer source (2) or (3).
+  4. The consumer body (`flatten` + `binary_map_accum`) is identical to
+     the sequential version — it just runs `par_factor` times in the
+     lowered graph.
+
+---
+
+## Source (2) — On-chip Parallelize node
+
+A single upstream load with one Parallelize op fanning N consumers. Use
+when the timing report shows the *consumer-side* op as the bottleneck and
+the source has slack to keep N consumers fed. No HBM cost; the risk is
+that the Parallelize dispatcher is single-threaded — back-pressure from
+any one consumer stalls all of them. If the lowered graph shows the
+Parallelize op as the bottleneck after the change, escalate to source (3).
+
+### Variant 2a — Two-input zipped (element_wise_add)
+
+`parallelize` on each input load separately, then pair them up in a
+Python `for`-loop. Lockstep slicing means consumer `i` pairs A's i-th
+M-slice with B's i-th M-slice.
+
+Sequential:
+```python
+{element_wise_add_seq_code}
+```
+
+Parallelized:
+```python
+{element_wise_add_par_code}
+```
+
+Note the `flatten(min_rank=1, max_rank=2)` on each load — without it
+`parallelize` would slice the leading singleton dim and emit empty
+consumers.
+
+### Variant 2b — Reduction stays inside the consumer (vector_reduce_sum)
+
+A reduction along an *inner* stream dim is safe to keep inside each
+consumer's body — what's parallelized is the non-reduced axis. The
+stream-shape choreography is a little different because `accum_add`
+collapses a stream dim, so a `promote_outer` is needed before the store
+to restore `offchip_store`'s minimum-rank requirement.
+
+Sequential:
+```python
+{vector_reduce_sum_seq_code}
+```
+
+Parallelized:
+```python
+{vector_reduce_sum_par_code}
+```
+
+The full chain: `offchip_load (1, m_tiles, k_tiles) → flatten (m_tiles,
+k_tiles) → parallelize → [per consumer: (m_tiles/par, k_tiles) → accum_add
+(m_tiles/par,)] → static_reassemble (m_tiles,) → promote_outer (1,
+m_tiles) → offchip_store`.
+
+### Variant 2c — Deep compute chain (chained_unary)
+
+When the consumer body is a deep chain of compute ops, a single
+`parallelize` placed *before* the chain emits one IR Parallelize node
+feeding `par_factor` replicated chains. This is structurally simpler
+than threading `par_factor` parallelizations through each stage and
+amortizes the start-up latency of the pipeline once across `par_factor`
+parallel instances.
+
+Sequential:
+```python
+{chained_unary_seq_code}
+```
+
+Parallelized:
+```python
+{chained_unary_par_code}
+```
+
+### Variant 2d — GEMM M-axis SHARED (contrast with source (1))
+
+Same kernel, same axis as source (1)'s independent example — but the
+mechanism is different. One LinearOffChipLoad for A, one for B, plus a
+pair of `parallelize` calls. HBM traffic is unchanged from the sequential
+baseline. Use this in place of source (1) when the HBM cost of source
+(1)'s replicated B reads outweighs the dispatcher-stall risk of having a
+single Parallelize node.
+
+```python
+{gemm_par_shared_code}
+```
+
+---
+
+## Source (3) — Parallelize with per-branch bufferize/streamify
+
+When source (2)'s lowered graph shows the Parallelize op stalling (the
+classic sign: the dispatcher's `end` time tracks the slowest consumer's
+back-pressure rather than the upstream load's emission rate), insert a
+per-branch `bufferize → streamify` between `parallelize`'s output and
+the per-consumer body. The buffer absorbs back-pressure so the dispatcher
+can keep round-robin'ing tiles to the *other* consumers even when one
+branch is momentarily blocked.
+
+Two buffer depths to choose from:
+
+  - **(3b) Shallow** — `bufferize(rank=1)` over the innermost N-tile dim
+    only. The per-branch buffer holds exactly one M-tile-row's worth of
+    tiles. SRAM cost per branch is `n_tiles * tile_m * tile_n` bytes.
+    Decouples per-M-tile-row latency variance, which is usually enough
+    for SDPA-shape kernels where the row-max → subtract chain dominates
+    per-row variance.
+
+  - **(3a) Deep** — `promote_outer` + `bufferize(rank=2)` to absorb both
+    the M-tile and N-tile axes into a per-branch Buffer of shape
+    `(m_tiles_per, n_tiles)`. Total SRAM per branch grows by
+    `m_tiles_per×`, so the kernel footprint scales by `par_factor` times
+    that. Pays off only when shallow buffers still stall — typically
+    short-context or irregular-per-row workloads.
+
+### Worked example: sdpa_core_max, M-axis parallel
+
+This kernel computes `softmax_max(Q @ K^T) @ V`. The natural axis is M
+(every query row is independent). It already contains an *intra-kernel*
+bufferize on the QK^T → subtract path to delay the subtract until row_max
+is ready — that buffer is unrelated to the parallelize-side buffers we're
+adding here.
+
+Sequential baseline:
+```python
+{sdpa_core_max_seq_code}
+```
+
+#### (3b) Shallow per-branch buffer
+
+```python
+{sdpa_core_max_par_shallow_code}
+```
+
+The `_identity_replay(x, n_tiles)` helper is the canonical `bufferize +
+streamify` pair for shallow decoupling. It's placed immediately after
+each `parallelize` output (Q, K, V) and before any compute touches the
+stream — so the Parallelize dispatcher only sees the buffer's intake,
+which is sized to one M-tile-row.
+
+#### (3a) Deep per-branch buffer
+
+```python
+{sdpa_core_max_par_deep_code}
+```
+
+The `_deep_replay` helper uses `promote_outer` to lift the per-branch
+stream from 2-D to 3-D, then `bufferize(rank=2)` absorbs both stream
+dims into a single Buffer holding the entire per-consumer slice. A
+trailing `flatten` drops the singleton so the body sees the same
+2-D stream as the shallow variant.
+
+---
+
+## Picking a source
+
+| Bottleneck (per timing report)                       | Pick    |
+|------------------------------------------------------|---------|
+| A LinearOffChipLoad's `end` dominates total_cycles   | (1)     |
+| A compute op's `end` dominates, consumers are uniform | (2)    |
+| A Parallelize op's `end` dominates after applying (2) | (3)    |
+| (2) chosen and on-chip SRAM has headroom              | prefer (3b) over bare (2) defensively |
+
+---
+
+## Pitfalls
+
+  - **`parallelize` is not source (1).** DSL `parallelize(x, n)` lowers
+    to a single IR `Parallelize` op fed by one upstream — that's source
+    (2). For source (1) you write a Python `for`-loop of `offchip_load`
+    calls; there is no single DSL call that emits per-load fan-out.
+  - **`start_tile_idx` is in tile-grid units, not elements.** It indexes
+    the linearized tile grid of the underlying tensor (row-major over
+    the underlying's tile grid). Shifting by one M-tile row in a
+    `(m_tiles, k_tiles)` underlying means `start_tile_idx += k_tiles`,
+    not `+= tile_m * K`.
+  - **Stride along the parallelized axis must scale by `par_factor`.**
+    Forgetting this makes every source-(1) consumer read overlapping
+    ranges — the graph still type-checks, but the output is wrong by a
+    factor of `par_factor`.
+  - **Forgetting `flatten` on offchip_load's leading singleton.** Every
+    `offchip_load` adds a static-1 outermost stream dim. Without an
+    explicit `flatten(min_rank=k, max_rank=k+1)`, a `parallelize(x, n)`
+    will slice that singleton and emit `n-1` empty branches plus one
+    full branch. The IR translation will silently produce wrong output.
+  - **`static_reassemble` requires matching stream dtypes and
+    `dyn_mask`.** If consumers diverge (e.g. one feeds an extra op the
+    others skip), the merge will reject them.
+  - **`offchip_store` requires stream rank >= 1 (tensor ndim >= 4).**
+    If `accum_*` or `binary_map_accum` collapses a stream dim and you've
+    flattened away the leading singleton, the merged result has only
+    one stream dim; `promote_outer` before the store to add it back.
+  - **Static divisibility.** `par_factor` must divide the partitioned
+    axis's tile count exactly — the DSL doesn't currently emit padding
+    for parallel loads. Pick `par_factor` to be a clean factor.
+  - **Source (1) HBM duplication.** A `par_factor=8` independent split
+    of an op whose broadcast operand is the dominant traffic source
+    multiplies that traffic by 8. Watch the timing report's HBM
+    utilization, not just the consumer-op end times.
+  - **Source (2) dispatcher stall.** If the lowered graph's Parallelize
+    op `end` is the bottleneck after the change, the dispatcher is
+    serializing on the slowest consumer's back-pressure. Switch to (3).
+  - **Source (3) bufferize rank ceiling.** `bufferize.rank <= input
+    stream rank - 1`. To get a "deep" buffer that absorbs both axes,
+    `promote_outer` first to add an extra stream dim so the absorbed
+    rank can be one larger.

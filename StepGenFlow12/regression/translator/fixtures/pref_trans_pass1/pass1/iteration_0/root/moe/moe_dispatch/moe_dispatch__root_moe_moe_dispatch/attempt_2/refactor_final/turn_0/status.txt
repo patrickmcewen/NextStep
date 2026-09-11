@@ -1,0 +1,1 @@
+FAIL: AttributeError: 'StepTensor' object has no attribute 'reshape'. Did you mean: 'shape'?

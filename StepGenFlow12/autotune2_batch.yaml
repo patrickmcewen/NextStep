@@ -1,0 +1,47 @@
+# Batch config for run_autotune2_batch.py.
+#
+# Only args listed under autotune2_args are forwarded to run_autotune2.py.
+# Any run_autotune2.py arg omitted here uses run_autotune2.py's default.
+max_parallel: 2
+results_root: /workspace/autotune2_batch_results
+run_autotune2: /workspace/NextStep/StepGenFlow12/run_autotune2.py
+
+autotune2_args:
+  autotune_config: /workspace/NextStep/StepGenFlow12/autotune_configs.yaml
+  autotune_config_name: autotune_config_general
+
+jobs:
+  - label: prefill_transformer_fewshot_copy
+    outer_dir: /workspace/checkpoints/prefill_transformer_fewshot_copy/prefill_transformer_simple/outer_0
+    autotune2_args:
+      checkpoint_dir: /workspace/autotune2_batch_checkpoints/prefill_transformer_fewshot_copy
+
+  - label: prefill_transformer_working_contract
+    outer_dir: /workspace/checkpoints/prefill_transformer_working_contract/prefill_transformer_simple/outer_0
+    autotune2_args:
+      checkpoint_dir: /workspace/autotune2_batch_checkpoints/prefill_transformer_working_contract
+  
+  #- label: bart_deep
+  #  outer_dir: /workspace/checkpoints/bart_deep/kernelbench_bart_large/outer_0
+  #  autotune2_args:
+  #    checkpoint_dir: /workspace/autotune2_batch_checkpoints/bart_deep
+
+  - label: gpt2_deep
+    outer_dir: /workspace/checkpoints/gpt2_deep/kernelbench_gpt2/outer_0
+    autotune2_args:
+      checkpoint_dir: /workspace/autotune2_batch_checkpoints/gpt2_deep
+
+  - label: opt_1_deep
+    outer_dir: /workspace/checkpoints/opt_1_deep/kernelbench_opt_1p3b/outer_0
+    autotune2_args:
+      checkpoint_dir: /workspace/autotune2_batch_checkpoints/opt_1_deep
+
+  - label: opt1_latest
+    outer_dir: /workspace/checkpoints/opt1_latest/kernelbench_opt_1p3b/outer_0
+    autotune2_args:
+      checkpoint_dir: /workspace/autotune2_batch_checkpoints/opt1_latest
+  
+  - label: bart_latest
+    outer_dir: /workspace/checkpoints/bart_latest/kernelbench_bart_large/outer_0
+    autotune2_args:
+      checkpoint_dir: /workspace/autotune2_batch_checkpoints/bart_latest

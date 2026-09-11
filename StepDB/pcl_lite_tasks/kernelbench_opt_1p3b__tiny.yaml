@@ -1,0 +1,162 @@
+test_name: kernelbench_opt_1p3b__tiny
+# Derived from StepDB seed_kernels/kernelbench/level4/opt_1p3b (preset: tiny).
+# Preset values: B=2, T=8, V=32, P=16, D=16, L=2, H=2, I=32, D_head=8.
+# Mirrors the OPT-1.3b hand-roll in StepDB seed_kernels/kernelbench/level4/
+# opt_1p3b/reference.py:Model.forward (PRE-norm sub-blocks with
+# do_layer_norm_before=True, nn.Linear convention x @ W.T + b, relu
+# activation, single decoder-level final LayerNorm, tied LM head).
+#
+# Deviations from the StepDB reference:
+#   * Token-embedding + learned positional lookup (wte[input_ids] +
+#     wpe[positions + 2]) is precomputed as a single fp32 input ``x_in``
+#     of shape (B, T, D); PCL-lite has no integer dtype and no gather op.
+#   * The tied LM head weight materialises as a separate ``lm_head_w``
+#     input of shape (V, D) — same pattern as the gpt2 / bart_large ports
+#     in this directory.
+#   * The reference scales q by 1/sqrt(D_head) BEFORE the q @ k.T matmul
+#     (mirroring transformers' OPTAttention numerics, which keep
+#     ``q * scaling`` split from the matmul). This port preserves that
+#     order so gold matches the reference to float32 rounding.
+#
+# Per-layer weight banks are stacked along axis 0; matrix slices stay >=2-D
+# (matmul shape), vector slices use a (1, D) / (1, I) layout so they remain
+# >=2-D for StepDB's offchip_load. LayerNorm and relu are inlined inside
+# data_transform so the spec depends only on top-level torch ops.
+dims:
+  B: 2
+  T: 8
+  V: 32
+  D: 16
+  L: 2
+  H: 2
+  I: 32
+  D_head: 8
+
+inputs:
+  - name: x_in
+    dtype: fp32
+    dims: [D, T, B]
+    data_gen: torch.randn
+  - name: causal_mask
+    dtype: fp32
+    dims: [T, T]
+    data_gen: torch.randn
+  - name: self_attn_ln_w
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: self_attn_ln_b
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: w_q
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: w_k
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: w_v
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: w_out
+    dtype: fp32
+    dims: [D, D, L]
+    data_gen: torch.randn
+  - name: b_q
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: b_k
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: b_v
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: b_out
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: final_ln_w
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: final_ln_b
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: w_fc1
+    dtype: fp32
+    dims: [D, I, L]
+    data_gen: torch.randn
+  - name: b_fc1
+    dtype: fp32
+    dims: [I, 1, L]
+    data_gen: torch.randn
+  - name: w_fc2
+    dtype: fp32
+    dims: [I, D, L]
+    data_gen: torch.randn
+  - name: b_fc2
+    dtype: fp32
+    dims: [D, 1, L]
+    data_gen: torch.randn
+  - name: decoder_ln_w
+    dtype: fp32
+    dims: [D, 1]
+    data_gen: torch.randn
+  - name: decoder_ln_b
+    dtype: fp32
+    dims: [D, 1]
+    data_gen: torch.randn
+  - name: lm_head_w
+    dtype: fp32
+    dims: [D, V]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [V, T, B]
+    data_transform:
+      - |
+        B_dim = B_value
+        T_dim = T_value
+        D_dim = D_value
+        L_dim = L_value
+        H_dim = H_value
+        Dh = D_head_value
+        inv_sqrt_dh = 1.0 / (Dh ** 0.5)
+        def _ln(t, w, b, eps=1e-5):
+            mean = t.mean(dim=-1, keepdim=True)
+            var = t.var(dim=-1, keepdim=True, unbiased=False)
+            return (t - mean) * torch.rsqrt(var + eps) * w.squeeze(0) + b.squeeze(0)
+        x = input_data['x_in']
+        mask = input_data['causal_mask']
+        for layer in range(L_dim):
+            residual = x
+            h = _ln(x, input_data['self_attn_ln_w'][layer], input_data['self_attn_ln_b'][layer])
+            q = (h @ input_data['w_q'][layer].T + input_data['b_q'][layer]) * inv_sqrt_dh
+            k = h @ input_data['w_k'][layer].T + input_data['b_k'][layer]
+            v = h @ input_data['w_v'][layer].T + input_data['b_v'][layer]
+            q = q.view(B_dim, T_dim, H_dim, Dh).transpose(1, 2)
+            k = k.view(B_dim, T_dim, H_dim, Dh).transpose(1, 2)
+            v = v.view(B_dim, T_dim, H_dim, Dh).transpose(1, 2)
+            scores = q @ k.transpose(-2, -1)
+            scores = scores + mask
+            attn = torch.softmax(scores, dim=-1)
+            ctx = (attn @ v).transpose(1, 2).contiguous().view(B_dim, T_dim, D_dim)
+            ctx = ctx @ input_data['w_out'][layer].T + input_data['b_out'][layer]
+            x = residual + ctx
+            residual = x
+            h = _ln(x, input_data['final_ln_w'][layer], input_data['final_ln_b'][layer])
+            h = h @ input_data['w_fc1'][layer].T + input_data['b_fc1'][layer]
+            h = torch.relu(h)
+            h = h @ input_data['w_fc2'][layer].T + input_data['b_fc2'][layer]
+            x = residual + h
+        x = _ln(x, input_data['decoder_ln_w'], input_data['decoder_ln_b'])
+        x @ input_data['lm_head_w'].T

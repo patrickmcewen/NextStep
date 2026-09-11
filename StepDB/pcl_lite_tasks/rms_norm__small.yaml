@@ -1,0 +1,26 @@
+test_name: rms_norm__small
+# Derived from StepDB seed_kernels/normalization/rms_norm (preset: small).
+# Preset values come from StepDB/bench_config.yaml; gold from
+# seed_kernels/normalization/rms_norm/reference.py:compute_gold.
+# eps is baked into the gold expression as a literal (StepDB threads it
+# through tensors['eps'] but the simulator doesn't support scalar inputs).
+dims:
+  M: 32
+  K: 64
+  tile_m: 16
+  tile_k: 64
+
+inputs:
+  - name: input
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+      - |
+        norm = input_data['input'].pow(2).mean(dim=-1, keepdim=True)
+        input_data['input'] * torch.rsqrt(norm + 1e-6)

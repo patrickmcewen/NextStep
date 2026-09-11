@@ -1,0 +1,54 @@
+## Node: {node_name}
+
+You are tuning node ``{node_name}``. The baseline source below is verified
+correct against the PyTorch reference; your goal is to **minimize cycle
+latency while staying within the on-chip memory budget**.
+
+### Required function signature
+
+```python
+{function_signature}
+```
+
+### PyTorch reference (semantics)
+
+```python
+{pytorch_reference}
+```
+
+### Dimensions
+
+{dims_block}
+
+### Tensors
+
+{tensors_block}
+
+### Verified baseline source
+
+```python
+{baseline_dsl}
+```
+{variant_section}{accepted_section}{budget_section}
+### Your task
+
+Propose a DSL implementation that:
+
+  - Is functionally equivalent to the PyTorch reference (gold-checked).
+  - **Minimizes cycles** subject to the on-chip memory budget above.
+    Look for opportunities to add or restructure parallelism using the
+    recipe in the system prompt — shared parallelism (``parallelize`` +
+    ``static_reassemble``) when the consumer is the bottleneck and the
+    source has slack, independent parallelism (per-consumer
+    ``offchip_load`` with ``start_tile_idx``) when the source itself
+    is the bottleneck. Account for the extra on-chip footprint that
+    replicated consumers / broadcast operands introduce so the variant
+    still fits the budget.
+  - Differs structurally from the pass-1 design and from any
+    already-accepted variants{accepted_hint}.
+  - Declares the boundary contracts your design exposes to the parent.{parent_hint}
+  - Emits only the standalone function for this node using the required
+    signature above. Do not emit composed code, child implementations, or a
+    ``tiled_reference`` wrapper; use those only as context.
+
+Emit your YAML + python blocks per the output protocol.

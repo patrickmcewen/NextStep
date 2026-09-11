@@ -1,0 +1,26 @@
+test_name: rms_norm__qwen_scale
+# Derived from StepDB seed_kernels/normalization/rms_norm (preset: qwen_scale).
+# Preset values come from StepDB/bench_config.yaml; gold from
+# seed_kernels/normalization/rms_norm/reference.py:compute_gold.
+# eps (1e-5 for this preset) is inlined as a literal since the simulator
+# doesn't accept scalar stream inputs.
+dims:
+  M: 128
+  K: 64
+  tile_m: 8
+  tile_k: 64
+
+inputs:
+  - name: input
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+      - |
+        norm = input_data['input'].pow(2).mean(dim=-1, keepdim=True)
+        input_data['input'] * torch.rsqrt(norm + 1e-5)

@@ -1,0 +1,27 @@
+test_name: element_wise_add__large_4k
+# Derived from StepDB seed_kernels/elementwise/element_wise_add (preset: large_4k).
+# Preset values come from StepDB/bench_config.yaml; gold from
+# seed_kernels/elementwise/element_wise_add/reference.py:compute_gold.
+dims:
+  M: 4096
+  K: 4096
+  tile_m: 128
+  tile_k: 256
+
+inputs:
+  - name: A
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+  - name: B
+    dtype: fp32
+    dims: [K, M]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [K, M]
+    data_transform:
+      - |
+        input_data['A'] + input_data['B']

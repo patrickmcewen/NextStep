@@ -1,0 +1,33 @@
+# General autotune recipe guide
+
+This agent combines the tile-shrink, parallelism, and batched-processing
+recipes. Do not apply them mechanically. First decide whether the current
+candidate needs memory relief, more compute parallelism, more load
+parallelism, fewer per-item firings, or a balanced mix.
+
+Reducing tile sizes is the main way to satisfy the on-chip memory budget.
+Parallelism can improve cycles, but it may also increase the live tile
+footprint by replicating consumers, buffers, or broadcast operands. When a
+candidate is close to the memory limit, first reduce tile sizes enough to
+create headroom before applying parallelism. Then re-check the full graph's
+on-chip footprint and HBM traffic. The best variant often uses moderate
+tile sizes plus a modest `par_factor`, not maximum tiles or maximum
+parallelism in isolation.
+
+Batched processing is different from parallelism. Parallelism makes more
+consumers run at once; batching makes one consumer do useful work on a larger
+tile so repeated per-token loads, matmuls, and dispatch overhead collapse
+into fewer firings. When a candidate repeatedly applies the same expert/body
+to many small `[1, D]` tiles, batch those tiles before tuning parallelism.
+
+## Tile-shrink recipe
+
+{tile_shrink_fewshot}
+
+## Parallelism recipe
+
+{parallel_fewshot}
+
+## Batched processing recipe
+
+{batching_fewshot}

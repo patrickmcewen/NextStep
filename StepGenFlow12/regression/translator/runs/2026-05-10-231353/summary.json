@@ -1,0 +1,40 @@
+{
+  "results": [
+    {
+      "fixture": "pref_trans0",
+      "kernel": "prefill_transformer_simple",
+      "preset": "small",
+      "status": "fail",
+      "exit_code": 1,
+      "duration_s": 10.8,
+      "log": "regression/translator/runs/2026-05-10-231353/pref_trans0/run.log"
+    },
+    {
+      "fixture": "pref_trans1",
+      "kernel": "prefill_transformer_simple",
+      "preset": "small",
+      "status": "fail",
+      "exit_code": 1,
+      "duration_s": 10.0,
+      "log": "regression/translator/runs/2026-05-10-231353/pref_trans1/run.log"
+    },
+    {
+      "fixture": "pref_trans_pass0",
+      "kernel": "prefill_transformer_simple",
+      "preset": "small",
+      "status": "pass",
+      "exit_code": 0,
+      "duration_s": 10.8,
+      "log": "regression/translator/runs/2026-05-10-231353/pref_trans_pass0/run.log"
+    },
+    {
+      "fixture": "prefill_transformer_simple__small__rope_lists",
+      "kernel": "prefill_transformer_simple",
+      "preset": "small",
+      "status": "fail",
+      "exit_code": 1,
+      "duration_s": 9.6,
+      "log": "regression/translator/runs/2026-05-10-231353/prefill_transformer_simple__small__rope_lists/run.log"
+    }
+  ]
+}

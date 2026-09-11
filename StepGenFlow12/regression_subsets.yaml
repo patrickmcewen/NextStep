@@ -1,0 +1,66 @@
+# Named groups for `python run_regression.py --subset <NAME>`.
+# Each group is a kernel -> preset mapping. A preset value may be a single
+# string or a list of preset names.
+
+quick_smoke:
+  silu_activation: small
+  chained_unary: small
+  vector_reduce_sum: small
+
+simple_benchmarks:
+  silu_activation: small
+  chained_unary: small
+  element_wise_add: small
+  copy_2d: small
+  vector_reduce_sum: small
+  broadcast_diamond: small
+  rms_norm: small
+  layernorm: small
+
+transformer_subparts:
+  gemm: large_4k
+  rope: qwen_b64
+  rms_norm: qwen_scale
+  sdpa_core_max: long_ctx_512
+  gated_mlp: qwen_16x
+  moe_routed: large_d1k
+  basic_prefill_attention: small
+  prefill_transformer_simple: small
+
+just_the_subparts:
+  rms_norm: qwen_scale
+  qkv_projection: qwen_scale
+  rope: qwen_b64
+  sdpa_core_max: long_ctx_512
+  moe_routed: large_d1k
+
+moe_routed_mlp:
+  moe_routed: large_d1k
+  gated_mlp: qwen_16x
+
+toughies:
+  basic_prefill_attention: small
+  prefill_transformer_simple: small
+
+end_to_end_subparts:
+  gqa_decode_e2e: mixtral_b32_ctx512
+  qkv_gen: mixtral_b64
+  kv_cache_tile_append: mixtral_b64
+  moe_routed: large_d1k
+
+full_bench_set:
+  element_wise_add: large_4k
+  gemm: large_4k
+  rope: qwen_b64
+  rms_norm: qwen_scale
+  sdpa_core_max: long_ctx_512
+  gated_mlp: qwen_16x
+  moe_routed: large_d1k
+  basic_prefill_attention: small
+  prefill_transformer_simple: small
+  kernelbench_mlp: hidden_1k
+  kernelbench_gpt2: deep
+  kernelbench_bart_large: deep
+  kernelbench_opt_1p3b: deep
+  end_to_end: mixtral_small_b64
+

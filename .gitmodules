@@ -1,3 +1,18 @@
 [submodule "step_tl"]
 	path = step_tl
 	url = https://github.com/stanford-ppl/step_tl.git
+[submodule "elasticy"]
+	path = elasticy
+	url = https://github.com/const-antin/elasticy.git
+[submodule "PCL-lite"]
+	path = PCL-lite
+	url = https://github.com/patrickmcewen/PCL-lite.git
+[submodule "openevolve"]
+	path = openevolve
+	url = https://github.com/algorithmicsuperintelligence/openevolve.git
+[submodule "hwsim"]
+	path = hwsim
+	url = https://github.com/stanford-ppl/hwsim.git
+[submodule "ace-agent"]
+	path = ace-agent
+	url = https://github.com/ace-agent/ace.git

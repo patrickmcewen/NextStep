@@ -1,0 +1,450 @@
+import torch
+import torch.nn as nn
+from src.blackbox_stub import make_stub, ContractRecorder
+from src.node_signature import (
+    IntArg,
+    ListOfIntArg,
+    ListOfTensorArg,
+    TensorArg,
+)
+
+
+def _tensor_specs(*shapes):
+    return tuple(TensorArg(shape=s) for s in shapes)
+
+
+class _Add(nn.Module):
+    def forward(self, a, b):
+        return a + b
+
+
+class _SplitQKV(nn.Module):
+    """Returns a 3-tuple — used to verify multi-output stub semantics."""
+    def forward(self, x):
+        # Treat last dim as 3*head_dim and split.
+        h = x.shape[-1] // 3
+        return x[..., :h], x[..., h:2 * h], x[..., 2 * h:]
+
+
+def test_stub_preserves_reference_semantics():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((1, 4, 8), (1, 4, 8)),
+        recorder=rec,
+    )
+    a = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8)
+    b = torch.ones(1, 4, 8) * 10
+    out = stub(a, b, out_shapes=((1, 4, 8),))
+    assert torch.equal(out, a + b)
+
+
+def test_stub_handles_tile_input_via_flatten_reshape():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a_vanilla = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    b_vanilla = torch.ones(4, 8) * 10
+    a_tiled = a_vanilla.reshape(2, 2, 4, 2)
+    b_tiled = b_vanilla.reshape(2, 2, 4, 2)
+    out = stub(a_tiled, b_tiled, out_shapes=((2, 2, 4, 2),))
+    expected = (a_vanilla + b_vanilla).reshape(2, 2, 4, 2)
+    assert torch.equal(out, expected)
+
+
+def test_recorder_captures_contract_on_first_call():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a = torch.randn(2, 2, 4, 2)
+    b = torch.randn(2, 2, 4, 2)
+    stub(a, b, out_shapes=((2, 2, 4, 2),))
+    contract = rec.contract
+    assert contract is not None
+    assert contract.arg_names == ("a", "b")
+    assert contract.tiled_shapes == ((2, 2, 4, 2), (2, 2, 4, 2))
+    assert torch.equal(contract.tiled_values[0], a)
+    assert contract.out_shapes == ((2, 2, 4, 2),)
+
+
+def test_recorder_only_captures_first_call():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a = torch.randn(2, 2, 4, 2)
+    b = torch.randn(2, 2, 4, 2)
+    stub(a, b, out_shapes=((2, 2, 4, 2),))
+    a2 = torch.randn(2, 2, 4, 2)
+    stub(a2, b, out_shapes=((2, 2, 4, 2),))
+    assert torch.equal(rec.contract.tiled_values[0], a)   # first call's value
+
+
+def test_stub_rejects_reinvocation_with_mismatched_input_tile_shape():
+    """A stub called again with a different input tile-stream shape must
+    fail loudly: the recorded contract only covers the first call's
+    shape, so the child's pass-1 is only validated against that shape.
+    A silent re-invocation with a different tile shape lets the bug
+    surface only at pass-2 (composed DSL) — too late.
+
+    This is the kernelbench_opt_1p3b bug: ``tiled_reference``'s loop
+    chains ``x = attention_block(x, ...)``; the iter-0 stub call sees
+    x with tile shape ``(1, B, T, 1, D)`` and declares ``out_shapes=
+    ((B, T, D),)``, so iter-1 hands x back with tile shape ``(B, T, D)``
+    which doesn't match the contract.
+    """
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a_iter0 = torch.randn(2, 2, 4, 2)        # tile-stream layout #1
+    b_iter0 = torch.randn(2, 2, 4, 2)
+    stub(a_iter0, b_iter0, out_shapes=((2, 2, 4, 2),))
+    a_iter1 = torch.randn(1, 4, 4, 2)        # same elem count, different tile shape
+    b_iter1 = torch.randn(2, 2, 4, 2)
+    try:
+        stub(a_iter1, b_iter1, out_shapes=((2, 2, 4, 2),))
+        raised = False
+    except AssertionError as e:
+        raised = True
+        msg = str(e)
+    assert raised, "stub must reject re-invocation with mismatched input tile shape"
+    assert "tiled" in msg and "a" in msg, (
+        f"error must point at the mismatched arg by name and mention tile "
+        f"shape; got: {msg!r}")
+
+
+def test_stub_rejects_reinvocation_with_mismatched_out_shapes():
+    """A stub called again with different ``out_shapes`` must fail —
+    the child only emits code for the first call's declared output
+    shape; a second call with a different shape would have no kernel
+    behind it.
+    """
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a = torch.randn(2, 2, 4, 2)
+    b = torch.randn(2, 2, 4, 2)
+    stub(a, b, out_shapes=((2, 2, 4, 2),))
+    try:
+        stub(a, b, out_shapes=((1, 4, 4, 2),))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised, "stub must reject re-invocation with mismatched out_shapes"
+
+
+def test_stub_returns_tuple_for_multi_output_ref():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_SplitQKV(),
+        arg_names=("x",),
+        arg_specs=_tensor_specs((1, 4, 24)),
+        recorder=rec,
+    )
+    x = torch.arange(96, dtype=torch.float32).reshape(1, 4, 24)
+    q, k, v = stub(x, out_shapes=((1, 4, 8), (1, 4, 8), (1, 4, 8)))
+    assert torch.equal(q, x[..., :8])
+    assert torch.equal(k, x[..., 8:16])
+    assert torch.equal(v, x[..., 16:24])
+    assert rec.contract.out_shapes == ((1, 4, 8), (1, 4, 8), (1, 4, 8))
+
+
+def test_stub_rejects_output_count_mismatch():
+    """Asking for 2 outputs from a 3-output ref must fail loudly."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_SplitQKV(),
+        arg_names=("x",),
+        arg_specs=_tensor_specs((1, 4, 24)),
+        recorder=rec,
+    )
+    x = torch.randn(1, 4, 24)
+    try:
+        stub(x, out_shapes=((1, 4, 8), (1, 4, 8)))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised
+
+
+def test_recorder_captures_tiled_outputs_single():
+    """Single-output ref: ``out_is_tuple=False``, ``tiled_outputs`` is a
+    1-tuple parallel to ``out_shapes`` and matches the stub return value."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a_vanilla = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    b_vanilla = torch.ones(4, 8) * 10
+    a_tiled = a_vanilla.reshape(2, 2, 4, 2)
+    b_tiled = b_vanilla.reshape(2, 2, 4, 2)
+    out = stub(a_tiled, b_tiled, out_shapes=((2, 2, 4, 2),))
+    contract = rec.contract
+    assert contract.out_is_tuple is False
+    assert len(contract.tiled_outputs) == 1
+    assert torch.equal(contract.tiled_outputs[0], out)
+
+
+def test_recorder_captures_tiled_outputs_tuple():
+    """Tuple-output ref: ``out_is_tuple=True``, ``tiled_outputs`` parallel
+    to ``out_shapes`` and matches each stub output element."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_SplitQKV(),
+        arg_names=("x",),
+        arg_specs=_tensor_specs((1, 4, 24)),
+        recorder=rec,
+    )
+    x = torch.arange(96, dtype=torch.float32).reshape(1, 4, 24)
+    q, k, v = stub(x, out_shapes=((1, 4, 8), (1, 4, 8), (1, 4, 8)))
+    contract = rec.contract
+    assert contract.out_is_tuple is True
+    assert len(contract.tiled_outputs) == 3
+    assert torch.equal(contract.tiled_outputs[0], q)
+    assert torch.equal(contract.tiled_outputs[1], k)
+    assert torch.equal(contract.tiled_outputs[2], v)
+
+
+# ---------------------------------------------------------------------------
+# List-typed child args (per-expert weight stacks, per-batch seq lengths)
+# ---------------------------------------------------------------------------
+
+class _MoEExpertSum(nn.Module):
+    """Reference for a child that takes ``list[Tensor]`` per-expert weights."""
+    def forward(self, x, w_list):
+        out = torch.zeros_like(x)
+        for w in w_list:
+            out = out + x @ w @ w.T
+        return out
+
+
+def test_stub_passes_list_of_tensor_through_unchanged():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MoEExpertSum(),
+        arg_names=("x", "w_list"),
+        arg_specs=(
+            TensorArg(shape=(1, 4, 8)),
+            ListOfTensorArg(length=3, elem_shape=(8, 8)),
+        ),
+        recorder=rec,
+    )
+    x = torch.randn(1, 4, 8)
+    w_list = [torch.randn(8, 8) for _ in range(3)]
+    out = stub(x, w_list, out_shapes=((1, 4, 8),))
+    expected = torch.zeros_like(x)
+    for w in w_list:
+        expected = expected + x @ w @ w.T
+    assert torch.equal(out, expected)
+
+
+def test_recorder_captures_list_of_tensor_contract():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MoEExpertSum(),
+        arg_names=("x", "w_list"),
+        arg_specs=(
+            TensorArg(shape=(1, 4, 8)),
+            ListOfTensorArg(length=3, elem_shape=(8, 8)),
+        ),
+        recorder=rec,
+    )
+    x = torch.randn(1, 4, 8)
+    w_list = [torch.randn(8, 8) for _ in range(3)]
+    stub(x, w_list, out_shapes=((1, 4, 8),))
+
+    contract = rec.contract
+    assert contract.arg_names == ("x", "w_list")
+    # vanilla/tiled shape entries are () for list args; spec carries the info.
+    assert contract.vanilla_shapes == ((1, 4, 8), ())
+    assert contract.tiled_shapes == ((1, 4, 8), ())
+    assert contract.arg_specs == (
+        TensorArg(shape=(1, 4, 8)),
+        ListOfTensorArg(length=3, elem_shape=(8, 8)),
+    )
+    # tiled_values mirrors the heterogeneous arg kinds.
+    assert isinstance(contract.tiled_values[0], torch.Tensor)
+    assert isinstance(contract.tiled_values[1], list)
+    assert len(contract.tiled_values[1]) == 3
+    for recorded, original in zip(contract.tiled_values[1], w_list):
+        assert torch.equal(recorded, original)
+
+
+class _RaggedScatter(nn.Module):
+    """Reference for a child that takes ``list[int]`` per-row sequence lengths."""
+    def forward(self, x, num_token_list):
+        out = torch.zeros_like(x)
+        for i in range(x.shape[0]):
+            n = num_token_list[i]
+            out[i, :n] = x[i, :n] * 2.0
+        return out
+
+
+def test_stub_passes_list_of_int_through_unchanged():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_RaggedScatter(),
+        arg_names=("x", "num_token_list"),
+        arg_specs=(
+            TensorArg(shape=(4, 8)),
+            ListOfIntArg(length=4),
+        ),
+        recorder=rec,
+    )
+    x = torch.randn(4, 8)
+    num_token_list = [2, 5, 3, 7]
+    out = stub(x.reshape(2, 2, 4, 2), num_token_list,
+               out_shapes=((2, 2, 4, 2),))
+
+    contract = rec.contract
+    assert contract.arg_specs[1] == ListOfIntArg(length=4)
+    assert contract.tiled_values[1] == [2, 5, 3, 7]
+    # tiled_values for the int list is a fresh copy, not the same reference.
+    assert contract.tiled_values[1] is not num_token_list
+
+
+class _MultiHeadView(nn.Module):
+    """Mirrors the planner-emitted ``attention_layer`` shape — takes a Python
+    int (head count) alongside a tensor and uses it for shape math only."""
+    def forward(self, x, n_head):
+        B, T, D = x.shape
+        D_head = D // n_head
+        return x.view(B, T, n_head, D_head).sum(dim=2)
+
+
+def test_stub_passes_int_arg_through_unchanged():
+    """IntArg values flow through the stub as a Python int, and the contract
+    records them with `()` vanilla/tiled shape — the fix that unblocks the
+    transformer-kernel pass-1 wrap crash."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MultiHeadView(),
+        arg_names=("x", "n_head"),
+        arg_specs=(TensorArg(shape=(2, 4, 12)), IntArg()),
+        recorder=rec,
+    )
+    x = torch.randn(2, 4, 12)
+    out = stub(x.reshape(1, 2, 4, 12), 4, out_shapes=((1, 2, 4, 3),))
+    assert out.shape == (1, 2, 4, 3)
+
+    contract = rec.contract
+    assert contract.arg_specs == (TensorArg(shape=(2, 4, 12)), IntArg())
+    assert contract.vanilla_shapes == ((2, 4, 12), ())
+    assert contract.tiled_shapes == ((1, 2, 4, 12), ())
+    assert contract.tiled_values[1] == 4
+    assert isinstance(contract.tiled_values[1], int)
+
+
+def test_stub_rejects_tensor_for_int_arg():
+    """A parent that passes a Tensor where IntArg was declared fails loud at
+    the stub boundary — catches a planner contract regression early."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MultiHeadView(),
+        arg_names=("x", "n_head"),
+        arg_specs=(TensorArg(shape=(2, 4, 12)), IntArg()),
+        recorder=rec,
+    )
+    x = torch.randn(1, 2, 4, 12)
+    try:
+        stub(x, torch.tensor(4), out_shapes=((1, 2, 4, 3),))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised
+
+
+def test_stub_rejects_non_tensor_for_tensor_arg():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+    )
+    a = torch.randn(4, 8)
+    bad_b = [torch.randn(4, 8)]   # parent passed a list where a tensor was declared
+    try:
+        stub(a, bad_b, out_shapes=((4, 8),))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised
+
+
+def test_stub_rejects_wrong_length_list():
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_MoEExpertSum(),
+        arg_names=("x", "w_list"),
+        arg_specs=(
+            TensorArg(shape=(1, 4, 8)),
+            ListOfTensorArg(length=3, elem_shape=(8, 8)),
+        ),
+        recorder=rec,
+    )
+    x = torch.randn(1, 4, 8)
+    w_list_short = [torch.randn(8, 8) for _ in range(2)]   # declared 3, got 2
+    try:
+        stub(x, w_list_short, out_shapes=((1, 4, 8),))
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised
+
+
+def test_make_stub_propagates_max_tile_to_contract():
+    """The contract recorded by the stub carries the ``max_tile`` bound from
+    ``make_stub``, and oversize out_shapes are rejected at record time."""
+    rec = ContractRecorder()
+    stub = make_stub(
+        ref_module=_Add(),
+        arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec,
+        max_tile=4,
+    )
+    a = torch.randn(2, 2, 4, 2)   # tile (4, 2) — within max_tile=4
+    b = torch.randn(2, 2, 4, 2)
+    stub(a, b, out_shapes=((2, 2, 4, 2),))
+    assert rec.contract is not None
+    assert rec.contract.max_tile == 4
+    # Re-running stub with an oversize out_shape requested would fail at
+    # Contract construction; bypass the recorder-first-call cache by using
+    # a fresh recorder.
+    rec2 = ContractRecorder()
+    stub2 = make_stub(
+        ref_module=_Add(), arg_names=("a", "b"),
+        arg_specs=_tensor_specs((4, 8), (4, 8)),
+        recorder=rec2, max_tile=2,
+    )
+    raised = False
+    try:
+        stub2(a, b, out_shapes=((2, 2, 4, 2),))   # tile (4, 2) > max_tile=2
+    except AssertionError as e:
+        raised = True
+        assert "max_tile=2" in str(e), str(e)
+    assert raised

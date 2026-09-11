@@ -7,6 +7,7 @@ Usage:
     python validate_functional.py --all               # all seed kernels, every preset
 """
 import argparse
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,9 @@ STEP_TL_PROTO = str(Path(__file__).resolve().parent.parent / "step_tl" / "src" /
 
 sys.path.insert(0, STEP_TL_SRC)
 sys.path.insert(0, STEP_TL_PROTO)
+sys.path.insert(0, STEPDB_DIR)
+
+from precompute import precompute_tensors
 
 # Imports prepended to step_impl code (mirrors validate_timing.py)
 IMPORT_SCAFFOLD = """\
@@ -131,7 +135,12 @@ def build_graph_from_impl(kernel_name, dims, config):
     namespace = {}
     exec(full_code, namespace)
     assert "build_graph" in namespace, f"build_graph not found in {impl_path}"
-    graph, output_op = namespace["build_graph"](dims)
+    build_graph_fn = namespace["build_graph"]
+    if "tensors" in inspect.signature(build_graph_fn).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        graph, output_op = build_graph_fn(dims, tensors)
+    else:
+        graph, output_op = build_graph_fn(dims)
     return graph, output_op
 
 
@@ -144,12 +153,16 @@ def run_reference(kernel_name, dims, config):
     namespace = {}
     exec(ref_code, namespace)
     assert "compute_gold" in namespace, f"compute_gold not found in {ref_path}"
-    return namespace["compute_gold"](dims)
+    compute_gold = namespace["compute_gold"]
+    if "tensors" in inspect.signature(compute_gold).parameters:
+        tensors = precompute_tensors(kernel_name, dims)
+        return compute_gold(dims, tensors)
+    return compute_gold(dims)
 
 
 def run_functional_sim(graph, output_op):
     """Run the functional simulation and return the output tensor."""
-    from step_py.functional import execute
+    from timing_and_emulator.functional import execute
     return execute(graph, output_op)
 
 
@@ -168,13 +181,23 @@ def validate_kernel(kernel_name, preset, config):
     gold = run_reference(kernel_name, dims, config)
     sim = run_functional_sim(graph2, output_op2)
 
-    # Compare
-    assert gold.shape == sim.shape, (
-        f"Shape mismatch: gold {gold.shape} vs sim {sim.shape}"
+    # Compare by element count first — graph rank/layout often differs from
+    # the PyTorch reference (e.g. (S, D) gold vs (S*D, 1) sim after a flatten),
+    # but a numel match is enough to do an elementwise correctness check.
+    assert gold.numel() == sim.numel(), (
+        f"Numel mismatch: gold {tuple(gold.shape)} (numel={gold.numel()}) "
+        f"vs sim {tuple(sim.shape)} (numel={sim.numel()})"
     )
+    if gold.shape != sim.shape:
+        print(
+            f"    [shape-reconciled] gold {tuple(gold.shape)} vs "
+            f"sim {tuple(sim.shape)} — comparing flattened"
+        )
 
-    max_err = (gold - sim).abs().max().item()
-    gold_scale = gold.abs().max().item() + 1e-12
+    gold_flat = gold.reshape(-1)
+    sim_flat = sim.reshape(-1)
+    max_err = (gold_flat - sim_flat).abs().max().item()
+    gold_scale = gold_flat.abs().max().item() + 1e-12
     rel_err = max_err / gold_scale
 
     # Float32 matmul accumulation introduces errors proportional to dimension

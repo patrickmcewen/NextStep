@@ -31,7 +31,7 @@ def build_graph(dims):
     )
 
     buff = Bufferize(step_graph, load, 1)
-    stream = Streamify(step_graph, buff, [], 1)
+    stream = Streamify(step_graph, buff, stride=[1], out_shape_tiled=[K // tile_k])
 
     output = OffChipStore(
         graph=step_graph,

@@ -1,0 +1,26 @@
+## Output protocol (leaf node)
+
+Your response MUST contain two fenced blocks in order: a ``yaml`` block
+declaring the boundary contracts this node consumes, followed by a
+``python`` block with the DSL function. Surrounding prose is ignored.
+
+```yaml
+parent_input_contracts:        # on-chip inputs only; empty mapping if none
+  Q: {reshape: [8, 8, 64], permutation: [1, 0, 2]}
+```
+
+```python
+def <node_name>(<args>, *, out_shapes):
+    ...
+```
+
+A contract is ``{reshape: <shape>, permutation: [...]}`` applied to the
+vanilla PyTorch tensor (`x_in = x_vanilla.reshape(reshape).permute(*permutation)`).
+RAW args have no input contract (they always arrive vanilla). Identity
+contracts (``reshape == vanilla_shape`` with identity permutation) mean
+"no rearrangement".
+
+Note: output contracts are NOT declared. The autotuner derives them
+mechanically from the built graph after your DSL passes the graph-build
+smoke test — the actual stream + tile shape of each output is read off
+the live IR and recorded automatically.

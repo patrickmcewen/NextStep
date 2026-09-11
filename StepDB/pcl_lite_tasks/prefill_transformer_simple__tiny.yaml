@@ -1,0 +1,132 @@
+test_name: prefill_transformer_simple__tiny
+# Derived from StepDB seed_kernels/transformer_layer/prefill_transformer_simple
+# (preset: tiny, model_name=mixtral, is_small=true, seq_len=8).
+# Model config (from end_to_end.model_configs:SmallerMixtral8x7B):
+#   hidden_dim=512, head_dim=32, num_heads=16, num_kv_heads=4,
+#   query_per_kvhead=4, dim=512, moe_inter_dim=1792,
+#   n_routed_experts=8, n_activated_experts=2.
+# Full single-decoder pipeline:
+#   RMSNorm -> QKV + QK-RMSNorm + RoPE -> GQA full-seq attention
+#       (max-subtraction softmax) -> O-proj -> ResAdd -> RMSNorm
+#       -> Routed top-k MoE -> ResAdd.
+# Per-expert weight banks (w_gate/w_up/w_down) are stacked along axis 0.
+# Routing is given as precomputed inputs: `expert_onehot` is a
+# Multihot(fp32, n_routed_experts) stream (loadable via step.SelectGen)
+# encoding which expert each (token, top-k slot) targets, and
+# `expert_weights` is the matching fp32 stream of softmax weights. Gold
+# mirrors seed_kernels/transformer_layer/prefill_transformer_simple/
+# reference.py with routing decoded from expert_onehot in-place.
+dims:
+  seq_len: 8
+  hidden_dim: 512
+  head_dim: 32
+  num_heads: 16
+  num_kv_heads: 4
+  query_per_kvhead: 4
+  num_heads_head_dim: 512
+  num_kv_heads_head_dim: 128
+  dim: 512
+  moe_inter_dim: 1792
+  n_routed_experts: 8
+  n_activated_experts: 2
+
+inputs:
+  - name: input_tensor
+    dtype: fp32
+    dims: [hidden_dim, seq_len]
+    data_gen: torch.randn
+  - name: q_proj
+    dtype: fp32
+    dims: [num_heads_head_dim, hidden_dim]
+    data_gen: torch.randn
+  - name: k_proj
+    dtype: fp32
+    dims: [num_kv_heads_head_dim, hidden_dim]
+    data_gen: torch.randn
+  - name: v_proj
+    dtype: fp32
+    dims: [num_kv_heads_head_dim, hidden_dim]
+    data_gen: torch.randn
+  - name: cos
+    dtype: fp32
+    dims: [head_dim, 1, seq_len]
+    data_gen: torch.randn
+  - name: sin
+    dtype: fp32
+    dims: [head_dim, 1, seq_len]
+    data_gen: torch.randn
+  - name: o_proj_weight
+    dtype: fp32
+    dims: [hidden_dim, num_heads_head_dim]
+    data_gen: torch.randn
+  - name: w_gate
+    dtype: fp32
+    dims: [moe_inter_dim, dim, n_routed_experts]
+    data_gen: torch.randn
+  - name: w_up
+    dtype: fp32
+    dims: [moe_inter_dim, dim, n_routed_experts]
+    data_gen: torch.randn
+  - name: w_down
+    dtype: fp32
+    dims: [dim, moe_inter_dim, n_routed_experts]
+    data_gen: torch.randn
+  - name: expert_onehot
+    dtype: Multihot(fp32, n_routed_experts)
+    dims: [n_activated_experts, seq_len]
+    min: 1
+    max: 1
+  - name: expert_weights
+    dtype: fp32
+    dims: [n_activated_experts, seq_len]
+    data_gen: torch.randn
+
+outputs:
+  - name: S0
+    dtype: fp32
+    dims: [hidden_dim, seq_len]
+    data_transform:
+      - |
+        S_dim = seq_len_value
+        H_dim = head_dim_value
+        NQ = num_heads_value
+        NKV = num_kv_heads_value
+        QPKV = query_per_kvhead_value
+        D_dim = dim_value
+        n_r = n_routed_experts_value
+        def _rms_norm(x, eps=1e-6):
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        def _rotate_half(x):
+            half = x.shape[-1] // 2
+            return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+        normed = _rms_norm(input_data['input_tensor'])
+        Q = (normed @ input_data['q_proj']).view(S_dim, NQ, H_dim)
+        K = (normed @ input_data['k_proj']).view(S_dim, NKV, H_dim)
+        V = (normed @ input_data['v_proj']).view(S_dim, NKV, H_dim)
+        Q = _rms_norm(Q)
+        K = _rms_norm(K)
+        Q = Q * input_data['cos'] + _rotate_half(Q) * input_data['sin']
+        K = K * input_data['cos'] + _rotate_half(K) * input_data['sin']
+        Qh = Q.view(S_dim, NKV, QPKV, H_dim).permute(1, 2, 0, 3)
+        Kh = K.permute(1, 0, 2).unsqueeze(1)
+        Vh = V.permute(1, 0, 2).unsqueeze(1)
+        scores = Qh @ Kh.transpose(-1, -2)
+        row_max = scores.amax(dim=-1, keepdim=True)
+        e = torch.exp(scores - row_max)
+        attn = (e @ Vh) / e.sum(dim=-1, keepdim=True)
+        attn = attn.permute(2, 0, 1, 3).reshape(S_dim, NQ, H_dim)
+        attn_flat = attn.reshape(S_dim, NQ * H_dim)
+        o_proj_out = attn_flat @ input_data['o_proj_weight']
+        res_add_0 = o_proj_out + input_data['input_tensor']
+        normed_2 = _rms_norm(res_add_0)
+        moe_output = torch.zeros(S_dim, D_dim, dtype=torch.float32)
+        for i in range(n_r):
+            tok, top_pos = torch.where(input_data['expert_onehot'][:, :, i] == 1)
+            if len(tok) == 0:
+                continue
+            gate_out = normed_2[tok] @ input_data['w_gate'][i]
+            up_out = normed_2[tok] @ input_data['w_up'][i]
+            hidden = (gate_out * torch.sigmoid(gate_out)) * up_out
+            down_out = hidden @ input_data['w_down'][i]
+            moe_output[tok] = moe_output[tok] + down_out * input_data['expert_weights'][tok, top_pos, None]
+        moe_output + res_add_0
